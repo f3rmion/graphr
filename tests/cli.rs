@@ -24,6 +24,6 @@ fn invalid_cli_is_concise() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "Usage: grapher --version\n"
+        "grapher: invalid command\n\nUsage:\n  grapher index [PATH] [--rebuild]\n  grapher serve [PATH]\n  grapher --version\n"
     );
 }

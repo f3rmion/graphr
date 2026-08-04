@@ -6,3 +6,10 @@ rust-version = "1.97.1"
 publish = false
 
 [dependencies]
+libc = "0.2.189"
+rmcp = { version = "=3.1.0", default-features = false, features = ["server", "macros", "transport-io"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync"] }
+tree-sitter = "0.26.11"
+tree-sitter-rust = "0.24.2"
