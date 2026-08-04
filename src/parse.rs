@@ -691,4 +691,23 @@ fn comment_test() {}
             "Rust import path exceeds 1024 bytes"
         );
     }
+
+    #[test]
+    fn skips_receiver_calls_that_cannot_be_resolved() {
+        let parsed = RustParser::new()
+            .unwrap()
+            .parse(
+                "impl Item { fn run(&self, other: Item) { local(); Item::make::<u8>(); self.work::<u8>(); other.work(); Item::make().work(); } }",
+            )
+            .unwrap();
+
+        assert_eq!(
+            parsed
+                .calls
+                .iter()
+                .map(|call| call.target.as_str())
+                .collect::<Vec<_>>(),
+            ["local", "Item::make::<u8>", "self.work::<u8>", "Item::make"]
+        );
+    }
 }

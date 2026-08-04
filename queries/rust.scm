@@ -31,6 +31,15 @@
   function: [
     (identifier)
     (scoped_identifier)
-    (field_expression)
-    (generic_function)
+    (field_expression
+      value: (self)
+      field: (field_identifier))
+    (generic_function
+      function: [
+        (identifier)
+        (scoped_identifier)
+        (field_expression
+          value: (self)
+          field: (field_identifier))
+      ])
   ] @call)
