@@ -18,6 +18,15 @@ const CHANGES_BUDGET: usize = 8192;
 const TRUNCATED: &str = "[truncated]\n";
 const BUSY_LIMIT: Duration = Duration::from_secs(5);
 const BUSY_POLL: Duration = Duration::from_millis(5);
+// ponytail: stable rowid order stops at the output budget; add BM25 only if
+// measured relevance warrants ranking every match.
+const SEARCH_SQL: &str = "SELECT n.id, n.kind, n.name, f.path, n.line_start
+       FROM nodes_fts
+       JOIN nodes n ON n.id=nodes_fts.rowid
+       JOIN files f ON f.id=n.file_id
+      WHERE nodes_fts MATCH ?1 AND (?2 IS NULL OR n.kind=?2)
+      ORDER BY nodes_fts.rowid
+      LIMIT ?3";
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -237,17 +246,7 @@ impl Store {
         let fts = literal_fts(query)?;
         let tx = self.connection.transaction().map_err(db_error)?;
         let state = read_state(&tx)?;
-        let mut statement = tx
-            .prepare(
-                "SELECT n.id, n.kind, n.name, f.path, n.line_start
-                 FROM nodes_fts
-                 JOIN nodes n ON n.id=nodes_fts.rowid
-                 JOIN files f ON f.id=n.file_id
-                 WHERE nodes_fts MATCH ?1 AND (?2 IS NULL OR n.kind=?2)
-                 ORDER BY bm25(nodes_fts), n.qualified_name, n.id
-                 LIMIT ?3",
-            )
-            .map_err(db_error)?;
+        let mut statement = tx.prepare(SEARCH_SQL).map_err(db_error)?;
         let rows = statement
             .query_map(params![fts, kind.map(NodeKind::db), limit + 1], |row| {
                 Ok(RowNode {
@@ -1714,6 +1713,40 @@ mod tests {
             "\"dispatch\"* AND \"OR\"*"
         );
         assert!(literal_fts("***").is_err());
+    }
+
+    #[test]
+    fn search_query_uses_the_bounded_fts_plan() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let cancelled = AtomicBool::new(false);
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((single_node_graph("common"), ()))
+            })
+            .unwrap();
+
+        let mut statement = store
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {SEARCH_SQL}"))
+            .unwrap();
+        let plan = statement
+            .query_map(params!["\"common\"*", Option::<&str>::None, 21], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("SCAN nodes_fts VIRTUAL TABLE INDEX"))
+        );
+        assert!(plan.iter().all(|step| {
+            !step.contains("TEMP B-TREE") && step != "SCAN n" && !step.starts_with("SCAN n ")
+        }));
     }
 
     #[test]
