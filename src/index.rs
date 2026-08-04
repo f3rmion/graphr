@@ -65,6 +65,22 @@ impl Project {
     pub fn view(&self, node_ref: &str, depth: u32, max_nodes: u32) -> Result<String, String> {
         Store::open_reader(&self.repository.database)?.view(node_ref, depth, max_nodes)
     }
+
+    pub fn changes_cancelled(
+        &self,
+        base: &str,
+        depth: u32,
+        max_nodes: u32,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<String, String> {
+        check_cancelled(&cancelled)?;
+        let changes = self.repository.worktree_changes(base, &cancelled)?;
+        if changes.is_empty() {
+            return Ok("no changes\n".into());
+        }
+        Store::open_reader(&self.repository.database)?
+            .changes(&changes, depth, max_nodes, &cancelled)
+    }
 }
 
 fn build_index(

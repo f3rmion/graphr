@@ -24,8 +24,8 @@ const MCP_LINE_LIMIT: usize = 3 * 1024;
 #[derive(Clone)]
 struct Grapher {
     project: Arc<Project>,
-    indexing: Arc<TokioMutex<()>>,
-    cancellation: Arc<IndexCancellation>,
+    jobs: Arc<TokioMutex<()>>,
+    cancellation: Arc<JobCancellation>,
 }
 
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
@@ -72,15 +72,33 @@ struct ViewParams {
     max_nodes: u32,
 }
 
-#[tool_router]
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct ChangesParams {
+    #[serde(default = "default_changes_base")]
+    #[schemars(length(min = 1, max = 256))]
+    base: String,
+    #[serde(default = "default_changes_depth")]
+    #[schemars(range(min = 0, max = 3))]
+    depth: u32,
+    #[serde(default = "default_changes_max_nodes")]
+    #[schemars(range(min = 1, max = 50))]
+    max_nodes: u32,
+}
+
 impl Grapher {
-    #[tool(description = "Refresh the Rust code graph for this repository")]
-    async fn index(&self, context: RequestContext<RoleServer>) -> ToolResult {
+    async fn exclusive_job(
+        &self,
+        context: RequestContext<RoleServer>,
+        busy: &'static str,
+        budget: usize,
+        work: impl FnOnce(Arc<Project>, Arc<AtomicBool>) -> ToolResult + Send + 'static,
+    ) -> ToolResult {
         let _guard = self
-            .indexing
+            .jobs
             .clone()
             .try_lock_owned()
-            .map_err(|_| "index busy".to_owned())?;
+            .map_err(|_| busy.to_owned())?;
         let cancelled = self.cancellation.begin();
         let _cancel_on_drop = CancelOnDrop {
             state: self.cancellation.clone(),
@@ -88,8 +106,7 @@ impl Grapher {
         };
         let project = self.project.clone();
         let worker_cancelled = cancelled.clone();
-        let mut worker =
-            tokio::task::spawn_blocking(move || project.index_cancelled(false, worker_cancelled));
+        let mut worker = tokio::task::spawn_blocking(move || work(project, worker_cancelled));
         let result = tokio::select! {
             result = &mut worker => result.map_err(|error| format!("worker failed: {error}"))?,
             () = context.ct.cancelled() => {
@@ -97,7 +114,18 @@ impl Grapher {
                 worker.await.map_err(|error| format!("worker failed: {error}"))?
             }
         };
-        error_budget(result, 256)
+        error_budget(result, budget)
+    }
+}
+
+#[tool_router]
+impl Grapher {
+    #[tool(description = "Refresh the Rust code graph for this repository")]
+    async fn index(&self, context: RequestContext<RoleServer>) -> ToolResult {
+        self.exclusive_job(context, "index busy", 256, |project, cancelled| {
+            project.index_cancelled(false, cancelled)
+        })
+        .await
     }
 
     #[tool(
@@ -137,6 +165,25 @@ impl Grapher {
             4096,
         )
     }
+
+    #[tool(
+        description = "Show changed Rust symbols and their bounded graph neighborhood",
+        input_schema = rmcp::handler::server::common::schema_for_input::<ChangesParams>()
+            .expect("valid changes schema")
+    )]
+    async fn changes(
+        &self,
+        Parameters(raw): Parameters<rmcp::serde_json::Value>,
+        context: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let params: ChangesParams = rmcp::serde_json::from_value(raw)
+            .map_err(|_| "invalid changes parameters".to_owned())?;
+        validate_changes(&params)?;
+        self.exclusive_job(context, "changes busy", 8192, move |project, cancelled| {
+            project.changes_cancelled(&params.base, params.depth, params.max_nodes, cancelled)
+        })
+        .await
+    }
 }
 
 #[tool_handler]
@@ -144,15 +191,17 @@ impl ServerHandler for Grapher {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("grapher", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Use search to get a node_ref, then view its graph.")
+            .with_instructions(
+                "Use search to get a node_ref, then view its graph. After edits, call index then changes.",
+            )
     }
 }
 
 pub async fn serve(project: Project) -> Result<(), String> {
-    let cancellation = Arc::new(IndexCancellation::default());
+    let cancellation = Arc::new(JobCancellation::default());
     let server = Grapher {
         project: Arc::new(project),
-        indexing: Arc::new(TokioMutex::new(())),
+        jobs: Arc::new(TokioMutex::new(())),
         cancellation: cancellation.clone(),
     };
     let input = CancelOnEof {
@@ -192,12 +241,12 @@ fn error_budget(result: ToolResult, limit: usize) -> ToolResult {
 }
 
 #[derive(Default)]
-struct IndexCancellation {
+struct JobCancellation {
     closed: AtomicBool,
     active: StdMutex<Option<Arc<AtomicBool>>>,
 }
 
-impl IndexCancellation {
+impl JobCancellation {
     fn begin(&self) -> Arc<AtomicBool> {
         let mut active = self
             .active
@@ -235,7 +284,7 @@ impl IndexCancellation {
 }
 
 struct CancelOnDrop {
-    state: Arc<IndexCancellation>,
+    state: Arc<JobCancellation>,
     flag: Arc<AtomicBool>,
 }
 
@@ -248,7 +297,7 @@ impl Drop for CancelOnDrop {
 
 struct CancelOnEof {
     input: tokio::io::Stdin,
-    cancellation: Arc<IndexCancellation>,
+    cancellation: Arc<JobCancellation>,
     line_bytes: usize,
 }
 
@@ -302,6 +351,23 @@ fn validate_search(params: &SearchParams) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_changes(params: &ChangesParams) -> Result<(), String> {
+    if params.base.trim().is_empty()
+        || params.base.len() > 256
+        || params.base.trim_start().starts_with('-')
+        || params.base.chars().any(char::is_control)
+    {
+        return Err("invalid changes base".into());
+    }
+    if params.depth > 3 {
+        return Err("depth must be in 0..=3".into());
+    }
+    if !(1..=50).contains(&params.max_nodes) {
+        return Err("max_nodes must be in 1..=50".into());
+    }
+    Ok(())
+}
+
 const fn default_search_limit() -> u32 {
     8
 }
@@ -312,6 +378,18 @@ const fn default_depth() -> u32 {
 
 const fn default_max_nodes() -> u32 {
     30
+}
+
+fn default_changes_base() -> String {
+    "HEAD".into()
+}
+
+const fn default_changes_depth() -> u32 {
+    2
+}
+
+const fn default_changes_max_nodes() -> u32 {
+    50
 }
 
 #[cfg(test)]
@@ -350,6 +428,58 @@ mod tests {
         assert_eq!(view["properties"]["depth"]["maximum"], 3);
         assert_eq!(view["properties"]["max_nodes"]["minimum"], 1);
         assert_eq!(view["properties"]["max_nodes"]["maximum"], 50);
+
+        let changes =
+            rmcp::serde_json::to_value(rmcp::schemars::schema_for!(ChangesParams)).unwrap();
+        assert_eq!(changes["properties"]["base"]["minLength"], 1);
+        assert_eq!(changes["properties"]["base"]["maxLength"], 256);
+        assert_eq!(changes["properties"]["depth"]["minimum"], 0);
+        assert_eq!(changes["properties"]["depth"]["maximum"], 3);
+        assert_eq!(changes["properties"]["max_nodes"]["minimum"], 1);
+        assert_eq!(changes["properties"]["max_nodes"]["maximum"], 50);
+    }
+
+    #[test]
+    fn validates_changes_defaults_and_boundaries() {
+        let defaults: ChangesParams =
+            rmcp::serde_json::from_value(rmcp::serde_json::json!({})).unwrap();
+        assert_eq!(defaults.base, "HEAD");
+        assert_eq!(defaults.depth, 2);
+        assert_eq!(defaults.max_nodes, 50);
+        assert!(validate_changes(&defaults).is_ok());
+
+        for invalid in [
+            ChangesParams {
+                base: " ".into(),
+                depth: 2,
+                max_nodes: 50,
+            },
+            ChangesParams {
+                base: "-HEAD".into(),
+                depth: 2,
+                max_nodes: 50,
+            },
+            ChangesParams {
+                base: "HEAD".into(),
+                depth: 4,
+                max_nodes: 50,
+            },
+            ChangesParams {
+                base: "HEAD".into(),
+                depth: 2,
+                max_nodes: 0,
+            },
+        ] {
+            assert!(validate_changes(&invalid).is_err());
+        }
+        assert!(
+            validate_changes(&ChangesParams {
+                base: "a".repeat(257),
+                depth: 2,
+                max_nodes: 50,
+            })
+            .is_err()
+        );
     }
 
     #[test]

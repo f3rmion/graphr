@@ -38,6 +38,38 @@ pub struct RustFiles {
     pub skipped: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LineSpan {
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ChangedFile {
+    pub path: String,
+    pub whole_file: bool,
+    pub spans: Vec<LineSpan>,
+    pub report_unmapped: bool,
+}
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PathRecord {
+    Deleted(String),
+    Renamed(String, String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct WorktreeChanges {
+    pub files: Vec<ChangedFile>,
+    pub records: Vec<PathRecord>,
+}
+
+impl WorktreeChanges {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.records.is_empty()
+    }
+}
+
 impl Repository {
     pub fn discover_cancelled(path: &Path, cancelled: &AtomicBool) -> Result<Self, String> {
         validate_utf8(path, "project path")?;
@@ -125,6 +157,63 @@ impl Repository {
         Ok(inventory)
     }
 
+    pub fn worktree_changes(
+        &self,
+        base: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<WorktreeChanges, String> {
+        validate_base(base)?;
+        let revision = format!("{base}^{{commit}}");
+        let oid = parse_oid(&run(
+            &self.root,
+            &["rev-parse", "--verify", "--end-of-options", &revision],
+            cancelled,
+        )?)?;
+        let tracked = parse_tracked_changes(
+            &run(
+                &self.root,
+                &[
+                    "diff",
+                    "--raw",
+                    "-z",
+                    "--patch",
+                    "--unified=0",
+                    "--abbrev=64",
+                    "--find-renames=50%",
+                    "-l0",
+                    "--diff-filter=AMDR",
+                    "--diff-algorithm=myers",
+                    "--no-indent-heuristic",
+                    "-O/dev/null",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--ignore-submodules=all",
+                    "--text",
+                    &oid,
+                    "--",
+                    "*.rs",
+                ],
+                cancelled,
+            )?,
+            cancelled,
+        )?;
+        let untracked = run(
+            &self.root,
+            &[
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                "*.rs",
+            ],
+            cancelled,
+        )?;
+        check_cancelled(cancelled)?;
+        merge_changes(tracked, &untracked, cancelled)
+    }
+
     pub fn read_rust_source(
         &self,
         source: &RustFile,
@@ -194,6 +283,357 @@ impl Repository {
             text,
         }))
     }
+}
+
+#[derive(Clone, Copy)]
+enum RawKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+struct RawChange {
+    kind: RawKind,
+    old: Option<String>,
+    new: Option<String>,
+}
+
+fn validate_base(base: &str) -> Result<(), String> {
+    if base.trim().is_empty()
+        || base.len() > 256
+        || base.trim_start().starts_with('-')
+        || base.chars().any(char::is_control)
+    {
+        Err("invalid changes base".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_oid(output: &[u8]) -> Result<String, String> {
+    let output = output.strip_suffix(b"\n").unwrap_or(output);
+    let output = output.strip_suffix(b"\r").unwrap_or(output);
+    if !valid_oid(output) {
+        return Err("Git returned an invalid commit ID".into());
+    }
+    Ok(std::str::from_utf8(output)
+        .expect("validated ASCII object ID")
+        .to_owned())
+}
+
+fn parse_tracked_changes(
+    output: &[u8],
+    cancelled: &AtomicBool,
+) -> Result<(Vec<ChangedFile>, Vec<PathRecord>), String> {
+    if output.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let boundary = output
+        .windows(2)
+        .position(|bytes| bytes == b"\0\0")
+        .ok_or_else(|| "Git returned malformed diff metadata".to_owned())?;
+    let raw = &output[..=boundary];
+    let patch = &output[boundary + 2..];
+    let raw = parse_raw_changes(raw, cancelled)?;
+    let hunks = parse_patch_hunks(patch, raw.len(), cancelled)?;
+    let mut files = Vec::new();
+    let mut records = Vec::new();
+
+    for (index, (change, spans)) in raw.into_iter().zip(hunks).enumerate() {
+        check_progress(index, cancelled)?;
+        match change.kind {
+            RawKind::Added => {
+                if let Some(path) = change.new {
+                    files.push(ChangedFile {
+                        path,
+                        whole_file: true,
+                        spans,
+                        report_unmapped: true,
+                    });
+                }
+            }
+            RawKind::Modified => {
+                if let Some(path) = change.new {
+                    files.push(ChangedFile {
+                        path,
+                        whole_file: false,
+                        spans,
+                        report_unmapped: true,
+                    });
+                }
+            }
+            RawKind::Deleted => {
+                if let Some(path) = change.old {
+                    records.push(PathRecord::Deleted(path));
+                }
+            }
+            RawKind::Renamed => match (change.old, change.new) {
+                (Some(old), Some(new)) => {
+                    files.push(ChangedFile {
+                        path: new.clone(),
+                        whole_file: true,
+                        report_unmapped: !spans.is_empty(),
+                        spans,
+                    });
+                    records.push(PathRecord::Renamed(old, new));
+                }
+                (Some(old), None) => records.push(PathRecord::Deleted(old)),
+                (None, Some(new)) => files.push(ChangedFile {
+                    path: new,
+                    whole_file: true,
+                    spans,
+                    report_unmapped: true,
+                }),
+                (None, None) => {}
+            },
+        }
+    }
+    Ok((files, records))
+}
+
+fn parse_raw_changes(input: &[u8], cancelled: &AtomicBool) -> Result<Vec<RawChange>, String> {
+    if !input.ends_with(&[0]) {
+        return Err("Git returned malformed diff metadata".into());
+    }
+    let mut records = input.split(|byte| *byte == 0);
+    let mut changes = Vec::new();
+    while let Some(header) = records.next() {
+        check_progress(changes.len(), cancelled)?;
+        if header.is_empty() {
+            if records.next().is_some() {
+                return Err("Git returned malformed diff metadata".into());
+            }
+            break;
+        }
+        let fields = header
+            .strip_prefix(b":")
+            .ok_or_else(|| "Git returned malformed diff metadata".to_owned())?
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        if fields.len() != 5
+            || !fields[..2]
+                .iter()
+                .all(|mode| mode.len() == 6 && mode.iter().all(|byte| matches!(byte, b'0'..=b'7')))
+            || !fields[2..4].iter().all(|oid| valid_oid(oid))
+        {
+            return Err("Git returned malformed diff metadata".into());
+        }
+        let status = fields[4];
+        let kind = match status {
+            b"A" => RawKind::Added,
+            b"M" => RawKind::Modified,
+            b"D" => RawKind::Deleted,
+            score
+                if score.first() == Some(&b'R')
+                    && score.len() > 1
+                    && score[1..].iter().all(u8::is_ascii_digit)
+                    && std::str::from_utf8(&score[1..])
+                        .ok()
+                        .and_then(|score| score.parse::<u8>().ok())
+                        .is_some_and(|score| score <= 100) =>
+            {
+                RawKind::Renamed
+            }
+            _ => return Err("Git returned unsupported diff metadata".into()),
+        };
+        let first = records
+            .next()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| "Git returned malformed diff metadata".to_owned())?;
+        let first = parse_change_path(first)?;
+        let (old, new) = if matches!(kind, RawKind::Renamed) {
+            let second = records
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| "Git returned malformed diff metadata".to_owned())?;
+            (first, parse_change_path(second)?)
+        } else if matches!(kind, RawKind::Deleted) {
+            (first, None)
+        } else {
+            (None, first)
+        };
+        changes.push(RawChange { kind, old, new });
+    }
+    Ok(changes)
+}
+
+fn parse_patch_hunks(
+    input: &[u8],
+    file_count: usize,
+    cancelled: &AtomicBool,
+) -> Result<Vec<Vec<LineSpan>>, String> {
+    if file_count == 0 || !input.starts_with(b"diff --git ") || !input.ends_with(b"\n") {
+        return Err("Git returned malformed patch metadata".into());
+    }
+    let mut hunks: Vec<Vec<LineSpan>> = vec![Vec::new(); file_count];
+    let mut current = None;
+    let mut sections = 0;
+    for (index, line) in input.split(|byte| *byte == b'\n').enumerate() {
+        check_progress(index, cancelled)?;
+        if line.starts_with(b"diff --git ") {
+            if sections == file_count {
+                return Err("Git diff changed while reading it; retry".into());
+            }
+            current = Some(sections);
+            sections += 1;
+        } else if line.starts_with(b"@@ ") {
+            let current =
+                current.ok_or_else(|| "Git returned a hunk without file metadata".to_owned())?;
+            let span = parse_hunk(line)?;
+            if hunks[current]
+                .last()
+                .is_some_and(|previous| previous.end >= span.start)
+            {
+                return Err("Git returned overlapping diff hunks".into());
+            }
+            hunks[current].push(span);
+        }
+    }
+    if sections != file_count {
+        return Err("Git diff changed while reading it; retry".into());
+    }
+    Ok(hunks)
+}
+
+fn parse_hunk(line: &[u8]) -> Result<LineSpan, String> {
+    let body = line
+        .strip_prefix(b"@@ -")
+        .ok_or_else(|| "Git returned a malformed hunk".to_owned())?;
+    let separator = body
+        .windows(2)
+        .position(|bytes| bytes == b" +")
+        .ok_or_else(|| "Git returned a malformed hunk".to_owned())?;
+    parse_hunk_side(&body[..separator])?;
+    let new = &body[separator + 2..];
+    let end = new
+        .windows(3)
+        .position(|bytes| bytes == b" @@")
+        .ok_or_else(|| "Git returned a malformed hunk".to_owned())?;
+    let (start, count) = parse_hunk_side(&new[..end])?;
+    if count == 0 {
+        let anchor = start
+            .checked_mul(2)
+            .and_then(|line| line.checked_add(1))
+            .ok_or_else(|| "Git hunk exceeds the supported line range".to_owned())?;
+        Ok(LineSpan {
+            start: anchor,
+            end: anchor,
+        })
+    } else {
+        if start == 0 {
+            return Err("Git returned a malformed hunk".into());
+        }
+        let last = start
+            .checked_add(count - 1)
+            .ok_or_else(|| "Git hunk exceeds the supported line range".to_owned())?;
+        Ok(LineSpan {
+            start: start
+                .checked_mul(2)
+                .ok_or_else(|| "Git hunk exceeds the supported line range".to_owned())?,
+            end: last
+                .checked_mul(2)
+                .ok_or_else(|| "Git hunk exceeds the supported line range".to_owned())?,
+        })
+    }
+}
+
+fn parse_hunk_side(input: &[u8]) -> Result<(u64, u64), String> {
+    let mut fields = input.split(|byte| *byte == b',');
+    let start = parse_decimal(fields.next().unwrap_or_default())?;
+    let count = fields.next().map(parse_decimal).transpose()?.unwrap_or(1);
+    if fields.next().is_some() {
+        return Err("Git returned a malformed hunk".into());
+    }
+    Ok((start, count))
+}
+
+fn parse_decimal(input: &[u8]) -> Result<u64, String> {
+    if input.is_empty() || !input.iter().all(u8::is_ascii_digit) {
+        return Err("Git returned a malformed hunk".into());
+    }
+    std::str::from_utf8(input)
+        .expect("validated ASCII integer")
+        .parse()
+        .map_err(|_| "Git hunk exceeds the supported line range".to_owned())
+}
+
+fn merge_changes(
+    (mut files, mut records): (Vec<ChangedFile>, Vec<PathRecord>),
+    untracked: &[u8],
+    cancelled: &AtomicBool,
+) -> Result<WorktreeChanges, String> {
+    if !untracked.is_empty() && !untracked.ends_with(&[0]) {
+        return Err("Git returned malformed untracked paths".into());
+    }
+    if let Some(paths) = untracked.strip_suffix(&[0]) {
+        for (index, path) in paths.split(|byte| *byte == 0).enumerate() {
+            check_progress(index, cancelled)?;
+            if path.is_empty() {
+                return Err("Git returned malformed untracked paths".into());
+            }
+            if let Some(path) = parse_change_path(path)? {
+                files.push(ChangedFile {
+                    path,
+                    whole_file: true,
+                    spans: Vec::new(),
+                    report_unmapped: true,
+                });
+            }
+        }
+    }
+    check_cancelled(cancelled)?;
+    files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    let mut merged = Vec::<ChangedFile>::with_capacity(files.len());
+    for (index, mut file) in files.into_iter().enumerate() {
+        check_progress(index, cancelled)?;
+        if let Some(previous) = merged.last_mut()
+            && previous.path == file.path
+        {
+            previous.whole_file |= file.whole_file;
+            previous.report_unmapped |= file.report_unmapped;
+            previous.spans.append(&mut file.spans);
+            previous
+                .spans
+                .sort_unstable_by_key(|span| (span.start, span.end));
+        } else {
+            merged.push(file);
+        }
+    }
+    let current = merged
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<HashSet<_>>();
+    records.retain(
+        |record| !matches!(record, PathRecord::Deleted(path) if current.contains(path.as_str())),
+    );
+    check_cancelled(cancelled)?;
+    records.sort_unstable();
+    records.dedup();
+    check_cancelled(cancelled)?;
+    Ok(WorktreeChanges {
+        files: merged,
+        records,
+    })
+}
+
+fn parse_change_path(input: &[u8]) -> Result<Option<String>, String> {
+    let Ok(path) = std::str::from_utf8(input) else {
+        return Ok(None);
+    };
+    if path.chars().any(char::is_control) {
+        return Ok(None);
+    }
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return Err("Git returned an unsafe changed path".into());
+    }
+    Ok(path.ends_with(".rs").then(|| path.to_owned()))
 }
 
 fn parse_rust_files(output: &[u8]) -> Result<RustFiles, String> {
@@ -293,6 +733,13 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
     }
 }
 
+fn check_progress(index: usize, cancelled: &AtomicBool) -> Result<(), String> {
+    if index & 1023 == 0 {
+        check_cancelled(cancelled)?;
+    }
+    Ok(())
+}
+
 fn same_file_version(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev()
         && left.ino() == right.ino()
@@ -356,6 +803,7 @@ fn run(cwd: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Vec<u8>, Str
         .args(["--no-pager", "-c", "core.fsmonitor=false", "-C"])
         .arg(cwd)
         .args(args)
+        .env("LC_ALL", "C")
         .env("GIT_PAGER", "cat")
         .env("GIT_NO_LAZY_FETCH", "1")
         .env_remove("GIT_DIR")
@@ -481,6 +929,79 @@ mod tests {
         let value = sanitize(b"bad\n\x1b[31m");
         assert!(!value.chars().any(char::is_control));
         assert!(value.len() <= 512);
+    }
+
+    #[test]
+    fn parses_changed_files_and_rejects_malformed_streams() {
+        let cancelled = AtomicBool::new(false);
+        let zero = "0".repeat(OID.len());
+        let tracked = format!(
+            ":000000 100644 {zero} {OID} A\0added.rs\0\
+             :100644 100644 {OID} {OID} M\0modified.rs\0\
+             :100644 000000 {OID} {zero} D\0deleted.rs\0\
+             :100644 100644 {OID} {OID} R100\0old.rs\0renamed.rs\0\0\
+             diff --git a/added.rs b/added.rs\n\
+             @@ -0,0 +1,2 @@\n+first\n+second\n\
+             diff --git a/modified.rs b/modified.rs\n\
+             @@ -2 +2 @@\n-old\n+new\n\
+             @@ -9,2 +8,0 @@\n-gone\n-away\n\
+             diff --git a/deleted.rs b/deleted.rs\n\
+             @@ -1 +0,0 @@\n-deleted\n\
+             diff --git a/old.rs b/renamed.rs\n\
+             similarity index 100%\n\
+             rename from old.rs\n\
+             rename to renamed.rs\n"
+        );
+        let changes = merge_changes(
+            parse_tracked_changes(tracked.as_bytes(), &cancelled).unwrap(),
+            b"untracked.rs\0",
+            &cancelled,
+        )
+        .unwrap();
+
+        assert_eq!(
+            changes,
+            WorktreeChanges {
+                files: vec![
+                    ChangedFile {
+                        path: "added.rs".into(),
+                        whole_file: true,
+                        spans: vec![LineSpan { start: 2, end: 4 }],
+                        report_unmapped: true,
+                    },
+                    ChangedFile {
+                        path: "modified.rs".into(),
+                        whole_file: false,
+                        spans: vec![
+                            LineSpan { start: 4, end: 4 },
+                            LineSpan { start: 17, end: 17 },
+                        ],
+                        report_unmapped: true,
+                    },
+                    ChangedFile {
+                        path: "renamed.rs".into(),
+                        whole_file: true,
+                        spans: Vec::new(),
+                        report_unmapped: false,
+                    },
+                    ChangedFile {
+                        path: "untracked.rs".into(),
+                        whole_file: true,
+                        spans: Vec::new(),
+                        report_unmapped: true,
+                    },
+                ],
+                records: vec![
+                    PathRecord::Deleted("deleted.rs".into()),
+                    PathRecord::Renamed("old.rs".into(), "renamed.rs".into()),
+                ],
+            }
+        );
+        assert!(
+            parse_tracked_changes(&tracked.as_bytes()[..tracked.len() - 1], &cancelled).is_err()
+        );
+        assert!(merge_changes((Vec::new(), Vec::new()), b"a.rs\0\0", &cancelled).is_err());
+        assert!(parse_change_path(b"../not-rust.txt").is_err());
     }
 
     #[test]

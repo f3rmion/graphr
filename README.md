@@ -14,7 +14,9 @@ codex mcp add grapher -- /absolute/path/to/grapher serve /absolute/repository
 claude mcp add --scope project grapher -- /absolute/path/to/grapher serve /absolute/repository
 ```
 
-The Rust-only slice exposes three MCP tools: `index`, `search`, and `view`.
+The Rust-only slice exposes four MCP tools: `index`, `search`, `view`, and
+`changes`.
 `index` hashes only dirty, untracked, or Git-OID-changed files and reparses only
 changed Rust sources. `search` returns compact `node_ref` values consumed by
-`view`.
+`view`. After editing, call `index` and then `changes` for a compact graph of
+changed symbols relative to `HEAD` or another base commit.

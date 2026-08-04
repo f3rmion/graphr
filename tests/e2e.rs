@@ -67,20 +67,7 @@ fn incremental_index_matches_rebuild_through_mutations() {
         fs::create_dir_all(root.join("crates/app/src")).unwrap();
         fs::write(root.join("crates/app/src/worker.rs"), "pub fn work() {}\n").unwrap();
         init_git(root);
-        assert!(
-            Command::new("git")
-                .args([
-                    "-C",
-                    root.to_str().unwrap(),
-                    "add",
-                    "--",
-                    "src",
-                    "crates/app/src/worker.rs",
-                ])
-                .status()
-                .unwrap()
-                .success()
-        );
+        git(root, &["add", "--", "src", "crates/app/src/worker.rs"]);
     }
 
     index_repository(&incremental.path, true);
@@ -159,6 +146,143 @@ fn incremental_index_matches_rebuild_through_mutations() {
 }
 
 #[test]
+fn changes_maps_mixed_worktree_edits_to_current_graph() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "mod changed;\nmod moved;\nmod removed;\nuse crate::changed::target;\npub fn caller() { target(); }\n#[test]\nfn checks_target() { target(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/changed.rs"),
+        "pub fn target() {\n    helper();\n}\npub fn helper() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/moved.rs"),
+        "pub fn moved_symbol() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/removed.rs"),
+        "pub fn removed_symbol() {}\n",
+    )
+    .unwrap();
+    fs::write(fixture.path.join(".gitignore"), "src/ignored.rs\n").unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git(
+        &fixture.path,
+        &[
+            "-c",
+            "user.name=Grapher Test",
+            "-c",
+            "user.email=grapher@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "baseline",
+        ],
+    );
+    index_repository(&fixture.path, true);
+
+    let mut client = Client::start(&fixture.path);
+    let _ = client.request(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"grapher-test","version":"0"}}}"#,
+    );
+    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    let clean = client.request(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{}}}"#,
+    );
+    assert!(clean.contains("no changes\\n"), "{clean}");
+
+    fs::write(
+        fixture.path.join("src/changed.rs"),
+        "pub fn target() {\n    helper();\n    helper();\n}\npub fn helper() {}\n",
+    )
+    .unwrap();
+    git(&fixture.path, &["add", "--", "src/changed.rs"]);
+    fs::write(
+        fixture.path.join("src/changed.rs"),
+        "pub fn target() {\n    helper();\n    helper();\n}\npub fn helper() { let _ = 1; }\n",
+    )
+    .unwrap();
+    git(
+        &fixture.path,
+        &["mv", "--", "src/moved.rs", "src/renamed.rs"],
+    );
+    fs::remove_file(fixture.path.join("src/removed.rs")).unwrap();
+    fs::write(
+        fixture.path.join("src/untracked.rs"),
+        "pub fn first_untracked() {}\npub fn second_untracked() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/ignored.rs"),
+        "pub fn ignored_symbol() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "// changed outside a symbol\nmod changed;\nmod moved;\nmod removed;\nuse crate::changed::target;\npub fn caller() { target(); }\n#[test]\nfn checks_target() { target(); }\n",
+    )
+    .unwrap();
+
+    let indexed = client.request(
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
+    );
+    assert!(indexed.contains("changed=6"), "{indexed}");
+    let generation = database_generation(&fixture.path.join(".git/grapher/index.db"));
+    let changed = client.request(
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"changes","arguments":{"depth":1,"max_nodes":50}}}"#,
+    );
+    let text = response_text(&changed);
+    for expected in [
+        "changed src/lib.rs",
+        "deleted src/removed.rs",
+        "renamed src/moved.rs -> src/renamed.rs",
+        "target",
+        "helper",
+        "moved_symbol",
+        "first_untracked",
+        "second_untracked",
+        "test <-",
+        "caller <-",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {changed}");
+    }
+    assert!(!text.contains("removed_symbol"), "{changed}");
+    assert!(!text.contains("ignored_symbol"), "{changed}");
+    assert!(text.contains(&format!(":{generation}:")), "{changed}");
+    assert_eq!(
+        database_generation(&fixture.path.join(".git/grapher/index.db")),
+        generation
+    );
+    let repeated = client.request(
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"changes","arguments":{"depth":1,"max_nodes":50}}}"#,
+    );
+    assert_eq!(response_text(&repeated), text);
+
+    for invalid in [
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"changes","arguments":{"base":"-HEAD"}}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"changes","arguments":{"base":"missing"}}}"#,
+        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"changes","arguments":{"depth":4}}}"#,
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"changes","arguments":{"max_nodes":0}}}"#,
+    ] {
+        let response = client.request(invalid);
+        assert!(tool_failed(&response), "{response}");
+        assert!(response.len() <= 8192, "{response}");
+    }
+    let bounded = client.request(
+        r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":1}}}"#,
+    );
+    assert!(bounded.contains("[truncated]"), "{bounded}");
+    assert!(bounded.len() <= 8192, "{bounded}");
+    client.close();
+}
+
+#[test]
 fn concurrent_initial_indexes_serialize() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
@@ -229,19 +353,7 @@ fn rust_index_search_view_over_mcp() {
     let fifo = fixture.path.join("src/pipe.rs");
     fs::write(&fifo, "fn replaced_by_fifo() {}\n").unwrap();
     init_git(&fixture.path);
-    assert!(
-        Command::new("git")
-            .args([
-                "-C",
-                fixture.path.to_str().unwrap(),
-                "add",
-                "--",
-                "src/pipe.rs"
-            ])
-            .status()
-            .unwrap()
-            .success()
-    );
+    git(&fixture.path, &["add", "--", "src/pipe.rs"]);
     fs::remove_file(&fifo).unwrap();
     let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
@@ -442,7 +554,7 @@ fn rust_index_search_view_over_mcp() {
     client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
 
     let tools = client.request(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
-    for name in ["index", "search", "view"] {
+    for name in ["changes", "index", "search", "view"] {
         assert!(tools.contains(&format!("\"name\":\"{name}\"")));
     }
     for invalid in [
@@ -579,9 +691,9 @@ fn rust_index_search_view_over_mcp() {
         r#"{"jsonrpc":"2.0","id":46,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
     );
     let busy = client.request(
-        r#"{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"changes","arguments":{}}}"#,
     );
-    assert!(busy.contains("index busy"), "{busy}");
+    assert!(busy.contains("changes busy"), "{busy}");
     thread::sleep(Duration::from_millis(50));
     let closed = Instant::now();
     client.close();
@@ -719,15 +831,18 @@ fn normalized_graph(path: &PathBuf) -> Vec<(String, String, String, u32)> {
         .unwrap()
 }
 
-fn init_git(path: &PathBuf) {
-    assert!(
-        Command::new("git")
-            .args(["init", "--quiet"])
-            .arg(path)
-            .status()
-            .unwrap()
-            .success()
-    );
+fn init_git(path: &Path) {
+    git(path, &["init", "--quiet"]);
+}
+
+fn git(path: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
 }
 
 fn find_executable(name: &str) -> PathBuf {
