@@ -362,21 +362,41 @@ impl Store {
         if changes.is_empty() {
             return Ok("no changes\n".into());
         }
+        if changes.files.is_empty() {
+            return Ok("no current symbols\n".into());
+        }
+        for file in &changes.files {
+            validate_changed_file(file)?;
+        }
+        if changes
+            .files
+            .windows(2)
+            .any(|files| files[0].path >= files[1].path)
+        {
+            return Err("changed files are not uniquely path-sorted".into());
+        }
 
+        let untracked = changes
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                PathRecord::Untracked(path) => Some(path.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let files = changes
+            .files
+            .iter()
+            .filter(|file| !untracked.contains(file.path.as_str()))
+            .chain(
+                changes
+                    .files
+                    .iter()
+                    .filter(|file| untracked.contains(file.path.as_str())),
+            );
         let mut lines = Vec::new();
         let mut line_bytes = 0;
-        for record in &changes.records {
-            let Some(line) = path_record_line(record) else {
-                return Ok(bounded(lines, CHANGES_BUDGET, true));
-            };
-            if !push_change_line(&mut lines, &mut line_bytes, line) {
-                return Ok(bounded(lines, CHANGES_BUDGET, true));
-            }
-        }
-        if changes.files.is_empty() {
-            return Ok(bounded(lines, CHANGES_BUDGET, false));
-        }
-
+        let mut unmapped_lines = Vec::new();
         let tx = self.connection.transaction().map_err(db_error)?;
         let state = read_state(&tx)?;
         let root_limit = max_nodes as usize;
@@ -400,15 +420,16 @@ impl Store {
                  ) ORDER BY line_start, line_end, id",
             )
             .map_err(db_error)?;
+        let mut file_nodes = tx
+            .prepare(
+                "SELECT n.id
+                   FROM files f JOIN nodes n ON n.file_id=f.id
+                  WHERE f.path=?1 AND n.kind='file'",
+            )
+            .map_err(db_error)?;
 
-        let mut previous_path = None;
-        for file in &changes.files {
+        for file in files {
             check_cancelled(cancelled)?;
-            validate_changed_file(file)?;
-            if previous_path.is_some_and(|path| path >= file.path.as_str()) {
-                return Err("changed files are not uniquely path-sorted".into());
-            }
-            previous_path = Some(file.path.as_str());
             let mut span_index = 0;
             let mut coverage = Vec::new();
             let mut saw_symbol = false;
@@ -461,15 +482,26 @@ impl Store {
                     has_unmapped_span(&file.spans, &coverage)
                 };
             if unmapped {
-                let Some(line) = path_line("changed ", &file.path) else {
+                if let Some(id) = file_nodes
+                    .query_row([&file.path], |row| row.get::<_, i64>(0))
+                    .optional()
+                    .map_err(db_error)?
+                    && root_seen.insert(id)
+                {
+                    if root_ids.len() < root_limit {
+                        root_ids.push(id);
+                    } else {
+                        omitted = true;
+                    }
+                }
+                let Some(line) = unmapped_line(file, &coverage) else {
                     return Ok(bounded(lines, CHANGES_BUDGET, true));
                 };
-                if !push_change_line(&mut lines, &mut line_bytes, line) {
-                    return Ok(bounded(lines, CHANGES_BUDGET, true));
-                }
+                unmapped_lines.push(line);
             }
         }
         drop(symbols);
+        drop(file_nodes);
 
         let mut roots = Vec::with_capacity(root_ids.len());
         for id in root_ids {
@@ -497,8 +529,14 @@ impl Store {
                 (&mut lines, &mut line_bytes),
             )?;
         }
+        for line in unmapped_lines {
+            if !push_change_line(&mut lines, &mut line_bytes, line) {
+                omitted = true;
+                break;
+            }
+        }
         if lines.is_empty() && !omitted {
-            Ok("no changes\n".into())
+            Ok("no current symbols\n".into())
         } else {
             Ok(bounded(lines, CHANGES_BUDGET, omitted))
         }
@@ -735,37 +773,46 @@ fn has_unmapped_span(changes: &[LineSpan], coverage: &[LineSpan]) -> bool {
         }
         coverage
             .get(covered)
-            .is_none_or(|symbol| symbol.start > change.end)
+            .is_none_or(|symbol| symbol.start > change.start || symbol.end < change.end)
     })
 }
 
-fn path_record_line(record: &PathRecord) -> Option<String> {
-    match record {
-        PathRecord::Deleted(path) => path_line("deleted ", path),
-        PathRecord::Renamed(old, new) => {
-            let mut output = String::from("renamed ");
-            if !push_escaped(&mut output, old, CHANGES_BUDGET)
-                || !push_literal(&mut output, " -> ", CHANGES_BUDGET)
-                || !push_escaped(&mut output, new, CHANGES_BUDGET)
-                || !push_literal(&mut output, "\n", CHANGES_BUDGET)
-            {
-                None
-            } else {
-                Some(output)
-            }
+fn unmapped_line(file: &ChangedFile, coverage: &[LineSpan]) -> Option<String> {
+    let mut output = String::from("unmapped ");
+    if !push_escaped(&mut output, &file.path, CHANGES_BUDGET) {
+        return None;
+    }
+    let mut covered = 0;
+    let mut locations = 0;
+    for change in &file.spans {
+        while coverage
+            .get(covered)
+            .is_some_and(|symbol| symbol.end < change.start)
+        {
+            covered += 1;
         }
+        if coverage
+            .get(covered)
+            .is_some_and(|symbol| symbol.start <= change.start && symbol.end >= change.end)
+        {
+            continue;
+        }
+        let start = (change.start / 2).max(1);
+        let end = (change.end / 2).max(start);
+        let location = if start == end {
+            format!("{}{start}", if locations == 0 { ':' } else { ',' })
+        } else {
+            format!("{}{start}-{end}", if locations == 0 { ':' } else { ',' })
+        };
+        if !push_literal(&mut output, &location, CHANGES_BUDGET) {
+            return None;
+        }
+        locations += 1;
     }
-}
-
-fn path_line(prefix: &str, path: &str) -> Option<String> {
-    let mut output = prefix.to_owned();
-    if push_escaped(&mut output, path, CHANGES_BUDGET)
-        && push_literal(&mut output, "\n", CHANGES_BUDGET)
-    {
-        Some(output)
-    } else {
-        None
+    if locations == 0 && !push_literal(&mut output, ":1", CHANGES_BUDGET) {
+        return None;
     }
+    push_literal(&mut output, "\n", CHANGES_BUDGET).then_some(output)
 }
 
 fn push_change_line(lines: &mut Vec<String>, bytes: &mut usize, line: String) -> bool {
@@ -2275,23 +2322,33 @@ mod tests {
                 byte_size: 64,
                 replace: true,
             }],
-            nodes: names
-                .iter()
-                .enumerate()
-                .map(|(index, name)| NodeInput {
-                    key: (*name).into(),
-                    file_key: "src/lib.rs".into(),
-                    kind: kinds[index],
-                    name: (*name).into(),
-                    qualified_name: (*name).into(),
-                    parent_key: None,
-                    owner_key: None,
-                    line_start: if index == 0 { 2 } else { index as u32 + 7 },
-                    line_end: if index == 0 { 6 } else { index as u32 + 7 },
-                    signature: String::new(),
-                    keys: vec![],
-                })
-                .collect(),
+            nodes: std::iter::once(NodeInput {
+                key: "file".into(),
+                file_key: "src/lib.rs".into(),
+                kind: NodeKind::File,
+                name: "src/lib.rs".into(),
+                qualified_name: "file".into(),
+                parent_key: None,
+                owner_key: None,
+                line_start: 1,
+                line_end: 64,
+                signature: String::new(),
+                keys: vec![],
+            })
+            .chain(names.iter().enumerate().map(|(index, name)| NodeInput {
+                key: (*name).into(),
+                file_key: "src/lib.rs".into(),
+                kind: kinds[index],
+                name: (*name).into(),
+                qualified_name: (*name).into(),
+                parent_key: None,
+                owner_key: None,
+                line_start: if index == 0 { 2 } else { index as u32 + 7 },
+                line_end: if index == 0 { 6 } else { index as u32 + 7 },
+                signature: String::new(),
+                keys: vec![],
+            }))
+            .collect(),
             edges: vec![
                 EdgeInput {
                     source_key: "test".into(),
@@ -2336,18 +2393,12 @@ mod tests {
                 PathRecord::Deleted("old.rs".into()),
                 PathRecord::Renamed("before.rs".into(), "after.rs".into()),
             ],
+            patch: String::new(),
+            skipped_paths: 0,
         };
         let output = store.changes(&changes, 1, 10, &cancelled).unwrap();
-        let positions = [
-            "deleted old.rs",
-            "renamed before.rs -> after.rs",
-            " root ",
-            "test <-",
-            "caller <-",
-            "call ->",
-            "import ->",
-        ]
-        .map(|part| output.find(part).unwrap());
+        let positions = [" root ", "test <-", "caller <-", "call ->", "import ->"]
+            .map(|part| output.find(part).unwrap());
         assert!(
             positions.windows(2).all(|pair| pair[0] < pair[1]),
             "{output}"
@@ -2365,10 +2416,57 @@ mod tests {
                 report_unmapped: true,
             }],
             records: vec![],
+            patch: String::new(),
+            skipped_paths: 0,
         };
+        let output = store.changes(&unmapped, 0, 10, &cancelled).unwrap();
+        assert!(output.contains(" File src/lib.rs src/lib.rs:1"), "{output}");
+        assert!(output.contains("unmapped src/lib.rs:1"), "{output}");
+
+        let mut flooded = WorktreeChanges {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                whole_file: false,
+                spans: vec![LineSpan { start: 7, end: 7 }],
+                report_unmapped: true,
+            }],
+            records: vec![],
+            patch: String::new(),
+            skipped_paths: 0,
+        };
+        for index in 0..500 {
+            let path = format!("src/untracked-{index:03}.rs");
+            flooded.files.push(ChangedFile {
+                path: path.clone(),
+                whole_file: true,
+                spans: vec![],
+                report_unmapped: true,
+            });
+            flooded.records.push(PathRecord::Untracked(path));
+        }
+        let output = store.changes(&flooded, 1, 10, &cancelled).unwrap();
+        assert!(output.contains(" root "), "{output}");
+        assert!(output.contains("test <-"), "{output}");
+        assert!(output.contains("caller <-"), "{output}");
+        assert!(output.contains(TRUNCATED.trim()), "{output}");
+    }
+
+    #[test]
+    fn partially_covered_hunks_remain_unmapped() {
+        let changed = LineSpan { start: 2, end: 14 };
+        let symbol = LineSpan { start: 4, end: 12 };
+        assert!(has_unmapped_span(&[changed], &[symbol]));
         assert_eq!(
-            store.changes(&unmapped, 0, 10, &cancelled).unwrap(),
-            "changed src/lib.rs\n"
+            unmapped_line(
+                &ChangedFile {
+                    path: "src/lib.rs".into(),
+                    whole_file: false,
+                    spans: vec![changed],
+                    report_unmapped: true,
+                },
+                &[symbol]
+            ),
+            Some("unmapped src/lib.rs:1-7\n".into())
         );
     }
 
@@ -2486,6 +2584,8 @@ mod tests {
                         report_unmapped: true,
                     }],
                     records: vec![],
+                    patch: String::new(),
+                    skipped_paths: 0,
                 },
                 0,
                 10,
@@ -2622,6 +2722,8 @@ mod tests {
                         report_unmapped: false,
                     }],
                     records: vec![],
+                    patch: String::new(),
+                    skipped_paths: 0,
                 },
                 1,
                 3,

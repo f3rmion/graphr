@@ -1,0 +1,4 @@
+interface:
+  display_name: "Graphr Review"
+  short_description: "Review Rust changes with bounded graph context"
+  default_prompt: "Use $graphr-review to review the current Rust changes without scanning the repository."

@@ -1,12 +1,13 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::thread;
 
-use crate::git::{Language, Repository, Source};
+use crate::git::{Language, PathRecord, Repository, Source, SourceFile, WorktreeChanges};
 use crate::parse::{DefinitionKind, ParsedFile, RustParser};
 use crate::python::PythonParser;
 use crate::store::{
@@ -15,6 +16,10 @@ use crate::store::{
 };
 
 const QUALIFIED_PATH_LIMIT: usize = 1024;
+const REVIEW_CONTEXT_BUDGET: usize = 8192;
+const REVIEW_GRAPH_RESERVE: usize = 3 * 1024;
+const REVIEW_MANIFEST_LIMIT: usize = 2 * 1024;
+const TRUNCATED: &str = "[truncated]\n";
 
 #[derive(Clone)]
 pub struct Project {
@@ -80,9 +85,90 @@ impl Project {
         if changes.is_empty() {
             return Ok("no changes\n".into());
         }
-        Store::open_reader(&self.repository.database)?
-            .changes(&changes, depth, max_nodes, &cancelled)
+        let graph = Store::open_reader(&self.repository.database)?
+            .changes(&changes, depth, max_nodes, &cancelled)?;
+        Ok(review_context(
+            &change_manifest(&changes),
+            &changes.patch,
+            &graph,
+        ))
     }
+}
+
+fn change_manifest(changes: &WorktreeChanges) -> String {
+    let mut output = String::new();
+    let separately_reported = changes
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            PathRecord::Renamed(_, path) | PathRecord::Untracked(path) => Some(path.as_str()),
+            PathRecord::Deleted(_) => None,
+        })
+        .collect::<HashSet<_>>();
+    for file in changes
+        .files
+        .iter()
+        .filter(|file| !separately_reported.contains(file.path.as_str()))
+    {
+        output.push_str("changed ");
+        output.push_str(&file.path);
+        output.push('\n');
+    }
+    for record in &changes.records {
+        match record {
+            PathRecord::Deleted(path) => {
+                output.push_str("deleted ");
+                output.push_str(path);
+            }
+            PathRecord::Renamed(old, new) => {
+                output.push_str("renamed ");
+                output.push_str(old);
+                output.push_str(" -> ");
+                output.push_str(new);
+            }
+            PathRecord::Untracked(path) => {
+                output.push_str("untracked ");
+                output.push_str(path);
+            }
+        }
+        output.push('\n');
+    }
+    if changes.skipped_paths > 0 {
+        output.push_str("skipped ");
+        output.push_str(&changes.skipped_paths.to_string());
+        output.push_str(" unsupported paths\n");
+    }
+    output
+}
+
+fn review_context(manifest: &str, patch: &str, graph: &str) -> String {
+    const FILES_HEADER: &str = "files\n";
+    const DIFF_HEADER: &str = "diff\n";
+    const GRAPH_HEADER: &str = "graph\n";
+
+    let mut available =
+        REVIEW_CONTEXT_BUDGET - FILES_HEADER.len() - DIFF_HEADER.len() - GRAPH_HEADER.len();
+    let manifest = bounded_section(manifest, available.min(REVIEW_MANIFEST_LIMIT));
+    available -= manifest.len();
+    let patch_budget = available.saturating_sub(graph.len().min(REVIEW_GRAPH_RESERVE));
+    let patch = bounded_section(patch, patch_budget);
+    let graph = bounded_section(graph, available - patch.len());
+    format!("{FILES_HEADER}{manifest}{DIFF_HEADER}{patch}{GRAPH_HEADER}{graph}")
+}
+
+fn bounded_section(value: &str, budget: usize) -> Cow<'_, str> {
+    if value.len() <= budget {
+        return Cow::Borrowed(value);
+    }
+    let mut end = budget.saturating_sub(TRUNCATED.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end = value[..end].rfind('\n').map_or(0, |line| line + 1);
+    let mut output = String::with_capacity(end + TRUNCATED.len());
+    output.push_str(&value[..end]);
+    output.push_str(TRUNCATED);
+    Cow::Owned(output)
 }
 
 fn build_index(
@@ -93,13 +179,12 @@ fn build_index(
 ) -> Result<(Graph, usize), String> {
     let inventory = repository.source_files(cancelled)?;
     let mut skipped = inventory.skipped;
-    let mut rust_parser = None;
-    let mut python_parser = None;
     let mut targets = TargetLayout::discover(&repository.root);
-    let mut graph = Graph::default();
-
-    // ponytail: parse changed files sequentially; add Rayon only after profiling proves it helps.
-    for file in &inventory.files {
+    let mut outputs = (0..inventory.files.len())
+        .map(|_| None)
+        .collect::<Vec<Option<Graph>>>();
+    let mut pending = Vec::new();
+    for (index, file) in inventory.files.iter().enumerate() {
         check_cancelled(cancelled)?;
         let rust_target = (file.language == Language::Rust).then(|| targets.for_path(&file.path));
         let parse_context = match file.language {
@@ -121,6 +206,7 @@ fn build_index(
             })
         {
             let old = old.expect("checked above");
+            let mut graph = Graph::default();
             graph.files.push(FileInput {
                 path: file.path.clone(),
                 language: file.language,
@@ -130,61 +216,165 @@ fn build_index(
                 byte_size: old.byte_size,
                 replace: false,
             });
+            outputs[index] = Some(graph);
             continue;
         }
-
-        let Some(source) = repository.read_source(file, cancelled)? else {
-            skipped += 1;
-            continue;
-        };
-        let content_hash = *blake3::hash(source.text.as_bytes()).as_bytes();
-        let byte_size = u64::try_from(source.text.len())
-            .map_err(|_| "source byte size exceeds supported range".to_owned())?;
-        let changed = full
-            || old.is_none_or(|old| {
-                old.language != file.language
-                    || old.content_hash != content_hash
-                    || old.parse_context != parse_context
-            });
-        graph.files.push(FileInput {
-            path: file.path.clone(),
-            language: file.language,
-            git_oid: file.git_oid.clone(),
-            content_hash,
+        pending.push(FileWork {
+            index,
+            file,
+            rust_target,
             parse_context,
-            byte_size,
-            replace: changed,
         });
-        if changed {
-            match file.language {
-                Language::Rust => {
-                    if rust_parser.is_none() {
-                        rust_parser = Some(RustParser::new()?);
-                    }
-                    add_rust_file(
-                        &mut graph,
-                        &source,
-                        rust_target.as_ref().expect("checked above"),
-                        rust_parser.as_mut().expect("initialized above"),
-                    )?;
-                }
-                Language::Python => {
-                    if python_parser.is_none() {
-                        python_parser = Some(PythonParser::new()?);
-                    }
-                    crate::python::add_file(
-                        &mut graph,
-                        &source,
-                        python_parser.as_mut().expect("initialized above"),
-                    )?;
-                }
+    }
+
+    // ponytail: avoid thread startup below five files; revisit for a few very large files.
+    let workers = thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(pending.len().div_ceil(4))
+        .max(1);
+    if workers == 1 {
+        let mut rust_parser = None;
+        let mut python_parser = None;
+        for work in &pending {
+            match build_file(
+                repository,
+                cancelled,
+                full,
+                existing,
+                work,
+                &mut rust_parser,
+                &mut python_parser,
+            )? {
+                Some(graph) => outputs[work.index] = Some(graph),
+                None => skipped += 1,
             }
         }
+    } else {
+        let next = AtomicUsize::new(0);
+        let parts = thread::scope(|scope| {
+            let handles = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut rust_parser = None;
+                        let mut python_parser = None;
+                        let mut parts = Vec::new();
+                        while let Some(work) = pending.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            parts.push((
+                                work.index,
+                                build_file(
+                                    repository,
+                                    cancelled,
+                                    full,
+                                    existing,
+                                    work,
+                                    &mut rust_parser,
+                                    &mut python_parser,
+                                )?,
+                            ));
+                        }
+                        Ok::<_, String>(parts)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut parts = Vec::with_capacity(pending.len());
+            for handle in handles {
+                parts.extend(
+                    handle
+                        .join()
+                        .map_err(|_| "source parser worker panicked".to_owned())??,
+                );
+            }
+            Ok::<_, String>(parts)
+        })?;
+        for (index, part) in parts {
+            match part {
+                Some(graph) => outputs[index] = Some(graph),
+                None => skipped += 1,
+            }
+        }
+    }
+
+    let mut graph = Graph::default();
+    for mut part in outputs.into_iter().flatten() {
+        graph.files.append(&mut part.files);
+        graph.nodes.append(&mut part.nodes);
+        graph.refs.append(&mut part.refs);
+        graph
+            .trait_implementations
+            .append(&mut part.trait_implementations);
+        graph.edges.append(&mut part.edges);
     }
     if full {
         resolve(&mut graph, cancelled)?;
     }
     Ok((graph, skipped))
+}
+
+struct FileWork<'a> {
+    index: usize,
+    file: &'a SourceFile,
+    rust_target: Option<TargetPath>,
+    parse_context: String,
+}
+
+fn build_file(
+    repository: &Repository,
+    cancelled: &AtomicBool,
+    full: bool,
+    existing: &HashMap<String, crate::store::StoredFile>,
+    work: &FileWork<'_>,
+    rust_parser: &mut Option<RustParser>,
+    python_parser: &mut Option<PythonParser>,
+) -> Result<Option<Graph>, String> {
+    let Some(source) = repository.read_source(work.file, cancelled)? else {
+        return Ok(None);
+    };
+    let content_hash = *blake3::hash(source.text.as_bytes()).as_bytes();
+    let byte_size = u64::try_from(source.text.len())
+        .map_err(|_| "source byte size exceeds supported range".to_owned())?;
+    let old = existing.get(&work.file.path);
+    let changed = full
+        || old.is_none_or(|old| {
+            old.language != work.file.language
+                || old.content_hash != content_hash
+                || old.parse_context != work.parse_context
+        });
+    let mut graph = Graph::default();
+    graph.files.push(FileInput {
+        path: work.file.path.clone(),
+        language: work.file.language,
+        git_oid: work.file.git_oid.clone(),
+        content_hash,
+        parse_context: work.parse_context.clone(),
+        byte_size,
+        replace: changed,
+    });
+    if changed {
+        match work.file.language {
+            Language::Rust => {
+                if rust_parser.is_none() {
+                    *rust_parser = Some(RustParser::new()?);
+                }
+                add_rust_file(
+                    &mut graph,
+                    &source,
+                    work.rust_target.as_ref().expect("checked above"),
+                    rust_parser.as_mut().expect("initialized above"),
+                )?;
+            }
+            Language::Python => {
+                if python_parser.is_none() {
+                    *python_parser = Some(PythonParser::new()?);
+                }
+                crate::python::add_file(
+                    &mut graph,
+                    &source,
+                    python_parser.as_mut().expect("initialized above"),
+                )?;
+            }
+        }
+    }
+    Ok(Some(graph))
 }
 
 #[cfg(test)]
@@ -1359,6 +1549,54 @@ fn check_progress(index: usize, cancelled: &AtomicBool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_context_keeps_diff_and_graph_inside_one_budget() {
+        assert_eq!(
+            review_context(
+                "changed src/lib.rs\n",
+                "-old\n+new\n",
+                "caller <- function run src/lib.rs:1\n"
+            ),
+            "files\nchanged src/lib.rs\ndiff\n-old\n+new\ngraph\ncaller <- function run src/lib.rs:1\n"
+        );
+
+        let patch = "é changed\n".repeat(2_000);
+        let graph = format!(
+            "caller <- function run src/lib.rs:1\n{}",
+            "edge\n".repeat(2_000)
+        );
+        let output = review_context("changed src/lib.rs\n", &patch, &graph);
+        assert!(output.len() <= REVIEW_CONTEXT_BUDGET, "{}", output.len());
+        assert!(output.starts_with("files\nchanged src/lib.rs\ndiff\n"));
+        assert!(output.contains("graph\ncaller <- function run"), "{output}");
+        assert_eq!(output.matches(TRUNCATED.trim()).count(), 2, "{output}");
+    }
+
+    #[test]
+    fn change_manifest_preserves_every_path_and_status() {
+        let changes = WorktreeChanges {
+            files: ["src/current.rs", "src/new.rs", "src/new_file.rs"]
+                .map(|path| crate::git::ChangedFile {
+                    path: path.into(),
+                    whole_file: false,
+                    spans: vec![],
+                    report_unmapped: true,
+                })
+                .into(),
+            records: vec![
+                PathRecord::Deleted("src/deleted.rs".into()),
+                PathRecord::Renamed("src/old.rs".into(), "src/new.rs".into()),
+                PathRecord::Untracked("src/new_file.rs".into()),
+            ],
+            patch: String::new(),
+            skipped_paths: 2,
+        };
+        assert_eq!(
+            change_manifest(&changes),
+            "changed src/current.rs\ndeleted src/deleted.rs\nrenamed src/old.rs -> src/new.rs\nuntracked src/new_file.rs\nskipped 2 unsupported paths\n"
+        );
+    }
 
     #[test]
     fn emits_cross_file_exact_keys_and_test_calls() {

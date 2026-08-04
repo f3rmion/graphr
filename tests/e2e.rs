@@ -80,7 +80,14 @@ fn rust_attribute_only_changes_map_to_declarations() {
     for name in ["Item", "free_function", "method", "test_function"] {
         assert!(text.contains(name), "missing {name}: {changes}");
     }
-    assert!(!text.contains("changed src/lib.rs"), "{changes}");
+    assert!(
+        !text
+            .split_once("graph\n")
+            .unwrap()
+            .1
+            .contains("unmapped src/lib.rs"),
+        "{changes}"
+    );
     client.close();
 }
 
@@ -142,7 +149,8 @@ fn empty_trait_impl_resolves_across_files_and_retargets_incrementally() {
         let search = client.request(&format!(
             r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"search","arguments":{{"query":"{query}","kind":"type"}}}}}}"#,
         ));
-        let node_ref = response_text(&search).split_whitespace().next().unwrap();
+        let search_text = response_text(&search);
+        let node_ref = search_text.split_whitespace().next().unwrap();
         let view = client.request(&format!(
             r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":1}}}}}}"#,
             id + 1
@@ -366,7 +374,8 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
     let search = client.request(
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"query":"Stage","kind":"type"}}}"#,
     );
-    let node_ref = response_text(&search).split_whitespace().next().unwrap();
+    let search_text = response_text(&search);
+    let node_ref = search_text.split_whitespace().next().unwrap();
     let view = client.request(&format!(
         r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":2}}}}}}"#
     ));
@@ -395,10 +404,11 @@ fn incremental_index_matches_rebuild_through_mutations() {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
             root.join("src/lib.rs"),
-            "mod caller;\nmod ext;\nmod target;\n",
+            "mod caller;\nmod ext;\nmod extra;\nmod target;\n",
         )
         .unwrap();
         fs::write(root.join("src/caller.rs"), CALLER).unwrap();
+        fs::write(root.join("src/extra.rs"), "pub fn extra() {}\n").unwrap();
         fs::write(
             root.join("src/ext.rs"),
             "use crate::target::Widget;\nimpl Widget { pub fn ping(&self) {} }\n",
@@ -582,6 +592,7 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         "changed src/lib.rs",
         "deleted src/removed.rs",
         "renamed src/moved.rs -> src/renamed.rs",
+        "untracked src/untracked.rs",
         "target",
         "helper",
         "moved_symbol",
@@ -592,8 +603,17 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     ] {
         assert!(text.contains(expected), "missing {expected}: {changed}");
     }
-    assert!(!text.contains("removed_symbol"), "{changed}");
-    assert!(!text.contains("ignored_symbol"), "{changed}");
+    assert!(text.contains("+    helper();"), "{changed}");
+    assert!(text.contains("-pub fn removed_symbol() {}"), "{changed}");
+    assert!(
+        text.contains("diff --git a/src/changed.rs b/src/changed.rs"),
+        "{changed}"
+    );
+    let graph = text.split_once("graph\n").unwrap().1;
+    assert!(graph.contains("unmapped src/lib.rs"), "{changed}");
+    assert!(!graph.contains("removed_symbol"), "{changed}");
+    assert!(!graph.contains("ignored_symbol"), "{changed}");
+    assert!(text.len() <= 8192, "{}", text.len());
     assert!(text.contains(&format!(":{generation}:")), "{changed}");
     assert_eq!(
         database_generation(&fixture.path.join(".git/graphr/index.db")),
@@ -609,13 +629,14 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"changes","arguments":{"base":"missing"}}}"#,
         r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"changes","arguments":{"depth":4}}}"#,
         r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"changes","arguments":{"max_nodes":0}}}"#,
+        r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"changes","arguments":{"base":"HEAD..HEAD"}}}"#,
     ] {
         let response = client.request(invalid);
         assert!(tool_failed(&response), "{response}");
         assert!(response.len() <= 8192, "{response}");
     }
     let bounded = client.request(
-        r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":1}}}"#,
+        r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":1}}}"#,
     );
     assert!(bounded.contains("[truncated]"), "{bounded}");
     assert!(bounded.len() <= 8192, "{bounded}");
@@ -960,11 +981,8 @@ fn rust_index_search_view_over_mcp() {
         r#"{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"search","arguments":{"query":"dispatch"}}}"#,
     );
     assert!(search.contains("dispatch"), "{search}");
-    let node_ref = response_text(&search)
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_owned();
+    let search_text = response_text(&search);
+    let node_ref = search_text.split_whitespace().next().unwrap().to_owned();
 
     let view = client.request(&format!(
         r#"{{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":2,"max_nodes":30}}}}}}"#
@@ -981,7 +999,8 @@ fn rust_index_search_view_over_mcp() {
         let search = client.request(&format!(
             r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"search","arguments":{{"query":"{query}","kind":"{kind}"}}}}}}"#
         ));
-        let node_ref = response_text(&search).split_whitespace().next().unwrap();
+        let search_text = response_text(&search);
+        let node_ref = search_text.split_whitespace().next().unwrap();
         let view = client.request(&format!(
             r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":1}}}}}}"#,
             id + 1
@@ -1285,13 +1304,12 @@ fn version_at_least(version: &str, floor: [u32; 3]) -> bool {
         >= floor.as_slice()
 }
 
-fn response_text(response: &str) -> &str {
-    let marker = "\"text\":\"";
-    let text = response
-        .split_once(marker)
-        .map(|(_, text)| text)
-        .expect("text tool result");
-    text.split_once('"').map_or(text, |(text, _)| text)
+fn response_text(response: &str) -> String {
+    rmcp::serde_json::from_str::<rmcp::serde_json::Value>(response).unwrap()["result"]["content"][0]
+        ["text"]
+        .as_str()
+        .expect("text tool result")
+        .to_owned()
 }
 
 fn tool_failed(response: &str) -> bool {

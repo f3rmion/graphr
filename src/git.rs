@@ -16,6 +16,7 @@ const STDOUT_LIMIT: usize = 64 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(30);
 const SOURCE_LIMIT: u64 = 2 * 1024 * 1024;
+const PATCH_CAPTURE_LIMIT: usize = 8 * 1024;
 
 pub struct Repository {
     pub root: PathBuf,
@@ -80,17 +81,20 @@ pub struct ChangedFile {
 pub enum PathRecord {
     Deleted(String),
     Renamed(String, String),
+    Untracked(String),
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct WorktreeChanges {
     pub files: Vec<ChangedFile>,
     pub records: Vec<PathRecord>,
+    pub patch: String,
+    pub skipped_paths: usize,
 }
 
 impl WorktreeChanges {
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.records.is_empty()
+        self.files.is_empty() && self.records.is_empty() && self.skipped_paths == 0
     }
 }
 
@@ -189,16 +193,26 @@ impl Repository {
     ) -> Result<WorktreeChanges, String> {
         validate_base(base)?;
         let revision = format!("{base}^{{commit}}");
-        let oid = parse_oid(&run(
-            &self.root,
-            &["rev-parse", "--verify", "--end-of-options", &revision],
-            cancelled,
-        )?)?;
-        let tracked = parse_tracked_changes(
-            &run(
+        let (tracked, untracked) = thread::scope(|scope| {
+            let untracked = scope.spawn(|| {
+                run(
+                    &self.root,
+                    &[
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                        "-z",
+                        "--",
+                        "*.rs",
+                        "*.py",
+                    ],
+                    cancelled,
+                )
+            });
+            let tracked = run(
                 &self.root,
                 &[
-                    "diff",
+                    "diff-index",
                     "--raw",
                     "-z",
                     "--patch",
@@ -211,32 +225,25 @@ impl Repository {
                     "--no-indent-heuristic",
                     "-O/dev/null",
                     "--no-color",
+                    "--src-prefix=a/",
+                    "--dst-prefix=b/",
                     "--no-ext-diff",
                     "--no-textconv",
                     "--ignore-submodules=all",
                     "--text",
-                    &oid,
+                    &revision,
                     "--",
                     "*.rs",
                     "*.py",
                 ],
                 cancelled,
-            )?,
-            cancelled,
-        )?;
-        let untracked = run(
-            &self.root,
-            &[
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "-z",
-                "--",
-                "*.rs",
-                "*.py",
-            ],
-            cancelled,
-        )?;
+            );
+            let untracked = untracked
+                .join()
+                .map_err(|_| "Git inventory worker panicked".to_owned())?;
+            Ok::<_, String>((tracked?, untracked?))
+        })?;
+        let tracked = parse_tracked_changes(&tracked, cancelled)?;
         check_cancelled(cancelled)?;
         merge_changes(tracked, &untracked, cancelled)
     }
@@ -338,23 +345,12 @@ fn validate_base(base: &str) -> Result<(), String> {
     }
 }
 
-fn parse_oid(output: &[u8]) -> Result<String, String> {
-    let output = output.strip_suffix(b"\n").unwrap_or(output);
-    let output = output.strip_suffix(b"\r").unwrap_or(output);
-    if !valid_oid(output) {
-        return Err("Git returned an invalid commit ID".into());
-    }
-    Ok(std::str::from_utf8(output)
-        .expect("validated ASCII object ID")
-        .to_owned())
-}
-
 fn parse_tracked_changes(
     output: &[u8],
     cancelled: &AtomicBool,
-) -> Result<(Vec<ChangedFile>, Vec<PathRecord>), String> {
+) -> Result<(Vec<ChangedFile>, Vec<PathRecord>, String, usize), String> {
     if output.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), String::new(), 0));
     }
     let boundary = output
         .windows(2)
@@ -363,6 +359,14 @@ fn parse_tracked_changes(
     let raw = &output[..=boundary];
     let patch = &output[boundary + 2..];
     let raw = parse_raw_changes(raw, cancelled)?;
+    let skipped_paths = raw
+        .iter()
+        .filter(|change| match change.kind {
+            RawKind::Added | RawKind::Modified => change.new.is_none(),
+            RawKind::Deleted => change.old.is_none(),
+            RawKind::Renamed => change.old.is_none() || change.new.is_none(),
+        })
+        .count();
     let hunks = parse_patch_hunks(patch, raw.len(), cancelled)?;
     let mut files = Vec::new();
     let mut records = Vec::new();
@@ -416,7 +420,21 @@ fn parse_tracked_changes(
             },
         }
     }
-    Ok((files, records))
+    Ok((files, records, capture_patch(patch), skipped_paths))
+}
+
+fn capture_patch(input: &[u8]) -> String {
+    if input.len() <= PATCH_CAPTURE_LIMIT {
+        return String::from_utf8_lossy(input).into_owned();
+    }
+    let prefix = &input[..PATCH_CAPTURE_LIMIT];
+    let end = prefix
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(prefix.len(), |index| index + 1);
+    let mut output = String::from_utf8_lossy(&prefix[..end]).into_owned();
+    output.push_str("[truncated]\n");
+    output
 }
 
 fn parse_raw_changes(input: &[u8], cancelled: &AtomicBool) -> Result<Vec<RawChange>, String> {
@@ -587,7 +605,12 @@ fn parse_decimal(input: &[u8]) -> Result<u64, String> {
 }
 
 fn merge_changes(
-    (mut files, mut records): (Vec<ChangedFile>, Vec<PathRecord>),
+    (mut files, mut records, patch, mut skipped_paths): (
+        Vec<ChangedFile>,
+        Vec<PathRecord>,
+        String,
+        usize,
+    ),
     untracked: &[u8],
     cancelled: &AtomicBool,
 ) -> Result<WorktreeChanges, String> {
@@ -601,12 +624,15 @@ fn merge_changes(
                 return Err("Git returned malformed untracked paths".into());
             }
             if let Some(path) = parse_change_path(path)? {
+                records.push(PathRecord::Untracked(path.clone()));
                 files.push(ChangedFile {
                     path,
                     whole_file: true,
                     spans: Vec::new(),
                     report_unmapped: true,
                 });
+            } else {
+                skipped_paths += 1;
             }
         }
     }
@@ -642,6 +668,8 @@ fn merge_changes(
     Ok(WorktreeChanges {
         files: merged,
         records,
+        patch,
+        skipped_paths,
     })
 }
 
@@ -972,6 +1000,17 @@ mod tests {
     }
 
     #[test]
+    fn captures_a_bounded_utf8_safe_patch() {
+        let mut patch = vec![b'x'; PATCH_CAPTURE_LIMIT + 1];
+        patch[1] = 0xff;
+        patch[PATCH_CAPTURE_LIMIT - 1] = b'\n';
+        let captured = capture_patch(&patch);
+        assert!(captured.contains('\u{fffd}'));
+        assert!(captured.ends_with("[truncated]\n"));
+        assert!(captured.len() <= PATCH_CAPTURE_LIMIT + "[truncated]\n".len() + 2);
+    }
+
+    #[test]
     fn parses_changed_files_and_rejects_malformed_streams() {
         let cancelled = AtomicBool::new(false);
         let zero = "0".repeat(OID.len());
@@ -1034,13 +1073,32 @@ mod tests {
                 records: vec![
                     PathRecord::Deleted("deleted.rs".into()),
                     PathRecord::Renamed("old.rs".into(), "renamed.rs".into()),
+                    PathRecord::Untracked("untracked.rs".into()),
                 ],
+                patch: tracked.split_once("\0\0").unwrap().1.into(),
+                skipped_paths: 0,
             }
         );
+        assert!(changes.patch.contains("-old\n+new\n"));
         assert!(
             parse_tracked_changes(&tracked.as_bytes()[..tracked.len() - 1], &cancelled).is_err()
         );
-        assert!(merge_changes((Vec::new(), Vec::new()), b"a.rs\0\0", &cancelled).is_err());
+        assert!(
+            merge_changes(
+                (Vec::new(), Vec::new(), String::new(), 0),
+                b"a.rs\0\0",
+                &cancelled
+            )
+            .is_err()
+        );
+        let skipped = merge_changes(
+            (Vec::new(), Vec::new(), String::new(), 0),
+            b"\xff.rs\0",
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(skipped.skipped_paths, 1);
+        assert!(!skipped.is_empty());
         assert!(parse_change_path(b"../not-rust.txt").is_err());
     }
 

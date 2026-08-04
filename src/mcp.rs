@@ -167,7 +167,7 @@ impl Graphr {
     }
 
     #[tool(
-        description = "Show changed symbols and their bounded graph neighborhood",
+        description = "Return one bounded review context: diff, changed symbols, callers, tests, and dependencies. Do not fan out to search/view unless it is truncated or unmapped",
         input_schema = rmcp::handler::server::common::schema_for_input::<ChangesParams>()
             .expect("valid changes schema")
     )]
@@ -192,7 +192,7 @@ impl ServerHandler for Graphr {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("graphr", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Use search to get a node_ref, then view its graph. After edits, call index then changes.",
+                "For reviews, call changes once with the review base; do not fan out to search/view unless it reports truncated, untracked, or unmapped changes. For exploration, use search then view. The graph is indexed at startup; after edits, call index once before changes.",
             )
     }
 }
