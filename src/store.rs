@@ -9,7 +9,7 @@ use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 const TRUNCATED: &str = "[truncated]\n";
@@ -40,8 +40,19 @@ pub enum EdgeKind {
 }
 
 pub struct FileInput {
-    pub key: String,
     pub path: String,
+    pub git_oid: Option<String>,
+    pub content_hash: [u8; 32],
+    pub parse_context: String,
+    pub byte_size: u64,
+    pub replace: bool,
+}
+
+pub struct StoredFile {
+    id: i64,
+    pub git_oid: Option<String>,
+    pub content_hash: [u8; 32],
+    pub parse_context: String,
     pub byte_size: u64,
 }
 
@@ -52,6 +63,7 @@ pub struct NodeInput {
     pub name: String,
     pub qualified_name: String,
     pub parent_key: Option<String>,
+    pub owner_key: Option<String>,
     pub line_start: u32,
     pub line_end: u32,
     pub signature: String,
@@ -162,11 +174,11 @@ impl Store {
         })
     }
 
-    pub fn replace_with<T>(
+    pub fn index_with<T>(
         &mut self,
         cancelled: &AtomicBool,
-        build: impl FnOnce() -> Result<(Graph, T)>,
-    ) -> Result<(State, T)> {
+        build: impl FnOnce(bool, &HashMap<String, StoredFile>) -> Result<(Graph, T)>,
+    ) -> Result<(State, usize, T)> {
         let tx = begin_immediate(&self.connection, cancelled)?;
         check_cancelled(cancelled)?;
         let version: i64 = tx
@@ -180,181 +192,39 @@ impl Store {
         if !new_schema {
             read_state(&tx)?;
         }
-        let (graph, value) = build()?;
-        check_cancelled(cancelled)?;
-        if new_schema {
-            create_schema(&tx)?;
-        } else if rebuild_schema {
-            drop_graph_schema(&tx)?;
-            create_schema(&tx)?;
+        let full = new_schema || rebuild_schema;
+        let existing = if full {
+            HashMap::new()
         } else {
-            tx.execute_batch(
-                "DELETE FROM nodes_fts;
-                 DELETE FROM edges;
-                 DELETE FROM ref_keys;
-                 DELETE FROM refs;
-                 DELETE FROM node_keys;
-                 DELETE FROM nodes;
-                 DELETE FROM files;",
+            load_stored_files(&tx)?
+        };
+        let (graph, value) = build(full, &existing)?;
+        check_cancelled(cancelled)?;
+
+        let changed = if full {
+            if new_schema {
+                create_schema(&tx)?;
+            } else {
+                drop_graph_schema(&tx)?;
+                create_schema(&tx)?;
+            }
+            insert_graph(&tx, &graph, cancelled, false)?;
+            graph.files.len()
+        } else {
+            apply_incremental(&tx, &graph, &existing, cancelled)?
+        };
+        if full || changed != 0 {
+            tx.execute(
+                "UPDATE state SET generation=generation+1 WHERE singleton=1",
+                [],
             )
             .map_err(db_error)?;
         }
-
-        let mut files = HashMap::with_capacity(graph.files.len());
-        {
-            let mut insert = tx
-                .prepare("INSERT INTO files(path, language, byte_size) VALUES(?1, 'rust', ?2)")
-                .map_err(db_error)?;
-            for file in &graph.files {
-                check_cancelled(cancelled)?;
-                let byte_size = i64::try_from(file.byte_size)
-                    .map_err(|_| "file size exceeds SQLite range".to_owned())?;
-                insert
-                    .execute(params![file.path, byte_size])
-                    .map_err(db_error)?;
-                files.insert(
-                    file.key.as_str(),
-                    (tx.last_insert_rowid(), file.path.as_str()),
-                );
-            }
-        }
-
-        let mut nodes = HashMap::with_capacity(graph.nodes.len());
-        {
-            let mut insert_node = tx
-                .prepare(
-                    "INSERT INTO nodes(
-                    file_id, kind, name, qualified_name, parent_id,
-                    line_start, line_end, signature
-                 ) VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
-                )
-                .map_err(db_error)?;
-            let mut insert_key = tx
-                .prepare("INSERT INTO node_keys(key, node_id) VALUES(?1, ?2)")
-                .map_err(db_error)?;
-            let mut insert_fts = tx
-                .prepare(
-                    "INSERT INTO nodes_fts(rowid, name, qualified_name, path, signature)
-                 VALUES(?1, ?2, ?3, ?4, ?5)",
-                )
-                .map_err(db_error)?;
-            for node in &graph.nodes {
-                check_cancelled(cancelled)?;
-                let (file_id, path) = files
-                    .get(node.file_key.as_str())
-                    .ok_or_else(|| "node references an unknown file".to_owned())?;
-                insert_node
-                    .execute(params![
-                        file_id,
-                        node.kind.db(),
-                        node.name,
-                        node.qualified_name,
-                        node.line_start,
-                        node.line_end,
-                        node.signature
-                    ])
-                    .map_err(db_error)?;
-                let node_id = tx.last_insert_rowid();
-                nodes.insert(node.key.as_str(), node_id);
-                for key in &node.keys {
-                    insert_key
-                        .execute(params![key, node_id])
-                        .map_err(db_error)?;
-                }
-                insert_fts
-                    .execute(params![
-                        node_id,
-                        node.name,
-                        node.qualified_name,
-                        path,
-                        node.signature
-                    ])
-                    .map_err(db_error)?;
-            }
-        }
-
-        {
-            let mut update_parent = tx
-                .prepare("UPDATE nodes SET parent_id=?1 WHERE id=?2")
-                .map_err(db_error)?;
-            for node in &graph.nodes {
-                check_cancelled(cancelled)?;
-                if let Some(parent) = &node.parent_key {
-                    let node_id = lookup(&nodes, &node.key, "node")?;
-                    let parent_id = lookup(&nodes, parent, "parent")?;
-                    update_parent
-                        .execute(params![parent_id, node_id])
-                        .map_err(db_error)?;
-                }
-            }
-        }
-
-        {
-            let mut insert_ref = tx
-                .prepare(
-                    "INSERT INTO refs(source_id, kind, line, resolved_target_id)
-                 VALUES(?1, ?2, ?3, ?4)",
-                )
-                .map_err(db_error)?;
-            let mut insert_ref_key = tx
-                .prepare("INSERT INTO ref_keys(ref_id, rank, key) VALUES(?1, ?2, ?3)")
-                .map_err(db_error)?;
-            for reference in &graph.refs {
-                check_cancelled(cancelled)?;
-                let source_id = lookup(&nodes, &reference.source_key, "reference source")?;
-                let target_id = reference
-                    .resolved_target_key
-                    .as_ref()
-                    .map(|key| lookup(&nodes, key, "reference target"))
-                    .transpose()?;
-                insert_ref
-                    .execute(params![
-                        source_id,
-                        reference.kind.db(),
-                        reference.line,
-                        target_id
-                    ])
-                    .map_err(db_error)?;
-                let reference_id = tx.last_insert_rowid();
-                for (rank, key) in reference.keys.iter().enumerate() {
-                    let rank = i64::try_from(rank)
-                        .map_err(|_| "reference rank exceeds SQLite range".to_owned())?;
-                    insert_ref_key
-                        .execute(params![reference_id, rank, key])
-                        .map_err(db_error)?;
-                }
-            }
-        }
-
-        {
-            let mut insert_edge = tx
-                .prepare(
-                    "INSERT INTO edges(source_id, target_id, kind, support_count)
-                 VALUES(?1, ?2, ?3, ?4)",
-                )
-                .map_err(db_error)?;
-            for edge in &graph.edges {
-                check_cancelled(cancelled)?;
-                insert_edge
-                    .execute(params![
-                        lookup(&nodes, &edge.source_key, "edge source")?,
-                        lookup(&nodes, &edge.target_key, "edge target")?,
-                        edge.kind.db(),
-                        edge.support_count
-                    ])
-                    .map_err(db_error)?;
-            }
-        }
-        tx.execute(
-            "UPDATE state SET generation=generation+1 WHERE singleton=1",
-            [],
-        )
-        .map_err(db_error)?;
         let state = read_state(&tx)?;
         check_cancelled(cancelled)?;
         tx.commit().map_err(db_error)?;
         self.rebuild = false;
-        Ok((state, value))
+        Ok((state, changed, value))
     }
 
     pub fn search(&mut self, query: &str, kind: Option<NodeKind>, limit: u32) -> Result<String> {
@@ -522,6 +392,573 @@ impl RowNode {
     }
 }
 
+fn load_stored_files(connection: &Connection) -> Result<HashMap<String, StoredFile>> {
+    let mut statement = connection
+        .prepare("SELECT id, path, git_oid, content_hash, parse_context, byte_size FROM files")
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut files = HashMap::new();
+    for row in rows {
+        let (id, path, git_oid, hash, parse_context, byte_size) = row.map_err(db_error)?;
+        if id <= 0 || byte_size < 0 || !git_oid.as_deref().is_none_or(valid_oid) {
+            return Err("database file metadata is invalid".into());
+        }
+        let content_hash: [u8; 32] = hash
+            .try_into()
+            .map_err(|_| "database content hash is invalid".to_owned())?;
+        let byte_size =
+            u64::try_from(byte_size).map_err(|_| "database file size is invalid".to_owned())?;
+        if files
+            .insert(
+                path,
+                StoredFile {
+                    id,
+                    git_oid,
+                    content_hash,
+                    parse_context,
+                    byte_size,
+                },
+            )
+            .is_some()
+        {
+            return Err("database contains duplicate file paths".into());
+        }
+    }
+    Ok(files)
+}
+
+fn apply_incremental(
+    tx: &Transaction<'_>,
+    graph: &Graph,
+    existing: &HashMap<String, StoredFile>,
+    cancelled: &AtomicBool,
+) -> Result<usize> {
+    if !graph.edges.is_empty()
+        || graph
+            .refs
+            .iter()
+            .any(|reference| reference.resolved_target_key.is_some())
+    {
+        return Err("incremental graph contains resolved edges".into());
+    }
+
+    let mut current = HashMap::with_capacity(graph.files.len());
+    for file in &graph.files {
+        if !file.git_oid.as_deref().is_none_or(valid_oid)
+            || current.insert(file.path.as_str(), file).is_some()
+            || (!file.replace && !existing.contains_key(&file.path))
+        {
+            return Err("incremental file metadata is invalid".into());
+        }
+    }
+    let mut removed = existing
+        .iter()
+        .filter(|(path, _)| current.get(path.as_str()).is_none_or(|file| file.replace))
+        .map(|(_, file)| file.id)
+        .collect::<Vec<_>>();
+    removed.sort_unstable();
+    let changed = removed.len()
+        + graph
+            .files
+            .iter()
+            .filter(|file| file.replace && !existing.contains_key(&file.path))
+            .count();
+    if changed == 0 && (!graph.nodes.is_empty() || !graph.refs.is_empty()) {
+        return Err("no-op incremental graph contains parsed rows".into());
+    }
+
+    let metadata_changed = graph.files.iter().filter(|file| !file.replace).any(|file| {
+        let old = existing
+            .get(&file.path)
+            .expect("validated existing file above");
+        old.git_oid != file.git_oid
+            || old.content_hash != file.content_hash
+            || old.parse_context != file.parse_context
+            || old.byte_size != file.byte_size
+    });
+    if metadata_changed {
+        let mut update = tx
+            .prepare(
+                "UPDATE files
+                    SET git_oid=?1, content_hash=?2, parse_context=?3, byte_size=?4
+                  WHERE id=?5",
+            )
+            .map_err(db_error)?;
+        for file in graph.files.iter().filter(|file| !file.replace) {
+            check_cancelled(cancelled)?;
+            let old = existing
+                .get(&file.path)
+                .ok_or_else(|| "incremental file is missing from the database".to_owned())?;
+            if old.git_oid != file.git_oid
+                || old.content_hash != file.content_hash
+                || old.parse_context != file.parse_context
+                || old.byte_size != file.byte_size
+            {
+                update
+                    .execute(params![
+                        file.git_oid,
+                        file.content_hash.as_slice(),
+                        file.parse_context,
+                        i64::try_from(file.byte_size)
+                            .map_err(|_| "file size exceeds SQLite range".to_owned())?,
+                        old.id
+                    ])
+                    .map_err(db_error)?;
+            }
+        }
+    }
+    if changed == 0 {
+        return Ok(0);
+    }
+
+    let mut affected_keys = HashSet::new();
+    let mut affected_owners = HashSet::new();
+    {
+        let mut keys = tx
+            .prepare(
+                "SELECT nk.key FROM node_keys nk
+                   JOIN nodes n ON n.id=nk.node_id
+                  WHERE n.file_id=?1",
+            )
+            .map_err(db_error)?;
+        let mut owners = tx
+            .prepare("SELECT owner_key FROM nodes WHERE file_id=?1 AND owner_key IS NOT NULL")
+            .map_err(db_error)?;
+        for file_id in &removed {
+            check_cancelled(cancelled)?;
+            for row in keys
+                .query_map([file_id], |row| row.get::<_, String>(0))
+                .map_err(db_error)?
+            {
+                let key = row.map_err(db_error)?;
+                if key.starts_with("rust:type:") {
+                    affected_owners.insert(key.clone());
+                }
+                affected_keys.insert(key);
+            }
+            for row in owners
+                .query_map([file_id], |row| row.get::<_, String>(0))
+                .map_err(db_error)?
+            {
+                affected_owners.insert(row.map_err(db_error)?);
+            }
+        }
+    }
+    for node in &graph.nodes {
+        for key in &node.keys {
+            if key.starts_with("rust:type:") {
+                affected_owners.insert(key.clone());
+            }
+            affected_keys.insert(key.clone());
+        }
+        if let Some(owner) = &node.owner_key {
+            affected_owners.insert(owner.clone());
+        }
+    }
+
+    let mut affected_refs = HashSet::new();
+    {
+        let mut refs = tx
+            .prepare("SELECT ref_id FROM ref_keys WHERE key=?1 ORDER BY ref_id")
+            .map_err(db_error)?;
+        for key in &affected_keys {
+            check_cancelled(cancelled)?;
+            for row in refs
+                .query_map([key], |row| row.get::<_, i64>(0))
+                .map_err(db_error)?
+            {
+                affected_refs.insert(row.map_err(db_error)?);
+            }
+        }
+    }
+
+    {
+        let mut delete_fts = tx
+            .prepare("DELETE FROM nodes_fts WHERE rowid IN (SELECT id FROM nodes WHERE file_id=?1)")
+            .map_err(db_error)?;
+        let mut delete_file = tx
+            .prepare("DELETE FROM files WHERE id=?1")
+            .map_err(db_error)?;
+        for file_id in &removed {
+            check_cancelled(cancelled)?;
+            delete_fts.execute([file_id]).map_err(db_error)?;
+            delete_file.execute([file_id]).map_err(db_error)?;
+        }
+    }
+
+    let new_refs = insert_graph(tx, graph, cancelled, true)?;
+    affected_refs.extend(new_refs);
+    resolve_references(tx, affected_refs, cancelled)?;
+    reparent_methods(tx, affected_owners, cancelled)?;
+    Ok(changed)
+}
+
+fn resolve_references(
+    tx: &Transaction<'_>,
+    references: HashSet<i64>,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    if references.is_empty() {
+        return Ok(());
+    }
+    let mut references = references.into_iter().collect::<Vec<_>>();
+    references.sort_unstable();
+    let mut load_ref = tx
+        .prepare(
+            "SELECT r.kind, n.kind, r.resolved_target_id
+               FROM refs r JOIN nodes n ON n.id=r.source_id
+              WHERE r.id=?1",
+        )
+        .map_err(db_error)?;
+    let mut load_keys = tx
+        .prepare("SELECT key FROM ref_keys WHERE ref_id=?1 ORDER BY rank")
+        .map_err(db_error)?;
+    let mut candidates = tx
+        .prepare("SELECT node_id FROM node_keys WHERE key=?1 ORDER BY node_id LIMIT 2")
+        .map_err(db_error)?;
+    let mut update_ref = tx
+        .prepare("UPDATE refs SET resolved_target_id=?1 WHERE id=?2")
+        .map_err(db_error)?;
+    let mut decrement = tx
+        .prepare(
+            "UPDATE edges SET support_count=support_count-1
+              WHERE source_id=(SELECT source_id FROM refs WHERE id=?1)
+                AND target_id=?2 AND kind=?3 AND support_count>1",
+        )
+        .map_err(db_error)?;
+    let mut delete_edge = tx
+        .prepare(
+            "DELETE FROM edges
+              WHERE source_id=(SELECT source_id FROM refs WHERE id=?1)
+                AND target_id=?2 AND kind=?3 AND support_count=1",
+        )
+        .map_err(db_error)?;
+    let mut increment = tx
+        .prepare(
+            "INSERT INTO edges(source_id, target_id, kind, support_count)
+             SELECT source_id, ?2, ?3, 1 FROM refs WHERE id=?1
+             ON CONFLICT(source_id, target_id, kind)
+             DO UPDATE SET support_count=support_count+1",
+        )
+        .map_err(db_error)?;
+
+    for reference_id in references {
+        check_cancelled(cancelled)?;
+        let Some((ref_kind, source_kind, old_target)) = load_ref
+            .query_row([reference_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .optional()
+            .map_err(db_error)?
+        else {
+            continue;
+        };
+        let mut new_target = None;
+        for row in load_keys
+            .query_map([reference_id], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+        {
+            match candidate(&mut candidates, &row.map_err(db_error)?)? {
+                DbCandidate::Unique(target) => {
+                    new_target = Some(target);
+                    break;
+                }
+                DbCandidate::Ambiguous => break,
+                DbCandidate::Missing => {}
+            }
+        }
+        if old_target == new_target {
+            continue;
+        }
+        let edge_kind = match (ref_kind.as_str(), source_kind.as_str()) {
+            ("IMPORTS", _) => "IMPORTS",
+            ("CALLS", "test") => "TEST_CALLS",
+            ("CALLS", "file" | "type" | "function") => "CALLS",
+            _ => return Err("database reference kind is invalid".into()),
+        };
+        if let Some(target) = old_target
+            && decrement
+                .execute(params![reference_id, target, edge_kind])
+                .map_err(db_error)?
+                == 0
+        {
+            delete_edge
+                .execute(params![reference_id, target, edge_kind])
+                .map_err(db_error)?;
+        }
+        update_ref
+            .execute(params![new_target, reference_id])
+            .map_err(db_error)?;
+        if let Some(target) = new_target {
+            increment
+                .execute(params![reference_id, target, edge_kind])
+                .map_err(db_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn reparent_methods(
+    tx: &Transaction<'_>,
+    owners: HashSet<String>,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let mut owners = owners.into_iter().collect::<Vec<_>>();
+    owners.sort();
+    let mut candidates = tx
+        .prepare("SELECT node_id FROM node_keys WHERE key=?1 ORDER BY node_id LIMIT 2")
+        .map_err(db_error)?;
+    let mut methods = tx
+        .prepare(
+            "SELECT n.id, file_node.id FROM nodes n
+               JOIN nodes file_node
+                 ON file_node.file_id=n.file_id AND file_node.kind='file'
+              WHERE n.owner_key=?1 ORDER BY n.id",
+        )
+        .map_err(db_error)?;
+    let mut update = tx
+        .prepare("UPDATE nodes SET parent_id=?1 WHERE id=?2")
+        .map_err(db_error)?;
+    for owner in owners {
+        check_cancelled(cancelled)?;
+        let unique = match candidate(&mut candidates, &owner)? {
+            DbCandidate::Unique(target) => Some(target),
+            _ => None,
+        };
+        for row in methods
+            .query_map([owner], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(db_error)?
+        {
+            let (method, file) = row.map_err(db_error)?;
+            update
+                .execute(params![unique.unwrap_or(file), method])
+                .map_err(db_error)?;
+        }
+    }
+    Ok(())
+}
+
+enum DbCandidate {
+    Missing,
+    Unique(i64),
+    Ambiguous,
+}
+
+fn candidate(statement: &mut rusqlite::Statement<'_>, key: &str) -> Result<DbCandidate> {
+    let mut rows = statement.query([key]).map_err(db_error)?;
+    let Some(first) = rows.next().map_err(db_error)? else {
+        return Ok(DbCandidate::Missing);
+    };
+    let node = first.get(0).map_err(db_error)?;
+    if rows.next().map_err(db_error)?.is_some() {
+        Ok(DbCandidate::Ambiguous)
+    } else {
+        Ok(DbCandidate::Unique(node))
+    }
+}
+
+fn valid_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn insert_graph(
+    tx: &Transaction<'_>,
+    graph: &Graph,
+    cancelled: &AtomicBool,
+    delta: bool,
+) -> Result<Vec<i64>> {
+    let file_count = if delta {
+        graph.files.iter().filter(|file| file.replace).count()
+    } else {
+        graph.files.len()
+    };
+    let mut files = HashMap::with_capacity(file_count);
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO files(
+                    path, language, git_oid, content_hash, parse_context, byte_size
+                 ) VALUES(?1, 'rust', ?2, ?3, ?4, ?5)",
+            )
+            .map_err(db_error)?;
+        for file in graph.files.iter().filter(|file| !delta || file.replace) {
+            check_cancelled(cancelled)?;
+            let byte_size = i64::try_from(file.byte_size)
+                .map_err(|_| "file size exceeds SQLite range".to_owned())?;
+            insert
+                .execute(params![
+                    file.path,
+                    file.git_oid,
+                    file.content_hash.as_slice(),
+                    file.parse_context,
+                    byte_size
+                ])
+                .map_err(db_error)?;
+            files.insert(
+                file.path.as_str(),
+                (tx.last_insert_rowid(), file.path.as_str()),
+            );
+        }
+    }
+
+    let mut nodes = HashMap::with_capacity(graph.nodes.len());
+    {
+        let mut insert_node = tx
+            .prepare(
+                "INSERT INTO nodes(
+                    file_id, kind, name, qualified_name, parent_id, owner_key,
+                    line_start, line_end, signature
+                 ) VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
+            )
+            .map_err(db_error)?;
+        let mut insert_key = tx
+            .prepare("INSERT INTO node_keys(key, node_id) VALUES(?1, ?2)")
+            .map_err(db_error)?;
+        let mut insert_fts = tx
+            .prepare(
+                "INSERT INTO nodes_fts(rowid, name, qualified_name, path, signature)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(db_error)?;
+        for node in &graph.nodes {
+            check_cancelled(cancelled)?;
+            let (file_id, path) = files
+                .get(node.file_key.as_str())
+                .ok_or_else(|| "node references an unknown file".to_owned())?;
+            insert_node
+                .execute(params![
+                    file_id,
+                    node.kind.db(),
+                    node.name,
+                    node.qualified_name,
+                    node.owner_key,
+                    node.line_start,
+                    node.line_end,
+                    node.signature
+                ])
+                .map_err(db_error)?;
+            let node_id = tx.last_insert_rowid();
+            nodes.insert(node.key.as_str(), node_id);
+            for key in &node.keys {
+                insert_key
+                    .execute(params![key, node_id])
+                    .map_err(db_error)?;
+            }
+            insert_fts
+                .execute(params![
+                    node_id,
+                    node.name,
+                    node.qualified_name,
+                    path,
+                    node.signature
+                ])
+                .map_err(db_error)?;
+        }
+    }
+
+    {
+        let mut update_parent = tx
+            .prepare("UPDATE nodes SET parent_id=?1 WHERE id=?2")
+            .map_err(db_error)?;
+        for node in &graph.nodes {
+            check_cancelled(cancelled)?;
+            if let Some(parent) = &node.parent_key {
+                let node_id = lookup(&nodes, &node.key, "node")?;
+                let parent_id = lookup(&nodes, parent, "parent")?;
+                update_parent
+                    .execute(params![parent_id, node_id])
+                    .map_err(db_error)?;
+            }
+        }
+    }
+
+    let mut reference_ids = if delta {
+        Vec::with_capacity(graph.refs.len())
+    } else {
+        Vec::new()
+    };
+    {
+        let mut insert_ref = tx
+            .prepare(
+                "INSERT INTO refs(source_id, kind, line, resolved_target_id)
+                 VALUES(?1, ?2, ?3, ?4)",
+            )
+            .map_err(db_error)?;
+        let mut insert_ref_key = tx
+            .prepare("INSERT INTO ref_keys(ref_id, rank, key) VALUES(?1, ?2, ?3)")
+            .map_err(db_error)?;
+        for reference in &graph.refs {
+            check_cancelled(cancelled)?;
+            let source_id = lookup(&nodes, &reference.source_key, "reference source")?;
+            let target_id = reference
+                .resolved_target_key
+                .as_ref()
+                .map(|key| lookup(&nodes, key, "reference target"))
+                .transpose()?;
+            insert_ref
+                .execute(params![
+                    source_id,
+                    reference.kind.db(),
+                    reference.line,
+                    target_id
+                ])
+                .map_err(db_error)?;
+            let reference_id = tx.last_insert_rowid();
+            if delta {
+                reference_ids.push(reference_id);
+            }
+            for (rank, key) in reference.keys.iter().enumerate() {
+                let rank = i64::try_from(rank)
+                    .map_err(|_| "reference rank exceeds SQLite range".to_owned())?;
+                insert_ref_key
+                    .execute(params![reference_id, rank, key])
+                    .map_err(db_error)?;
+            }
+        }
+    }
+
+    {
+        let mut insert_edge = tx
+            .prepare(
+                "INSERT INTO edges(source_id, target_id, kind, support_count)
+                 VALUES(?1, ?2, ?3, ?4)",
+            )
+            .map_err(db_error)?;
+        for edge in &graph.edges {
+            check_cancelled(cancelled)?;
+            insert_edge
+                .execute(params![
+                    lookup(&nodes, &edge.source_key, "edge source")?,
+                    lookup(&nodes, &edge.target_key, "edge target")?,
+                    edge.kind.db(),
+                    edge.support_count
+                ])
+                .map_err(db_error)?;
+        }
+    }
+    Ok(reference_ids)
+}
+
 fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS state(
@@ -535,7 +972,8 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             path TEXT NOT NULL UNIQUE,
             language TEXT NOT NULL,
             git_oid TEXT,
-            content_hash BLOB,
+            content_hash BLOB NOT NULL CHECK(length(content_hash)=32),
+            parse_context TEXT NOT NULL,
             byte_size INTEGER NOT NULL CHECK(byte_size>=0)
          );
          CREATE TABLE nodes(
@@ -545,11 +983,13 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             name TEXT NOT NULL,
             qualified_name TEXT NOT NULL UNIQUE,
             parent_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
+            owner_key TEXT,
             line_start INTEGER NOT NULL CHECK(line_start>0),
             line_end INTEGER NOT NULL CHECK(line_end>=line_start),
             signature TEXT NOT NULL
          );
          CREATE INDEX nodes_parent ON nodes(parent_id, kind, line_start, id);
+         CREATE INDEX nodes_owner ON nodes(owner_key, id) WHERE owner_key IS NOT NULL;
          CREATE INDEX nodes_file_lines ON nodes(file_id, line_start, line_end);
          CREATE UNIQUE INDEX nodes_one_file ON nodes(file_id) WHERE kind='file';
          CREATE TABLE node_keys(
@@ -587,7 +1027,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE INDEX edges_target ON edges(target_id, kind, source_id);
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=1;",
+         PRAGMA user_version=2;",
     )
     .map_err(db_error)
 }
@@ -1012,18 +1452,22 @@ mod tests {
         };
         let graph = Graph {
             files: vec![FileInput {
-                key: "file".into(),
                 path: "src/lib.rs".into(),
+                git_oid: None,
+                content_hash: [0; 32],
+                parse_context: String::new(),
                 byte_size: 1,
+                replace: true,
             }],
             nodes: vec![
                 NodeInput {
                     key: "root".into(),
-                    file_key: "file".into(),
+                    file_key: "src/lib.rs".into(),
                     kind: NodeKind::Function,
                     name: "root".into(),
                     qualified_name: "root@src/lib.rs:1".into(),
                     parent_key: None,
+                    owner_key: None,
                     line_start: 1,
                     line_end: 1,
                     signature: "fn root()".into(),
@@ -1031,11 +1475,12 @@ mod tests {
                 },
                 NodeInput {
                     key: "child".into(),
-                    file_key: "file".into(),
+                    file_key: "src/lib.rs".into(),
                     kind: NodeKind::Function,
                     name: "child".into(),
                     qualified_name: "child@src/lib.rs:2".into(),
                     parent_key: None,
+                    owner_key: None,
                     line_start: 2,
                     line_end: 2,
                     signature: "fn child()".into(),
@@ -1051,7 +1496,9 @@ mod tests {
             ..Graph::default()
         };
         let cancelled = AtomicBool::new(false);
-        let (state, ()) = store.replace_with(&cancelled, || Ok((graph, ()))).unwrap();
+        let (state, _, ()) = store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
 
         let output = store
             .view(&format!("{}:{}:1", state.epoch, state.generation), 3, 2)
@@ -1067,8 +1514,10 @@ mod tests {
             rebuild: false,
         };
         let cancelled = AtomicBool::new(false);
-        let (before, ()) = store
-            .replace_with(&cancelled, || Ok((single_node_graph("old"), ())))
+        let (before, _, ()) = store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((single_node_graph("old"), ()))
+            })
             .unwrap();
 
         let mut invalid = single_node_graph("new");
@@ -1080,7 +1529,15 @@ mod tests {
         });
         assert!(
             store
-                .replace_with(&cancelled, || Ok((invalid, ())))
+                .index_with(&cancelled, |_full, _existing| Ok((invalid, ())))
+                .is_err()
+        );
+
+        let mut invalid_delta = single_node_graph("new");
+        invalid_delta.nodes[0].parent_key = Some("missing".into());
+        assert!(
+            store
+                .index_with(&cancelled, |_full, _existing| Ok((invalid_delta, ())))
                 .is_err()
         );
 
@@ -1113,11 +1570,12 @@ mod tests {
             let key = format!("child-{index}");
             graph.nodes.push(NodeInput {
                 key: key.clone(),
-                file_key: "file".into(),
+                file_key: "src/lib.rs".into(),
                 kind: NodeKind::Function,
                 name: key.clone(),
                 qualified_name: key.clone(),
                 parent_key: None,
+                owner_key: None,
                 line_start: 1,
                 line_end: 1,
                 signature: String::new(),
@@ -1131,7 +1589,9 @@ mod tests {
             });
         }
         let cancelled = AtomicBool::new(false);
-        store.replace_with(&cancelled, || Ok((graph, ()))).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
 
         let (neighbors, more) = load_neighbors(&store.connection, 1, 3, false).unwrap();
         assert_eq!(neighbors.len(), 3);
@@ -1141,17 +1601,21 @@ mod tests {
     fn single_node_graph(name: &str) -> Graph {
         Graph {
             files: vec![FileInput {
-                key: "file".into(),
                 path: "src/lib.rs".into(),
+                git_oid: None,
+                content_hash: [0; 32],
+                parse_context: String::new(),
                 byte_size: 1,
+                replace: true,
             }],
             nodes: vec![NodeInput {
                 key: name.into(),
-                file_key: "file".into(),
+                file_key: "src/lib.rs".into(),
                 kind: NodeKind::Function,
                 name: name.into(),
                 qualified_name: name.into(),
                 parent_key: None,
+                owner_key: None,
                 line_start: 1,
                 line_end: 1,
                 signature: String::new(),

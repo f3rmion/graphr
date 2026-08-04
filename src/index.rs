@@ -41,19 +41,8 @@ impl Project {
     ) -> Result<String, String> {
         check_cancelled(&cancelled)?;
         let mut store = Store::open(&self.repository.database, rebuild, &cancelled)?;
-        let (state, (changed, skipped)) = store.replace_with(&cancelled, || {
-            // ponytail: parse sequentially; add Rayon only after profiling proves it helps.
-            let mut parser = RustParser::new()?;
-            let mut targets = TargetLayout::discover(&self.repository.root);
-            let mut graph = Graph::default();
-            let counts = self.repository.visit_rust_sources(&cancelled, |source| {
-                check_cancelled(&cancelled)?;
-                let target = targets.for_path(&source.path);
-                add_file(&mut graph, &source, &target, &mut parser)
-            })?;
-            check_cancelled(&cancelled)?;
-            resolve(&mut graph, &cancelled)?;
-            Ok((graph, (counts.indexed, counts.skipped)))
+        let (state, changed, skipped) = store.index_with(&cancelled, |full, existing| {
+            build_index(&self.repository, &cancelled, full, existing)
         })?;
         Ok(format!(
             "indexed generation={} changed={} skipped={}",
@@ -78,6 +67,82 @@ impl Project {
     }
 }
 
+fn build_index(
+    repository: &Repository,
+    cancelled: &AtomicBool,
+    full: bool,
+    existing: &HashMap<String, crate::store::StoredFile>,
+) -> Result<(Graph, usize), String> {
+    let inventory = repository.rust_files(cancelled)?;
+    let mut skipped = inventory.skipped;
+    let mut parser = None;
+    let mut targets = TargetLayout::discover(&repository.root);
+    let mut graph = Graph::default();
+
+    // ponytail: parse changed files sequentially; add Rayon only after profiling proves it helps.
+    for file in &inventory.files {
+        check_cancelled(cancelled)?;
+        let target = targets.for_path(&file.path);
+        let parse_context = target.parse_context();
+        let old = existing.get(&file.path);
+        if !full
+            && old.is_some_and(|old| {
+                old.parse_context == parse_context
+                    && file
+                        .git_oid
+                        .as_ref()
+                        .is_some_and(|oid| old.git_oid.as_ref() == Some(oid))
+            })
+        {
+            let old = old.expect("checked above");
+            graph.files.push(FileInput {
+                path: file.path.clone(),
+                git_oid: file.git_oid.clone(),
+                content_hash: old.content_hash,
+                parse_context,
+                byte_size: old.byte_size,
+                replace: false,
+            });
+            continue;
+        }
+
+        let Some(source) = repository.read_rust_source(file, cancelled)? else {
+            skipped += 1;
+            continue;
+        };
+        let content_hash = *blake3::hash(source.text.as_bytes()).as_bytes();
+        let byte_size = u64::try_from(source.text.len())
+            .map_err(|_| "source byte size exceeds supported range".to_owned())?;
+        let changed = full
+            || old.is_none_or(|old| {
+                old.content_hash != content_hash || old.parse_context != parse_context
+            });
+        graph.files.push(FileInput {
+            path: file.path.clone(),
+            git_oid: file.git_oid.clone(),
+            content_hash,
+            parse_context,
+            byte_size,
+            replace: changed,
+        });
+        if changed {
+            if parser.is_none() {
+                parser = Some(RustParser::new()?);
+            }
+            add_file(
+                &mut graph,
+                &source,
+                &target,
+                parser.as_mut().expect("initialized above"),
+            )?;
+        }
+    }
+    if full {
+        resolve(&mut graph, cancelled)?;
+    }
+    Ok((graph, skipped))
+}
+
 #[cfg(test)]
 fn build_graph(sources: &[Source], cancelled: &AtomicBool) -> Result<Graph, String> {
     let mut parser = RustParser::new()?;
@@ -91,6 +156,15 @@ fn build_graph(sources: &[Source], cancelled: &AtomicBool) -> Result<Graph, Stri
     for source in sources {
         check_cancelled(cancelled)?;
         let target = targets.for_path(&source.path);
+        graph.files.push(FileInput {
+            path: source.path.clone(),
+            git_oid: None,
+            content_hash: *blake3::hash(source.text.as_bytes()).as_bytes(),
+            parse_context: target.parse_context(),
+            byte_size: u64::try_from(source.text.len())
+                .map_err(|_| "source byte size exceeds supported range".to_owned())?,
+            replace: true,
+        });
         add_file(&mut graph, source, &target, &mut parser)?;
     }
     resolve(&mut graph, cancelled)?;
@@ -104,12 +178,6 @@ fn add_file(
     parser: &mut RustParser,
 ) -> Result<(), String> {
     let parsed = parser.parse(&source.text)?;
-    graph.files.push(FileInput {
-        key: source.path.clone(),
-        path: source.path.clone(),
-        byte_size: u64::try_from(source.text.len())
-            .map_err(|_| "source byte size exceeds supported range")?,
-    });
 
     let file_key = identity(&source.path, "file", &source.path, 0, 0);
     graph.nodes.push(NodeInput {
@@ -119,6 +187,7 @@ fn add_file(
         name: source.path.clone(),
         qualified_name: file_key.clone(),
         parent_key: None,
+        owner_key: None,
         line_start: 1,
         line_end: line_count(&source.text)?,
         signature: String::new(),
@@ -153,6 +222,16 @@ fn add_file(
         let kind = node_kind(definition.kind);
         let keys = definition_keys(definition.kind, absolute.as_deref());
         let key = node_keys[local].clone();
+        let owner_key = (definition.kind == DefinitionKind::Method
+            && definition.impl_target.is_some()
+            && definition.parent.is_none())
+        .then(|| {
+            absolute
+                .as_deref()?
+                .rsplit_once("::")
+                .map(|(owner, _)| format!("rust:type:{owner}"))
+        })
+        .flatten();
         graph.nodes.push(NodeInput {
             key: key.clone(),
             file_key: source.path.clone(),
@@ -160,6 +239,7 @@ fn add_file(
             name: definition.name.clone(),
             qualified_name: key.clone(),
             parent_key: Some(parent_key),
+            owner_key,
             line_start: to_u32(definition.line_start)?,
             line_end: to_u32(definition.line_end)?,
             signature: definition.signature.clone(),
@@ -257,15 +337,10 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
         if graph.nodes[parent_index].kind != NodeKind::File {
             continue;
         }
-        let Some(owner) = node.keys.iter().find_map(|key| {
-            key.strip_prefix("rust:method:")?
-                .rsplit_once("::")
-                .map(|(owner, _)| owner)
-        }) else {
+        let Some(type_key) = node.owner_key.as_deref() else {
             continue;
         };
-        let type_key = format!("rust:type:{owner}");
-        let Some(Candidate::Unique(target)) = candidates.get(type_key.as_str()) else {
+        let Some(Candidate::Unique(target)) = candidates.get(type_key) else {
             continue;
         };
         parent_updates.push((node_index, graph.nodes[*target].key.clone()));
@@ -738,6 +813,12 @@ fn normalize_relative(raw: &str, module: &str, root: &str) -> Option<String> {
 struct TargetPath {
     root: String,
     module: String,
+}
+
+impl TargetPath {
+    fn parse_context(&self) -> String {
+        format!("{}:{}{}", self.root.len(), self.root, self.module)
+    }
 }
 
 #[derive(Clone, Copy, Default)]

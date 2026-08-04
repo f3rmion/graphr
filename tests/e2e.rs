@@ -4,13 +4,13 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 #[test]
 fn binary_only_crate_resolves_crate_paths() {
@@ -41,6 +41,124 @@ fn binary_only_crate_resolves_crate_paths() {
 }
 
 #[test]
+fn incremental_index_matches_rebuild_through_mutations() {
+    const CALLER: &str = "use crate::target::answer;\npub fn call() { answer(); answer(); }\n";
+    const EDITED_CALLER: &str =
+        "use crate::target::answer;\npub fn call() { answer(); answer(); answer(); }\n";
+    const TARGET: &str =
+        "pub struct Widget;\nimpl Widget { pub fn local(&self) {} }\npub fn answer() {}\n";
+
+    let incremental = Fixture::new();
+    let oracle = Fixture::new();
+    let roots = [&incremental.path, &oracle.path];
+    for root in roots {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "mod caller;\nmod ext;\nmod target;\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/caller.rs"), CALLER).unwrap();
+        fs::write(
+            root.join("src/ext.rs"),
+            "use crate::target::Widget;\nimpl Widget { pub fn ping(&self) {} }\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("crates/app/src")).unwrap();
+        fs::write(root.join("crates/app/src/worker.rs"), "pub fn work() {}\n").unwrap();
+        init_git(root);
+        assert!(
+            Command::new("git")
+                .args([
+                    "-C",
+                    root.to_str().unwrap(),
+                    "add",
+                    "--",
+                    "src",
+                    "crates/app/src/worker.rs",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    index_repository(&incremental.path, true);
+    index_repository(&oracle.path, true);
+    assert_eq!(
+        semantic_graph(&incremental.path),
+        semantic_graph(&oracle.path)
+    );
+    assert_resolution(&incremental.path, None, "file");
+
+    let generation = database_generation(&incremental.path.join(".git/grapher/index.db"));
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 0);
+    assert_eq!(
+        database_generation(&incremental.path.join(".git/grapher/index.db")),
+        generation
+    );
+
+    for root in roots {
+        fs::write(
+            root.join("crates/app/Cargo.toml"),
+            "[package]\nname='app'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/app/src/lib.rs"), "mod worker;\n").unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+
+    for root in roots {
+        fs::remove_file(root.join("crates/app/Cargo.toml")).unwrap();
+        fs::remove_file(root.join("crates/app/src/lib.rs")).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+
+    for root in roots {
+        fs::write(root.join("src/target.rs"), TARGET).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_resolution(&incremental.path, Some(2), "type");
+
+    for root in roots {
+        fs::write(root.join("src/caller.rs"), EDITED_CALLER).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_resolution(&incremental.path, Some(3), "type");
+
+    for root in roots {
+        fs::create_dir(root.join("src/target")).unwrap();
+        fs::write(root.join("src/target/mod.rs"), TARGET).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_resolution(&incremental.path, None, "file");
+
+    for root in roots {
+        fs::remove_file(root.join("src/target/mod.rs")).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_resolution(&incremental.path, Some(3), "type");
+
+    for root in roots {
+        fs::rename(root.join("src/target.rs"), root.join("src/moved.rs")).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+    assert_resolution(&incremental.path, None, "file");
+
+    for root in roots {
+        fs::rename(root.join("src/moved.rs"), root.join("src/target.rs")).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+    assert_resolution(&incremental.path, Some(3), "type");
+
+    for root in roots {
+        fs::write(root.join("src/caller.rs"), CALLER).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_resolution(&incremental.path, Some(2), "type");
+}
+
+#[test]
 fn concurrent_initial_indexes_serialize() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
@@ -50,7 +168,7 @@ fn concurrent_initial_indexes_serialize() {
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_grapher"));
         command
-            .args(["index", fixture.path.to_str().unwrap(), "--rebuild"])
+            .args(["index", fixture.path.to_str().unwrap()])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.spawn().unwrap()
@@ -67,11 +185,11 @@ fn concurrent_initial_indexes_serialize() {
     outputs.sort_by(|left, right| left.stdout.cmp(&right.stdout));
     assert_eq!(
         String::from_utf8(outputs[0].stdout.clone()).unwrap(),
-        "indexed generation=1 changed=1 skipped=0\n"
+        "indexed generation=1 changed=0 skipped=0\n"
     );
     assert_eq!(
         String::from_utf8(outputs[1].stdout.clone()).unwrap(),
-        "indexed generation=2 changed=1 skipped=0\n"
+        "indexed generation=1 changed=1 skipped=0\n"
     );
 
     let database = fixture.path.join(".git/grapher/index.db");
@@ -367,7 +485,7 @@ fn rust_index_search_view_over_mcp() {
     let pong = client.request(r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#);
     assert!(pong.contains("\"id\":4"), "{pong}");
 
-    let expected_generation = generation_before_cancel + 1;
+    let expected_generation = generation_before_cancel;
     let mut reindexed = String::new();
     for id in 10..30 {
         reindexed = client.request(&format!(
@@ -380,7 +498,7 @@ fn rust_index_search_view_over_mcp() {
     }
     assert!(
         reindexed.contains(&format!(
-            "indexed generation={expected_generation} changed=2 skipped=4"
+            "indexed generation={expected_generation} changed=0 skipped=4"
         )),
         "{reindexed}"
     );
@@ -420,11 +538,37 @@ fn rust_index_search_view_over_mcp() {
         assert!(view.contains("member ->"), "{view}");
     }
 
-    let _ = client.request(
+    let no_op = client.request(
         r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
     );
-    let stale = client.request(&format!(
+    assert!(
+        no_op.contains(&format!(
+            "indexed generation={expected_generation} changed=0 skipped=4"
+        )),
+        "{no_op}"
+    );
+    let still_valid = client.request(&format!(
         r#"{{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}"}}}}}}"#
+    ));
+    assert!(still_valid.contains("dispatch"), "{still_valid}");
+
+    fs::write(
+        fixture.path.join("src/mailer.rs"),
+        "pub struct Mailer;\npub fn added() {}\n",
+    )
+    .unwrap();
+    let changed = client.request(
+        r#"{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
+    );
+    assert!(
+        changed.contains(&format!(
+            "indexed generation={} changed=1 skipped=4",
+            expected_generation + 1
+        )),
+        "{changed}"
+    );
+    let stale = client.request(&format!(
+        r#"{{"jsonrpc":"2.0","id":45,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}"}}}}}}"#
     ));
     assert!(stale.contains("stale node_ref"), "{stale}");
 
@@ -432,10 +576,10 @@ fn rust_index_search_view_over_mcp() {
     lock.execute_batch("BEGIN IMMEDIATE").unwrap();
     let generation_before_eof = database_generation(&database);
     client.notify(
-        r#"{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":46,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
     );
     let busy = client.request(
-        r#"{"jsonrpc":"2.0","id":45,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
     );
     assert!(busy.contains("index busy"), "{busy}");
     thread::sleep(Duration::from_millis(50));
@@ -444,6 +588,106 @@ fn rust_index_search_view_over_mcp() {
     assert!(closed.elapsed() < Duration::from_secs(1));
     lock.execute_batch("ROLLBACK").unwrap();
     assert_eq!(database_generation(&database), generation_before_eof);
+}
+
+fn index_repository(path: &Path, rebuild: bool) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_grapher"));
+    command.arg("index").arg(path);
+    if rebuild {
+        command.arg("--rebuild");
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn assert_incremental_matches_rebuild(incremental: &Path, oracle: &Path, expected_changed: usize) {
+    let indexed = index_repository(incremental, false);
+    assert!(
+        indexed.contains(&format!("changed={expected_changed} skipped=0")),
+        "{indexed}"
+    );
+    index_repository(oracle, true);
+    assert_eq!(semantic_graph(incremental), semantic_graph(oracle));
+}
+
+fn assert_resolution(path: &Path, support: Option<i64>, parent_kind: &str) {
+    let connection = Connection::open(path.join(".git/grapher/index.db")).unwrap();
+    let actual = connection
+        .query_row(
+            "SELECT e.support_count FROM edges e
+               JOIN nodes source ON source.id=e.source_id
+               JOIN nodes target ON target.id=e.target_id
+              WHERE source.name='call' AND target.name='answer' AND e.kind='CALLS'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(actual, support);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT parent.kind FROM nodes method
+                   JOIN nodes parent ON parent.id=method.parent_id
+                  WHERE method.name='ping'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        parent_kind
+    );
+}
+
+fn semantic_graph(path: &Path) -> Vec<String> {
+    let connection = Connection::open(path.join(".git/grapher/index.db")).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT value FROM (
+                 SELECT 'file:' || json_array(
+                            path, language, git_oid, hex(content_hash), parse_context, byte_size
+                        ) AS value
+                   FROM files
+                 UNION ALL
+                 SELECT 'node:' || json_array(
+                            file.path, node.kind, node.name, node.qualified_name,
+                            parent.qualified_name, node.owner_key, node.line_start,
+                            node.line_end, node.signature
+                        )
+                   FROM nodes node
+                   JOIN files file ON file.id=node.file_id
+                   LEFT JOIN nodes parent ON parent.id=node.parent_id
+                 UNION ALL
+                 SELECT 'key:' || json_array(node.qualified_name, node_key.key)
+                   FROM node_keys node_key JOIN nodes node ON node.id=node_key.node_id
+                 UNION ALL
+                 SELECT 'ref:' || json_array(
+                            source.qualified_name, reference.kind, reference.line,
+                            target.qualified_name, ref_key.rank, ref_key.key
+                        )
+                   FROM refs reference
+                   JOIN nodes source ON source.id=reference.source_id
+                   LEFT JOIN nodes target ON target.id=reference.resolved_target_id
+                   JOIN ref_keys ref_key ON ref_key.ref_id=reference.id
+                 UNION ALL
+                 SELECT 'edge:' || json_array(
+                            source.qualified_name, target.qualified_name,
+                            edge.kind, edge.support_count
+                        )
+                   FROM edges edge
+                   JOIN nodes source ON source.id=edge.source_id
+                   JOIN nodes target ON target.id=edge.target_id
+                 UNION ALL
+                 SELECT 'fts:' || json_array(name, qualified_name, path, signature)
+                   FROM nodes_fts
+             ) ORDER BY value",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
 }
 
 fn database_generation(path: &PathBuf) -> i64 {

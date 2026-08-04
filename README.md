@@ -15,4 +15,6 @@ claude mcp add --scope project grapher -- /absolute/path/to/grapher serve /absol
 ```
 
 The Rust-only slice exposes three MCP tools: `index`, `search`, and `view`.
-`search` returns compact `node_ref` values consumed by `view`.
+`index` hashes only dirty, untracked, or Git-OID-changed files and reparses only
+changed Rust sources. `search` returns compact `node_ref` values consumed by
+`view`.
