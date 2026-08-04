@@ -18,8 +18,8 @@
 (attribute_item) @attribute
 (use_declaration) @import
 [
-  (parameter pattern: (_) @binding)
-  (let_declaration pattern: (_) @binding)
+  (parameter) @binding
+  (let_declaration) @binding
   (let_condition pattern: (_) @binding)
   (for_expression pattern: (_) @binding)
   (match_arm pattern: (_) @binding)
@@ -33,14 +33,14 @@
     (identifier)
     (scoped_identifier)
     (field_expression
-      value: (self)
+      value: [(self) (identifier)]
       field: (field_identifier))
     (generic_function
       function: [
         (identifier)
         (scoped_identifier)
         (field_expression
-          value: (self)
+          value: [(self) (identifier)]
           field: (field_identifier))
       ])
   ] @call)

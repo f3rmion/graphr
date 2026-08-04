@@ -33,6 +33,7 @@ pub struct Import {
     pub line: usize,
     pub module: Option<usize>,
     pub block_local: bool,
+    pub exported: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -42,9 +43,19 @@ pub struct Call {
     pub line: usize,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct Implementation {
+    pub type_target: String,
+    pub trait_target: String,
+    pub module: Option<usize>,
+    pub line_start: usize,
+    pub line_end: usize,
+}
+
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct ParsedFile {
     pub definitions: Vec<Definition>,
+    pub implementations: Vec<Implementation>,
     pub modules: Vec<Module>,
     pub imports: Vec<Import>,
     pub bindings: Vec<ValueBinding>,
@@ -55,6 +66,7 @@ pub struct ParsedFile {
 pub struct ValueBinding {
     pub source: usize,
     pub name: String,
+    pub type_target: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -90,6 +102,7 @@ struct AttributeChain {
     parent: usize,
     last: usize,
     has_test: bool,
+    line_start: usize,
 }
 
 pub struct RustParser {
@@ -172,6 +185,8 @@ impl RustParser {
                 });
             if capture.index == self.captures.type_ {
                 if let Some(name) = field_text(node, "name", source) {
+                    let line_start = take_attached_attributes(&mut attributes, node)
+                        .map_or_else(|| line_start(node), |attributes| attributes.line_start);
                     let definition = parsed.definitions.len();
                     let (parent, impl_target) = match current_method_container {
                         Some(MethodContainer::Impl {
@@ -195,7 +210,7 @@ impl RustParser {
                         name: name.to_owned(),
                         parent,
                         impl_target,
-                        line_start: line_start(node),
+                        line_start,
                         line_end: line_end(node),
                         signature: signature(node, source),
                         module: current_module,
@@ -230,8 +245,32 @@ impl RustParser {
             } else if capture.index == self.captures.implementation {
                 if let Some(target_node) = node.child_by_field_name("type") {
                     let target = text(target_node, source).trim();
-                    if target.len() > PATH_LIMIT {
+                    let trait_target = node
+                        .child_by_field_name("trait")
+                        .map(|trait_node| text(trait_node, source).trim());
+                    if target.len() > PATH_LIMIT
+                        || trait_target.is_some_and(|target| target.len() > PATH_LIMIT)
+                    {
                         return Err("Rust qualified path exceeds 1024 bytes".into());
+                    }
+                    let attached = take_attached_attributes(&mut attributes, node);
+                    let mut children = node.walk();
+                    let negative = node
+                        .children(&mut children)
+                        .any(|child| child.kind() == "!");
+                    if let Some(trait_target) = trait_target.filter(|_| !negative) {
+                        parsed.implementations.push(Implementation {
+                            type_target: target.to_owned(),
+                            trait_target: trait_target.to_owned(),
+                            module: current_module,
+                            line_start: attached.map_or_else(
+                                || line_start(node),
+                                |attributes| attributes.line_start,
+                            ),
+                            line_end: node
+                                .child_by_field_name("body")
+                                .map_or_else(|| line_end(node), line_start),
+                        });
                     }
                     scopes.push(Scope {
                         end_byte: node.end_byte(),
@@ -273,19 +312,18 @@ impl RustParser {
                         }
                         None => (DefinitionKind::Function, current_parent, None),
                     };
-                    let is_test = attributes.as_ref().is_some_and(|attributes| {
-                        attributes.has_test
-                            && node.parent().map(|parent| parent.id()) == Some(attributes.parent)
-                            && previous_item(node).map(|sibling| sibling.id())
-                                == Some(attributes.last)
-                    });
-                    attributes = None;
+                    let attached = take_attached_attributes(&mut attributes, node);
+                    let is_test = attached
+                        .as_ref()
+                        .is_some_and(|attributes| attributes.has_test);
+                    let line_start = attached
+                        .map_or_else(|| line_start(node), |attributes| attributes.line_start);
                     parsed.definitions.push(Definition {
                         kind: if is_test { DefinitionKind::Test } else { kind },
                         name: name.to_owned(),
                         parent,
                         impl_target,
-                        line_start: line_start(node),
+                        line_start,
                         line_end: line_end(node),
                         signature: signature(node, source),
                         module: current_module,
@@ -313,11 +351,16 @@ impl RustParser {
                             parent: parent.id(),
                             last: node.id(),
                             has_test: test,
+                            line_start: line_start(node),
                         },
                     });
                 }
             } else if capture.index == self.captures.import {
                 let mut paths = Vec::new();
+                let mut children = node.walk();
+                let exported = node
+                    .named_children(&mut children)
+                    .any(|child| child.kind() == "visibility_modifier");
                 if let Some(argument) = node.child_by_field_name("argument") {
                     flatten_use(argument, "", source, &mut paths)?;
                 }
@@ -328,6 +371,7 @@ impl RustParser {
                         line: line_start(node),
                         module: current_module,
                         block_local: node.parent().is_some_and(|parent| parent.kind() == "block"),
+                        exported,
                     });
                 }
             } else if capture.index == self.captures.binding {
@@ -374,6 +418,16 @@ fn is_test_attribute(raw: &str) -> bool {
     path.rsplit("::").next() == Some("test")
 }
 
+fn take_attached_attributes(
+    attributes: &mut Option<AttributeChain>,
+    node: Node<'_>,
+) -> Option<AttributeChain> {
+    let attributes = attributes.take()?;
+    (node.parent().map(|parent| parent.id()) == Some(attributes.parent)
+        && previous_item(node).map(|sibling| sibling.id()) == Some(attributes.last))
+    .then_some(attributes)
+}
+
 fn previous_item(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
         node = node.prev_named_sibling()?;
@@ -389,25 +443,47 @@ fn collect_binding_names(
     source_definition: usize,
     bindings: &mut Vec<ValueBinding>,
 ) {
-    let mut pending = vec![node];
+    let pattern = node.child_by_field_name("pattern").unwrap_or(node);
+    let type_target = simple_binding_pattern(pattern)
+        .then(|| node.child_by_field_name("type"))
+        .flatten()
+        .and_then(|type_| binding_type(type_, source));
+    let mut pending = vec![pattern];
     while let Some(node) = pending.pop() {
         if matches!(node.kind(), "identifier" | "shorthand_field_identifier") {
             bindings.push(ValueBinding {
                 source: source_definition,
                 name: text(node, source).to_owned(),
+                type_target: type_target.clone(),
             });
             continue;
         }
-        let type_child = node.child_by_field_name("type").map(|child| child.id());
-        let condition = node
-            .child_by_field_name("condition")
-            .map(|child| child.id());
         let mut cursor = node.walk();
-        pending.extend(
-            node.named_children(&mut cursor)
-                .filter(|child| Some(child.id()) != type_child && Some(child.id()) != condition),
-        );
+        pending.extend(node.named_children(&mut cursor));
     }
+}
+
+fn simple_binding_pattern(mut node: Node<'_>) -> bool {
+    while node.kind() == "mut_pattern" {
+        let Some(child) = node.named_child(0) else {
+            return false;
+        };
+        node = child;
+    }
+    matches!(node.kind(), "identifier" | "shorthand_field_identifier")
+}
+
+fn binding_type(mut node: Node<'_>, source: &str) -> Option<String> {
+    while node.kind() == "reference_type" {
+        node = node.child_by_field_name("type")?;
+    }
+    matches!(
+        node.kind(),
+        "type_identifier" | "scoped_type_identifier" | "generic_type"
+    )
+    .then(|| text(node, source).trim())
+    .filter(|target| !target.is_empty() && target.len() <= PATH_LIMIT)
+    .map(str::to_owned)
 }
 
 fn flatten_use(
@@ -582,6 +658,7 @@ fn register_dispatches() {
                 (DefinitionKind::Test, "register_dispatches"),
             ]
         );
+        assert!(parsed.imports.iter().all(|import| !import.exported));
         assert_eq!(parsed.definitions[1].parent, Some(0));
         assert_eq!(parsed.definitions[1].impl_target.as_deref(), Some("Mailer"));
         assert_eq!(parsed.definitions[1].line_start, 6);
@@ -644,16 +721,24 @@ fn register_dispatches() {
         let mut parser = RustParser::new().unwrap();
         let first = parser
             .parse(
-                r#"trait Runner {
+                r#"#[allow(dead_code)]
+trait Runner {
+    #[must_use]
     fn declared(&self);
     #[test]
     // comments do not detach an outer attribute
     #[ignore]
     fn run() { helper(); }
 }
+#[inline]
+// comments may sit directly between an attribute and its item
+fn helper() {}
 #[test]
 // comments may sit directly between an attribute and its item
 fn comment_test() {}
+#[allow(dead_code)]
+const ATTRIBUTE_OWNER: usize = 0;
+fn detached() {}
 "#,
             )
             .unwrap();
@@ -663,10 +748,50 @@ fn comment_test() {}
         assert_eq!(first.definitions[1].signature, "fn declared(&self)");
         assert_eq!(first.definitions[2].kind, DefinitionKind::Test);
         assert_eq!(first.definitions[2].parent, Some(0));
-        assert_eq!(first.definitions[3].kind, DefinitionKind::Test);
+        assert_eq!(first.definitions[3].kind, DefinitionKind::Function);
+        assert_eq!(first.definitions[4].kind, DefinitionKind::Test);
+        assert_eq!(first.definitions[5].kind, DefinitionKind::Function);
+        assert_eq!(
+            first
+                .definitions
+                .iter()
+                .map(|definition| definition.line_start)
+                .collect::<Vec<_>>(),
+            [1, 3, 5, 10, 13, 18]
+        );
         assert_eq!(first.calls[0].source, 2);
         assert_eq!(second.definitions[0].kind, DefinitionKind::Function);
         assert_eq!(second.calls[0].source, 0);
+    }
+
+    #[test]
+    fn records_only_positive_trait_implementations() {
+        let parsed = RustParser::new()
+            .unwrap()
+            .parse(
+                r#"mod nested {
+    #[cfg(unix)]
+    // comments remain part of the implementation range
+    impl crate::Marker
+        for super::Thing
+    {}
+    impl !crate::Denied for super::Thing {}
+    impl super::Thing {}
+}
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            parsed.implementations,
+            [Implementation {
+                type_target: "super::Thing".into(),
+                trait_target: "crate::Marker".into(),
+                module: Some(0),
+                line_start: 2,
+                line_end: 6,
+            }]
+        );
     }
 
     #[test]
@@ -719,7 +844,7 @@ fn comment_test() {}
     }
 
     #[test]
-    fn skips_receiver_calls_that_cannot_be_resolved() {
+    fn captures_only_receiver_calls_with_supported_shapes() {
         let parsed = RustParser::new()
             .unwrap()
             .parse(
@@ -733,7 +858,16 @@ fn comment_test() {}
                 .iter()
                 .map(|call| call.target.as_str())
                 .collect::<Vec<_>>(),
-            ["local", "Item::make::<u8>", "self.work::<u8>", "Item::make"]
+            [
+                "local",
+                "Item::make::<u8>",
+                "self.work::<u8>",
+                "other.work",
+                "Item::make"
+            ]
         );
+        assert!(parsed.bindings.iter().any(|binding| {
+            binding.name == "other" && binding.type_target.as_deref() == Some("Item")
+        }));
     }
 }

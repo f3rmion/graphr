@@ -2,6 +2,7 @@ mod git;
 mod index;
 mod mcp;
 mod parse;
+mod python;
 mod store;
 
 use std::env;
@@ -17,9 +18,9 @@ use std::thread;
 use index::Project;
 
 const USAGE: &str = "Usage:
-  grapher index [PATH] [--rebuild]
-  grapher serve [PATH]
-  grapher --version";
+  graphr index [PATH] [--rebuild]
+  graphr serve [PATH]
+  graphr --version";
 
 enum Action {
     Version,
@@ -32,14 +33,14 @@ async fn main() -> ExitCode {
     let action = match parse_args(env::args_os().skip(1)) {
         Ok(action) => action,
         Err(error) => {
-            eprintln!("grapher: {error}\n\n{USAGE}");
+            eprintln!("graphr: {error}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
 
     let result = match action {
         Action::Version => {
-            println!("grapher {}", env!("CARGO_PKG_VERSION"));
+            println!("graphr {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
         Action::Index { path, rebuild } => Project::open(&path).and_then(|p| p.index(rebuild)),
@@ -54,7 +55,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("grapher: {}", terminal_safe(&error));
+            eprintln!("graphr: {}", terminal_safe(&error));
             ExitCode::FAILURE
         }
     }
@@ -64,7 +65,7 @@ async fn serve(path: PathBuf) -> Result<String, String> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let watcher = thread::Builder::new()
-        .name("grapher-stdin".into())
+        .name("graphr-stdin".into())
         .spawn({
             let cancelled = cancelled.clone();
             let done = done.clone();

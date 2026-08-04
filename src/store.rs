@@ -9,9 +9,9 @@ use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
-use crate::git::{ChangedFile, LineSpan, PathRecord, WorktreeChanges};
+use crate::git::{ChangedFile, Language, LineSpan, PathRecord, WorktreeChanges};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 const CHANGES_BUDGET: usize = 8192;
@@ -53,6 +53,7 @@ pub enum EdgeKind {
 
 pub struct FileInput {
     pub path: String,
+    pub language: Language,
     pub git_oid: Option<String>,
     pub content_hash: [u8; 32],
     pub parse_context: String,
@@ -62,6 +63,7 @@ pub struct FileInput {
 
 pub struct StoredFile {
     id: i64,
+    pub language: Language,
     pub git_oid: Option<String>,
     pub content_hash: [u8; 32],
     pub parse_context: String,
@@ -87,7 +89,16 @@ pub struct RefInput {
     pub kind: RefKind,
     pub line: u32,
     pub keys: Vec<String>,
+    pub alias_key: Option<String>,
     pub resolved_target_key: Option<String>,
+}
+
+pub struct TraitImplementationInput {
+    pub file_key: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub implementor_key: String,
+    pub trait_key: String,
 }
 
 pub struct EdgeInput {
@@ -102,6 +113,7 @@ pub struct Graph {
     pub files: Vec<FileInput>,
     pub nodes: Vec<NodeInput>,
     pub refs: Vec<RefInput>,
+    pub trait_implementations: Vec<TraitImplementationInput>,
     pub edges: Vec<EdgeInput>,
 }
 
@@ -220,7 +232,8 @@ impl Store {
                 drop_graph_schema(&tx)?;
                 create_schema(&tx)?;
             }
-            insert_graph(&tx, &graph, cancelled, false)?;
+            let (_, implementations) = insert_graph(&tx, &graph, cancelled, false)?;
+            resolve_trait_implementations(&tx, implementations.into_iter().collect(), cancelled)?;
             graph.files.len()
         } else {
             apply_incremental(&tx, &graph, &existing, cancelled)?
@@ -293,11 +306,11 @@ impl Store {
         let root_has_members = matches!(root.kind.as_str(), "file" | "type");
         let mut lines = vec![root_line];
         let mut visited = HashSet::from([root_id]);
-        let mut queue = VecDeque::from([(root_id, 0_u32)]);
+        let mut queue = VecDeque::from([(root_id, root.kind == "type", 0_u32)]);
         let mut row_budget = max_nodes as usize + 1;
         let mut omitted = false;
 
-        while let Some((current, level)) = queue.pop_front() {
+        while let Some((current, include_traits, level)) = queue.pop_front() {
             if row_budget == 0 {
                 omitted = true;
                 break;
@@ -307,6 +320,7 @@ impl Store {
                 current,
                 row_budget,
                 current == root_id && root_has_members,
+                include_traits,
             )?;
             for (relation, node) in neighbors {
                 row_budget -= 1;
@@ -318,12 +332,13 @@ impl Store {
                     break;
                 }
                 visited.insert(node.id);
+                let include_traits = node.kind == "type";
                 let Some(line) = node.line(&state, Some(&relation), VIEW_BUDGET)? else {
                     omitted = true;
                     break;
                 };
                 lines.push(line);
-                queue.push_back((node.id, level + 1));
+                queue.push_back((node.id, include_traits, level + 1));
             }
             if omitted || more_neighbors {
                 omitted = true;
@@ -366,13 +381,23 @@ impl Store {
         let state = read_state(&tx)?;
         let root_limit = max_nodes as usize;
         let mut root_ids = Vec::with_capacity(root_limit);
+        let mut root_seen = HashSet::new();
         let mut omitted = false;
         let mut symbols = tx
             .prepare(
-                "SELECT n.id, n.line_start, n.line_end
-                   FROM files f JOIN nodes n ON n.file_id=f.id
-                  WHERE f.path=?1 AND n.kind!='file'
-                  ORDER BY n.line_start, n.line_end, n.id",
+                "SELECT id, line_start, line_end FROM (
+                    SELECT n.id, n.line_start, n.line_end
+                      FROM files f JOIN nodes n ON n.file_id=f.id
+                     WHERE f.path=?1 AND n.kind!='file'
+                    UNION ALL
+                    SELECT i.resolved_implementor_id, i.line_start, i.line_end
+                      FROM files f JOIN trait_implementations i ON i.file_id=f.id
+                     WHERE f.path=?1 AND i.resolved_implementor_id IS NOT NULL
+                    UNION ALL
+                    SELECT i.resolved_trait_id, i.line_start, i.line_end
+                      FROM files f JOIN trait_implementations i ON i.file_id=f.id
+                     WHERE f.path=?1 AND i.resolved_trait_id IS NOT NULL
+                 ) ORDER BY line_start, line_end, id",
             )
             .map_err(db_error)?;
 
@@ -400,7 +425,7 @@ impl Store {
                 check_cancelled(cancelled)?;
                 let (id, line_start, line_end) = row.map_err(db_error)?;
                 if id <= 0 || line_start == 0 || line_end < line_start {
-                    return Err("database node interval is invalid".into());
+                    return Err("database change interval is invalid".into());
                 }
                 saw_symbol = true;
                 let interval = LineSpan {
@@ -420,7 +445,7 @@ impl Store {
                         .spans
                         .get(span_index)
                         .is_some_and(|span| span.start <= interval.end);
-                if changed {
+                if changed && root_seen.insert(id) {
                     if root_ids.len() < root_limit {
                         root_ids.push(id);
                     } else {
@@ -540,9 +565,10 @@ impl RowNode {
     }
 }
 
-const CHANGE_NEIGHBORS: [(&str, &str); 4] = [
+const CHANGE_NEIGHBORS: [(&str, bool, &str); 6] = [
     (
         "test <-",
+        false,
         "SELECT n.id, n.kind, n.name, f.path, n.line_start
            FROM edges e JOIN nodes n ON n.id=e.source_id
            JOIN files f ON f.id=n.file_id
@@ -551,6 +577,7 @@ const CHANGE_NEIGHBORS: [(&str, &str); 4] = [
     ),
     (
         "caller <-",
+        false,
         "SELECT n.id, n.kind, n.name, f.path, n.line_start
            FROM edges e JOIN nodes n ON n.id=e.source_id
            JOIN files f ON f.id=n.file_id
@@ -558,7 +585,17 @@ const CHANGE_NEIGHBORS: [(&str, &str); 4] = [
           ORDER BY e.source_id LIMIT ?2",
     ),
     (
+        "impl <-",
+        true,
+        "SELECT DISTINCT n.id, n.kind, n.name, f.path, n.line_start
+           FROM trait_implementations i JOIN nodes n ON n.id=i.resolved_implementor_id
+           JOIN files f ON f.id=n.file_id
+          WHERE i.resolved_trait_id=?1
+          ORDER BY n.id LIMIT ?2",
+    ),
+    (
         "call ->",
+        false,
         "SELECT n.id, n.kind, n.name, f.path, n.line_start
            FROM edges e JOIN nodes n ON n.id=e.target_id
            JOIN files f ON f.id=n.file_id
@@ -566,7 +603,17 @@ const CHANGE_NEIGHBORS: [(&str, &str); 4] = [
           ORDER BY e.kind, e.target_id LIMIT ?2",
     ),
     (
+        "implements ->",
+        true,
+        "SELECT DISTINCT n.id, n.kind, n.name, f.path, n.line_start
+           FROM trait_implementations i JOIN nodes n ON n.id=i.resolved_trait_id
+           JOIN files f ON f.id=n.file_id
+          WHERE i.resolved_implementor_id=?1
+          ORDER BY n.id LIMIT ?2",
+    ),
+    (
         "import ->",
+        false,
         "SELECT n.id, n.kind, n.name, f.path, n.line_start
            FROM edges e JOIN nodes n ON n.id=e.target_id
            JOIN files f ON f.id=n.file_id
@@ -586,15 +633,21 @@ fn traverse_changes(
 ) -> Result<bool> {
     let (lines, line_bytes) = output;
     let mut visited = roots.iter().map(|node| node.id).collect::<HashSet<_>>();
-    let mut current = roots.iter().map(|node| node.id).collect::<Vec<_>>();
+    let mut current = roots
+        .iter()
+        .map(|node| (node.id, node.kind == "type"))
+        .collect::<Vec<_>>();
     let mut next = Vec::with_capacity(max_nodes);
     let mut row_budget = max_nodes + 1;
 
     for level in 0..=depth {
         next.clear();
-        for (relation, sql) in CHANGE_NEIGHBORS {
+        for (relation, types_only, sql) in CHANGE_NEIGHBORS {
             let mut statement = connection.prepare(sql).map_err(db_error)?;
-            for source in &current {
+            for &(source, is_type) in &current {
+                if types_only && !is_type {
+                    continue;
+                }
                 check_cancelled(cancelled)?;
                 let limit = row_budget;
                 if limit == 0 {
@@ -632,7 +685,7 @@ fn traverse_changes(
                         return Ok(true);
                     }
                     visited.insert(node.id);
-                    next.push(node.id);
+                    next.push((node.id, node.kind == "type"));
                 }
                 if fetched == limit as usize {
                     return Ok(true);
@@ -730,26 +783,32 @@ fn push_change_line(lines: &mut Vec<String>, bytes: &mut usize, line: String) ->
 
 fn load_stored_files(connection: &Connection) -> Result<HashMap<String, StoredFile>> {
     let mut statement = connection
-        .prepare("SELECT id, path, git_oid, content_hash, parse_context, byte_size FROM files")
+        .prepare(
+            "SELECT id, path, language, git_oid, content_hash, parse_context, byte_size FROM files",
+        )
         .map_err(db_error)?;
     let rows = statement
         .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })
         .map_err(db_error)?;
     let mut files = HashMap::new();
     for row in rows {
-        let (id, path, git_oid, hash, parse_context, byte_size) = row.map_err(db_error)?;
+        let (id, path, language, git_oid, hash, parse_context, byte_size) =
+            row.map_err(db_error)?;
         if id <= 0 || byte_size < 0 || !git_oid.as_deref().is_none_or(valid_oid) {
             return Err("database file metadata is invalid".into());
         }
+        let language = Language::parse(&language)
+            .ok_or_else(|| "database file language is invalid".to_owned())?;
         let content_hash: [u8; 32] = hash
             .try_into()
             .map_err(|_| "database content hash is invalid".to_owned())?;
@@ -760,6 +819,7 @@ fn load_stored_files(connection: &Connection) -> Result<HashMap<String, StoredFi
                 path,
                 StoredFile {
                     id,
+                    language,
                     git_oid,
                     content_hash,
                     parse_context,
@@ -794,6 +854,10 @@ fn apply_incremental(
         if !file.git_oid.as_deref().is_none_or(valid_oid)
             || current.insert(file.path.as_str(), file).is_some()
             || (!file.replace && !existing.contains_key(&file.path))
+            || (!file.replace
+                && existing
+                    .get(&file.path)
+                    .is_some_and(|old| old.language != file.language))
         {
             return Err("incremental file metadata is invalid".into());
         }
@@ -810,7 +874,11 @@ fn apply_incremental(
             .iter()
             .filter(|file| file.replace && !existing.contains_key(&file.path))
             .count();
-    if changed == 0 && (!graph.nodes.is_empty() || !graph.refs.is_empty()) {
+    if changed == 0
+        && (!graph.nodes.is_empty()
+            || !graph.refs.is_empty()
+            || !graph.trait_implementations.is_empty())
+    {
         return Err("no-op incremental graph contains parsed rows".into());
     }
 
@@ -871,6 +939,13 @@ fn apply_incremental(
         let mut owners = tx
             .prepare("SELECT owner_key FROM nodes WHERE file_id=?1 AND owner_key IS NOT NULL")
             .map_err(db_error)?;
+        let mut aliases = tx
+            .prepare(
+                "SELECT r.alias_key FROM refs r
+                   JOIN nodes n ON n.id=r.source_id
+                  WHERE n.file_id=?1 AND r.alias_key IS NOT NULL",
+            )
+            .map_err(db_error)?;
         for file_id in &removed {
             check_cancelled(cancelled)?;
             for row in keys
@@ -889,6 +964,12 @@ fn apply_incremental(
             {
                 affected_owners.insert(row.map_err(db_error)?);
             }
+            for row in aliases
+                .query_map([file_id], |row| row.get::<_, String>(0))
+                .map_err(db_error)?
+            {
+                affected_keys.insert(row.map_err(db_error)?);
+            }
         }
     }
     for node in &graph.nodes {
@@ -902,19 +983,54 @@ fn apply_incremental(
             affected_owners.insert(owner.clone());
         }
     }
+    for reference in &graph.refs {
+        if let Some(alias) = &reference.alias_key {
+            affected_keys.insert(alias.clone());
+        }
+    }
 
     let mut affected_refs = HashSet::new();
+    let mut affected_implementations = HashSet::new();
+    let mut affected_aliases = HashSet::new();
     {
         let mut refs = tx
-            .prepare("SELECT ref_id FROM ref_keys WHERE key=?1 ORDER BY ref_id")
+            .prepare(
+                "SELECT rk.ref_id, r.alias_key FROM ref_keys rk
+                   JOIN refs r ON r.id=rk.ref_id
+                  WHERE rk.key=?1 ORDER BY rk.ref_id",
+            )
+            .map_err(db_error)?;
+        let mut implementations = tx
+            .prepare(
+                "SELECT id FROM trait_implementations
+                  WHERE implementor_key=?1 OR trait_key=?1 ORDER BY id",
+            )
             .map_err(db_error)?;
         for key in &affected_keys {
             check_cancelled(cancelled)?;
             for row in refs
+                .query_map([key], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(db_error)?
+            {
+                let (reference, alias) = row.map_err(db_error)?;
+                affected_refs.insert(reference);
+                affected_aliases.extend(alias);
+            }
+            for row in implementations
                 .query_map([key], |row| row.get::<_, i64>(0))
                 .map_err(db_error)?
             {
-                affected_refs.insert(row.map_err(db_error)?);
+                affected_implementations.insert(row.map_err(db_error)?);
+            }
+        }
+        for alias in affected_aliases {
+            for row in implementations
+                .query_map([alias], |row| row.get::<_, i64>(0))
+                .map_err(db_error)?
+            {
+                affected_implementations.insert(row.map_err(db_error)?);
             }
         }
     }
@@ -933,26 +1049,69 @@ fn apply_incremental(
         }
     }
 
-    let new_refs = insert_graph(tx, graph, cancelled, true)?;
+    let (new_refs, new_implementations) = insert_graph(tx, graph, cancelled, true)?;
     affected_refs.extend(new_refs);
+    affected_implementations.extend(new_implementations);
     resolve_references(tx, affected_refs, cancelled)?;
+    resolve_trait_implementations(tx, affected_implementations, cancelled)?;
     reparent_methods(tx, affected_owners, cancelled)?;
     Ok(changed)
 }
 
 fn resolve_references(
     tx: &Transaction<'_>,
-    references: HashSet<i64>,
+    mut references: HashSet<i64>,
     cancelled: &AtomicBool,
 ) -> Result<()> {
     if references.is_empty() {
         return Ok(());
     }
-    let mut references = references.into_iter().collect::<Vec<_>>();
+    let mut load_alias = tx
+        .prepare("SELECT alias_key FROM refs WHERE id=?1")
+        .map_err(db_error)?;
+    let mut alias_keys = HashSet::new();
+    let mut exporters = HashSet::new();
+    for reference_id in &references {
+        if let Some(alias) = load_alias
+            .query_row([reference_id], |row| row.get::<_, Option<String>>(0))
+            .optional()
+            .map_err(db_error)?
+            .flatten()
+        {
+            alias_keys.insert(alias);
+            exporters.insert(*reference_id);
+        }
+    }
+    let mut consumers = tx
+        .prepare(
+            "SELECT rk.ref_id, r.alias_key IS NOT NULL
+               FROM ref_keys rk JOIN refs r ON r.id=rk.ref_id
+              WHERE rk.key=?1 ORDER BY rk.ref_id",
+        )
+        .map_err(db_error)?;
+    for alias in alias_keys {
+        check_cancelled(cancelled)?;
+        for row in consumers
+            .query_map([alias], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+            })
+            .map_err(db_error)?
+        {
+            let (reference_id, exports) = row.map_err(db_error)?;
+            references.insert(reference_id);
+            if exports {
+                exporters.insert(reference_id);
+            }
+        }
+    }
+    let mut references = references
+        .into_iter()
+        .map(|reference_id| (!exporters.contains(&reference_id), reference_id))
+        .collect::<Vec<_>>();
     references.sort_unstable();
     let mut load_ref = tx
         .prepare(
-            "SELECT r.kind, n.kind, r.resolved_target_id
+            "SELECT r.kind, n.kind, r.alias_key, r.resolved_target_id
                FROM refs r JOIN nodes n ON n.id=r.source_id
               WHERE r.id=?1",
         )
@@ -962,6 +1121,13 @@ fn resolve_references(
         .map_err(db_error)?;
     let mut candidates = tx
         .prepare("SELECT node_id FROM node_keys WHERE key=?1 ORDER BY node_id LIMIT 2")
+        .map_err(db_error)?;
+    let mut alias_candidates = tx
+        .prepare(
+            "SELECT count(*), count(resolved_target_id),
+                    count(DISTINCT resolved_target_id), min(resolved_target_id)
+               FROM refs WHERE alias_key=?1",
+        )
         .map_err(db_error)?;
     let mut update_ref = tx
         .prepare("UPDATE refs SET resolved_target_id=?1 WHERE id=?2")
@@ -989,14 +1155,15 @@ fn resolve_references(
         )
         .map_err(db_error)?;
 
-    for reference_id in references {
+    for (_, reference_id) in references {
         check_cancelled(cancelled)?;
-        let Some((ref_kind, source_kind, old_target)) = load_ref
+        let Some((ref_kind, source_kind, alias_key, old_target)) = load_ref
             .query_row([reference_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
                 ))
             })
             .optional()
@@ -1009,7 +1176,14 @@ fn resolve_references(
             .query_map([reference_id], |row| row.get::<_, String>(0))
             .map_err(db_error)?
         {
-            match candidate(&mut candidates, &row.map_err(db_error)?)? {
+            let key = row.map_err(db_error)?;
+            let direct = candidate(&mut candidates, &key)?;
+            let alias = if alias_key.is_none() {
+                alias_candidate(&mut alias_candidates, &key)?
+            } else {
+                DbCandidate::Missing
+            };
+            match merge_candidates(direct, alias) {
                 DbCandidate::Unique(target) => {
                     new_target = Some(target);
                     break;
@@ -1043,6 +1217,85 @@ fn resolve_references(
         if let Some(target) = new_target {
             increment
                 .execute(params![reference_id, target, edge_kind])
+                .map_err(db_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_trait_implementations(
+    tx: &Transaction<'_>,
+    implementations: HashSet<i64>,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    if implementations.is_empty() {
+        return Ok(());
+    }
+    let mut implementations = implementations.into_iter().collect::<Vec<_>>();
+    implementations.sort_unstable();
+    let mut load = tx
+        .prepare(
+            "SELECT implementor_key, trait_key,
+                    resolved_implementor_id, resolved_trait_id
+               FROM trait_implementations WHERE id=?1",
+        )
+        .map_err(db_error)?;
+    let mut candidates = tx
+        .prepare(
+            "SELECT nk.node_id FROM node_keys nk JOIN nodes n ON n.id=nk.node_id
+              WHERE nk.key=?1 AND n.kind='type' ORDER BY nk.node_id LIMIT 2",
+        )
+        .map_err(db_error)?;
+    let mut alias_candidates = tx
+        .prepare(
+            "SELECT count(*), count(r.resolved_target_id),
+                    count(DISTINCT CASE WHEN n.kind='type' THEN r.resolved_target_id END),
+                    min(CASE WHEN n.kind='type' THEN r.resolved_target_id END)
+               FROM refs r LEFT JOIN nodes n ON n.id=r.resolved_target_id
+              WHERE r.alias_key=?1",
+        )
+        .map_err(db_error)?;
+    let mut update = tx
+        .prepare(
+            "UPDATE trait_implementations
+                SET resolved_implementor_id=?1, resolved_trait_id=?2
+              WHERE id=?3",
+        )
+        .map_err(db_error)?;
+
+    for implementation_id in implementations {
+        check_cancelled(cancelled)?;
+        let Some((implementor_key, trait_key, old_implementor, old_trait)) = load
+            .query_row([implementation_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })
+            .optional()
+            .map_err(db_error)?
+        else {
+            continue;
+        };
+        let implementor = match merge_candidates(
+            candidate(&mut candidates, &implementor_key)?,
+            alias_candidate(&mut alias_candidates, &implementor_key)?,
+        ) {
+            DbCandidate::Unique(node) => Some(node),
+            DbCandidate::Missing | DbCandidate::Ambiguous => None,
+        };
+        let trait_ = match merge_candidates(
+            candidate(&mut candidates, &trait_key)?,
+            alias_candidate(&mut alias_candidates, &trait_key)?,
+        ) {
+            DbCandidate::Unique(node) => Some(node),
+            DbCandidate::Missing | DbCandidate::Ambiguous => None,
+        };
+        if (old_implementor, old_trait) != (implementor, trait_) {
+            update
+                .execute(params![implementor, trait_, implementation_id])
                 .map_err(db_error)?;
         }
     }
@@ -1094,10 +1347,24 @@ fn reparent_methods(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 enum DbCandidate {
     Missing,
     Unique(i64),
     Ambiguous,
+}
+
+fn merge_candidates(left: DbCandidate, right: DbCandidate) -> DbCandidate {
+    match (left, right) {
+        (DbCandidate::Ambiguous, _) | (_, DbCandidate::Ambiguous) => DbCandidate::Ambiguous,
+        (DbCandidate::Unique(left), DbCandidate::Unique(right)) if left != right => {
+            DbCandidate::Ambiguous
+        }
+        (DbCandidate::Unique(target), _) | (_, DbCandidate::Unique(target)) => {
+            DbCandidate::Unique(target)
+        }
+        (DbCandidate::Missing, DbCandidate::Missing) => DbCandidate::Missing,
+    }
 }
 
 fn candidate(statement: &mut rusqlite::Statement<'_>, key: &str) -> Result<DbCandidate> {
@@ -1117,12 +1384,36 @@ fn valid_oid(oid: &str) -> bool {
     matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn alias_candidate(statement: &mut rusqlite::Statement<'_>, key: &str) -> Result<DbCandidate> {
+    let (total, resolved, distinct, target) = statement
+        .query_row([key], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .map_err(db_error)?;
+    Ok(if total == 0 {
+        DbCandidate::Missing
+    } else if resolved != total {
+        DbCandidate::Ambiguous
+    } else if distinct == 0 {
+        DbCandidate::Missing
+    } else if distinct != 1 {
+        DbCandidate::Ambiguous
+    } else {
+        DbCandidate::Unique(target.ok_or_else(|| "database alias target is invalid".to_owned())?)
+    })
+}
+
 fn insert_graph(
     tx: &Transaction<'_>,
     graph: &Graph,
     cancelled: &AtomicBool,
     delta: bool,
-) -> Result<Vec<i64>> {
+) -> Result<(Vec<i64>, Vec<i64>)> {
     let file_count = if delta {
         graph.files.iter().filter(|file| file.replace).count()
     } else {
@@ -1134,7 +1425,7 @@ fn insert_graph(
             .prepare(
                 "INSERT INTO files(
                     path, language, git_oid, content_hash, parse_context, byte_size
-                 ) VALUES(?1, 'rust', ?2, ?3, ?4, ?5)",
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .map_err(db_error)?;
         for file in graph.files.iter().filter(|file| !delta || file.replace) {
@@ -1144,6 +1435,7 @@ fn insert_graph(
             insert
                 .execute(params![
                     file.path,
+                    file.language.as_str(),
                     file.git_oid,
                     file.content_hash.as_slice(),
                     file.parse_context,
@@ -1228,6 +1520,33 @@ fn insert_graph(
         }
     }
 
+    let mut implementation_ids = Vec::with_capacity(graph.trait_implementations.len());
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO trait_implementations(
+                    file_id, implementor_key, trait_key, line_start, line_end
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(db_error)?;
+        for implementation in &graph.trait_implementations {
+            check_cancelled(cancelled)?;
+            let (file_id, _) = files
+                .get(implementation.file_key.as_str())
+                .ok_or_else(|| "trait implementation references an unknown file".to_owned())?;
+            insert
+                .execute(params![
+                    file_id,
+                    implementation.implementor_key,
+                    implementation.trait_key,
+                    implementation.line_start,
+                    implementation.line_end
+                ])
+                .map_err(db_error)?;
+            implementation_ids.push(tx.last_insert_rowid());
+        }
+    }
+
     let mut reference_ids = if delta {
         Vec::with_capacity(graph.refs.len())
     } else {
@@ -1236,8 +1555,8 @@ fn insert_graph(
     {
         let mut insert_ref = tx
             .prepare(
-                "INSERT INTO refs(source_id, kind, line, resolved_target_id)
-                 VALUES(?1, ?2, ?3, ?4)",
+                "INSERT INTO refs(source_id, kind, line, alias_key, resolved_target_id)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
             )
             .map_err(db_error)?;
         let mut insert_ref_key = tx
@@ -1256,6 +1575,7 @@ fn insert_graph(
                     source_id,
                     reference.kind.db(),
                     reference.line,
+                    reference.alias_key,
                     target_id
                 ])
                 .map_err(db_error)?;
@@ -1292,7 +1612,7 @@ fn insert_graph(
                 .map_err(db_error)?;
         }
     }
-    Ok(reference_ids)
+    Ok((reference_ids, implementation_ids))
 }
 
 fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
@@ -1339,12 +1659,15 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
             kind TEXT NOT NULL CHECK(kind IN ('CALLS','IMPORTS')),
             line INTEGER NOT NULL CHECK(line>0),
+            alias_key TEXT CHECK(alias_key IS NULL OR length(alias_key)>0),
             resolved_target_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL
          );
          CREATE INDEX refs_source_target
              ON refs(source_id, kind, resolved_target_id);
          CREATE INDEX refs_target_source
              ON refs(resolved_target_id, kind, source_id);
+         CREATE INDEX refs_alias
+             ON refs(alias_key, resolved_target_id) WHERE alias_key IS NOT NULL;
          CREATE TABLE ref_keys(
             ref_id INTEGER NOT NULL REFERENCES refs(id) ON DELETE CASCADE,
             rank INTEGER NOT NULL CHECK(rank>=0),
@@ -1352,6 +1675,28 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             PRIMARY KEY(ref_id, rank)
          ) WITHOUT ROWID;
          CREATE INDEX ref_keys_key ON ref_keys(key, ref_id, rank);
+         CREATE TABLE trait_implementations(
+            id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            implementor_key TEXT NOT NULL CHECK(length(implementor_key)>0),
+            trait_key TEXT NOT NULL CHECK(length(trait_key)>0),
+            line_start INTEGER NOT NULL CHECK(line_start>0),
+            line_end INTEGER NOT NULL CHECK(line_end>=line_start),
+            resolved_implementor_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
+            resolved_trait_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL
+         );
+         CREATE INDEX trait_implementations_file_lines
+             ON trait_implementations(file_id, line_start, line_end, id);
+         CREATE INDEX trait_implementations_implementor_key
+             ON trait_implementations(implementor_key, id);
+         CREATE INDEX trait_implementations_trait_key
+             ON trait_implementations(trait_key, id);
+         CREATE INDEX trait_implementations_resolved_implementor
+             ON trait_implementations(resolved_implementor_id, resolved_trait_id, id)
+             WHERE resolved_implementor_id IS NOT NULL;
+         CREATE INDEX trait_implementations_resolved_trait
+             ON trait_implementations(resolved_trait_id, resolved_implementor_id, id)
+             WHERE resolved_trait_id IS NOT NULL;
          CREATE TABLE edges(
             source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
             target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
@@ -1363,7 +1708,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE INDEX edges_target ON edges(target_id, kind, source_id);
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=2;",
+         PRAGMA user_version=4;",
     )
     .map_err(db_error)
 }
@@ -1371,6 +1716,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 fn drop_graph_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     tx.execute_batch(
         "DROP TABLE IF EXISTS nodes_fts;
+         DROP TABLE IF EXISTS trait_implementations;
          DROP TABLE IF EXISTS edges;
          DROP TABLE IF EXISTS ref_keys;
          DROP TABLE IF EXISTS refs;
@@ -1438,11 +1784,13 @@ fn load_neighbors(
     id: i64,
     limit: usize,
     include_members: bool,
+    include_traits: bool,
 ) -> Result<(Vec<(String, RowNode)>, bool)> {
     let queries = [
         (
             "member ->",
             true,
+            false,
             "SELECT n.id, n.kind, n.name, f.path, n.line_start
                FROM nodes n JOIN files f ON f.id=n.file_id
               WHERE n.parent_id=?1
@@ -1450,6 +1798,7 @@ fn load_neighbors(
         ),
         (
             "test <-",
+            false,
             false,
             "SELECT n.id, n.kind, n.name, f.path, n.line_start
                FROM edges e JOIN nodes n ON n.id=e.source_id
@@ -1460,6 +1809,7 @@ fn load_neighbors(
         (
             "caller <-",
             false,
+            false,
             "SELECT n.id, n.kind, n.name, f.path, n.line_start
                FROM edges e JOIN nodes n ON n.id=e.source_id
                JOIN files f ON f.id=n.file_id
@@ -1467,7 +1817,18 @@ fn load_neighbors(
               ORDER BY e.source_id LIMIT ?2",
         ),
         (
+            "impl <-",
+            false,
+            true,
+            "SELECT DISTINCT n.id, n.kind, n.name, f.path, n.line_start
+               FROM trait_implementations i JOIN nodes n ON n.id=i.resolved_implementor_id
+               JOIN files f ON f.id=n.file_id
+              WHERE i.resolved_trait_id=?1
+              ORDER BY n.id LIMIT ?2",
+        ),
+        (
             "call ->",
+            false,
             false,
             "SELECT n.id, n.kind, n.name, f.path, n.line_start
                FROM edges e JOIN nodes n ON n.id=e.target_id
@@ -1476,7 +1837,18 @@ fn load_neighbors(
               ORDER BY e.kind, e.target_id LIMIT ?2",
         ),
         (
+            "implements ->",
+            false,
+            true,
+            "SELECT DISTINCT n.id, n.kind, n.name, f.path, n.line_start
+               FROM trait_implementations i JOIN nodes n ON n.id=i.resolved_trait_id
+               JOIN files f ON f.id=n.file_id
+              WHERE i.resolved_implementor_id=?1
+              ORDER BY n.id LIMIT ?2",
+        ),
+        (
             "in <-",
+            false,
             false,
             "SELECT coalesce(p.id, file_node.id),
                     coalesce(p.kind, file_node.kind),
@@ -1496,6 +1868,7 @@ fn load_neighbors(
         (
             "import ->",
             false,
+            false,
             "SELECT n.id, n.kind, n.name, f.path, n.line_start
                FROM edges e JOIN nodes n ON n.id=e.target_id
                JOIN files f ON f.id=n.file_id
@@ -1505,8 +1878,8 @@ fn load_neighbors(
     ];
     let mut neighbors = Vec::with_capacity(limit);
 
-    for (relation, members_only, sql) in queries {
-        if members_only && !include_members {
+    for (relation, members_only, types_only, sql) in queries {
+        if (members_only && !include_members) || (types_only && !include_traits) {
             continue;
         }
         let remaining = limit - neighbors.len();
@@ -1791,7 +2164,7 @@ mod tests {
     #[test]
     fn schema_mismatch_does_not_change_journal_mode() {
         let path = std::env::temp_dir().join(format!(
-            "grapher-store-{}-{}.db",
+            "graphr-store-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1823,6 +2196,7 @@ mod tests {
         let graph = Graph {
             files: vec![FileInput {
                 path: "src/lib.rs".into(),
+                language: Language::Rust,
                 git_oid: None,
                 content_hash: [0; 32],
                 parse_context: String::new(),
@@ -1894,6 +2268,7 @@ mod tests {
         let graph = Graph {
             files: vec![FileInput {
                 path: "src/lib.rs".into(),
+                language: Language::Rust,
                 git_oid: None,
                 content_hash: [0; 32],
                 parse_context: String::new(),
@@ -1994,6 +2369,167 @@ mod tests {
         assert_eq!(
             store.changes(&unmapped, 0, 10, &cancelled).unwrap(),
             "changed src/lib.rs\n"
+        );
+    }
+
+    #[test]
+    fn trait_implementations_resolve_incrementally_and_map_headers() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let cancelled = AtomicBool::new(false);
+        let file = |path: &str, replace| FileInput {
+            path: path.into(),
+            language: Language::Rust,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: String::new(),
+            byte_size: 1,
+            replace,
+        };
+        let type_node = |key: &str, path: &str, name: &str, lookup: &str| NodeInput {
+            key: key.into(),
+            file_key: path.into(),
+            kind: NodeKind::Type,
+            name: name.into(),
+            qualified_name: format!("{name}@{path}"),
+            parent_key: None,
+            owner_key: None,
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            keys: vec![lookup.into()],
+        };
+
+        let graph = Graph {
+            files: vec![file("src/impl.rs", true), file("src/trait.rs", true)],
+            nodes: vec![type_node("flow", "src/trait.rs", "Flow", "rust:item:Flow")],
+            trait_implementations: vec![TraitImplementationInput {
+                file_key: "src/impl.rs".into(),
+                line_start: 10,
+                line_end: 11,
+                implementor_key: "rust:item:Cursor".into(),
+                trait_key: "rust:item:Flow".into(),
+            }],
+            ..Graph::default()
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT resolved_implementor_id, resolved_trait_id
+                       FROM trait_implementations",
+                    [],
+                    |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .unwrap(),
+            (None, Some(1))
+        );
+
+        let graph = Graph {
+            files: vec![
+                file("src/impl.rs", false),
+                file("src/trait.rs", false),
+                file("src/cursor.rs", true),
+            ],
+            nodes: vec![type_node(
+                "cursor",
+                "src/cursor.rs",
+                "Cursor",
+                "rust:item:Cursor",
+            )],
+            ..Graph::default()
+        };
+        let (state, _, ()) = store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        let (implementor, trait_) = store
+            .connection
+            .query_row(
+                "SELECT resolved_implementor_id, resolved_trait_id
+                   FROM trait_implementations",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert!(
+            store
+                .view(
+                    &format!("{}:{}:{implementor}", state.epoch, state.generation),
+                    1,
+                    10,
+                )
+                .unwrap()
+                .contains("implements ->")
+        );
+        assert!(
+            store
+                .view(
+                    &format!("{}:{}:{trait_}", state.epoch, state.generation),
+                    1,
+                    10,
+                )
+                .unwrap()
+                .contains("impl <-")
+        );
+        let output = store
+            .changes(
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/impl.rs".into(),
+                        whole_file: false,
+                        spans: vec![LineSpan { start: 20, end: 20 }],
+                        report_unmapped: true,
+                    }],
+                    records: vec![],
+                },
+                0,
+                10,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(
+            output.contains(" Cursor ") && output.contains(" Flow "),
+            "{output}"
+        );
+
+        let graph = Graph {
+            files: vec![file("src/impl.rs", false), file("src/trait.rs", false)],
+            ..Graph::default()
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        assert!(
+            store
+                .connection
+                .query_row(
+                    "SELECT resolved_implementor_id IS NULL FROM trait_implementations",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+
+        let graph = Graph {
+            files: vec![file("src/trait.rs", false)],
+            ..Graph::default()
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM trait_implementations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
         );
     }
 
@@ -2118,7 +2654,7 @@ mod tests {
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
             .unwrap();
 
-        let (neighbors, more) = load_neighbors(&store.connection, 1, 3, false).unwrap();
+        let (neighbors, more) = load_neighbors(&store.connection, 1, 3, false, false).unwrap();
         assert_eq!(neighbors.len(), 3);
         assert!(more);
     }
@@ -2127,6 +2663,7 @@ mod tests {
         Graph {
             files: vec![FileInput {
                 path: "src/lib.rs".into(),
+                language: Language::Rust,
                 git_oid: None,
                 content_hash: [0; 32],
                 parse_context: String::new(),

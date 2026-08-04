@@ -24,13 +24,13 @@ fn binary_only_crate_resolves_crate_paths() {
     fs::write(fixture.path.join("src/worker.rs"), "pub fn work() {}\n").unwrap();
     init_git(&fixture.path);
 
-    let indexed = Command::new(env!("CARGO_BIN_EXE_grapher"))
+    let indexed = Command::new(env!("CARGO_BIN_EXE_graphr"))
         .args(["index", fixture.path.to_str().unwrap(), "--rebuild"])
         .output()
         .unwrap();
     assert!(indexed.status.success(), "{:?}", indexed.stderr);
     assert_eq!(
-        Connection::open(fixture.path.join(".git/grapher/index.db"))
+        Connection::open(fixture.path.join(".git/graphr/index.db"))
             .unwrap()
             .query_row("SELECT count(*) FROM edges WHERE kind='CALLS'", [], |row| {
                 row.get::<_, i64>(0)
@@ -38,6 +38,346 @@ fn binary_only_crate_resolves_crate_paths() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn rust_attribute_only_changes_map_to_declarations() {
+    const BASELINE: &str = "#[derive(Debug)]\npub struct Item;\n\n#[inline]\npub fn free_function() {}\n\npub struct Worker;\nimpl Worker {\n    #[inline]\n    pub fn method(&self) {}\n}\n\n#[ignore = \"before\"]\n#[test]\nfn test_function() {}\n";
+    const EDITED: &str = "#[derive(Clone)]\npub struct Item;\n\n#[cold]\npub fn free_function() {}\n\npub struct Worker;\nimpl Worker {\n    #[cold]\n    pub fn method(&self) {}\n}\n\n#[ignore = \"after\"]\n#[test]\nfn test_function() {}\n";
+
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(fixture.path.join("src/lib.rs"), BASELINE).unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git(
+        &fixture.path,
+        &[
+            "-c",
+            "user.name=Graphr Test",
+            "-c",
+            "user.email=graphr@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "baseline",
+        ],
+    );
+    index_repository(&fixture.path, true);
+
+    fs::write(fixture.path.join("src/lib.rs"), EDITED).unwrap();
+    index_repository(&fixture.path, false);
+
+    let mut client = Client::start(&fixture.path);
+    let _ = client.request(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
+    );
+    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    let changes = client.request(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":20}}}"#,
+    );
+    let text = response_text(&changes);
+    for name in ["Item", "free_function", "method", "test_function"] {
+        assert!(text.contains(name), "missing {name}: {changes}");
+    }
+    assert!(!text.contains("changed src/lib.rs"), "{changes}");
+    client.close();
+}
+
+#[test]
+fn empty_trait_impl_resolves_across_files_and_retargets_incrementally() {
+    const MARKER_IMPL: &str = "impl crate::api::Marker for crate::model::Item {}\nimpl crate::api::Maybe for crate::model::Item {}\npub fn call() { crate::api::maybe_call(); }\n";
+    const OTHER_IMPL: &str = "impl crate::api::Other for crate::model::Item {}\nimpl crate::api::Maybe for crate::model::Item {}\npub fn call() { crate::api::maybe_call(); }\n";
+
+    let incremental = Fixture::new();
+    let oracle = Fixture::new();
+    for root in [&incremental.path, &oracle.path] {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "mod api;\nmod implementations;\nmod model;\nmod traits;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/api.rs"),
+            "pub use crate::traits::{Marker, Other};\n#[cfg(unix)]\npub use crate::traits::Ambiguous as Maybe;\n#[cfg(windows)]\npub use external::Ambiguous as Maybe;\n#[cfg(unix)]\npub use crate::model::helper as maybe_call;\n#[cfg(windows)]\npub use external::helper as maybe_call;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/model.rs"),
+            "pub struct Item;\npub fn helper() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/traits.rs"),
+            "pub trait Marker {}\npub trait Other {}\npub trait Ambiguous {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/implementations.rs"), MARKER_IMPL).unwrap();
+        init_git(root);
+        git(root, &["add", "--", "."]);
+    }
+
+    index_repository(&incremental.path, true);
+    index_repository(&oracle.path, true);
+    assert_eq!(
+        trait_implementation_count(&incremental.path, "Item", "Marker"),
+        1
+    );
+    assert_eq!(
+        trait_implementation_count(&incremental.path, "Item", "Ambiguous"),
+        0
+    );
+    assert_eq!(named_edge_count(&incremental.path, "call", "helper"), 0);
+
+    let mut client = Client::start(&incremental.path);
+    let _ = client.request(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
+    );
+    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    for (id, query, relation, related) in [
+        (2, "Item", "implements ->", "Marker"),
+        (4, "Marker", "impl <-", "Item"),
+    ] {
+        let search = client.request(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"search","arguments":{{"query":"{query}","kind":"type"}}}}}}"#,
+        ));
+        let node_ref = response_text(&search).split_whitespace().next().unwrap();
+        let view = client.request(&format!(
+            r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":1}}}}}}"#,
+            id + 1
+        ));
+        assert!(view.contains(relation), "{view}");
+        assert!(view.contains(related), "{view}");
+    }
+    client.close();
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(
+            root.join("src/traits.rs"),
+            "#[allow(dead_code)]\npub trait Marker {}\n#[allow(dead_code)]\npub trait Other {}\n#[allow(dead_code)]\npub trait Ambiguous {}\n",
+        )
+        .unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_eq!(
+        trait_implementation_count(&incremental.path, "Item", "Marker"),
+        1
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(root.join("src/implementations.rs"), OTHER_IMPL).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_eq!(
+        trait_implementation_count(&incremental.path, "Item", "Marker"),
+        0
+    );
+    assert_eq!(
+        trait_implementation_count(&incremental.path, "Item", "Other"),
+        1
+    );
+    assert_eq!(
+        trait_implementation_count(&incremental.path, "Item", "Ambiguous"),
+        0
+    );
+    assert_eq!(named_edge_count(&incremental.path, "call", "helper"), 0);
+}
+
+#[test]
+fn python_index_search_view_and_incremental_changes_over_mcp() {
+    const INIT: &str = "from sample.engine import run as public_run\nfrom sample.mid import mid_run as chained_run\nfrom sample.engine import run as api\nimport sample.api as public_module\n";
+    const EDITED_INIT: &str = "from sample.engine import run as public_run\nfrom sample.mid import mid_run as chained_run\nfrom sample.engine import run as api\nimport sample.api as public_module\n# changed\n";
+    const CHECKS: &str = "def validate(value):\n    return value\n\ndef secret():\n    return None\n\n@first\ndef decorated():\n    return None\n";
+    const EDITED_CHECKS: &str = "def validate(value):\n    return value\n\ndef secret():\n    return None\n\n@second\ndef decorated():\n    return None\n";
+    const ENGINE: &str = "from sample.checks import validate as check, secret as sibling, secret as module_value\n\nmodule_value = lambda: None\n\nclass Stage:\n    check = None\n    def dispatch(self, value):\n        return check(value)\n\ndef run(value):\n    return Stage()\n\ndef module_user():\n    module_value()\n\ndef outer(check):\n    def sibling():\n        return None\n    def inner():\n        check()\n        sibling()\n        inner()\n    return inner\n";
+    const EDITED_ENGINE: &str = "from sample.checks import validate as check, secret as sibling, secret as module_value\n\nmodule_value = lambda: None\n\nclass Stage:\n    check = None\n    def dispatch(self, value):\n        return check(check(value))\n\ndef run(value):\n    return Stage()\n\ndef module_user():\n    module_value()\n\ndef outer(check):\n    def sibling():\n        return None\n    def inner():\n        check()\n        sibling()\n        inner()\n    return inner\n";
+
+    let incremental = Fixture::new();
+    let oracle = Fixture::new();
+    for root in [&incremental.path, &oracle.path] {
+        fs::create_dir_all(root.join("src/sample")).unwrap();
+        fs::create_dir(root.join("src/sample/mid")).unwrap();
+        fs::create_dir(root.join("tests")).unwrap();
+        fs::write(root.join("src/sample/__init__.py"), INIT).unwrap();
+        fs::write(
+            root.join("src/sample/mid/__init__.py"),
+            "from sample.engine import run as mid_run\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/sample/api.py"), "VALUE = 1\n").unwrap();
+        fs::write(root.join("src/sample/checks.py"), CHECKS).unwrap();
+        fs::write(root.join("src/sample/engine.py"), ENGINE).unwrap();
+        fs::write(
+            root.join("tests/test_engine.py"),
+            "from sample import api, public_module, public_run, secret\nfrom sample.future import later\n\ndef test_run():\n    assert public_run(1)\n    later()\n    secret()\n\ndef test_collision():\n    api()\n\ndef test_module_alias():\n    public_module()\n",
+        )
+        .unwrap();
+        init_git(root);
+        git(root, &["add", "--", "."]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Graphr Test",
+                "-c",
+                "user.email=graphr@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+    }
+
+    index_repository(&incremental.path, true);
+
+    let database = incremental.path.join(".git/graphr/index.db");
+    let connection = Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM files WHERE language='python'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        6
+    );
+    for (source_path, source, target_path, target, kind) in [
+        (
+            "src/sample/engine.py",
+            "dispatch",
+            "src/sample/checks.py",
+            "validate",
+            "CALLS",
+        ),
+        (
+            "src/sample/engine.py",
+            "run",
+            "src/sample/engine.py",
+            "Stage",
+            "CALLS",
+        ),
+        (
+            "tests/test_engine.py",
+            "test_run",
+            "src/sample/engine.py",
+            "run",
+            "TEST_CALLS",
+        ),
+    ] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM edges edge
+                       JOIN nodes source ON source.id=edge.source_id
+                       JOIN files source_file ON source_file.id=source.file_id
+                       JOIN nodes target ON target.id=edge.target_id
+                       JOIN files target_file ON target_file.id=target.file_id
+                      WHERE source_file.path=?1 AND source.name=?2
+                        AND target_file.path=?3 AND target.name=?4 AND edge.kind=?5",
+                    [source_path, source, target_path, target, kind],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+    assert_eq!(named_edge_count(&incremental.path, "test_run", "secret"), 0);
+    assert_eq!(named_edge_count(&incremental.path, "inner", "validate"), 0);
+    assert_eq!(named_edge_count(&incremental.path, "inner", "secret"), 0);
+    assert_eq!(
+        named_edge_count(&incremental.path, "module_user", "secret"),
+        0
+    );
+    assert_eq!(named_edge_count(&incremental.path, "inner", "sibling"), 1);
+    assert_eq!(named_edge_count(&incremental.path, "inner", "inner"), 1);
+    assert_eq!(
+        named_edge_count(&incremental.path, "test_collision", "run"),
+        0
+    );
+    assert_eq!(
+        named_edge_count(&incremental.path, "test_collision", "src/sample/api.py"),
+        0
+    );
+    assert_eq!(
+        named_edge_count(&incremental.path, "test_module_alias", "src/sample/api.py"),
+        1
+    );
+    drop(connection);
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(root.join("src/sample/engine.py"), EDITED_ENGINE).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(root.join("src/sample/__init__.py"), EDITED_INIT).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(
+            root.join("src/sample/future.py"),
+            "def later():\n    return None\n",
+        )
+        .unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_eq!(named_edge_count(&incremental.path, "test_run", "later"), 1);
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::rename(
+            root.join("src/sample/future.py"),
+            root.join("src/sample/moved.py"),
+        )
+        .unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+    assert_eq!(named_edge_count(&incremental.path, "test_run", "later"), 0);
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::rename(
+            root.join("src/sample/moved.py"),
+            root.join("src/sample/future.py"),
+        )
+        .unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+    assert_eq!(named_edge_count(&incremental.path, "test_run", "later"), 1);
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::remove_file(root.join("src/sample/future.py")).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_eq!(named_edge_count(&incremental.path, "test_run", "later"), 0);
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(root.join("src/sample/checks.py"), EDITED_CHECKS).unwrap();
+    }
+    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+
+    let mut client = Client::start(&incremental.path);
+    let _ = client.request(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
+    );
+    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    let search = client.request(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"query":"Stage","kind":"type"}}}"#,
+    );
+    let node_ref = response_text(&search).split_whitespace().next().unwrap();
+    let view = client.request(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":2}}}}}}"#
+    ));
+    assert!(view.contains("member ->"), "{view}");
+    assert!(view.contains("dispatch"), "{view}");
+    let changes = client.request(
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"changes","arguments":{}}}"#,
+    );
+    assert!(changes.contains("dispatch"), "{changes}");
+    assert!(changes.contains("decorated"), "{changes}");
+    client.close();
 }
 
 #[test]
@@ -78,10 +418,10 @@ fn incremental_index_matches_rebuild_through_mutations() {
     );
     assert_resolution(&incremental.path, None, "file");
 
-    let generation = database_generation(&incremental.path.join(".git/grapher/index.db"));
+    let generation = database_generation(&incremental.path.join(".git/graphr/index.db"));
     assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 0);
     assert_eq!(
-        database_generation(&incremental.path.join(".git/grapher/index.db")),
+        database_generation(&incremental.path.join(".git/graphr/index.db")),
         generation
     );
 
@@ -176,9 +516,9 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         &fixture.path,
         &[
             "-c",
-            "user.name=Grapher Test",
+            "user.name=Graphr Test",
             "-c",
-            "user.email=grapher@example.invalid",
+            "user.email=graphr@example.invalid",
             "commit",
             "--quiet",
             "-m",
@@ -189,7 +529,7 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
 
     let mut client = Client::start(&fixture.path);
     let _ = client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"grapher-test","version":"0"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
     );
     client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
     let clean = client.request(
@@ -233,7 +573,7 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
     );
     assert!(indexed.contains("changed=6"), "{indexed}");
-    let generation = database_generation(&fixture.path.join(".git/grapher/index.db"));
+    let generation = database_generation(&fixture.path.join(".git/graphr/index.db"));
     let changed = client.request(
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"changes","arguments":{"depth":1,"max_nodes":50}}}"#,
     );
@@ -256,7 +596,7 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     assert!(!text.contains("ignored_symbol"), "{changed}");
     assert!(text.contains(&format!(":{generation}:")), "{changed}");
     assert_eq!(
-        database_generation(&fixture.path.join(".git/grapher/index.db")),
+        database_generation(&fixture.path.join(".git/graphr/index.db")),
         generation
     );
     let repeated = client.request(
@@ -290,7 +630,7 @@ fn concurrent_initial_indexes_serialize() {
     init_git(&fixture.path);
 
     let command = || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_grapher"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_graphr"));
         command
             .args(["index", fixture.path.to_str().unwrap()])
             .stdout(Stdio::piped())
@@ -316,9 +656,9 @@ fn concurrent_initial_indexes_serialize() {
         "indexed generation=1 changed=1 skipped=0\n"
     );
 
-    let database = fixture.path.join(".git/grapher/index.db");
+    let database = fixture.path.join(".git/graphr/index.db");
     let concurrent = normalized_graph(&database);
-    let rebuilt = Command::new(env!("CARGO_BIN_EXE_grapher"))
+    let rebuilt = Command::new(env!("CARGO_BIN_EXE_graphr"))
         .args(["index", fixture.path.to_str().unwrap(), "--rebuild"])
         .output()
         .unwrap();
@@ -358,7 +698,7 @@ fn rust_index_search_view_over_mcp() {
     let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
 
-    let indexed = Command::new(env!("CARGO_BIN_EXE_grapher"))
+    let indexed = Command::new(env!("CARGO_BIN_EXE_graphr"))
         .args(["index", fixture.path.to_str().unwrap(), "--rebuild"])
         .env("GIT_LITERAL_PATHSPECS", "1")
         .output()
@@ -369,7 +709,7 @@ fn rust_index_search_view_over_mcp() {
         "indexed generation=1 changed=2 skipped=4\n"
     );
 
-    let database = fixture.path.join(".git/grapher/index.db");
+    let database = fixture.path.join(".git/graphr/index.db");
     let connection = Connection::open(&database).unwrap();
     let sqlite: String = connection
         .query_row("SELECT sqlite_version()", [], |row| row.get(0))
@@ -381,7 +721,7 @@ fn rust_index_search_view_over_mcp() {
     connection.pragma_update(None, "user_version", 999).unwrap();
     drop(connection);
 
-    let rejected = Command::new(env!("CARGO_BIN_EXE_grapher"))
+    let rejected = Command::new(env!("CARGO_BIN_EXE_graphr"))
         .args(["index", fixture.path.to_str().unwrap()])
         .output()
         .unwrap();
@@ -401,7 +741,7 @@ fn rust_index_search_view_over_mcp() {
     );
     drop(connection);
 
-    let rebuilt = Command::new(env!("CARGO_BIN_EXE_grapher"))
+    let rebuilt = Command::new(env!("CARGO_BIN_EXE_graphr"))
         .args(["index", fixture.path.to_str().unwrap(), "--rebuild"])
         .output()
         .unwrap();
@@ -414,7 +754,7 @@ fn rust_index_search_view_over_mcp() {
     let connection = Connection::open(&database).unwrap();
     connection.execute("DROP INDEX nodes_parent", []).unwrap();
     drop(connection);
-    let healed = Command::new(env!("CARGO_BIN_EXE_grapher"))
+    let healed = Command::new(env!("CARGO_BIN_EXE_graphr"))
         .args(["index", fixture.path.to_str().unwrap(), "--rebuild"])
         .output()
         .unwrap();
@@ -462,7 +802,7 @@ fn rust_index_search_view_over_mcp() {
     assert_eq!(exact_request.len(), 3 * 1024);
     let mut boundary_client = Client::start(&fixture.path);
     let _ = boundary_client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"grapher-test","version":"0"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
     );
     boundary_client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
     let boundary_response = boundary_client.request(&exact_request);
@@ -477,7 +817,7 @@ fn rust_index_search_view_over_mcp() {
     ] {
         let mut bounded_client = Client::start(&fixture.path);
         let _ = bounded_client.request(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"grapher-test","version":"0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
         );
         bounded_client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
         let _ = bounded_client.try_notify(&request);
@@ -498,7 +838,7 @@ fn rust_index_search_view_over_mcp() {
     fs::create_dir(&wrapper_dir).unwrap();
     fs::write(
         &wrapper,
-        "#!/bin/sh\nif [ -e \"$GRAPHER_BLOCK_GIT\" ]; then\n  printf '%s\\n' \"$$\" > \"$GRAPHER_GIT_ENTERED\"\n  exec sleep 600\nfi\n\"$GRAPHER_REAL_GIT\" \"$@\"\nstatus=$?\nprintf 'done\\n' >> \"$GRAPHER_GIT_FINISHED\"\nexit \"$status\"\n",
+        "#!/bin/sh\nif [ -e \"$GRAPHR_BLOCK_GIT\" ]; then\n  printf '%s\\n' \"$$\" > \"$GRAPHR_GIT_ENTERED\"\n  exec sleep 600\nfi\n\"$GRAPHR_REAL_GIT\" \"$@\"\nstatus=$?\nprintf 'done\\n' >> \"$GRAPHR_GIT_FINISHED\"\nexit \"$status\"\n",
     )
     .unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
@@ -510,10 +850,10 @@ fn rust_index_search_view_over_mcp() {
     let configure_git = |command: &mut Command| {
         command
             .env("PATH", &wrapper_path)
-            .env("GRAPHER_REAL_GIT", &real_git)
-            .env("GRAPHER_BLOCK_GIT", &block_git)
-            .env("GRAPHER_GIT_ENTERED", &git_entered)
-            .env("GRAPHER_GIT_FINISHED", &git_finished);
+            .env("GRAPHR_REAL_GIT", &real_git)
+            .env("GRAPHR_BLOCK_GIT", &block_git)
+            .env("GRAPHR_GIT_ENTERED", &git_entered)
+            .env("GRAPHR_GIT_FINISHED", &git_finished);
     };
 
     let generation_before_startup_eof = database_generation(&database);
@@ -548,7 +888,7 @@ fn rust_index_search_view_over_mcp() {
 
     let mut client = Client::start_with(&fixture.path, configure_git);
     let initialized = client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"grapher-test","version":"0"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
     );
     assert!(initialized.contains("\"id\":1"));
     client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
@@ -703,7 +1043,7 @@ fn rust_index_search_view_over_mcp() {
 }
 
 fn index_repository(path: &Path, rebuild: bool) -> String {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_grapher"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_graphr"));
     command.arg("index").arg(path);
     if rebuild {
         command.arg("--rebuild");
@@ -723,8 +1063,36 @@ fn assert_incremental_matches_rebuild(incremental: &Path, oracle: &Path, expecte
     assert_eq!(semantic_graph(incremental), semantic_graph(oracle));
 }
 
+fn named_edge_count(path: &Path, source: &str, target: &str) -> i64 {
+    Connection::open(path.join(".git/graphr/index.db"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM edges edge
+               JOIN nodes source ON source.id=edge.source_id
+               JOIN nodes target ON target.id=edge.target_id
+              WHERE source.name=?1 AND target.name=?2",
+            [source, target],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn trait_implementation_count(path: &Path, implementor: &str, trait_: &str) -> i64 {
+    Connection::open(path.join(".git/graphr/index.db"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM trait_implementations implementation
+               JOIN nodes implementor ON implementor.id=implementation.resolved_implementor_id
+               JOIN nodes trait ON trait.id=implementation.resolved_trait_id
+              WHERE implementor.name=?1 AND trait.name=?2",
+            [implementor, trait_],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 fn assert_resolution(path: &Path, support: Option<i64>, parent_kind: &str) {
-    let connection = Connection::open(path.join(".git/grapher/index.db")).unwrap();
+    let connection = Connection::open(path.join(".git/graphr/index.db")).unwrap();
     let actual = connection
         .query_row(
             "SELECT e.support_count FROM edges e
@@ -752,7 +1120,7 @@ fn assert_resolution(path: &Path, support: Option<i64>, parent_kind: &str) {
 }
 
 fn semantic_graph(path: &Path) -> Vec<String> {
-    let connection = Connection::open(path.join(".git/grapher/index.db")).unwrap();
+    let connection = Connection::open(path.join(".git/graphr/index.db")).unwrap();
     let mut statement = connection
         .prepare(
             "SELECT value FROM (
@@ -775,12 +1143,25 @@ fn semantic_graph(path: &Path) -> Vec<String> {
                  UNION ALL
                  SELECT 'ref:' || json_array(
                             source.qualified_name, reference.kind, reference.line,
-                            target.qualified_name, ref_key.rank, ref_key.key
+                            reference.alias_key, target.qualified_name,
+                            ref_key.rank, ref_key.key
                         )
                    FROM refs reference
                    JOIN nodes source ON source.id=reference.source_id
                    LEFT JOIN nodes target ON target.id=reference.resolved_target_id
                    JOIN ref_keys ref_key ON ref_key.ref_id=reference.id
+                 UNION ALL
+                 SELECT 'impl:' || json_array(
+                            file.path, implementation.implementor_key,
+                            implementation.trait_key, implementation.line_start,
+                            implementation.line_end, implementor.qualified_name,
+                            trait.qualified_name
+                        )
+                   FROM trait_implementations implementation
+                   JOIN files file ON file.id=implementation.file_id
+                   LEFT JOIN nodes implementor
+                     ON implementor.id=implementation.resolved_implementor_id
+                   LEFT JOIN nodes trait ON trait.id=implementation.resolved_trait_id
                  UNION ALL
                  SELECT 'edge:' || json_array(
                             source.qualified_name, target.qualified_name,
@@ -929,7 +1310,7 @@ impl Client {
     }
 
     fn start_with(repository: &PathBuf, configure: impl FnOnce(&mut Command)) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_grapher"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_graphr"));
         command
             .arg("serve")
             .arg(repository)
@@ -1001,8 +1382,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("grapher-e2e-{}-{unique}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("graphr-e2e-{}-{unique}", std::process::id()));
         fs::create_dir(&path).unwrap();
         Self { path }
     }

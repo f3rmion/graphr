@@ -1,9 +1,9 @@
-# Grapher Engineering Guide
+# Graphr Engineering Guide
 
 ## Product boundaries
 
 - Build one Rust binary for Codex and Claude over MCP stdio.
-- Support Rust first; Python, JavaScript/TypeScript/TSX, and Go follow.
+- Support Rust and Python; JavaScript/TypeScript/TSX and Go follow.
 - Do not add Java, VS Code/editor code, HTTP, UI, embeddings, plugins, or
   migrations.
 - Keep tool output deterministic and compact.

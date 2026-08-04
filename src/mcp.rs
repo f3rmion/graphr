@@ -22,7 +22,7 @@ type ToolResult = Result<String, String>;
 const MCP_LINE_LIMIT: usize = 3 * 1024;
 
 #[derive(Clone)]
-struct Grapher {
+struct Graphr {
     project: Arc<Project>,
     jobs: Arc<TokioMutex<()>>,
     cancellation: Arc<JobCancellation>,
@@ -86,7 +86,7 @@ struct ChangesParams {
     max_nodes: u32,
 }
 
-impl Grapher {
+impl Graphr {
     async fn exclusive_job(
         &self,
         context: RequestContext<RoleServer>,
@@ -119,8 +119,8 @@ impl Grapher {
 }
 
 #[tool_router]
-impl Grapher {
-    #[tool(description = "Refresh the Rust code graph for this repository")]
+impl Graphr {
+    #[tool(description = "Refresh the code graph for this repository")]
     async fn index(&self, context: RequestContext<RoleServer>) -> ToolResult {
         self.exclusive_job(context, "index busy", 256, |project, cancelled| {
             project.index_cancelled(false, cancelled)
@@ -129,7 +129,7 @@ impl Grapher {
     }
 
     #[tool(
-        description = "Find Rust files, types, functions, and tests",
+        description = "Find files, types, functions, and tests",
         input_schema = rmcp::handler::server::common::schema_for_input::<SearchParams>()
             .expect("valid search schema")
     )]
@@ -167,7 +167,7 @@ impl Grapher {
     }
 
     #[tool(
-        description = "Show changed Rust symbols and their bounded graph neighborhood",
+        description = "Show changed symbols and their bounded graph neighborhood",
         input_schema = rmcp::handler::server::common::schema_for_input::<ChangesParams>()
             .expect("valid changes schema")
     )]
@@ -187,10 +187,10 @@ impl Grapher {
 }
 
 #[tool_handler]
-impl ServerHandler for Grapher {
+impl ServerHandler for Graphr {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("grapher", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("graphr", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Use search to get a node_ref, then view its graph. After edits, call index then changes.",
             )
@@ -199,7 +199,7 @@ impl ServerHandler for Grapher {
 
 pub async fn serve(project: Project) -> Result<(), String> {
     let cancellation = Arc::new(JobCancellation::default());
-    let server = Grapher {
+    let server = Graphr {
         project: Arc::new(project),
         jobs: Arc::new(TokioMutex::new(())),
         cancellation: cancellation.clone(),
@@ -385,7 +385,7 @@ fn default_changes_base() -> String {
 }
 
 const fn default_changes_depth() -> u32 {
-    2
+    1
 }
 
 const fn default_changes_max_nodes() -> u32 {
@@ -444,7 +444,7 @@ mod tests {
         let defaults: ChangesParams =
             rmcp::serde_json::from_value(rmcp::serde_json::json!({})).unwrap();
         assert_eq!(defaults.base, "HEAD");
-        assert_eq!(defaults.depth, 2);
+        assert_eq!(defaults.depth, 1);
         assert_eq!(defaults.max_nodes, 50);
         assert!(validate_changes(&defaults).is_ok());
 

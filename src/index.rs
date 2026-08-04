@@ -1,15 +1,17 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
-use crate::git::{Repository, Source};
+use crate::git::{Language, Repository, Source};
 use crate::parse::{DefinitionKind, ParsedFile, RustParser};
+use crate::python::PythonParser;
 use crate::store::{
     EdgeInput, EdgeKind, FileInput, Graph, NodeInput, NodeKind, RefInput, RefKind, Store,
+    TraitImplementationInput,
 };
 
 const QUALIFIED_PATH_LIMIT: usize = 1024;
@@ -89,21 +91,29 @@ fn build_index(
     full: bool,
     existing: &HashMap<String, crate::store::StoredFile>,
 ) -> Result<(Graph, usize), String> {
-    let inventory = repository.rust_files(cancelled)?;
+    let inventory = repository.source_files(cancelled)?;
     let mut skipped = inventory.skipped;
-    let mut parser = None;
+    let mut rust_parser = None;
+    let mut python_parser = None;
     let mut targets = TargetLayout::discover(&repository.root);
     let mut graph = Graph::default();
 
     // ponytail: parse changed files sequentially; add Rayon only after profiling proves it helps.
     for file in &inventory.files {
         check_cancelled(cancelled)?;
-        let target = targets.for_path(&file.path);
-        let parse_context = target.parse_context();
+        let rust_target = (file.language == Language::Rust).then(|| targets.for_path(&file.path));
+        let parse_context = match file.language {
+            Language::Rust => rust_target
+                .as_ref()
+                .expect("Rust source has a Rust target")
+                .parse_context(),
+            Language::Python => String::new(),
+        };
         let old = existing.get(&file.path);
         if !full
             && old.is_some_and(|old| {
-                old.parse_context == parse_context
+                old.language == file.language
+                    && old.parse_context == parse_context
                     && file
                         .git_oid
                         .as_ref()
@@ -113,6 +123,7 @@ fn build_index(
             let old = old.expect("checked above");
             graph.files.push(FileInput {
                 path: file.path.clone(),
+                language: file.language,
                 git_oid: file.git_oid.clone(),
                 content_hash: old.content_hash,
                 parse_context,
@@ -122,7 +133,7 @@ fn build_index(
             continue;
         }
 
-        let Some(source) = repository.read_rust_source(file, cancelled)? else {
+        let Some(source) = repository.read_source(file, cancelled)? else {
             skipped += 1;
             continue;
         };
@@ -131,10 +142,13 @@ fn build_index(
             .map_err(|_| "source byte size exceeds supported range".to_owned())?;
         let changed = full
             || old.is_none_or(|old| {
-                old.content_hash != content_hash || old.parse_context != parse_context
+                old.language != file.language
+                    || old.content_hash != content_hash
+                    || old.parse_context != parse_context
             });
         graph.files.push(FileInput {
             path: file.path.clone(),
+            language: file.language,
             git_oid: file.git_oid.clone(),
             content_hash,
             parse_context,
@@ -142,15 +156,29 @@ fn build_index(
             replace: changed,
         });
         if changed {
-            if parser.is_none() {
-                parser = Some(RustParser::new()?);
+            match file.language {
+                Language::Rust => {
+                    if rust_parser.is_none() {
+                        rust_parser = Some(RustParser::new()?);
+                    }
+                    add_rust_file(
+                        &mut graph,
+                        &source,
+                        rust_target.as_ref().expect("checked above"),
+                        rust_parser.as_mut().expect("initialized above"),
+                    )?;
+                }
+                Language::Python => {
+                    if python_parser.is_none() {
+                        python_parser = Some(PythonParser::new()?);
+                    }
+                    crate::python::add_file(
+                        &mut graph,
+                        &source,
+                        python_parser.as_mut().expect("initialized above"),
+                    )?;
+                }
             }
-            add_file(
-                &mut graph,
-                &source,
-                &target,
-                parser.as_mut().expect("initialized above"),
-            )?;
         }
     }
     if full {
@@ -167,6 +195,7 @@ fn build_graph(sources: &[Source], cancelled: &AtomicBool) -> Result<Graph, Stri
         files: Vec::with_capacity(sources.len()),
         nodes: Vec::new(),
         refs: Vec::new(),
+        trait_implementations: Vec::new(),
         edges: Vec::new(),
     };
     for source in sources {
@@ -174,6 +203,7 @@ fn build_graph(sources: &[Source], cancelled: &AtomicBool) -> Result<Graph, Stri
         let target = targets.for_path(&source.path);
         graph.files.push(FileInput {
             path: source.path.clone(),
+            language: Language::Rust,
             git_oid: None,
             content_hash: *blake3::hash(source.text.as_bytes()).as_bytes(),
             parse_context: target.parse_context(),
@@ -181,13 +211,13 @@ fn build_graph(sources: &[Source], cancelled: &AtomicBool) -> Result<Graph, Stri
                 .map_err(|_| "source byte size exceeds supported range".to_owned())?,
             replace: true,
         });
-        add_file(&mut graph, source, &target, &mut parser)?;
+        add_rust_file(&mut graph, source, &target, &mut parser)?;
     }
     resolve(&mut graph, cancelled)?;
     Ok(graph)
 }
 
-fn add_file(
+fn add_rust_file(
     graph: &mut Graph,
     source: &Source,
     target: &TargetPath,
@@ -261,19 +291,59 @@ fn add_file(
         });
     }
 
-    let mut values = HashMap::<usize, HashSet<String>>::new();
+    let mut values = HashMap::<usize, HashMap<String, Binding>>::new();
     for binding in &parsed.bindings {
         values
             .entry(binding.source)
             .or_default()
-            .insert(binding.name.clone());
+            .entry(binding.name.clone())
+            .and_modify(|value| *value = Binding::Ambiguous)
+            .or_insert_with(|| {
+                binding
+                    .type_target
+                    .clone()
+                    .map_or(Binding::Ambiguous, Binding::Unique)
+            });
     }
     let bindings = Bindings { imports, values };
+    for implementation in &parsed.implementations {
+        let implementation_module = lexical_module(implementation.module, module, &module_paths);
+        let Some(implementor) = normalize_impl_target(
+            &implementation.type_target,
+            implementation.module,
+            implementation_module,
+            &target.root,
+            &bindings.imports,
+        ) else {
+            continue;
+        };
+        let Some(trait_) = normalize_impl_target(
+            &implementation.trait_target,
+            implementation.module,
+            implementation_module,
+            &target.root,
+            &bindings.imports,
+        ) else {
+            continue;
+        };
+        graph.trait_implementations.push(TraitImplementationInput {
+            file_key: source.path.clone(),
+            line_start: to_u32(implementation.line_start)?,
+            line_end: to_u32(implementation.line_end)?,
+            implementor_key: item_key(&implementor),
+            trait_key: item_key(&trait_),
+        });
+    }
     for import in &parsed.imports {
         let import_module = lexical_module(import.module, module, &module_paths);
         let Some(path) = normalize_use(&import.path, import_module, &target.root) else {
             continue;
         };
+        let alias_key = import
+            .exported
+            .then(|| use_binding(&import.path, import_module, &target.root))
+            .flatten()
+            .map(|(alias, _)| item_key(&join_path(import_module, &alias)));
         graph.refs.push(RefInput {
             source_key: import
                 .source
@@ -282,6 +352,7 @@ fn add_file(
             kind: RefKind::Imports,
             line: to_u32(import.line)?,
             keys: vec![item_key(&path)],
+            alias_key,
             resolved_target_key: None,
         });
     }
@@ -305,6 +376,7 @@ fn add_file(
                 kind: RefKind::Calls,
                 line: to_u32(call.line)?,
                 keys,
+                alias_key: None,
                 resolved_target_key: None,
             });
         }
@@ -334,6 +406,25 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
         }
     }
 
+    let mut aliases = HashMap::<String, Candidate>::new();
+    for (index, reference) in graph.refs.iter().enumerate() {
+        check_progress(index, cancelled)?;
+        let Some(alias) = reference.alias_key.as_ref() else {
+            continue;
+        };
+        let target = reference_target(&reference.keys, &candidates, None)
+            .map_or(Candidate::Ambiguous, Candidate::Unique);
+        aliases
+            .entry(alias.clone())
+            .and_modify(|candidate| {
+                if !matches!((*candidate, target), (Candidate::Unique(current), Candidate::Unique(next)) if current == next)
+                {
+                    *candidate = Candidate::Ambiguous;
+                }
+            })
+            .or_insert(target);
+    }
+
     let mut node_by_key = HashMap::with_capacity(graph.nodes.len());
     for (index, node) in graph.nodes.iter().enumerate() {
         check_progress(index, cancelled)?;
@@ -359,49 +450,39 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
         };
         parent_updates.push((node_index, graph.nodes[*target].key.clone()));
     }
-    let mut edge_indices = HashMap::<(String, String, u8), usize>::new();
+    let mut edge_indices = HashMap::<(usize, usize, u8), usize>::new();
     let mut edges = Vec::<EdgeInput>::new();
     for (index, reference) in graph.refs.iter_mut().enumerate() {
         check_progress(index, cancelled)?;
-        let mut target = None;
-        for key in &reference.keys {
-            match candidates.get(key.as_str()) {
-                Some(Candidate::Unique(node)) => {
-                    target = Some(*node);
-                    break;
-                }
-                Some(Candidate::Ambiguous) => break,
-                None => {}
-            }
-        }
-        let Some(target) = target else {
+        let alias_candidates = reference.alias_key.is_none().then_some(&aliases);
+        let Some(target) = reference_target(&reference.keys, &candidates, alias_candidates) else {
             continue;
         };
-        let target_key = graph.nodes[target].key.clone();
-        reference.resolved_target_key = Some(target_key.clone());
+        reference.resolved_target_key = Some(graph.nodes[target].key.clone());
+        let source = node_by_key
+            .get(reference.source_key.as_str())
+            .copied()
+            .ok_or_else(|| "reference source is missing".to_owned())?;
 
         let edge_kind = match reference.kind {
             RefKind::Imports => 2,
             RefKind::Calls => {
-                if node_by_key
-                    .get(reference.source_key.as_str())
-                    .is_some_and(|source| graph.nodes[*source].kind == NodeKind::Test)
-                {
+                if graph.nodes[source].kind == NodeKind::Test {
                     1
                 } else {
                     0
                 }
             }
         };
-        let key = (reference.source_key.clone(), target_key, edge_kind);
+        let key = (source, target, edge_kind);
         if let Some(&edge) = edge_indices.get(&key) {
             edges[edge].support_count += 1;
         } else {
             let edge = edges.len();
-            edge_indices.insert(key.clone(), edge);
+            edge_indices.insert(key, edge);
             edges.push(EdgeInput {
-                source_key: key.0,
-                target_key: key.1,
+                source_key: graph.nodes[key.0].key.clone(),
+                target_key: graph.nodes[key.1].key.clone(),
                 kind: match key.2 {
                     0 => EdgeKind::Calls,
                     1 => EdgeKind::TestCalls,
@@ -419,6 +500,28 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
         graph.nodes[node].parent_key = Some(parent_key);
     }
     check_cancelled(cancelled)
+}
+
+fn reference_target(
+    keys: &[String],
+    candidates: &HashMap<&str, Candidate>,
+    aliases: Option<&HashMap<String, Candidate>>,
+) -> Option<usize> {
+    for key in keys {
+        let direct = candidates.get(key.as_str());
+        let alias = aliases.and_then(|aliases| aliases.get(key));
+        match (direct, alias) {
+            (Some(Candidate::Ambiguous), _) | (_, Some(Candidate::Ambiguous)) => return None,
+            (Some(Candidate::Unique(left)), Some(Candidate::Unique(right))) if left != right => {
+                return None;
+            }
+            (Some(Candidate::Unique(node)), _) | (_, Some(Candidate::Unique(node))) => {
+                return Some(*node);
+            }
+            (None, None) => {}
+        }
+    }
+    None
 }
 
 fn definition_path(
@@ -547,7 +650,7 @@ type ImportBindings = HashMap<ImportScope, HashMap<String, Binding>>;
 
 struct Bindings {
     imports: ImportBindings,
-    values: HashMap<usize, HashSet<String>>,
+    values: HashMap<usize, HashMap<String, Binding>>,
 }
 
 fn import_bindings(
@@ -650,9 +753,33 @@ fn call_keys(
         return Vec::new();
     }
 
-    if let Some(method) = raw.strip_prefix("self.") {
-        return source_owner(source, parsed, paths)
-            .map(|owner| vec![format!("rust:method:{}", join_path(owner, method))])
+    if let Some((receiver, method)) = raw.split_once('.') {
+        if !valid_identifier(method) {
+            return Vec::new();
+        }
+        let owner = if receiver == "self" {
+            source_owner(source, parsed, paths).map(str::to_owned)
+        } else if valid_identifier(receiver) {
+            bindings
+                .values
+                .get(&source)
+                .and_then(|values| values.get(receiver))
+                .and_then(|binding| match binding {
+                    Binding::Unique(type_target) => normalize_value_type(
+                        type_target,
+                        source,
+                        module_index,
+                        module,
+                        root,
+                        &bindings.imports,
+                    ),
+                    Binding::Ambiguous => None,
+                })
+        } else {
+            None
+        };
+        return owner
+            .map(|owner| vec![format!("rust:method:{}", join_path(&owner, method))])
             .unwrap_or_default();
     }
 
@@ -667,21 +794,27 @@ fn call_keys(
         if bindings
             .values
             .get(&source)
-            .is_some_and(|bindings| bindings.contains(name))
+            .is_some_and(|bindings| bindings.contains_key(name))
         {
             return vec![format!("rust:shadowed-value:{name}")];
         }
         if let Some(binding) = import_binding(&bindings.imports, source, module_index, name) {
             return match binding {
-                Binding::Unique(path) => vec![format!("rust:function:{path}")],
+                Binding::Unique(path) => {
+                    vec![format!("rust:function:{path}"), item_key(path)]
+                }
                 Binding::Ambiguous => vec![format!("rust:ambiguous-import:{name}")],
             };
         }
-        let mut keys = Vec::with_capacity(2);
+        let mut keys = Vec::with_capacity(4);
         if let Some(scope) = source_scope(source, parsed, paths, module) {
-            keys.push(format!("rust:function:{}", join_path(scope, name)));
+            let target = join_path(scope, name);
+            keys.push(format!("rust:function:{target}"));
+            keys.push(item_key(&target));
         }
-        keys.push(format!("rust:function:{}", join_path(module, name)));
+        let target = join_path(module, name);
+        keys.push(format!("rust:function:{target}"));
+        keys.push(item_key(&target));
         return dedup_keys(keys);
     }
 
@@ -710,8 +843,35 @@ fn call_keys(
         let target = join_path(&owner, method);
         keys.push(format!("rust:function:{target}"));
         keys.push(format!("rust:method:{target}"));
+        keys.push(item_key(&target));
     }
     dedup_keys(keys)
+}
+
+fn normalize_value_type(
+    raw: &str,
+    source: usize,
+    module_index: Option<usize>,
+    module: &str,
+    root: &str,
+    imports: &ImportBindings,
+) -> Option<String> {
+    let target = strip_trailing_type_arguments(raw.trim())?;
+    let parts = target.split("::").map(str::trim).collect::<Vec<_>>();
+    let first = *parts.first()?;
+    if !matches!(first, "crate" | "self" | "super")
+        && let Some(binding) = import_binding(imports, source, module_index, first)
+    {
+        return match binding {
+            Binding::Unique(path) => Some(if parts.len() == 1 {
+                path.clone()
+            } else {
+                join_path(path, &parts[1..].join("::"))
+            }),
+            Binding::Ambiguous => None,
+        };
+    }
+    normalize_relative(&target, module, root)
 }
 
 fn import_binding<'a>(
@@ -1330,7 +1490,12 @@ fn register_dispatches() { register(); }
         let reference = graph
             .refs
             .iter()
-            .find(|reference| reference.keys == ["rust:function:duplicate"])
+            .find(|reference| {
+                reference
+                    .keys
+                    .iter()
+                    .any(|key| key == "rust:function:duplicate")
+            })
             .unwrap();
 
         assert!(reference.resolved_target_key.is_none());
@@ -1444,7 +1609,7 @@ mod scoped { impl crate::model::Item { fn stop() {} } }
         let sources = [
             Source {
                 path: "src/lib.rs".into(),
-                text: "mod model; use crate::model::Cursor; trait Stream { type Item; } impl Stream for Cursor { type Item = u8; }".into(),
+                text: "mod model; use crate::model::Cursor; mod traits { pub trait Stream { type Item; fn next(&mut self); } } use crate::traits::Stream as Flow; impl Flow for Cursor { type Item = u8; fn next(&mut self) {} }".into(),
             },
             Source {
                 path: "src/model.rs".into(),
@@ -1454,7 +1619,7 @@ mod scoped { impl crate::model::Item { fn stop() {} } }
         let graph = build_graph(&sources, &AtomicBool::new(false)).unwrap();
 
         for (item_key, owner_key) in [
-            ("rust:type:Stream::Item", "rust:type:Stream"),
+            ("rust:type:traits::Stream::Item", "rust:type:traits::Stream"),
             ("rust:type:model::Cursor::Item", "rust:type:model::Cursor"),
         ] {
             let item = graph
@@ -1475,6 +1640,10 @@ mod scoped { impl crate::model::Item { fn stop() {} } }
                 .iter()
                 .all(|node| !node.keys.contains(&"rust:type:Item".into()))
         );
+        assert!(graph.trait_implementations.iter().any(|implementation| {
+            implementation.implementor_key == "rust:item:model::Cursor"
+                && implementation.trait_key == "rust:item:traits::Stream"
+        }));
     }
 
     #[test]
@@ -1541,6 +1710,89 @@ mod anonymous {
             .unwrap();
         assert!(graph.refs.iter().any(|reference| {
             reference.source_key == local_import.key && reference.resolved_target_key.is_none()
+        }));
+    }
+
+    #[test]
+    fn resolves_typed_receivers_and_one_hop_public_reexports() {
+        let sources = [Source {
+            path: "src/lib.rs".into(),
+            text: r#"
+mod model {
+    pub struct Worker;
+    impl Worker { pub fn run(&self) {} }
+    pub fn helper() {}
+}
+mod api {
+    pub use crate::model::helper as execute;
+    #[cfg(unix)] pub use crate::model::helper as maybe;
+    #[cfg(windows)] pub use external::helper as maybe;
+}
+mod facade { pub use crate::api::execute as launch; }
+use crate::model::Worker as Job;
+use crate::api::{execute, maybe};
+use crate::facade::launch;
+fn call(job: Job) {
+    job.run();
+    let other: crate::model::Worker = job;
+    other.run();
+    let inferred = other;
+    inferred.run();
+    execute();
+    maybe();
+    launch();
+}
+"#
+            .into(),
+        }];
+        let graph = build_graph(&sources, &AtomicBool::new(false)).unwrap();
+        let call = graph.nodes.iter().find(|node| node.name == "call").unwrap();
+        let target = |name: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.name == name)
+                .map(|node| node.key.as_str())
+                .unwrap()
+        };
+
+        assert_eq!(
+            graph
+                .refs
+                .iter()
+                .filter(|reference| {
+                    reference.source_key == call.key
+                        && reference.resolved_target_key.as_deref() == Some(target("run"))
+                })
+                .count(),
+            2
+        );
+        assert!(graph.refs.iter().any(|reference| {
+            reference.source_key == call.key
+                && reference.resolved_target_key.as_deref() == Some(target("helper"))
+        }));
+        assert!(graph.refs.iter().any(|reference| {
+            reference.source_key == call.key
+                && reference
+                    .keys
+                    .iter()
+                    .any(|key| key == "rust:item:facade::launch")
+                && reference.resolved_target_key.is_none()
+        }));
+        assert!(graph.refs.iter().any(|reference| {
+            reference.source_key == call.key
+                && reference
+                    .keys
+                    .iter()
+                    .any(|key| key == "rust:item:api::maybe")
+                && reference.resolved_target_key.is_none()
+        }));
+        assert!(!graph.refs.iter().any(|reference| {
+            reference.source_key == call.key
+                && reference
+                    .keys
+                    .iter()
+                    .any(|key| key.contains("inferred::run"))
         }));
     }
 

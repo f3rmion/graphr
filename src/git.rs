@@ -27,14 +27,38 @@ pub struct Source {
     pub text: String,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub struct RustFile {
-    pub path: String,
-    pub git_oid: Option<String>,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Language {
+    Rust,
+    Python,
 }
 
-pub struct RustFiles {
-    pub files: Vec<RustFile>,
+impl Language {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "rust" => Some(Self::Rust),
+            "python" => Some(Self::Python),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct SourceFile {
+    pub path: String,
+    pub git_oid: Option<String>,
+    pub language: Language,
+}
+
+pub struct SourceFiles {
+    pub files: Vec<SourceFile>,
     pub skipped: usize,
 }
 
@@ -104,11 +128,11 @@ impl Repository {
                 "rev-parse",
                 "--path-format=absolute",
                 "--git-path",
-                "grapher/index.db",
+                "graphr/index.db",
             ],
             cancelled,
         )?)?;
-        if database != git_dir.join("grapher/index.db") {
+        if database != git_dir.join("graphr/index.db") {
             return Err("Git returned an unsafe database path".into());
         }
         validate_database_path(&git_dir, &database)?;
@@ -116,7 +140,7 @@ impl Repository {
         Ok(Self { root, database })
     }
 
-    pub fn rust_files(&self, cancelled: &AtomicBool) -> Result<RustFiles, String> {
+    pub fn source_files(&self, cancelled: &AtomicBool) -> Result<SourceFiles, String> {
         let output = run(
             &self.root,
             &[
@@ -131,11 +155,12 @@ impl Repository {
                 "--exclude-standard",
                 "--",
                 "*.rs",
+                "*.py",
             ],
             cancelled,
         )?;
         check_cancelled(cancelled)?;
-        let mut inventory = parse_rust_files(&output)?;
+        let mut inventory = parse_source_files(&output)?;
         let mut files = Vec::with_capacity(inventory.files.len());
         for source in inventory.files {
             check_cancelled(cancelled)?;
@@ -193,6 +218,7 @@ impl Repository {
                     &oid,
                     "--",
                     "*.rs",
+                    "*.py",
                 ],
                 cancelled,
             )?,
@@ -207,6 +233,7 @@ impl Repository {
                 "-z",
                 "--",
                 "*.rs",
+                "*.py",
             ],
             cancelled,
         )?;
@@ -214,13 +241,13 @@ impl Repository {
         merge_changes(tracked, &untracked, cancelled)
     }
 
-    pub fn read_rust_source(
+    pub fn read_source(
         &self,
-        source: &RustFile,
+        source: &SourceFile,
         cancelled: &AtomicBool,
     ) -> Result<Option<Source>, String> {
         check_cancelled(cancelled)?;
-        if !valid_rust_path(&source.path) {
+        if language_for_path(&source.path) != Some(source.language) {
             return Ok(None);
         }
         let path = source.path.as_str();
@@ -633,23 +660,23 @@ fn parse_change_path(input: &[u8]) -> Result<Option<String>, String> {
     {
         return Err("Git returned an unsafe changed path".into());
     }
-    Ok(path.ends_with(".rs").then(|| path.to_owned()))
+    Ok(language_for_path(path).map(|_| path.to_owned()))
 }
 
-fn parse_rust_files(output: &[u8]) -> Result<RustFiles, String> {
+fn parse_source_files(output: &[u8]) -> Result<SourceFiles, String> {
     if !output.is_empty() && !output.ends_with(&[0]) {
         return Err("Git returned malformed file inventory".into());
     }
-    let mut candidates = HashMap::<String, Option<String>>::new();
+    let mut candidates = HashMap::<(String, Language), Option<String>>::new();
     let mut unsupported = HashSet::new();
 
     for record in nul_records(output) {
         if let Some(raw_path) = record.strip_prefix(b"? ") {
-            let Some(path) = parse_rust_path(raw_path) else {
+            let Some((path, language)) = parse_source_path(raw_path) else {
                 unsupported.insert(raw_path.to_vec());
                 continue;
             };
-            candidates.insert(path, None);
+            candidates.insert((path, language), None);
             continue;
         }
         let tab = record
@@ -657,7 +684,7 @@ fn parse_rust_files(output: &[u8]) -> Result<RustFiles, String> {
             .position(|byte| *byte == b'\t')
             .ok_or_else(|| "Git returned malformed index metadata".to_owned())?;
         let raw_path = &record[tab + 1..];
-        let Some(path) = parse_rust_path(raw_path) else {
+        let Some((path, language)) = parse_source_path(raw_path) else {
             unsupported.insert(raw_path.to_vec());
             continue;
         };
@@ -684,17 +711,21 @@ fn parse_rust_files(output: &[u8]) -> Result<RustFiles, String> {
                     .to_owned()
             });
         candidates
-            .entry(path)
+            .entry((path, language))
             .and_modify(|oid| *oid = None)
             .or_insert(git_oid);
     }
 
     let mut files = candidates
         .into_iter()
-        .map(|(path, git_oid)| RustFile { path, git_oid })
+        .map(|((path, language), git_oid)| SourceFile {
+            path,
+            git_oid,
+            language,
+        })
         .collect::<Vec<_>>();
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
-    Ok(RustFiles {
+    Ok(SourceFiles {
         files,
         skipped: unsupported.len(),
     })
@@ -706,19 +737,28 @@ fn nul_records(input: &[u8]) -> impl Iterator<Item = &[u8]> {
         .filter(|record| !record.is_empty())
 }
 
-fn parse_rust_path(input: &[u8]) -> Option<String> {
+fn parse_source_path(input: &[u8]) -> Option<(String, Language)> {
     let path = std::str::from_utf8(input).ok()?;
-    valid_rust_path(path).then(|| path.to_owned())
+    language_for_path(path).map(|language| (path.to_owned(), language))
 }
 
-fn valid_rust_path(path: &str) -> bool {
+fn language_for_path(path: &str) -> Option<Language> {
     let relative = Path::new(path);
-    path.ends_with(".rs")
-        && !path.chars().any(char::is_control)
-        && !relative.is_absolute()
-        && relative
+    if path.chars().any(char::is_control)
+        || relative.is_absolute()
+        || !relative
             .components()
             .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
+    if path.ends_with(".rs") {
+        Some(Language::Rust)
+    } else if path.ends_with(".py") {
+        Some(Language::Python)
+    } else {
+        None
+    }
 }
 
 fn valid_oid(oid: &[u8]) -> bool {
@@ -759,7 +799,7 @@ fn validate_database_path(git_dir: &Path, database: &Path) -> Result<(), String>
             .map_err(|error| format!("cannot inspect database directory: {error}"))?;
         let canonical = fs::canonicalize(parent)
             .map_err(|error| format!("cannot resolve database directory: {error}"))?;
-        if !metadata.is_dir() || canonical != git_dir.join("grapher") {
+        if !metadata.is_dir() || canonical != git_dir.join("graphr") {
             return Err("database directory is not a safe Git directory".into());
         }
     }
@@ -1007,7 +1047,7 @@ mod tests {
     #[test]
     fn detects_a_source_version_change() {
         let path =
-            std::env::temp_dir().join(format!("grapher-source-version-{}", std::process::id()));
+            std::env::temp_dir().join(format!("graphr-source-version-{}", std::process::id()));
         fs::write(&path, "a").unwrap();
         let before = fs::metadata(&path).unwrap();
         fs::write(&path, "changed").unwrap();
@@ -1021,7 +1061,7 @@ mod tests {
         let output = format!(
             "H 100644 {OID} 0\tb.rs\0H 100755 {OID} 0\ta.rs\0h 100644 {OID} 0\tc.rs\0H 100644 {OID} 1\td.rs\0H 120000 {OID} 0\te.rs\0C 100755 {OID} 0\ta.rs\0? f.rs\0"
         );
-        let inventory = parse_rust_files(output.as_bytes()).unwrap();
+        let inventory = parse_source_files(output.as_bytes()).unwrap();
 
         assert_eq!(
             inventory.files,
@@ -1033,9 +1073,10 @@ mod tests {
                 ("e.rs", None),
                 ("f.rs", None),
             ]
-            .map(|(path, oid)| RustFile {
+            .map(|(path, oid)| SourceFile {
                 path: path.into(),
                 git_oid: oid.map(str::to_owned),
+                language: Language::Rust,
             })
         );
         assert_eq!(inventory.skipped, 0);
@@ -1044,28 +1085,30 @@ mod tests {
     #[test]
     fn inventory_sorts_deduplicates_and_rejects_unsafe_paths() {
         let mut output = format!(
-            "H 100644 {OID} 0\tz.rs\0H 100644 {OID} 0\tz.rs\0H 100644 {OID} 0\t../bad.rs\0? nested/a.rs\0? nested/a.rs\0? not-rust.txt\0? bad\nname.rs\0"
+            "H 100644 {OID} 0\tz.rs\0H 100644 {OID} 0\tz.rs\0H 100644 {OID} 0\t../bad.rs\0? nested/a.py\0? nested/a.py\0? not-source.txt\0? bad\nname.rs\0"
         )
         .into_bytes();
         output.extend_from_slice(b"? \xff.rs\0");
-        let inventory = parse_rust_files(&output).unwrap();
+        let inventory = parse_source_files(&output).unwrap();
 
         assert_eq!(
             inventory.files,
             [
-                RustFile {
-                    path: "nested/a.rs".into(),
+                SourceFile {
+                    path: "nested/a.py".into(),
                     git_oid: None,
+                    language: Language::Python,
                 },
-                RustFile {
+                SourceFile {
                     path: "z.rs".into(),
                     git_oid: None,
+                    language: Language::Rust,
                 },
             ]
         );
         assert_eq!(inventory.skipped, 4);
-        assert!(parse_rust_files(b"broken").is_err());
-        assert!(parse_rust_files(b"broken\0").is_err());
+        assert!(parse_source_files(b"broken").is_err());
+        assert!(parse_source_files(b"broken\0").is_err());
     }
 
     #[test]
@@ -1092,13 +1135,14 @@ mod tests {
         );
         fs::write(root.join("src/dirty.rs"), "fn after() {}\n").unwrap();
         fs::write(root.join("src/untracked.rs"), "fn untracked() {}\n").unwrap();
+        fs::write(root.join("src/untracked.py"), "def untracked(): pass\n").unwrap();
 
         let repository = Repository {
             root: fs::canonicalize(&root).unwrap(),
-            database: root.join(".git/grapher/index.db"),
+            database: root.join(".git/graphr/index.db"),
         };
         let cancelled = AtomicBool::new(false);
-        let inventory = repository.rust_files(&cancelled).unwrap();
+        let inventory = repository.source_files(&cancelled).unwrap();
         assert_eq!(
             inventory
                 .files
@@ -1108,6 +1152,7 @@ mod tests {
             [
                 ("src/clean.rs", true),
                 ("src/dirty.rs", false),
+                ("src/untracked.py", false),
                 ("src/untracked.rs", false),
             ]
         );
@@ -1118,7 +1163,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             repository
-                .read_rust_source(dirty, &cancelled)
+                .read_source(dirty, &cancelled)
                 .unwrap()
                 .unwrap()
                 .text,
@@ -1130,7 +1175,7 @@ mod tests {
 
     fn temp_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "grapher-git-{label}-{}-{}",
+            "graphr-git-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
