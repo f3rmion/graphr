@@ -4,6 +4,7 @@
   (union_item)
   (trait_item)
   (type_item)
+  (associated_type)
 ] @type
 
 (mod_item

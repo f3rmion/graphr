@@ -238,16 +238,14 @@ fn add_file(
         let kind = node_kind(definition.kind);
         let keys = definition_keys(definition.kind, absolute.as_deref());
         let key = node_keys[local].clone();
-        let owner_key = (definition.kind == DefinitionKind::Method
-            && definition.impl_target.is_some()
-            && definition.parent.is_none())
-        .then(|| {
-            absolute
-                .as_deref()?
-                .rsplit_once("::")
-                .map(|(owner, _)| format!("rust:type:{owner}"))
-        })
-        .flatten();
+        let owner_key = (definition.impl_target.is_some() && definition.parent.is_none())
+            .then(|| {
+                absolute
+                    .as_deref()?
+                    .rsplit_once("::")
+                    .map(|(owner, _)| format!("rust:type:{owner}"))
+            })
+            .flatten();
         graph.nodes.push(NodeInput {
             key: key.clone(),
             file_key: source.path.clone(),
@@ -1439,6 +1437,44 @@ mod scoped { impl crate::model::Item { fn stop() {} } }
                         .find(|node| node.name == "run")
                         .map(|node| node.key.clone())
         }));
+    }
+
+    #[test]
+    fn scopes_associated_types_to_their_impl_owner() {
+        let sources = [
+            Source {
+                path: "src/lib.rs".into(),
+                text: "mod model; use crate::model::Cursor; trait Stream { type Item; } impl Stream for Cursor { type Item = u8; }".into(),
+            },
+            Source {
+                path: "src/model.rs".into(),
+                text: "pub struct Cursor;".into(),
+            },
+        ];
+        let graph = build_graph(&sources, &AtomicBool::new(false)).unwrap();
+
+        for (item_key, owner_key) in [
+            ("rust:type:Stream::Item", "rust:type:Stream"),
+            ("rust:type:model::Cursor::Item", "rust:type:model::Cursor"),
+        ] {
+            let item = graph
+                .nodes
+                .iter()
+                .find(|node| node.keys.iter().any(|key| key == item_key))
+                .unwrap();
+            let owner = graph
+                .nodes
+                .iter()
+                .find(|node| node.keys.iter().any(|key| key == owner_key))
+                .unwrap();
+            assert_eq!(item.parent_key, Some(owner.key.clone()));
+        }
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| !node.keys.contains(&"rust:type:Item".into()))
+        );
     }
 
     #[test]

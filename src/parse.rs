@@ -162,24 +162,50 @@ impl RustParser {
 
             let current_parent = scopes.last().and_then(|scope| scope.parent);
             let current_module = scopes.last().and_then(|scope| scope.module);
-            let current_method_container = scopes.last().and_then(|scope| scope.method_container);
+            let current_method_container = scopes
+                .last()
+                .and_then(|scope| scope.method_container)
+                .filter(|_| {
+                    node.parent()
+                        .and_then(|parent| parent.parent())
+                        .is_some_and(|parent| matches!(parent.kind(), "impl_item" | "trait_item"))
+                });
             if capture.index == self.captures.type_ {
                 if let Some(name) = field_text(node, "name", source) {
                     let definition = parsed.definitions.len();
+                    let (parent, impl_target) = match current_method_container {
+                        Some(MethodContainer::Impl {
+                            target,
+                            local_name,
+                            fallback_parent,
+                        }) => {
+                            if let Some(local_name) = local_name {
+                                pending_parents.push(PendingParent {
+                                    definition,
+                                    local_name,
+                                    module: current_module,
+                                });
+                            }
+                            (fallback_parent, Some(target.to_owned()))
+                        }
+                        _ => (current_parent, None),
+                    };
                     parsed.definitions.push(Definition {
                         kind: DefinitionKind::Type,
                         name: name.to_owned(),
-                        parent: current_parent,
-                        impl_target: None,
+                        parent,
+                        impl_target,
                         line_start: line_start(node),
                         line_end: line_end(node),
                         signature: signature(node, source),
                         module: current_module,
                     });
-                    type_parents
-                        .entry((current_module, name))
-                        .and_modify(|candidate| *candidate = None)
-                        .or_insert(Some(definition));
+                    if current_method_container.is_none() {
+                        type_parents
+                            .entry((current_module, name))
+                            .and_modify(|candidate| *candidate = None)
+                            .or_insert(Some(definition));
+                    }
                     scopes.push(Scope {
                         end_byte: node.end_byte(),
                         parent: Some(definition),
