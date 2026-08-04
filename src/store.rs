@@ -596,7 +596,7 @@ fn traverse_changes(
             let mut statement = connection.prepare(sql).map_err(db_error)?;
             for source in &current {
                 check_cancelled(cancelled)?;
-                let limit = row_budget.min(max_nodes.saturating_sub(visited.len()) + 1);
+                let limit = row_budget;
                 if limit == 0 {
                     return Ok(true);
                 }
@@ -2050,6 +2050,53 @@ mod tests {
     }
 
     #[test]
+    fn changes_do_not_truncate_on_visited_rows_with_budget_left() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let mut graph = single_node_graph("a");
+        graph.nodes.push(function_node("b", 2));
+        graph.edges.extend([
+            EdgeInput {
+                source_key: "a".into(),
+                target_key: "a".into(),
+                kind: EdgeKind::Imports,
+                support_count: 1,
+            },
+            EdgeInput {
+                source_key: "a".into(),
+                target_key: "b".into(),
+                kind: EdgeKind::Imports,
+                support_count: 1,
+            },
+        ]);
+        let cancelled = AtomicBool::new(false);
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        let output = store
+            .changes(
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        whole_file: true,
+                        spans: vec![],
+                        report_unmapped: false,
+                    }],
+                    records: vec![],
+                },
+                1,
+                3,
+                &cancelled,
+            )
+            .unwrap();
+
+        assert!(!output.contains(TRUNCATED.trim()), "{output}");
+    }
+
+    #[test]
     fn neighbor_queries_stop_at_the_shared_budget() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
@@ -2058,19 +2105,7 @@ mod tests {
         let mut graph = single_node_graph("root");
         for index in 0..100 {
             let key = format!("child-{index}");
-            graph.nodes.push(NodeInput {
-                key: key.clone(),
-                file_key: "src/lib.rs".into(),
-                kind: NodeKind::Function,
-                name: key.clone(),
-                qualified_name: key.clone(),
-                parent_key: None,
-                owner_key: None,
-                line_start: 1,
-                line_end: 1,
-                signature: String::new(),
-                keys: vec![],
-            });
+            graph.nodes.push(function_node(&key, 1));
             graph.edges.push(EdgeInput {
                 source_key: "root".into(),
                 target_key: key,
@@ -2098,20 +2133,24 @@ mod tests {
                 byte_size: 1,
                 replace: true,
             }],
-            nodes: vec![NodeInput {
-                key: name.into(),
-                file_key: "src/lib.rs".into(),
-                kind: NodeKind::Function,
-                name: name.into(),
-                qualified_name: name.into(),
-                parent_key: None,
-                owner_key: None,
-                line_start: 1,
-                line_end: 1,
-                signature: String::new(),
-                keys: vec![],
-            }],
+            nodes: vec![function_node(name, 1)],
             ..Graph::default()
+        }
+    }
+
+    fn function_node(name: &str, line: u32) -> NodeInput {
+        NodeInput {
+            key: name.into(),
+            file_key: "src/lib.rs".into(),
+            kind: NodeKind::Function,
+            name: name.into(),
+            qualified_name: name.into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: line,
+            line_end: line,
+            signature: String::new(),
+            keys: vec![],
         }
     }
 }
