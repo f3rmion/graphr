@@ -565,7 +565,7 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     fs::remove_file(fixture.path.join("src/removed.rs")).unwrap();
     fs::write(
         fixture.path.join("src/untracked.rs"),
-        "pub fn first_untracked() {}\npub fn second_untracked() {}\n",
+        "pub fn first_untracked() { second_untracked(); }\npub fn second_untracked() {}\n#[test]\nfn checks_untracked() { first_untracked(); }\n",
     )
     .unwrap();
     fs::write(
@@ -598,6 +598,7 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         "moved_symbol",
         "first_untracked",
         "second_untracked",
+        "checks_untracked",
         "risk overall=",
         "flow ",
         "test <-",
@@ -606,9 +607,38 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         assert!(text.contains(expected), "missing {expected}: {changed}");
     }
     assert!(text.contains("+    helper();"), "{changed}");
+    assert!(text.contains("@@ -0,0 +1,4 @@"), "{changed}");
+    assert!(
+        text.lines().any(|line| {
+            line.starts_with("flow ")
+                && line.contains(
+                    "first_untracked@src/untracked.rs:1 -> second_untracked@src/untracked.rs:2",
+                )
+        }),
+        "{text}"
+    );
+    assert!(
+        text.lines().any(|line| {
+            line.contains("Function first_untracked src/untracked.rs:1")
+                && !line.contains("direct-test-gap")
+        }),
+        "{text}"
+    );
+    assert!(
+        text.contains("Test checks_untracked src/untracked.rs:3"),
+        "{text}"
+    );
     assert!(text.contains("-pub fn removed_symbol() {}"), "{changed}");
     assert!(
         text.contains("diff --git a/src/changed.rs b/src/changed.rs"),
+        "{changed}"
+    );
+    assert!(
+        text.contains("diff --git a/src/untracked.rs b/src/untracked.rs"),
+        "{changed}"
+    );
+    assert!(
+        text.contains("+pub fn first_untracked() { second_untracked(); }"),
         "{changed}"
     );
     let graph = text.split_once("graph\n").unwrap().1;
@@ -640,10 +670,146 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     let bounded = client.request(
         r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":1}}}"#,
     );
-    assert!(bounded.contains("changed_symbols_omitted=4"), "{bounded}");
+    assert!(bounded.contains("changed_symbols_omitted=5"), "{bounded}");
     assert!(bounded.contains("neighborhood_omitted=true"), "{bounded}");
     assert!(!bounded.contains("[truncated]"), "{bounded}");
     assert!(bounded.len() <= 8192, "{bounded}");
+    client.close();
+}
+
+#[test]
+fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(fixture.path.join("src/lib.rs"), "pub fn stable() {}\n").unwrap();
+    let sha2 = fixture.path.join(".cargo/vendor/sha2");
+    fs::create_dir_all(sha2.join("src")).unwrap();
+    fs::write(
+        sha2.join("Cargo.toml"),
+        "[package]\nname = \"sha2\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(sha2.join(".cargo-checksum.json"), "{\"old\":true}\n").unwrap();
+    fs::write(sha2.join("src/lib.rs"), "pub fn old_digest() {}\n").unwrap();
+    fs::write(
+        fixture.path.join(".cargo/vendor/build.rs"),
+        "pub fn old_vendor_root() {}\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git(
+        &fixture.path,
+        &[
+            "-c",
+            "user.name=Graphr Test",
+            "-c",
+            "user.email=graphr@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "baseline",
+        ],
+    );
+
+    fs::write(
+        fixture.path.join("src/canonical.rs"),
+        "pub fn canonical_digest() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join(".cargo/vendor/build.rs"),
+        "pub fn vendor_root() {}\n",
+    )
+    .unwrap();
+    fs::write(sha2.join(".cargo-checksum.json"), "{\"new\":true}\n").unwrap();
+    fs::write(sha2.join("src/lib.rs"), "pub fn vendor_digest() {}\n").unwrap();
+    let cpufeatures = fixture.path.join(".cargo/vendor/cpufeatures");
+    fs::create_dir_all(cpufeatures.join("src")).unwrap();
+    fs::write(
+        cpufeatures.join("Cargo.toml"),
+        "[package]\nname = \"cpufeatures\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(cpufeatures.join(".cargo-checksum.json"), "{}\n").unwrap();
+    fs::write(
+        cpufeatures.join("src/lib.rs"),
+        "pub fn vendor_feature() {}\n",
+    )
+    .unwrap();
+
+    let mut client = Client::start(&fixture.path);
+    let _ = client.request(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
+    );
+    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+
+    let boundary = response_text(&client.request(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{"depth":1,"max_nodes":10}}}"#,
+    ));
+    for expected in [
+        "dependency_mode=boundary",
+        "dependency-boundary root=.cargo/vendor packages=2 files=5 path_digest=",
+        "dependency-package name=cpufeatures files=3 supported_sources=1 checksum_files=1",
+        "dependency-package name=sha2 files=2 supported_sources=1 checksum_files=1",
+        "changed supported .cargo/vendor/build.rs status=modified",
+        "untracked supported src/canonical.rs",
+        "diff --git a/.cargo/vendor/build.rs b/.cargo/vendor/build.rs",
+        "diff --git a/src/canonical.rs b/src/canonical.rs",
+        "dependency_analysis=collapsed",
+    ] {
+        assert!(
+            boundary.contains(expected),
+            "missing {expected}: {boundary}"
+        );
+    }
+    for omitted in [
+        ".cargo/vendor/sha2/src/lib.rs",
+        "vendor_digest",
+        "vendor_feature",
+    ] {
+        assert!(
+            !boundary.contains(omitted),
+            "unexpected {omitted}: {boundary}"
+        );
+    }
+    let boundary_graph = boundary.split_once("graph\n").unwrap().1;
+    for expected in [
+        "Function canonical_digest src/canonical.rs:1",
+        "Function vendor_root .cargo/vendor/build.rs:1",
+    ] {
+        assert!(
+            boundary_graph.contains(expected),
+            "missing {expected}: {boundary}"
+        );
+    }
+
+    let full = response_text(&client.request(
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":10,"dependency_mode":"full"}}}"#,
+    ));
+    for expected in [
+        "dependency_mode=full",
+        "changed supported .cargo/vendor/sha2/src/lib.rs status=modified",
+        "diff --git a/.cargo/vendor/sha2/src/lib.rs b/.cargo/vendor/sha2/src/lib.rs",
+        "untracked supported .cargo/vendor/cpufeatures/src/lib.rs",
+        "diff --git a/.cargo/vendor/cpufeatures/src/lib.rs b/.cargo/vendor/cpufeatures/src/lib.rs",
+        "dependency_analysis=full",
+    ] {
+        assert!(full.contains(expected), "missing {expected}: {full}");
+    }
+    assert!(!full.contains("dependency-package name="), "{full}");
+    let full_graph = full.split_once("graph\n").unwrap().1;
+    for expected in [
+        "Function vendor_digest .cargo/vendor/sha2/src/lib.rs:1",
+        "Function vendor_feature .cargo/vendor/cpufeatures/src/lib.rs:1",
+    ] {
+        assert!(full_graph.contains(expected), "missing {expected}: {full}");
+    }
     client.close();
 }
 

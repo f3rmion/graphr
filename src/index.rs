@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -9,7 +9,8 @@ use std::sync::{
 use std::thread;
 
 use crate::git::{
-    ChangeStatus, ChangedPath, Language, Repository, Source, SourceFile, WorktreeChanges,
+    ChangeStatus, ChangedPath, DependencyMode, Language, Repository, Source, SourceFile,
+    WorktreeChanges, changed_dependency_package,
 };
 use crate::parse::{DefinitionKind, ParsedFile, RustParser};
 use crate::python::PythonParser;
@@ -84,6 +85,7 @@ impl Project {
         base: &str,
         depth: u32,
         max_nodes: u32,
+        dependency_mode: DependencyMode,
         cursor: Option<&str>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<String, String> {
@@ -96,12 +98,14 @@ impl Project {
                 .unwrap_or_else(|error| error.into_inner());
             let snapshot = snapshot
                 .as_ref()
-                .filter(|snapshot| snapshot.matches(base, depth, max_nodes))
+                .filter(|snapshot| snapshot.matches(base, depth, max_nodes, dependency_mode))
                 .ok_or_else(|| "stale changes cursor".to_owned())?;
             return render_section(snapshot, &cursor);
         }
 
-        let changes = self.repository.worktree_changes(base, &cancelled)?;
+        let changes = self
+            .repository
+            .worktree_changes(base, dependency_mode, &cancelled)?;
         if changes.is_empty() {
             *self
                 .review_snapshot
@@ -109,9 +113,14 @@ impl Project {
                 .unwrap_or_else(|error| error.into_inner()) = None;
             return Ok("no changes\n".into());
         }
-        let graph = Store::open_reader(&self.repository.database)?
-            .changes(&changes, depth, max_nodes, &cancelled)?;
-        let snapshot = ReviewSnapshot::new(base, depth, max_nodes, changes, graph);
+        let graph = Store::open_reader(&self.repository.database)?.changes(
+            &changes,
+            depth,
+            max_nodes,
+            dependency_mode,
+            &cancelled,
+        )?;
+        let snapshot = ReviewSnapshot::new(base, depth, max_nodes, dependency_mode, changes, graph);
         let output = review_context(&snapshot)?;
         // ponytail: retain one bounded review snapshot; use a keyed LRU only if
         // concurrent independent review paginations become a real requirement.
@@ -123,10 +132,59 @@ impl Project {
     }
 }
 
-fn change_manifest(changes: &WorktreeChanges) -> String {
+#[derive(Default)]
+struct DependencyPackageSummary {
+    files: usize,
+    supported_sources: usize,
+    checksum_files: usize,
+    statuses: [usize; 7],
+}
+
+fn change_manifest(changes: &WorktreeChanges, dependency_mode: DependencyMode) -> String {
     let mut output = String::new();
+    let mut dependencies = BTreeMap::<&str, DependencyPackageSummary>::new();
+    let mut dependency_files = 0_usize;
+    let mut dependency_hash = blake3::Hasher::new();
     for path in &changes.paths {
+        if dependency_mode == DependencyMode::Boundary
+            && let Some(package) = changed_dependency_package(path)
+        {
+            let mut record = String::new();
+            change_path_line(&mut record, path);
+            dependency_hash.update(&(record.len() as u64).to_le_bytes());
+            dependency_hash.update(record.as_bytes());
+            dependency_files += 1;
+            let summary = dependencies.entry(package).or_default();
+            summary.files += 1;
+            summary.supported_sources += usize::from(path.language.is_some());
+            summary.checksum_files += usize::from(path.path.ends_with("/.cargo-checksum.json"));
+            summary.statuses[change_status_index(path.status)] += 1;
+            continue;
+        }
         change_path_line(&mut output, path);
+    }
+    if !dependencies.is_empty() {
+        output.push_str(&format!(
+            "dependency-boundary root=.cargo/vendor packages={} files={} path_digest={}\n",
+            dependencies.len(),
+            dependency_files,
+            dependency_hash.finalize().to_hex(),
+        ));
+        for (package, summary) in dependencies {
+            output.push_str(&format!(
+                "dependency-package name={package} files={} supported_sources={} checksum_files={} added={} modified={} deleted={} renamed={} type_changed={} unmerged={} untracked={}\n",
+                summary.files,
+                summary.supported_sources,
+                summary.checksum_files,
+                summary.statuses[0],
+                summary.statuses[1],
+                summary.statuses[2],
+                summary.statuses[3],
+                summary.statuses[4],
+                summary.statuses[5],
+                summary.statuses[6],
+            ));
+        }
     }
     if changes.skipped_paths > 0 {
         output.push_str("skipped ");
@@ -134,6 +192,18 @@ fn change_manifest(changes: &WorktreeChanges) -> String {
         output.push_str(" unsafe paths\n");
     }
     output
+}
+
+const fn change_status_index(status: ChangeStatus) -> usize {
+    match status {
+        ChangeStatus::Added => 0,
+        ChangeStatus::Modified => 1,
+        ChangeStatus::Deleted => 2,
+        ChangeStatus::Renamed => 3,
+        ChangeStatus::TypeChanged => 4,
+        ChangeStatus::Unmerged => 5,
+        ChangeStatus::Untracked => 6,
+    }
 }
 
 fn change_path_line(output: &mut String, path: &ChangedPath) {
@@ -218,6 +288,7 @@ struct ReviewSnapshot {
     base: String,
     depth: u32,
     max_nodes: u32,
+    dependency_mode: DependencyMode,
     manifest: String,
     changes: WorktreeChanges,
     graph: String,
@@ -236,31 +307,41 @@ impl ReviewSnapshot {
         base: &str,
         depth: u32,
         max_nodes: u32,
+        dependency_mode: DependencyMode,
         changes: WorktreeChanges,
         graph: String,
     ) -> Self {
-        let manifest = change_manifest(&changes);
-        let checksum = review_snapshot(base, depth, max_nodes, &manifest, &changes.patch, &graph);
+        let manifest = change_manifest(&changes, dependency_mode);
+        let checksum = review_snapshot(
+            base,
+            depth,
+            max_nodes,
+            dependency_mode,
+            &manifest,
+            &changes.patch,
+            &graph,
+        );
         let file_ranges = line_ranges(&manifest, None);
         let hunk_ranges = hunk_ranges(&changes.patch);
         let flow_ranges = line_ranges(&graph, Some("flow "));
-        let all_path_hunks = change_hunk_totals(&changes, hunk_ranges.len());
+        let all_path_hunks = change_hunk_totals(&changes, hunk_ranges.len(), dependency_mode);
         let patch_totals = change_totals(
             "patch",
-            changes.paths.iter().filter(|path| {
-                (path.language.is_some() || path.old_language.is_some())
-                    && path.status != ChangeStatus::Untracked
-            }),
+            changes
+                .paths
+                .iter()
+                .filter(|path| path_in_patch(path, dependency_mode)),
             0,
         );
         let all_path_totals =
             change_totals("all_path", changes.paths.iter(), changes.skipped_paths);
         let complete_after_pagination =
-            graph_review_complete(&graph) && change_content_complete(&changes);
+            graph_review_complete(&graph) && change_content_complete(&changes, dependency_mode);
         Self {
             base: base.into(),
             depth,
             max_nodes,
+            dependency_mode,
             manifest,
             changes,
             graph,
@@ -275,8 +356,17 @@ impl ReviewSnapshot {
         }
     }
 
-    fn matches(&self, base: &str, depth: u32, max_nodes: u32) -> bool {
-        self.base == base && self.depth == depth && self.max_nodes == max_nodes
+    fn matches(
+        &self,
+        base: &str,
+        depth: u32,
+        max_nodes: u32,
+        dependency_mode: DependencyMode,
+    ) -> bool {
+        self.base == base
+            && self.depth == depth
+            && self.max_nodes == max_nodes
+            && self.dependency_mode == dependency_mode
     }
 
     fn value(&self, section: ReviewSection) -> &str {
@@ -363,7 +453,8 @@ fn render_section_page(
         ReviewSection::Files => {
             let coverage = record_coverage(snapshot.ranges(section), &page);
             output.push_str(&format!(
-                "files rename_detection=supported-only emitted_bytes={} total_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_entries={} partial_entries={} total_entries={} prior_entries={} remaining_entries={} page_complete={}\n",
+                "files dependency_mode={} rename_detection=supported-only emitted_bytes={} total_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_entries={} partial_entries={} total_entries={} prior_entries={} remaining_entries={} page_complete={}\n",
+                snapshot.dependency_mode.as_str(),
                 emitted_bytes,
                 value.len(),
                 page.start,
@@ -382,7 +473,8 @@ fn render_section_page(
         ReviewSection::Diff => {
             let coverage = record_coverage(snapshot.ranges(section), &page);
             output.push_str(&format!(
-                "diff scope=supported-tracked emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_hunks={} partial_hunks={} total_hunks={} prior_hunks={} remaining_hunks={} {} {} {} page_complete={}\n",
+                "diff scope=supported-source dependency_mode={} emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_hunks={} partial_hunks={} total_hunks={} prior_hunks={} remaining_hunks={} {} {} {} page_complete={}\n",
+                snapshot.dependency_mode.as_str(),
                 emitted_bytes,
                 value.len(),
                 page.start,
@@ -489,18 +581,21 @@ fn review_snapshot(
     base: &str,
     depth: u32,
     max_nodes: u32,
+    dependency_mode: DependencyMode,
     manifest: &str,
     patch: &str,
     graph: &str,
 ) -> String {
     let depth = depth.to_string();
     let max_nodes = max_nodes.to_string();
+    let dependency_mode = dependency_mode.as_str();
     let mut hash = blake3::Hasher::new();
     for value in [
         b"graphr changes v1".as_slice(),
         base.as_bytes(),
         depth.as_bytes(),
         max_nodes.as_bytes(),
+        dependency_mode.as_bytes(),
         manifest.as_bytes(),
         patch.as_bytes(),
         graph.as_bytes(),
@@ -585,14 +680,22 @@ fn change_totals<'a>(
     }
 }
 
-fn change_hunk_totals(changes: &WorktreeChanges, patch_hunks: usize) -> String {
+fn path_in_patch(path: &ChangedPath, dependency_mode: DependencyMode) -> bool {
+    (path.language.is_some() || path.old_language.is_some())
+        && (dependency_mode == DependencyMode::Full || changed_dependency_package(path).is_none())
+        && path.additions.is_some()
+        && path.deletions.is_some()
+}
+
+fn change_hunk_totals(
+    changes: &WorktreeChanges,
+    patch_hunks: usize,
+    dependency_mode: DependencyMode,
+) -> String {
     let mut total = patch_hunks;
     let mut unknown = changes.skipped_paths;
     for path in &changes.paths {
-        let captured = path.status != ChangeStatus::Untracked
-            && (path.language.is_some() || path.old_language.is_some())
-            && path.additions.is_some()
-            && path.deletions.is_some();
+        let captured = path_in_patch(path, dependency_mode);
         if captured {
             continue;
         }
@@ -697,14 +800,19 @@ fn graph_review_complete(value: &str) -> bool {
         && graph_summary_value(value, "unmapped_ranges") == Some("0")
 }
 
-fn change_content_complete(changes: &WorktreeChanges) -> bool {
+fn change_content_complete(changes: &WorktreeChanges, dependency_mode: DependencyMode) -> bool {
     changes.skipped_paths == 0
         && changes.paths.iter().all(|path| {
-            path.language.is_some()
-                && (path.status != ChangeStatus::Renamed || path.old_language.is_some())
-                && path.status != ChangeStatus::Untracked
-                && path.additions.is_some()
-                && path.deletions.is_some()
+            if dependency_mode == DependencyMode::Boundary
+                && changed_dependency_package(path).is_some()
+            {
+                true
+            } else {
+                path.language.is_some()
+                    && (path.status != ChangeStatus::Renamed || path.old_language.is_some())
+                    && path.additions.is_some()
+                    && path.deletions.is_some()
+            }
         })
 }
 
@@ -2116,7 +2224,9 @@ mod tests {
             patch,
             skipped_paths: 0,
         };
-        let snapshot = ReviewSnapshot::new("HEAD", 6, 50, changes, graph);
+        let snapshot = ReviewSnapshot::new("HEAD", 6, 50, DependencyMode::Boundary, changes, graph);
+        assert!(snapshot.matches("HEAD", 6, 50, DependencyMode::Boundary));
+        assert!(!snapshot.matches("HEAD", 6, 50, DependencyMode::Full));
         let initial = review_context(&snapshot).unwrap();
         assert!(initial.len() <= REVIEW_CONTEXT_BUDGET);
         assert!(initial.contains("emitted_entries=1 partial_entries=0 total_entries=1"));
@@ -2181,7 +2291,14 @@ mod tests {
         };
         let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 direct_test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
-        let snapshot = ReviewSnapshot::new("HEAD", 6, 50, changes, graph.into());
+        let snapshot = ReviewSnapshot::new(
+            "HEAD",
+            6,
+            50,
+            DependencyMode::Boundary,
+            changes,
+            graph.into(),
+        );
         let output = review_context(&snapshot).unwrap();
 
         assert!(output.contains("review_complete=false"), "{output}");
@@ -2210,7 +2327,14 @@ mod tests {
         };
         let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
-        let snapshot = ReviewSnapshot::new("HEAD", 6, 50, changes, graph.into());
+        let snapshot = ReviewSnapshot::new(
+            "HEAD",
+            6,
+            50,
+            DependencyMode::Boundary,
+            changes,
+            graph.into(),
+        );
         let output = review_context(&snapshot).unwrap();
 
         assert!(
@@ -2261,7 +2385,14 @@ mod tests {
         };
         let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
-        let snapshot = ReviewSnapshot::new("HEAD", 6, 50, changes, graph.into());
+        let snapshot = ReviewSnapshot::new(
+            "HEAD",
+            6,
+            50,
+            DependencyMode::Boundary,
+            changes,
+            graph.into(),
+        );
         let output = review_context(&snapshot).unwrap();
 
         assert!(
@@ -2288,8 +2419,48 @@ mod tests {
             skipped_paths: 0,
         };
         assert_eq!(
-            change_hunk_totals(&unknown, 0),
+            change_hunk_totals(&unknown, 0, DependencyMode::Boundary),
             "all_path_hunks_at_least=0 all_path_unknown_hunk_paths=1"
+        );
+    }
+
+    #[test]
+    fn supported_untracked_source_is_complete_diff_content() {
+        let changes = WorktreeChanges {
+            files: vec![],
+            records: vec![crate::git::PathRecord::Untracked("src/new.rs".into())],
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Untracked,
+                old_path: None,
+                old_language: None,
+                path: "src/new.rs".into(),
+                language: Some(Language::Rust),
+                additions: Some(1),
+                deletions: Some(0),
+            }],
+            patch: "diff --git a/src/new.rs b/src/new.rs\n@@ -0,0 +1 @@\n+fn new() {}\n".into(),
+            skipped_paths: 0,
+        };
+        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let output = review_context(&ReviewSnapshot::new(
+            "HEAD",
+            0,
+            1,
+            DependencyMode::Boundary,
+            changes,
+            graph.into(),
+        ))
+        .unwrap();
+
+        assert!(output.contains("scope=supported-source"), "{output}");
+        assert!(
+            output.contains("patch_additions=1 patch_deletions=0"),
+            "{output}"
+        );
+        assert!(output.contains("all_path_hunks=1"), "{output}");
+        assert!(
+            output.contains("review_complete=true review_complete_when_pages_exhausted=true"),
+            "{output}"
         );
     }
 
@@ -2340,7 +2511,7 @@ mod tests {
             skipped_paths: 2,
         };
         assert_eq!(
-            change_manifest(&changes),
+            change_manifest(&changes, DependencyMode::Boundary),
             "changed supported src/current.rs status=modified additions=2 deletions=1\ndeleted supported src/deleted.rs additions=0 deletions=3\nrenamed supported src/old.rs -> src/new.rs additions=0 deletions=0\nuntracked unsupported tests/fixture.tsv additions=3 deletions=0\nskipped 2 unsafe paths\n"
         );
     }
@@ -2352,6 +2523,7 @@ mod tests {
             "HEAD",
             6,
             50,
+            DependencyMode::Boundary,
             WorktreeChanges {
                 files: vec![],
                 records: vec![],

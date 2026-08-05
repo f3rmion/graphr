@@ -9,13 +9,19 @@ use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
-use crate::git::{ChangedFile, Language, LineSpan, PathRecord, WorktreeChanges};
+use crate::git::{
+    ChangedFile, DependencyMode, Language, LineSpan, PathRecord, WorktreeChanges,
+    dependency_package,
+};
 
 const SCHEMA_VERSION: i64 = 4;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
 const CHANGE_ANALYSIS_LIMIT: usize = 500;
+// ponytail: inspect a bounded dependency tail after first-party neighbors;
+// raise only if real call sites reach more than 256 vendored symbols at once.
+const DEPENDENCY_NEIGHBOR_SCAN_LIMIT: usize = 256;
 const FLOW_DEPTH: u32 = 15;
 const FLOW_SCAN_LIMIT: usize = 500;
 const FLOW_QUERY_LIMIT: usize = 5_000;
@@ -384,6 +390,7 @@ impl Store {
         changes: &WorktreeChanges,
         depth: u32,
         max_nodes: u32,
+        dependency_mode: DependencyMode,
         cancelled: &AtomicBool,
     ) -> Result<String> {
         if depth > 6 || !(1..=50).contains(&max_nodes) {
@@ -397,6 +404,10 @@ impl Store {
             .records
             .iter()
             .filter(|record| matches!(record, PathRecord::Deleted(_)))
+            .filter(|record| {
+                dependency_mode == DependencyMode::Full
+                    || !matches!(record, PathRecord::Deleted(path) if dependency_package(path).is_some())
+            })
             .count();
         if changes.files.is_empty() {
             let flow_accounting = if deleted_paths_unanalyzed == 0 {
@@ -405,8 +416,9 @@ impl Store {
                 "flows_discovered=0 flows_total=unknown"
             };
             return Ok(format!(
-                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} direct_test_gaps=0 analysis_complete={} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0\n",
+                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} direct_test_gaps=0 analysis_complete={} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 dependency_analysis={}\n",
                 deleted_paths_unanalyzed == 0,
+                dependency_analysis(dependency_mode),
             ));
         }
         for file in &changes.files {
@@ -431,11 +443,18 @@ impl Store {
         let files = changes
             .files
             .iter()
+            .filter(|file| {
+                dependency_mode == DependencyMode::Full || dependency_package(&file.path).is_none()
+            })
             .filter(|file| !untracked.contains(file.path.as_str()))
             .chain(
                 changes
                     .files
                     .iter()
+                    .filter(|file| {
+                        dependency_mode == DependencyMode::Full
+                            || dependency_package(&file.path).is_none()
+                    })
                     .filter(|file| untracked.contains(file.path.as_str())),
             );
         let mut unmapped_lines = Vec::new();
@@ -569,7 +588,13 @@ impl Store {
         );
         let analysis_roots_omitted = analysis_roots_total.saturating_sub(analysis_ids.len());
         let mut roots = load_nodes(&tx, &analysis_ids)?;
-        let analysis = analyze_changed_roots(&tx, &roots, CHANGE_ANALYSIS_LIMIT, cancelled)?;
+        let analysis = analyze_changed_roots(
+            &tx,
+            &roots,
+            CHANGE_ANALYSIS_LIMIT,
+            dependency_mode,
+            cancelled,
+        )?;
         roots.sort_by(|left, right| {
             analysis
                 .risks
@@ -610,11 +635,17 @@ impl Store {
             false
         } else {
             traverse_changes(
-                &tx, &state, &roots, depth, root_limit, cancelled, &mut lines,
+                &tx,
+                &state,
+                &roots,
+                (depth, root_limit),
+                dependency_mode,
+                cancelled,
+                &mut lines,
             )?
         };
         for flow in &analysis.flows {
-            lines.push(flow_line(flow)?);
+            lines.push(flow_line(flow, dependency_mode)?);
         }
         let overall = analysis
             .risks
@@ -640,7 +671,7 @@ impl Store {
         lines.insert(
             0,
             format!(
-                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} direct_test_gaps={} analysis_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={}\n",
+                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} direct_test_gaps={} analysis_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} dependency_analysis={}\n",
                 score_text(overall),
                 changed_symbols_total,
                 analysis.risks.len(),
@@ -653,6 +684,7 @@ impl Store {
                 deleted_paths_unanalyzed,
                 neighborhood_omitted,
                 unmapped_range_count,
+                dependency_analysis(dependency_mode),
             ),
         );
         Ok(lines.concat())
@@ -760,7 +792,7 @@ const CHANGE_NEIGHBORS: [(&str, bool, &str); 6] = [
            FROM edges e JOIN nodes n ON n.id=e.source_id
            JOIN files f ON f.id=n.file_id
           WHERE e.target_id=?1 AND e.kind='TEST_CALLS'
-          ORDER BY e.source_id LIMIT ?2",
+          ORDER BY f.path GLOB '.cargo/vendor/*/*', e.source_id LIMIT ?2",
     ),
     (
         "caller <-",
@@ -769,7 +801,7 @@ const CHANGE_NEIGHBORS: [(&str, bool, &str); 6] = [
            FROM edges e JOIN nodes n ON n.id=e.source_id
            JOIN files f ON f.id=n.file_id
           WHERE e.target_id=?1 AND e.kind='CALLS'
-          ORDER BY e.source_id LIMIT ?2",
+          ORDER BY f.path GLOB '.cargo/vendor/*/*', e.source_id LIMIT ?2",
     ),
     (
         "impl <-",
@@ -778,7 +810,7 @@ const CHANGE_NEIGHBORS: [(&str, bool, &str); 6] = [
            FROM trait_implementations i JOIN nodes n ON n.id=i.resolved_implementor_id
            JOIN files f ON f.id=n.file_id
           WHERE i.resolved_trait_id=?1
-          ORDER BY n.id LIMIT ?2",
+          ORDER BY f.path GLOB '.cargo/vendor/*/*', n.id LIMIT ?2",
     ),
     (
         "call ->",
@@ -787,7 +819,7 @@ const CHANGE_NEIGHBORS: [(&str, bool, &str); 6] = [
            FROM edges e JOIN nodes n ON n.id=e.target_id
            JOIN files f ON f.id=n.file_id
           WHERE e.source_id=?1 AND e.kind IN ('CALLS','TEST_CALLS')
-          ORDER BY e.kind, e.target_id LIMIT ?2",
+          ORDER BY f.path GLOB '.cargo/vendor/*/*', e.kind, e.target_id LIMIT ?2",
     ),
     (
         "implements ->",
@@ -796,7 +828,7 @@ const CHANGE_NEIGHBORS: [(&str, bool, &str); 6] = [
            FROM trait_implementations i JOIN nodes n ON n.id=i.resolved_trait_id
            JOIN files f ON f.id=n.file_id
           WHERE i.resolved_implementor_id=?1
-          ORDER BY n.id LIMIT ?2",
+          ORDER BY f.path GLOB '.cargo/vendor/*/*', n.id LIMIT ?2",
     ),
     (
         "import ->",
@@ -805,7 +837,7 @@ const CHANGE_NEIGHBORS: [(&str, bool, &str); 6] = [
            FROM edges e JOIN nodes n ON n.id=e.target_id
            JOIN files f ON f.id=n.file_id
           WHERE e.source_id=?1 AND e.kind='IMPORTS'
-          ORDER BY e.target_id LIMIT ?2",
+          ORDER BY f.path GLOB '.cargo/vendor/*/*', e.target_id LIMIT ?2",
     ),
 ];
 
@@ -813,11 +845,12 @@ fn traverse_changes(
     connection: &Connection,
     state: &State,
     roots: &[RowNode],
-    depth: u32,
-    max_nodes: usize,
+    limits: (u32, usize),
+    dependency_mode: DependencyMode,
     cancelled: &AtomicBool,
     lines: &mut Vec<String>,
 ) -> Result<bool> {
+    let (depth, max_nodes) = limits;
     let mut visited = roots.iter().map(|node| node.id).collect::<HashSet<_>>();
     let mut current = roots
         .iter()
@@ -825,6 +858,8 @@ fn traverse_changes(
         .collect::<Vec<_>>();
     let mut next = Vec::with_capacity(max_nodes);
     let mut row_budget = max_nodes + 1;
+    let mut dependency_packages = HashSet::new();
+    let mut dependency_omitted = false;
 
     for level in 0..=depth {
         next.clear();
@@ -835,15 +870,19 @@ fn traverse_changes(
                     continue;
                 }
                 check_cancelled(cancelled)?;
-                let limit = row_budget;
-                if limit == 0 {
+                if row_budget == 0 {
                     return Ok(true);
                 }
-                let limit = i64::try_from(limit)
+                let limit = if dependency_mode == DependencyMode::Boundary {
+                    row_budget.saturating_add(DEPENDENCY_NEIGHBOR_SCAN_LIMIT)
+                } else {
+                    row_budget
+                };
+                let sql_limit = i64::try_from(limit)
                     .map_err(|_| "neighbor limit exceeds SQLite range".to_owned())?;
                 let mut fetched = 0;
                 let rows = statement
-                    .query_map(params![source, limit], |row| {
+                    .query_map(params![source, sql_limit], |row| {
                         Ok(RowNode {
                             id: row.get(0)?,
                             kind: row.get(1)?,
@@ -856,8 +895,27 @@ fn traverse_changes(
                 for row in rows {
                     check_cancelled(cancelled)?;
                     fetched += 1;
-                    row_budget -= 1;
                     let node = row.map_err(db_error)?;
+                    if dependency_mode == DependencyMode::Boundary
+                        && let Some(package) = dependency_package(&node.path)
+                    {
+                        if dependency_packages.contains(package) {
+                            continue;
+                        }
+                        if dependency_packages.len() == DEPENDENCY_NEIGHBOR_SCAN_LIMIT {
+                            dependency_omitted = true;
+                            continue;
+                        }
+                        dependency_packages.insert(package.to_owned());
+                        lines.push(format!(
+                            "  {relation} dependency-boundary package={package}\n"
+                        ));
+                        continue;
+                    }
+                    if row_budget == 0 {
+                        return Ok(true);
+                    }
+                    row_budget -= 1;
                     if visited.contains(&node.id) {
                         continue;
                     }
@@ -871,7 +929,7 @@ fn traverse_changes(
                     visited.insert(node.id);
                     next.push((node.id, node.kind == "type"));
                 }
-                if fetched == limit as usize {
+                if fetched == limit {
                     return Ok(true);
                 }
             }
@@ -881,13 +939,14 @@ fn traverse_changes(
         }
         std::mem::swap(&mut current, &mut next);
     }
-    Ok(false)
+    Ok(dependency_omitted)
 }
 
 fn analyze_changed_roots(
     connection: &Connection,
     roots: &[RowNode],
     max_flows: usize,
+    dependency_mode: DependencyMode,
     cancelled: &AtomicBool,
 ) -> Result<ChangeAnalysis> {
     let risk_root_ids = roots
@@ -918,6 +977,7 @@ fn analyze_changed_roots(
         &flow_roots,
         max_flows,
         &mut query_budget,
+        dependency_mode,
         cancelled,
     )?;
     omitted |= entries_omitted;
@@ -933,6 +993,7 @@ fn analyze_changed_roots(
             entry,
             &flow_root_ids,
             &mut query_budget,
+            dependency_mode,
             cancelled,
         )?;
         omitted |= truncated;
@@ -1042,28 +1103,49 @@ fn affected_entries(
     roots: &[FlowNode],
     limit: usize,
     query_budget: &mut usize,
+    dependency_mode: DependencyMode,
     cancelled: &AtomicBool,
 ) -> Result<(Vec<FlowNode>, bool)> {
     let mut entries = Vec::new();
     let mut omitted = false;
     let mut visited = HashSet::new();
+    let mut dependency_packages = HashSet::new();
+    let mut first_party_visited = 0;
     let mut queue = VecDeque::new();
 
     for start in roots.iter().filter(|node| node.kind != "test").cloned() {
         if visited.insert(start.id) {
+            if dependency_mode == DependencyMode::Boundary
+                && let Some(package) = dependency_package(&start.path)
+            {
+                dependency_packages.insert(package.to_owned());
+            } else {
+                first_party_visited += 1;
+            }
             queue.push_back((start, 0_u32));
         }
     }
 
     while let Some((current, depth)) = queue.pop_front() {
         check_cancelled(cancelled)?;
+        if dependency_mode == DependencyMode::Boundary
+            && dependency_package(&current.path).is_some()
+        {
+            continue;
+        }
         if *query_budget == 0 {
             omitted = true;
             break;
         }
         *query_budget -= 1;
-        let remaining = FLOW_SCAN_LIMIT.saturating_sub(visited.len());
-        let (callers, more) = load_flow_neighbors(connection, current.id, true, remaining.max(1))?;
+        let remaining = FLOW_SCAN_LIMIT.saturating_sub(first_party_visited);
+        let (callers, more) = load_flow_neighbors(
+            connection,
+            current.id,
+            true,
+            remaining.max(1),
+            dependency_mode,
+        )?;
         omitted |= more;
 
         if current.kind == "function" && (callers.is_empty() || conventional_entry(&current.name)) {
@@ -1081,10 +1163,23 @@ fn affected_entries(
             if visited.contains(&caller.id) {
                 continue;
             }
-            if visited.len() == FLOW_SCAN_LIMIT {
+            if dependency_mode == DependencyMode::Boundary
+                && let Some(package) = dependency_package(&caller.path)
+            {
+                if dependency_packages.contains(package) {
+                    continue;
+                }
+                if dependency_packages.len() == DEPENDENCY_NEIGHBOR_SCAN_LIMIT {
+                    omitted = true;
+                    continue;
+                }
+                dependency_packages.insert(package.to_owned());
+            } else if first_party_visited == FLOW_SCAN_LIMIT {
                 omitted = true;
                 queue.clear();
                 break;
+            } else {
+                first_party_visited += 1;
             }
             visited.insert(caller.id);
             queue.push_back((caller, depth + 1));
@@ -1098,24 +1193,40 @@ fn trace_flow(
     entry: FlowNode,
     root_ids: &HashSet<i64>,
     query_budget: &mut usize,
+    dependency_mode: DependencyMode,
     cancelled: &AtomicBool,
 ) -> Result<(Option<AffectedFlow>, bool)> {
     let mut nodes = vec![entry.clone()];
     let mut parents = HashMap::new();
     let mut visited = HashSet::from([entry.id]);
+    let mut dependency_packages = dependency_package(&entry.path)
+        .map(|package| HashSet::from([package.to_owned()]))
+        .unwrap_or_default();
+    let mut first_party_visited = usize::from(dependency_packages.is_empty());
     let mut queue = VecDeque::from([(entry.clone(), 0_u32)]);
     let mut depth_reached = 0;
     let mut omitted = false;
 
     while let Some((current, depth)) = queue.pop_front() {
         check_cancelled(cancelled)?;
+        if dependency_mode == DependencyMode::Boundary
+            && dependency_package(&current.path).is_some()
+        {
+            continue;
+        }
         if *query_budget == 0 {
             omitted = true;
             break;
         }
         *query_budget -= 1;
-        let remaining = FLOW_SCAN_LIMIT.saturating_sub(visited.len());
-        let (callees, more) = load_flow_neighbors(connection, current.id, false, remaining.max(1))?;
+        let remaining = FLOW_SCAN_LIMIT.saturating_sub(first_party_visited);
+        let (callees, more) = load_flow_neighbors(
+            connection,
+            current.id,
+            false,
+            remaining.max(1),
+            dependency_mode,
+        )?;
         omitted |= more;
         if depth == FLOW_DEPTH {
             omitted |= callees.iter().any(|node| !visited.contains(&node.id));
@@ -1126,10 +1237,23 @@ fn trace_flow(
             if visited.contains(&callee.id) {
                 continue;
             }
-            if visited.len() == FLOW_SCAN_LIMIT {
+            if dependency_mode == DependencyMode::Boundary
+                && let Some(package) = dependency_package(&callee.path)
+            {
+                if dependency_packages.contains(package) {
+                    continue;
+                }
+                if dependency_packages.len() == DEPENDENCY_NEIGHBOR_SCAN_LIMIT {
+                    omitted = true;
+                    continue;
+                }
+                dependency_packages.insert(package.to_owned());
+            } else if first_party_visited == FLOW_SCAN_LIMIT {
                 omitted = true;
                 queue.clear();
                 break;
+            } else {
+                first_party_visited += 1;
             }
             visited.insert(callee.id);
             parents.insert(callee.id, current.id);
@@ -1199,25 +1323,30 @@ fn load_flow_neighbors(
     id: i64,
     incoming: bool,
     limit: usize,
+    dependency_mode: DependencyMode,
 ) -> Result<(Vec<FlowNode>, bool)> {
-    let sql = if incoming {
-        "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start
-           FROM edges e JOIN nodes n ON n.id=e.source_id
-           JOIN files f ON f.id=n.file_id
-          WHERE e.target_id=?1 AND e.kind='CALLS' AND n.kind='function'
-          ORDER BY n.id LIMIT ?2"
+    let (neighbor, source, kind) = if incoming {
+        ("source_id", "target_id", " AND n.kind='function'")
     } else {
-        "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start
-           FROM edges e JOIN nodes n ON n.id=e.target_id
-           JOIN files f ON f.id=n.file_id
-          WHERE e.source_id=?1 AND e.kind='CALLS'
-          ORDER BY n.id LIMIT ?2"
+        ("target_id", "source_id", "")
     };
     let fetch = limit
         .checked_add(1)
         .ok_or_else(|| "flow neighbor limit overflow".to_owned())?;
     let fetch = i64::try_from(fetch).map_err(|_| "flow neighbor limit exceeds SQLite range")?;
-    let mut statement = connection.prepare(sql).map_err(db_error)?;
+    let path_filter = if dependency_mode == DependencyMode::Boundary {
+        " AND f.path NOT GLOB '.cargo/vendor/*/*'"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start
+           FROM edges e JOIN nodes n ON n.id=e.{neighbor}
+           JOIN files f ON f.id=n.file_id
+          WHERE e.{source}=?1 AND e.kind='CALLS'{kind}{path_filter}
+          ORDER BY n.id LIMIT ?2"
+    );
+    let mut statement = connection.prepare(&sql).map_err(db_error)?;
     let mut nodes = statement
         .query_map(params![id, fetch], flow_node)
         .map_err(db_error)?
@@ -1225,6 +1354,33 @@ fn load_flow_neighbors(
         .map_err(db_error)?;
     let more = nodes.len() > limit;
     nodes.truncate(limit);
+    if dependency_mode == DependencyMode::Boundary {
+        let dependency_fetch = i64::try_from(DEPENDENCY_NEIGHBOR_SCAN_LIMIT + 1)
+            .map_err(|_| "dependency neighbor limit exceeds SQLite range")?;
+        let sql = format!(
+            "SELECT MIN(n.id), MIN(n.kind), MIN(n.name), MIN(n.qualified_name),
+                    MIN(f.path), MIN(n.line_start)
+               FROM edges e JOIN nodes n ON n.id=e.{neighbor}
+               JOIN files f ON f.id=n.file_id
+              WHERE e.{source}=?1 AND e.kind='CALLS'{kind}
+                AND f.path GLOB '.cargo/vendor/*/*'
+              GROUP BY substr(f.path, 15, instr(substr(f.path, 15), '/') - 1)
+              ORDER BY MIN(n.id) LIMIT ?2"
+        );
+        let mut statement = connection.prepare(&sql).map_err(db_error)?;
+        let dependencies = statement
+            .query_map(params![id, dependency_fetch], flow_node)
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        let dependencies_more = dependencies.len() > DEPENDENCY_NEIGHBOR_SCAN_LIMIT;
+        nodes.extend(
+            dependencies
+                .into_iter()
+                .take(DEPENDENCY_NEIGHBOR_SCAN_LIMIT),
+        );
+        return Ok((nodes, more || dependencies_more));
+    }
     Ok((nodes, more))
 }
 
@@ -1420,7 +1576,14 @@ fn score_text(score: u32) -> String {
     format!("{}.{:04}", score / 10_000, score % 10_000)
 }
 
-fn flow_line(flow: &AffectedFlow) -> Result<String> {
+const fn dependency_analysis(mode: DependencyMode) -> &'static str {
+    match mode {
+        DependencyMode::Boundary => "collapsed",
+        DependencyMode::Full => "full",
+    }
+}
+
+fn flow_line(flow: &AffectedFlow, dependency_mode: DependencyMode) -> Result<String> {
     let changed = flow
         .nodes
         .iter()
@@ -1442,6 +1605,42 @@ fn flow_line(flow: &AffectedFlow) -> Result<String> {
         route.push(parent);
     }
     route.reverse();
+    if dependency_mode == DependencyMode::Boundary {
+        let mut best_tail: Option<Vec<i64>> = None;
+        for boundary in flow
+            .nodes
+            .iter()
+            .filter(|node| dependency_package(&node.path).is_some())
+        {
+            let mut tail = vec![boundary.id];
+            let mut current = boundary.id;
+            while current != changed {
+                let Some(parent) = flow.parents.get(&current).copied() else {
+                    tail.clear();
+                    break;
+                };
+                if tail.contains(&parent) || tail.len() > FLOW_DEPTH as usize {
+                    return Err("affected flow path is cyclic".into());
+                }
+                tail.push(parent);
+                current = parent;
+            }
+            if tail.is_empty() {
+                continue;
+            }
+            tail.reverse();
+            tail.remove(0);
+            if best_tail
+                .as_ref()
+                .is_none_or(|best| (tail.len(), &tail) < (best.len(), best))
+            {
+                best_tail = Some(tail);
+            }
+        }
+        if let Some(tail) = best_tail {
+            route.extend(tail);
+        }
+    }
 
     let mut output = format!(
         "flow {} depth={} nodes={} files={} changed={} ",
@@ -1458,11 +1657,21 @@ fn flow_line(flow: &AffectedFlow) -> Result<String> {
             .find(|node| node.id == id)
             .ok_or_else(|| "affected flow node is missing".to_owned())?;
         let mut step = String::new();
-        if !push_escaped(&mut step, &node.name, usize::MAX)
-            || !push_literal(&mut step, "@", usize::MAX)
-            || !push_escaped(&mut step, &node.path, usize::MAX)
-            || !push_literal(&mut step, &format!(":{}", node.line), usize::MAX)
+        let complete = if dependency_mode == DependencyMode::Boundary
+            && let Some(package) = dependency_package(&node.path)
         {
+            push_literal(
+                &mut step,
+                &format!("dependency-boundary[{package}]"),
+                usize::MAX,
+            )
+        } else {
+            push_escaped(&mut step, &node.name, usize::MAX)
+                && push_literal(&mut step, "@", usize::MAX)
+                && push_escaped(&mut step, &node.path, usize::MAX)
+                && push_literal(&mut step, &format!(":{}", node.line), usize::MAX)
+        };
+        if !complete {
             return Err("affected flow line exceeds address space".into());
         }
         let separator = if index == 0 { "" } else { " -> " };
@@ -3138,7 +3347,9 @@ mod tests {
             patch: String::new(),
             skipped_paths: 0,
         };
-        let output = store.changes(&changes, 6, 50, &cancelled).unwrap();
+        let output = store
+            .changes(&changes, 6, 50, DependencyMode::Boundary, &cancelled)
+            .unwrap();
         assert!(output.contains(" n6 "), "{output}");
         assert!(!output.contains(" n7 "), "{output}");
         assert!(output.contains("neighborhood_omitted=true"), "{output}");
@@ -3149,7 +3360,11 @@ mod tests {
                 .view(&format!("{}:{}:1", state.epoch, state.generation), 7, 50)
                 .is_err()
         );
-        assert!(store.changes(&changes, 7, 50, &cancelled).is_err());
+        assert!(
+            store
+                .changes(&changes, 7, 50, DependencyMode::Boundary, &cancelled)
+                .is_err()
+        );
     }
 
     #[test]
@@ -3251,7 +3466,9 @@ mod tests {
             patch: String::new(),
             skipped_paths: 0,
         };
-        let output = store.changes(&changes, 1, 10, &cancelled).unwrap();
+        let output = store
+            .changes(&changes, 1, 10, DependencyMode::Boundary, &cancelled)
+            .unwrap();
         assert!(
             output.contains(
                 "risk overall=0.4200 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown direct_test_gaps=0 analysis_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
@@ -3273,7 +3490,9 @@ mod tests {
         );
         assert!(!output.contains(TRUNCATED.trim()), "{output}");
 
-        let depth_zero = store.changes(&changes, 0, 10, &cancelled).unwrap();
+        let depth_zero = store
+            .changes(&changes, 0, 10, DependencyMode::Boundary, &cancelled)
+            .unwrap();
         assert!(
             depth_zero.contains("neighborhood_omitted=true"),
             "{depth_zero}"
@@ -3292,7 +3511,9 @@ mod tests {
             patch: String::new(),
             skipped_paths: 0,
         };
-        let output = store.changes(&unmapped, 0, 10, &cancelled).unwrap();
+        let output = store
+            .changes(&unmapped, 0, 10, DependencyMode::Boundary, &cancelled)
+            .unwrap();
         assert!(output.contains(" File src/lib.rs src/lib.rs:1"), "{output}");
         assert!(
             output.contains("flow 0.1200 depth=2 nodes=3 files=1 changed=3"),
@@ -3320,7 +3541,9 @@ mod tests {
             patch: String::new(),
             skipped_paths: 0,
         };
-        let output = store.changes(&type_change, 0, 10, &cancelled).unwrap();
+        let output = store
+            .changes(&type_change, 0, 10, DependencyMode::Boundary, &cancelled)
+            .unwrap();
         assert!(output.contains(" Type imported src/lib.rs:11"), "{output}");
         assert!(output.contains("flow 0.1200"), "{output}");
 
@@ -3346,7 +3569,9 @@ mod tests {
             });
             flooded.records.push(PathRecord::Untracked(path));
         }
-        let output = store.changes(&flooded, 1, 10, &cancelled).unwrap();
+        let output = store
+            .changes(&flooded, 1, 10, DependencyMode::Boundary, &cancelled)
+            .unwrap();
         assert!(output.contains(" root "), "{output}");
         assert!(output.contains("test <-"), "{output}");
         assert!(output.contains("caller <-"), "{output}");
@@ -3471,7 +3696,9 @@ mod tests {
             .index_with(&cancelled, |_full, _existing| Ok((graph(true), ())))
             .unwrap();
 
-        let output = store.changes(&changes(), 0, 10, &cancelled).unwrap();
+        let output = store
+            .changes(&changes(), 0, 10, DependencyMode::Boundary, &cancelled)
+            .unwrap();
         assert!(output.contains("unmapped src/lib.rs:1-4,6-7"), "{output}");
 
         let renamed = WorktreeChanges {
@@ -3489,14 +3716,18 @@ mod tests {
             patch: String::new(),
             skipped_paths: 0,
         };
-        let output = store.changes(&renamed, 0, 10, &cancelled).unwrap();
+        let output = store
+            .changes(&renamed, 0, 10, DependencyMode::Boundary, &cancelled)
+            .unwrap();
         assert!(output.contains("unmapped src/lib.rs:1\n"), "{output}");
         assert!(!output.contains("unmapped src/lib.rs:1-4,6-7"), "{output}");
 
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph(false), ())))
             .unwrap();
-        let output = store.changes(&changes(), 0, 10, &cancelled).unwrap();
+        let output = store
+            .changes(&changes(), 0, 10, DependencyMode::Boundary, &cancelled)
+            .unwrap();
         assert!(output.contains("unmapped src/lib.rs:1-7"), "{output}");
         assert!(!output.contains("unmapped src/lib.rs:1\n"), "{output}");
     }
@@ -3518,6 +3749,7 @@ mod tests {
                 },
                 0,
                 10,
+                DependencyMode::Boundary,
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -3589,6 +3821,7 @@ mod tests {
                 },
                 0,
                 10,
+                DependencyMode::Boundary,
                 &cancelled,
             )
             .unwrap();
@@ -3642,6 +3875,7 @@ mod tests {
                 },
                 0,
                 50,
+                DependencyMode::Boundary,
                 &cancelled,
             )
             .unwrap();
@@ -3706,6 +3940,7 @@ mod tests {
                 },
                 0,
                 50,
+                DependencyMode::Boundary,
                 &cancelled,
             )
             .unwrap();
@@ -3841,6 +4076,7 @@ mod tests {
                 },
                 0,
                 10,
+                DependencyMode::Boundary,
                 &cancelled,
             )
             .unwrap();
@@ -3980,11 +4216,196 @@ mod tests {
                 },
                 1,
                 3,
+                DependencyMode::Boundary,
                 &cancelled,
             )
             .unwrap();
 
         assert!(!output.contains(TRUNCATED.trim()), "{output}");
+    }
+
+    #[test]
+    fn boundary_neighbors_do_not_spend_the_first_party_budget() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let mut graph = single_node_graph("root");
+        graph.files.extend([
+            FileInput {
+                path: ".cargo/vendor/sha2/src/lib.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [1; 32],
+                parse_context: String::new(),
+                byte_size: 1,
+                replace: true,
+            },
+            FileInput {
+                path: "src/other.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [2; 32],
+                parse_context: String::new(),
+                byte_size: 1,
+                replace: true,
+            },
+        ]);
+        for index in 0..100 {
+            let key = format!("vendor_{index:03}");
+            let mut node = function_node(&key, 1);
+            node.file_key = ".cargo/vendor/sha2/src/lib.rs".into();
+            graph.nodes.push(node);
+            graph.edges.push(EdgeInput {
+                source_key: "root".into(),
+                target_key: key,
+                kind: EdgeKind::Calls,
+                support_count: 1,
+            });
+        }
+        let mut first_party = function_node("first_party", 1);
+        first_party.file_key = "src/other.rs".into();
+        graph.nodes.push(first_party);
+        graph.edges.push(EdgeInput {
+            source_key: "root".into(),
+            target_key: "first_party".into(),
+            kind: EdgeKind::Calls,
+            support_count: 1,
+        });
+        let cancelled = AtomicBool::new(false);
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        let output = store
+            .changes(
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        whole_file: true,
+                        spans: vec![],
+                        report_unmapped: false,
+                    }],
+                    records: vec![],
+                    paths: vec![],
+                    patch: String::new(),
+                    skipped_paths: 0,
+                },
+                1,
+                3,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+
+        assert!(output.contains("first_party src/other.rs:1"), "{output}");
+        assert!(
+            output.contains("call -> dependency-boundary package=sha2"),
+            "{output}"
+        );
+        assert!(output.contains("neighborhood_omitted=false"), "{output}");
+        assert!(!output.contains("vendor_099"), "{output}");
+    }
+
+    #[test]
+    fn boundary_flows_collapse_vendor_fanout_before_the_scan_budget() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let mut graph = single_node_graph("root");
+        graph.files.extend([
+            FileInput {
+                path: ".cargo/vendor/sha2/src/lib.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [1; 32],
+                parse_context: String::new(),
+                byte_size: 1,
+                replace: true,
+            },
+            FileInput {
+                path: "src/other.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [2; 32],
+                parse_context: String::new(),
+                byte_size: 1,
+                replace: true,
+            },
+            FileInput {
+                path: ".cargo/vendor/block-buffer/src/lib.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [3; 32],
+                parse_context: String::new(),
+                byte_size: 1,
+                replace: true,
+            },
+        ]);
+        for index in 0..FLOW_SCAN_LIMIT {
+            let key = format!("vendor_{index:03}");
+            let mut node = function_node(&key, 1);
+            node.file_key = ".cargo/vendor/sha2/src/lib.rs".into();
+            graph.nodes.push(node);
+            graph.edges.push(EdgeInput {
+                source_key: "root".into(),
+                target_key: key,
+                kind: EdgeKind::Calls,
+                support_count: 1,
+            });
+        }
+        let mut nested_dependency = function_node("nested_dependency", 1);
+        nested_dependency.file_key = ".cargo/vendor/block-buffer/src/lib.rs".into();
+        graph.nodes.push(nested_dependency);
+        graph.edges.push(EdgeInput {
+            source_key: "vendor_000".into(),
+            target_key: "nested_dependency".into(),
+            kind: EdgeKind::Calls,
+            support_count: 1,
+        });
+        let mut first_party = function_node("first_party", 1);
+        first_party.file_key = "src/other.rs".into();
+        graph.nodes.push(first_party);
+        graph.edges.push(EdgeInput {
+            source_key: "root".into(),
+            target_key: "first_party".into(),
+            kind: EdgeKind::Calls,
+            support_count: 1,
+        });
+        let cancelled = AtomicBool::new(false);
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        let entry = load_flow_nodes(&store.connection, &[1]).unwrap().remove(0);
+        let mut query_budget = FLOW_QUERY_LIMIT;
+        let (flow, omitted) = trace_flow(
+            &store.connection,
+            entry,
+            &HashSet::from([1]),
+            &mut query_budget,
+            DependencyMode::Boundary,
+            &cancelled,
+        )
+        .unwrap();
+        let flow = flow.unwrap();
+
+        assert!(!omitted);
+        assert!(flow.nodes.iter().any(|node| node.name == "first_party"));
+        assert!(
+            !flow
+                .nodes
+                .iter()
+                .any(|node| node.name == "nested_dependency")
+        );
+        assert_eq!(
+            flow.nodes
+                .iter()
+                .filter(|node| dependency_package(&node.path).is_some())
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -4012,6 +4433,64 @@ mod tests {
         let (neighbors, more) = load_neighbors(&store.connection, 1, 3, false, false).unwrap();
         assert_eq!(neighbors.len(), 3);
         assert!(more);
+    }
+
+    #[test]
+    fn boundary_flow_keeps_one_dependency_terminal() {
+        let entry = FlowNode {
+            id: 1,
+            kind: "function".into(),
+            name: "entry".into(),
+            qualified_name: "entry".into(),
+            path: "src/lib.rs".into(),
+            line: 1,
+        };
+        let changed = FlowNode {
+            id: 2,
+            kind: "function".into(),
+            name: "digest".into(),
+            qualified_name: "digest".into(),
+            path: "src/canonical.rs".into(),
+            line: 2,
+        };
+        let helper = FlowNode {
+            id: 3,
+            kind: "function".into(),
+            name: "helper".into(),
+            qualified_name: "helper".into(),
+            path: "src/canonical.rs".into(),
+            line: 3,
+        };
+        let dependency = FlowNode {
+            id: 4,
+            kind: "function".into(),
+            name: "internal_digest".into(),
+            qualified_name: "internal_digest".into(),
+            path: ".cargo/vendor/sha2/src/lib.rs".into(),
+            line: 4,
+        };
+        let dependency_internal = FlowNode {
+            id: 5,
+            kind: "function".into(),
+            name: "compress".into(),
+            qualified_name: "compress".into(),
+            path: ".cargo/vendor/sha2/src/internal.rs".into(),
+            line: 5,
+        };
+        let flow = AffectedFlow {
+            entry: entry.clone(),
+            nodes: vec![entry, changed, helper, dependency, dependency_internal],
+            parents: HashMap::from([(2, 1), (3, 2), (4, 3), (5, 4)]),
+            changed: vec![2],
+            depth: 4,
+            file_count: 4,
+            criticality: 1_000,
+        };
+
+        assert_eq!(
+            flow_line(&flow, DependencyMode::Boundary).unwrap(),
+            "flow 0.1000 depth=4 nodes=5 files=4 changed=1 entry@src/lib.rs:1 -> digest@src/canonical.rs:2 -> helper@src/canonical.rs:3 -> dependency-boundary[sha2]\n"
+        );
     }
 
     fn single_node_graph(name: &str) -> Graph {

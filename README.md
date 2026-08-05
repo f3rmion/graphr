@@ -23,11 +23,11 @@ Graphr detects Rust and Python sources automatically and exposes four MCP tools:
 - `index` reparses only dirty, untracked, or Git-OID-changed files.
 - `search` finds symbols and returns compact `node_ref` values.
 - `view` traverses callers, callees, and related tests up to six graph hops.
-- `changes` returns bounded 8 KiB review pages with every safe changed path, a count of skipped unsafe paths, the supported-source diff, risk-ranked changed symbols, affected static execution paths, and graph impact.
+- `changes` returns bounded 8 KiB review pages with every safe changed path, a count of skipped unsafe paths, tracked and untracked supported-source diffs, risk-ranked changed symbols, affected static execution paths, and graph impact. `.cargo/vendor` changes collapse to deterministic package boundaries by default; pass `dependency_mode="full"` to inspect dependency internals.
 
 Affected-flow discovery follows `CALLS` edges up to 15 hops. These are possible source-level call chains, not recorded runtime call stacks. Risk scores use flow, test, security-name, and caller signals; community and churn factors are not used.
 
-The server indexes when it starts. Run `index` after source changes. For reviews, start with `changes` and pass every returned `files_next_cursor`, `diff_next_cursor`, and `graph_next_cursor` back as `cursor` until each section is complete. Those cursors read one immutable snapshot; a new cursorless call replaces it. Coverage is complete only when all cursors are exhausted and `review_complete_when_pages_exhausted=true`. Use `search` and `view` for exploration, not to fill review-page omissions.
+The server indexes when it starts. Run `index` after source changes. For reviews, start with `changes` and pass every returned `files_next_cursor`, `diff_next_cursor`, and `graph_next_cursor` back as `cursor` with the same `dependency_mode` until each section is complete. Those cursors read one immutable snapshot; a new cursorless call replaces it. Coverage is complete only when all cursors are exhausted and `review_complete_when_pages_exhausted=true`. Use `search` and `view` for exploration, not to fill review-page omissions.
 
 Rename detection is limited to supported regular Rust and Python sources. Unsupported renames are conservatively listed as separate additions and deletions.
 

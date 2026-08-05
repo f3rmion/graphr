@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -33,6 +32,27 @@ pub struct Source {
 pub enum Language {
     Rust,
     Python,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DependencyMode {
+    #[default]
+    Boundary,
+    Full,
+}
+
+impl DependencyMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Boundary => "boundary",
+            Self::Full => "full",
+        }
+    }
+}
+
+pub fn dependency_package(path: &str) -> Option<&str> {
+    let (package, file) = path.strip_prefix(".cargo/vendor/")?.split_once('/')?;
+    (!package.is_empty() && !file.is_empty()).then_some(package)
 }
 
 impl Language {
@@ -107,6 +127,16 @@ pub struct ChangedPath {
     pub deletions: Option<u64>,
 }
 
+pub fn changed_dependency_package(path: &ChangedPath) -> Option<&str> {
+    let package = dependency_package(&path.path)?;
+    if let Some(old) = path.old_path.as_deref()
+        && dependency_package(old) != Some(package)
+    {
+        return None;
+    }
+    Some(package)
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct WorktreeChanges {
     pub files: Vec<ChangedFile>,
@@ -124,6 +154,7 @@ struct WorktreeCapture {
 
 struct UntrackedSnapshot {
     paths: Vec<ChangedPath>,
+    patch: Vec<u8>,
     skipped_paths: usize,
     signature: [u8; 32],
 }
@@ -229,11 +260,12 @@ impl Repository {
     pub fn worktree_changes(
         &self,
         base: &str,
+        dependency_mode: DependencyMode,
         cancelled: &AtomicBool,
     ) -> Result<WorktreeChanges, String> {
         validate_base(base)?;
         let revision = format!("{base}^{{commit}}");
-        let capture = || {
+        let capture = |include_untracked_patch| {
             thread::scope(|scope| {
                 let untracked = scope.spawn(|| {
                     let output = run(
@@ -241,7 +273,13 @@ impl Repository {
                         &["ls-files", "--others", "--exclude-standard", "-z"],
                         cancelled,
                     )?;
-                    capture_untracked(&self.root, &output, cancelled)
+                    capture_untracked(
+                        &self.root,
+                        &output,
+                        dependency_mode,
+                        include_untracked_patch,
+                        cancelled,
+                    )
                 });
                 let inventory = scope.spawn(|| {
                     run(
@@ -262,35 +300,35 @@ impl Repository {
                         cancelled,
                     )
                 });
-                let tracked = run(
-                    &self.root,
-                    &[
-                        "diff-index",
-                        "--raw",
-                        "-z",
-                        "--patch",
-                        "--unified=0",
-                        "--abbrev=64",
-                        "--find-renames=50%",
-                        "-l0",
-                        "--diff-filter=AMDR",
-                        "--diff-algorithm=myers",
-                        "--no-indent-heuristic",
-                        "-O/dev/null",
-                        "--no-color",
-                        "--src-prefix=a/",
-                        "--dst-prefix=b/",
-                        "--no-ext-diff",
-                        "--no-textconv",
-                        "--ignore-submodules=all",
-                        "--text",
-                        &revision,
-                        "--",
-                        "*.rs",
-                        "*.py",
-                    ],
-                    cancelled,
-                );
+                let mut tracked_args = vec![
+                    "diff-index",
+                    "--raw",
+                    "-z",
+                    "--patch",
+                    "--unified=0",
+                    "--abbrev=64",
+                    "--find-renames=50%",
+                    "-l0",
+                    "--diff-filter=AMDR",
+                    "--diff-algorithm=myers",
+                    "--no-indent-heuristic",
+                    "-O/dev/null",
+                    "--no-color",
+                    "--src-prefix=a/",
+                    "--dst-prefix=b/",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--ignore-submodules=all",
+                    "--text",
+                    &revision,
+                    "--",
+                    "*.rs",
+                    "*.py",
+                ];
+                if dependency_mode == DependencyMode::Boundary {
+                    tracked_args.push(":(glob,exclude).cargo/vendor/*/**");
+                }
+                let tracked = run(&self.root, &tracked_args, cancelled);
                 let untracked = untracked
                     .join()
                     .map_err(|_| "Git inventory worker panicked".to_owned())?;
@@ -306,17 +344,23 @@ impl Repository {
         };
         // ponytail: two stable samples reject ordinary concurrent edits; use a
         // filesystem snapshot if adversarial ABA mutations ever matter.
-        let first = capture()?;
+        let first = capture(false)?;
         let signature = worktree_signature(&first);
         drop(first);
-        let outputs = capture()?;
+        let outputs = capture(true)?;
         if signature != worktree_signature(&outputs) {
             return Err("Git working tree changed while reading; retry".into());
         }
         let tracked = parse_tracked_changes(&outputs.tracked, cancelled)?;
         let inventory = parse_change_inventory(&outputs.inventory, cancelled)?;
         check_cancelled(cancelled)?;
-        merge_changes(tracked, inventory, outputs.untracked, cancelled)
+        merge_changes(
+            tracked,
+            inventory,
+            outputs.untracked,
+            dependency_mode,
+            cancelled,
+        )
     }
 
     pub fn read_source(
@@ -417,6 +461,8 @@ fn read_regular_file(
 fn capture_untracked(
     root: &Path,
     input: &[u8],
+    dependency_mode: DependencyMode,
+    include_patch: bool,
     cancelled: &AtomicBool,
 ) -> Result<UntrackedSnapshot, String> {
     if !input.is_empty() && !input.ends_with(&[0]) {
@@ -426,12 +472,17 @@ fn capture_untracked(
     hash.update(&(input.len() as u64).to_le_bytes());
     hash.update(input);
     let mut paths = Vec::new();
+    let mut patch = Vec::new();
     let mut skipped_paths = 0;
     let mut files_left = UNTRACKED_STATS_FILE_LIMIT;
     let mut bytes_left = UNTRACKED_STATS_BYTE_LIMIT;
+    // ponytail: one Git process per supported untracked file, all sharing one
+    // deadline; batch only if large untracked source sets become routine.
+    let patch_deadline = Instant::now() + DEADLINE;
     if input.is_empty() {
         return Ok(UntrackedSnapshot {
             paths,
+            patch,
             skipped_paths,
             signature: *hash.finalize().as_bytes(),
         });
@@ -452,14 +503,17 @@ fn capture_untracked(
             continue;
         };
         let before = safe_regular_metadata(root, &path);
-        let content = if before.is_some() && files_left > 0 && bytes_left > 0 {
-            files_left -= 1;
-            // ponytail: sample at most 256 files/2 MiB; raise these caps only if
-            // exact all-untracked statistics justify the filesystem exposure.
-            read_regular_file(root, &path, bytes_left, cancelled)?
-        } else {
-            None
-        };
+        let boundary_dependency =
+            dependency_mode == DependencyMode::Boundary && dependency_package(&path).is_some();
+        let content =
+            if !boundary_dependency && before.is_some() && files_left > 0 && bytes_left > 0 {
+                files_left -= 1;
+                // ponytail: sample at most 256 files/2 MiB; raise these caps only if
+                // exact all-untracked statistics justify the filesystem exposure.
+                read_regular_file(root, &path, bytes_left, cancelled)?
+            } else {
+                None
+            };
         let after = safe_regular_metadata(root, &path);
         let regular = match (&before, &after) {
             (Some(before), Some(after)) if same_file_version(before, after) => true,
@@ -470,7 +524,7 @@ fn capture_untracked(
         if let Some(metadata) = &after {
             hash_file_version(&mut hash, metadata);
         }
-        let (additions, deletions) = if let Some(content) = content {
+        let (mut additions, mut deletions) = if let Some(content) = content {
             bytes_left -= content.len() as u64;
             hash.update(&(content.len() as u64).to_le_bytes());
             hash.update(&content);
@@ -487,6 +541,28 @@ fn capture_untracked(
             hash.update(&u64::MAX.to_le_bytes());
             (None, None)
         };
+        if regular
+            && !boundary_dependency
+            && include_patch
+            && language_for_path(&path).is_some()
+            && after
+                .as_ref()
+                .is_some_and(|metadata| metadata.len() <= SOURCE_LIMIT)
+        {
+            let file_patch = untracked_patch(root, &path, patch_deadline, cancelled)?;
+            let current = safe_regular_metadata(root, &path)
+                .ok_or_else(|| format!("file changed while reading: {path}"))?;
+            if !same_file_version(after.as_ref().expect("regular file has metadata"), &current) {
+                return Err(format!("file changed while reading: {path}"));
+            }
+            let parsed = parse_patch_hunks(&file_patch, 1, cancelled)?;
+            additions = Some(parsed[0].additions);
+            deletions = Some(parsed[0].deletions);
+            if patch.len().saturating_add(file_patch.len()) > STDOUT_LIMIT {
+                return Err("Git output exceeded its limit".into());
+            }
+            patch.extend_from_slice(&file_patch);
+        }
         paths.push(ChangedPath {
             status: ChangeStatus::Untracked,
             old_path: None,
@@ -499,9 +575,54 @@ fn capture_untracked(
     }
     Ok(UntrackedSnapshot {
         paths,
+        patch,
         skipped_paths,
         signature: *hash.finalize().as_bytes(),
     })
+}
+
+fn untracked_patch(
+    root: &Path,
+    path: &str,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    let mut patch = run_git(
+        root,
+        &[
+            "diff",
+            "--no-index",
+            "--unified=0",
+            "--abbrev=64",
+            "--no-renames",
+            "--diff-algorithm=myers",
+            "--no-indent-heuristic",
+            "-O/dev/null",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--text",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--",
+            "/dev/null",
+            path,
+        ],
+        true,
+        true,
+        deadline,
+        cancelled,
+    )?;
+    // A no-index diff outside the repository always hashes with SHA-1. The
+    // header is not needed for review hunks, so omit it rather than claim the
+    // wrong object format for SHA-256 repositories.
+    if let Some(start) = patch.windows(7).position(|window| window == b"\nindex ") {
+        let start = start + 1;
+        if let Some(end) = patch[start..].iter().position(|byte| *byte == b'\n') {
+            patch.drain(start..start + end + 1);
+        }
+    }
+    Ok(patch)
 }
 
 fn safe_regular_metadata(root: &Path, path: &str) -> Option<fs::Metadata> {
@@ -944,6 +1065,7 @@ fn validate_supported_projection(
     files: &[ChangedFile],
     records: &[PathRecord],
     paths: &[ChangedPath],
+    dependency_mode: DependencyMode,
 ) -> Result<(), String> {
     let mut actual = files
         .iter()
@@ -959,6 +1081,10 @@ fn validate_supported_projection(
 
     let mut expected = Vec::new();
     for path in paths {
+        if dependency_mode == DependencyMode::Boundary && changed_dependency_package(path).is_some()
+        {
+            continue;
+        }
         match path.status {
             ChangeStatus::Added | ChangeStatus::Modified if path.language.is_some() => {
                 expected.push(SupportedProjection::Current(path.path.clone()));
@@ -1005,6 +1131,7 @@ fn apply_supported_stats(
     paths: &mut [ChangedPath],
     stats: Vec<TrackedStat>,
     mut omitted: HashSet<String>,
+    dependency_mode: DependencyMode,
 ) -> Result<(), String> {
     let mut by_path = HashMap::new();
     for stat in stats {
@@ -1016,6 +1143,10 @@ fn apply_supported_stats(
         }
     }
     for path in paths {
+        if dependency_mode == DependencyMode::Boundary && changed_dependency_package(path).is_some()
+        {
+            continue;
+        }
         let key = match path.status {
             ChangeStatus::Added | ChangeStatus::Modified | ChangeStatus::Deleted
                 if path.language.is_some() =>
@@ -1222,24 +1353,34 @@ fn parse_decimal(input: &[u8]) -> Result<u64, String> {
 
 fn merge_changes(
     tracked: TrackedChanges,
-    (mut paths, mut skipped_paths): (Vec<ChangedPath>, usize),
+    inventory: (Vec<ChangedPath>, usize),
     untracked: UntrackedSnapshot,
+    dependency_mode: DependencyMode,
     cancelled: &AtomicBool,
 ) -> Result<WorktreeChanges, String> {
+    let (mut paths, mut skipped_paths) = inventory;
     let TrackedChanges {
         mut files,
         mut records,
-        patch,
+        mut patch,
         stats,
         omitted_stats,
     } = tracked;
     coalesce_supported_renames(&mut paths, &records)?;
-    validate_supported_projection(&files, &records, &paths)?;
-    apply_supported_stats(&mut paths, stats, omitted_stats)?;
-    skipped_paths += untracked.skipped_paths;
-    for (index, path) in untracked.paths.into_iter().enumerate() {
+    validate_supported_projection(&files, &records, &paths, dependency_mode)?;
+    apply_supported_stats(&mut paths, stats, omitted_stats, dependency_mode)?;
+    let UntrackedSnapshot {
+        paths: untracked_paths,
+        patch: untracked_patch,
+        skipped_paths: untracked_skipped_paths,
+        signature: _,
+    } = untracked;
+    skipped_paths += untracked_skipped_paths;
+    for (index, path) in untracked_paths.into_iter().enumerate() {
         check_progress(index, cancelled)?;
-        if path.language.is_some() {
+        if path.language.is_some()
+            && (dependency_mode == DependencyMode::Full || dependency_package(&path.path).is_none())
+        {
             records.push(PathRecord::Untracked(path.path.clone()));
             files.push(ChangedFile {
                 path: path.path.clone(),
@@ -1250,6 +1391,11 @@ fn merge_changes(
         }
         paths.push(path);
     }
+    let untracked_patch = String::from_utf8_lossy(&untracked_patch);
+    if patch.len().saturating_add(untracked_patch.len()) > STDOUT_LIMIT {
+        return Err("Git output exceeded its limit".into());
+    }
+    patch.push_str(&untracked_patch);
     check_cancelled(cancelled)?;
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     let mut merged = Vec::<ChangedFile>::with_capacity(files.len());
@@ -1486,26 +1632,65 @@ fn parse_path(output: &[u8]) -> Result<PathBuf, String> {
 }
 
 fn run(cwd: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Vec<u8>, String> {
+    run_git(
+        cwd,
+        args,
+        false,
+        false,
+        Instant::now() + DEADLINE,
+        cancelled,
+    )
+}
+
+fn run_git(
+    cwd: &Path,
+    args: &[&str],
+    allow_diff_exit: bool,
+    isolate_repository: bool,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, String> {
     if cancelled.load(Ordering::Relaxed) {
         return Err("Git cancelled".into());
     }
-    let mut child = Command::new("git")
-        .args(["--no-pager", "-c", "core.fsmonitor=false", "-C"])
+    if Instant::now() >= deadline {
+        return Err("Git timed out".into());
+    }
+    let mut command = Command::new("git");
+    command.args(["--no-pager", "-c", "core.fsmonitor=false"]);
+    if isolate_repository {
+        command.args(["-c", "core.attributesFile=/dev/null"]);
+    }
+    command
+        .arg("-C")
         .arg(cwd)
         .args(args)
         .env("LC_ALL", "C")
         .env("GIT_PAGER", "cat")
         .env("GIT_NO_LAZY_FETCH", "1")
-        .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_NOSYSTEM")
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_ATTR_NOSYSTEM")
         .env_remove("GIT_LITERAL_PATHSPECS")
         .env_remove("GIT_GLOB_PATHSPECS")
         .env_remove("GIT_NOGLOB_PATHSPECS")
-        .env_remove("GIT_ICASE_PATHSPECS")
+        .env_remove("GIT_ICASE_PATHSPECS");
+    if isolate_repository {
+        command
+            .env("GIT_DIR", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1");
+    } else {
+        command.env_remove("GIT_DIR");
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1521,7 +1706,6 @@ fn run(cwd: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Vec<u8>, Str
     });
     let stderr_thread = thread::spawn(move || read_capped(stderr, STDERR_LIMIT, overflow_tx));
 
-    let started = Instant::now();
     let status = loop {
         if cancelled.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -1533,7 +1717,7 @@ fn run(cwd: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Vec<u8>, Str
             let _ = child.wait();
             break Err("Git output exceeded its limit".to_owned());
         }
-        if started.elapsed() >= DEADLINE {
+        if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             break Err("Git timed out".to_owned());
@@ -1552,7 +1736,7 @@ fn run(cwd: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Vec<u8>, Str
     let stdout = join(stdout_thread)?;
     let stderr = join(stderr_thread)?;
     let status = status?;
-    if status.success() {
+    if status.success() || allow_diff_exit && status.code() == Some(1) {
         Ok(stdout)
     } else {
         let detail = sanitize(&stderr);
@@ -1612,6 +1796,11 @@ mod tests {
         assert!(parse_path(b"").is_err());
         assert!(parse_path(b"/tmp/a\nb\n").is_err());
         assert!(parse_path(&[0xff]).is_err());
+        assert_eq!(
+            dependency_package(".cargo/vendor/sha2/src/lib.rs"),
+            Some("sha2")
+        );
+        assert_eq!(dependency_package(".cargo/vendor/build.rs"), None);
     }
 
     #[test]
@@ -1699,7 +1888,7 @@ mod tests {
             report_unmapped: true,
         }];
         let records = vec![PathRecord::Deleted("safe.py".into())];
-        validate_supported_projection(&files, &records, &paths).unwrap();
+        validate_supported_projection(&files, &records, &paths, DependencyMode::Boundary).unwrap();
         apply_supported_stats(
             &mut paths,
             vec![
@@ -1715,6 +1904,7 @@ mod tests {
                 },
             ],
             HashSet::new(),
+            DependencyMode::Boundary,
         )
         .unwrap();
         assert_eq!(
@@ -1787,9 +1977,11 @@ mod tests {
             parse_change_inventory(&inventory, &AtomicBool::new(false)).unwrap(),
             UntrackedSnapshot {
                 paths: Vec::new(),
+                patch: Vec::new(),
                 skipped_paths: 0,
                 signature: [0; 32],
             },
+            DependencyMode::Boundary,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1810,16 +2002,80 @@ mod tests {
         fs::write(root.join("fixture.tsv"), "one\n").unwrap();
         std::os::unix::fs::symlink("fixture.tsv", root.join("link.rs")).unwrap();
 
-        let first =
-            capture_untracked(&root, b"fixture.tsv\0link.rs\0", &AtomicBool::new(false)).unwrap();
+        let first = capture_untracked(
+            &root,
+            b"fixture.tsv\0link.rs\0",
+            DependencyMode::Boundary,
+            false,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         fs::write(root.join("fixture.tsv"), "two\n").unwrap();
-        let second =
-            capture_untracked(&root, b"fixture.tsv\0link.rs\0", &AtomicBool::new(false)).unwrap();
+        let second = capture_untracked(
+            &root,
+            b"fixture.tsv\0link.rs\0",
+            DependencyMode::Boundary,
+            false,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
 
         assert_eq!(first.paths[0].additions, second.paths[0].additions);
         assert_ne!(first.signature, second.signature);
         assert_eq!(second.paths[1].language, None);
         assert_eq!(second.paths[1].additions, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn untracked_patch_outlives_the_stats_sample() {
+        let root = temp_root("untracked-patch-sample");
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(root.join(".gitattributes"), "*.rs filter=replace\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["config", "filter.replace.clean", "sh -c 'printf FILTERED'",])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut input = Vec::new();
+        fs::write(root.join("empty.rs"), "").unwrap();
+        input.extend_from_slice(b"empty.rs\0");
+        for index in 0..=UNTRACKED_STATS_FILE_LIMIT {
+            let path = format!("file-{index:03}.rs");
+            fs::write(root.join(&path), format!("fn value_{index}() {{}}\n")).unwrap();
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+
+        let snapshot = capture_untracked(
+            &root,
+            &input,
+            DependencyMode::Boundary,
+            true,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.paths.len(), UNTRACKED_STATS_FILE_LIMIT + 2);
+        assert_eq!(snapshot.paths[0].additions, Some(0));
+        assert_eq!(snapshot.paths.last().unwrap().additions, Some(1));
+        let patch = String::from_utf8_lossy(&snapshot.patch);
+        assert!(!patch.contains("FILTERED"));
+        assert!(!patch.lines().any(|line| line.starts_with("index ")));
+        assert!(patch.contains("diff --git a/empty.rs b/empty.rs"));
+        assert!(patch.contains("diff --git a/file-256.rs b/file-256.rs"));
+        assert!(patch.contains("+fn value_256() {}"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1834,7 +2090,9 @@ mod tests {
             additions: Some(1),
             deletions: Some(1),
         };
-        assert!(validate_supported_projection(&[], &[], &[path]).is_err());
+        assert!(
+            validate_supported_projection(&[], &[], &[path], DependencyMode::Boundary).is_err()
+        );
 
         let changes = WorktreeChanges {
             files: Vec::new(),
@@ -1850,6 +2108,7 @@ mod tests {
             inventory,
             untracked: UntrackedSnapshot {
                 paths: Vec::new(),
+                patch: Vec::new(),
                 skipped_paths: 0,
                 signature: [0; 32],
             },
@@ -1889,11 +2148,33 @@ mod tests {
         );
         let root = temp_root("changed-files");
         fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
         fs::write(root.join("untracked.rs"), "fn untracked() {}\n").unwrap();
+        let untracked = capture_untracked(
+            &root,
+            b"untracked.rs\0",
+            DependencyMode::Boundary,
+            true,
+            &cancelled,
+        )
+        .unwrap();
+        let expected_patch = format!(
+            "{}{}",
+            tracked.split_once("\0\0").unwrap().1,
+            String::from_utf8_lossy(&untracked.patch)
+        );
         let changes = merge_changes(
             parse_tracked_changes(tracked.as_bytes(), &cancelled).unwrap(),
             parse_change_inventory(inventory.as_bytes(), &cancelled).unwrap(),
-            capture_untracked(&root, b"untracked.rs\0", &cancelled).unwrap(),
+            untracked,
+            DependencyMode::Boundary,
             &cancelled,
         )
         .unwrap();
@@ -1982,17 +2263,32 @@ mod tests {
                         deletions: Some(0),
                     },
                 ],
-                patch: tracked.split_once("\0\0").unwrap().1.into(),
+                patch: expected_patch,
                 skipped_paths: 0,
             }
         );
         assert!(changes.patch.contains("-old\n+new\n"));
         assert!(changes.patch.contains("rename from old.rs"));
+        assert!(
+            changes
+                .patch
+                .contains("diff --git a/untracked.rs b/untracked.rs")
+        );
+        assert!(changes.patch.contains("+fn untracked() {}"));
         fs::remove_dir_all(root).unwrap();
         assert!(
             parse_tracked_changes(&tracked.as_bytes()[..tracked.len() - 1], &cancelled).is_err()
         );
-        assert!(capture_untracked(&temp_root("missing"), b"a.rs\0\0", &cancelled).is_err());
+        assert!(
+            capture_untracked(
+                &temp_root("missing"),
+                b"a.rs\0\0",
+                DependencyMode::Boundary,
+                false,
+                &cancelled,
+            )
+            .is_err()
+        );
         let skipped = merge_changes(
             TrackedChanges {
                 files: Vec::new(),
@@ -2002,7 +2298,15 @@ mod tests {
                 omitted_stats: HashSet::new(),
             },
             (Vec::new(), 0),
-            capture_untracked(&temp_root("missing"), b"\xff.rs\0", &cancelled).unwrap(),
+            capture_untracked(
+                &temp_root("missing"),
+                b"\xff.rs\0",
+                DependencyMode::Boundary,
+                false,
+                &cancelled,
+            )
+            .unwrap(),
+            DependencyMode::Boundary,
             &cancelled,
         )
         .unwrap();
@@ -2195,7 +2499,7 @@ mod tests {
             database: root.join(".git/graphr/index.db"),
         };
         let changes = repository
-            .worktree_changes("HEAD", &AtomicBool::new(false))
+            .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
             .unwrap();
 
         assert_eq!(changes.skipped_paths, 1);

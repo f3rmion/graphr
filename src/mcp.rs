@@ -16,6 +16,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::git::DependencyMode;
 use crate::index::Project;
 
 type ToolResult = Result<String, String>;
@@ -85,8 +86,28 @@ struct ChangesParams {
     #[schemars(range(min = 1, max = 50))]
     max_nodes: u32,
     #[serde(default)]
+    dependency_mode: DependencyModeParam,
+    #[serde(default)]
     #[schemars(length(min = 1, max = 128))]
     cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(crate = "rmcp::schemars")]
+enum DependencyModeParam {
+    #[default]
+    Boundary,
+    Full,
+}
+
+impl DependencyModeParam {
+    const fn value(self) -> DependencyMode {
+        match self {
+            Self::Boundary => DependencyMode::Boundary,
+            Self::Full => DependencyMode::Full,
+        }
+    }
 }
 
 impl Graphr {
@@ -170,7 +191,7 @@ impl Graphr {
     }
 
     #[tool(
-        description = "Return an initial or cursor-selected bounded review page: changed-file manifest, diff, risk scores, affected static call paths, and graph impact up to 6 hops. Flow discovery traces CALLS up to 15 hops. Follow every files, diff, and graph continuation cursor from the immutable snapshot before any fallback",
+        description = "Return an initial or cursor-selected bounded review page: changed-file manifest, tracked and untracked source diff, risk scores, affected static call paths, and graph impact up to 6 hops. Cargo-vendored changes collapse to package boundaries by default; use dependency_mode=full for internals. Flow discovery traces CALLS up to 15 hops. Follow every files, diff, and graph continuation cursor from the immutable snapshot before any fallback",
         input_schema = rmcp::handler::server::common::schema_for_input::<ChangesParams>()
             .expect("valid changes schema")
     )]
@@ -187,6 +208,7 @@ impl Graphr {
                 &params.base,
                 params.depth,
                 params.max_nodes,
+                params.dependency_mode.value(),
                 params.cursor.as_deref(),
                 cancelled,
             )
@@ -201,7 +223,7 @@ impl ServerHandler for Graphr {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("graphr", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "For reviews, call changes once without a cursor using the review base and a depth from 0 through 6, then exhaust every files, diff, and graph continuation token by calling changes with the same arguments and the exact cursor. The cursors share one immutable snapshot; do not start another cursorless changes call until they are exhausted. Coverage is complete only when all cursors are exhausted and review_complete_when_pages_exhausted=true. It includes risk scores and affected static call paths, with flow discovery tracing CALLS up to 15 hops; these are possible source paths, not runtime call stacks. Do not use search/view for review coverage. A stale or failing cursor or an explicit analysis omission means coverage is incomplete. The graph is indexed at startup; after edits, call index once before changes.",
+                "For reviews, call changes once without a cursor using the review base, dependency_mode, and a depth from 0 through 6, then exhaust every files, diff, and graph continuation token by calling changes with the same arguments and the exact cursor. dependency_mode defaults to boundary, which accounts for .cargo/vendor changes as package boundaries without analyzing internals; use full only when dependency internals are review scope. The cursors share one immutable snapshot; do not start another cursorless changes call until they are exhausted. Coverage is complete only when all cursors are exhausted and review_complete_when_pages_exhausted=true. It includes tracked and untracked Rust/Python diffs, risk scores, and affected static call paths, with flow discovery tracing CALLS up to 15 hops; these are possible source paths, not runtime call stacks. Do not use search/view for review coverage. A stale or failing cursor or an explicit analysis omission means coverage is incomplete. The graph is indexed at startup; after edits, call index once before changes.",
             )
     }
 }
@@ -454,6 +476,10 @@ mod tests {
         assert_eq!(changes["properties"]["depth"]["maximum"], 6);
         assert_eq!(changes["properties"]["max_nodes"]["minimum"], 1);
         assert_eq!(changes["properties"]["max_nodes"]["maximum"], 50);
+        assert_eq!(
+            changes["$defs"]["DependencyModeParam"]["enum"],
+            rmcp::serde_json::json!(["boundary", "full"])
+        );
         assert_eq!(changes["properties"]["cursor"]["minLength"], 1);
         assert_eq!(changes["properties"]["cursor"]["maxLength"], 128);
     }
@@ -465,13 +491,24 @@ mod tests {
         assert_eq!(defaults.base, "HEAD");
         assert_eq!(defaults.depth, 1);
         assert_eq!(defaults.max_nodes, 50);
+        assert!(matches!(
+            defaults.dependency_mode,
+            DependencyModeParam::Boundary
+        ));
         assert_eq!(defaults.cursor, None);
         assert!(validate_changes(&defaults).is_ok());
+        assert!(
+            rmcp::serde_json::from_value::<ChangesParams>(
+                rmcp::serde_json::json!({ "dependency_mode": "transitive" })
+            )
+            .is_err()
+        );
         assert!(
             validate_changes(&ChangesParams {
                 base: "HEAD".into(),
                 depth: 6,
                 max_nodes: 50,
+                dependency_mode: DependencyModeParam::Boundary,
                 cursor: Some("a".repeat(128)),
             })
             .is_ok()
@@ -482,24 +519,28 @@ mod tests {
                 base: " ".into(),
                 depth: 2,
                 max_nodes: 50,
+                dependency_mode: DependencyModeParam::Boundary,
                 cursor: None,
             },
             ChangesParams {
                 base: "-HEAD".into(),
                 depth: 2,
                 max_nodes: 50,
+                dependency_mode: DependencyModeParam::Boundary,
                 cursor: None,
             },
             ChangesParams {
                 base: "HEAD".into(),
                 depth: 7,
                 max_nodes: 50,
+                dependency_mode: DependencyModeParam::Boundary,
                 cursor: None,
             },
             ChangesParams {
                 base: "HEAD".into(),
                 depth: 2,
                 max_nodes: 0,
+                dependency_mode: DependencyModeParam::Boundary,
                 cursor: None,
             },
         ] {
@@ -510,6 +551,7 @@ mod tests {
                 base: "a".repeat(257),
                 depth: 2,
                 max_nodes: 50,
+                dependency_mode: DependencyModeParam::Boundary,
                 cursor: None,
             })
             .is_err()
@@ -520,6 +562,7 @@ mod tests {
                     base: "HEAD".into(),
                     depth: 2,
                     max_nodes: 50,
+                    dependency_mode: DependencyModeParam::Boundary,
                     cursor: Some(cursor),
                 })
                 .is_err()
