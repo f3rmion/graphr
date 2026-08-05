@@ -589,10 +589,10 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     );
     let text = response_text(&changed);
     for expected in [
-        "changed src/lib.rs",
-        "deleted src/removed.rs",
-        "renamed src/moved.rs -> src/renamed.rs",
-        "untracked src/untracked.rs",
+        "changed supported src/lib.rs",
+        "deleted supported src/removed.rs",
+        "renamed supported src/moved.rs -> src/renamed.rs",
+        "untracked supported src/untracked.rs",
         "target",
         "helper",
         "moved_symbol",
@@ -640,9 +640,380 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     let bounded = client.request(
         r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":1}}}"#,
     );
-    assert!(bounded.contains("[truncated]"), "{bounded}");
+    assert!(bounded.contains("changed_symbols_omitted=4"), "{bounded}");
+    assert!(bounded.contains("neighborhood_omitted=true"), "{bounded}");
+    assert!(!bounded.contains("[truncated]"), "{bounded}");
     assert!(bounded.len() <= 8192, "{bounded}");
     client.close();
+}
+
+#[test]
+fn changes_pages_complete_inventory_diff_and_flows() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::create_dir_all(fixture.path.join("tests/fixtures")).unwrap();
+    fs::write(
+        fixture.path.join(".gitignore"),
+        "tests/fixtures/ignored.txt\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        review_fixture_source(false),
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git(
+        &fixture.path,
+        &[
+            "-c",
+            "user.name=Graphr Test",
+            "-c",
+            "user.email=graphr@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "baseline",
+        ],
+    );
+    index_repository(&fixture.path, true);
+
+    fs::write(fixture.path.join("src/lib.rs"), review_fixture_source(true)).unwrap();
+    fs::write(
+        fixture.path.join("tests/fixtures/alias-registry.v1.tsv"),
+        "one\ntwo\nthree\n",
+    )
+    .unwrap();
+    fs::write(fixture.path.join("tests/fixtures/ignored.txt"), "ignored\n").unwrap();
+    index_repository(&fixture.path, false);
+
+    let mut client = Client::start(&fixture.path);
+    let _ = client.request(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
+    );
+    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    let initial = response_text(&client.request(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{"depth":6,"max_nodes":50}}}"#,
+    ));
+    for expected in [
+        "changed supported src/lib.rs status=modified additions=14 deletions=14",
+        "untracked unsupported tests/fixtures/alias-registry.v1.tsv additions=3 deletions=0",
+        "total_hunks=14",
+        "all_path_hunks=15",
+        "all_path_additions=17 all_path_deletions=14",
+        "changed_symbols_total=14",
+        "flows_total=3",
+        "review_complete=false",
+        "review_complete_when_pages_exhausted=false",
+    ] {
+        assert!(initial.contains(expected), "missing {expected}: {initial}");
+    }
+    assert!(!initial.contains("ignored.txt"), "{initial}");
+    assert!(!initial.contains("[truncated]"), "{initial}");
+    assert!(initial.len() <= 8192, "{}", initial.len());
+    let diff_totals = assert_page_accounting(
+        &initial,
+        "diff",
+        [
+            "emitted_hunks",
+            "partial_hunks",
+            "total_hunks",
+            "prior_hunks",
+            "remaining_hunks",
+        ],
+        "diff_next_cursor",
+    );
+    let graph_totals = assert_page_accounting(
+        &initial,
+        "graph",
+        [
+            "emitted_flows",
+            "partial_flows",
+            "discovered_flows",
+            "prior_flows",
+            "remaining_discovered_flows",
+        ],
+        "graph_next_cursor",
+    );
+    assert_eq!(page_metric(&initial, "graph", "total_flows"), 3);
+
+    let first_diff_cursor = page_cursor(&initial, "diff_next_cursor").unwrap();
+    let repeated_a = changes_page(&mut client, 3, &first_diff_cursor);
+    let repeated_b = changes_page(&mut client, 4, &first_diff_cursor);
+    assert_eq!(repeated_a, repeated_b);
+    assert!(repeated_a.starts_with("diff\n"), "{repeated_a}");
+    assert!(!repeated_a.contains("\ngraph\n"), "{repeated_a}");
+    assert_eq!(
+        assert_page_accounting(
+            &repeated_a,
+            "diff",
+            [
+                "emitted_hunks",
+                "partial_hunks",
+                "total_hunks",
+                "prior_hunks",
+                "remaining_hunks",
+            ],
+            "diff_next_cursor",
+        ),
+        diff_totals
+    );
+
+    let mut next_id = 5;
+    let mut diff_pages = initial.clone();
+    let mut cursor = Some(first_diff_cursor.clone());
+    while let Some(token) = cursor {
+        let page = changes_page(&mut client, next_id, &token);
+        next_id += 1;
+        assert!(page.len() <= 8192, "{}", page.len());
+        assert!(!page.contains("[truncated]"), "{page}");
+        assert_eq!(
+            assert_page_accounting(
+                &page,
+                "diff",
+                [
+                    "emitted_hunks",
+                    "partial_hunks",
+                    "total_hunks",
+                    "prior_hunks",
+                    "remaining_hunks",
+                ],
+                "diff_next_cursor",
+            ),
+            diff_totals
+        );
+        cursor = page_cursor(&page, "diff_next_cursor");
+        diff_pages.push_str(&page);
+    }
+    assert!(diff_pages.contains("LAST_PAGE_SENTINEL"), "{diff_pages}");
+    assert_eq!(
+        diff_pages
+            .lines()
+            .filter(|line| line.starts_with("@@ "))
+            .count(),
+        14,
+        "{diff_pages}"
+    );
+
+    let mut graph_pages = initial.clone();
+    let mut cursor = page_cursor(&initial, "graph_next_cursor");
+    assert!(
+        cursor.is_some(),
+        "graph unexpectedly fit on one page: {initial}"
+    );
+    while let Some(token) = cursor {
+        let page = changes_page(&mut client, next_id, &token);
+        next_id += 1;
+        assert!(page.len() <= 8192, "{}", page.len());
+        assert!(!page.contains("[truncated]"), "{page}");
+        assert!(page.starts_with("graph\n"), "{page}");
+        assert!(!page.contains("\ndiff\n"), "{page}");
+        assert_eq!(
+            assert_page_accounting(
+                &page,
+                "graph",
+                [
+                    "emitted_flows",
+                    "partial_flows",
+                    "discovered_flows",
+                    "prior_flows",
+                    "remaining_discovered_flows",
+                ],
+                "graph_next_cursor",
+            ),
+            graph_totals
+        );
+        assert_eq!(page_metric(&page, "graph", "total_flows"), 3);
+        cursor = page_cursor(&page, "graph_next_cursor");
+        graph_pages.push_str(&page);
+    }
+    assert_eq!(
+        graph_pages
+            .lines()
+            .filter(|line| line.starts_with("flow "))
+            .count(),
+        3,
+        "{graph_pages}"
+    );
+
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        format!("{}// cursor is now stale\n", review_fixture_source(true)),
+    )
+    .unwrap();
+    let cached = changes_page(&mut client, next_id, &first_diff_cursor);
+    next_id += 1;
+    assert_eq!(cached, repeated_a, "cursor did not retain its snapshot");
+    let refreshed = response_text(&client.request(&format!(
+        r#"{{"jsonrpc":"2.0","id":{next_id},"method":"tools/call","params":{{"name":"changes","arguments":{{"depth":6,"max_nodes":50}}}}}}"#,
+    )));
+    next_id += 1;
+    assert!(
+        refreshed.contains("diff_next_cursor="),
+        "refreshed diff unexpectedly fit one page: {refreshed}"
+    );
+    let stale = client.request(&format!(
+        r#"{{"jsonrpc":"2.0","id":{next_id},"method":"tools/call","params":{{"name":"changes","arguments":{{"depth":6,"max_nodes":50,"cursor":"{first_diff_cursor}"}}}}}}"#,
+    ));
+    assert!(tool_failed(&stale), "{stale}");
+    assert!(stale.contains("stale changes cursor"), "{stale}");
+    client.close();
+}
+
+#[test]
+fn changes_reports_only_residual_lines_in_a_mixed_rust_hunk() {
+    const EDITED: &str = "use std::fmt::Debug;\nconst FLAG: bool = true;\nmacro_rules! identity { ($value:expr) => { $value }; }\n// syntax glue\npub fn first() { let _: bool = identity!(FLAG); }\n\npub fn second() { let _ = std::any::type_name::<dyn Debug>(); }\n";
+
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(fixture.path.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git(
+        &fixture.path,
+        &[
+            "-c",
+            "user.name=Graphr Test",
+            "-c",
+            "user.email=graphr@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "baseline",
+        ],
+    );
+    index_repository(&fixture.path, true);
+    fs::write(fixture.path.join("src/lib.rs"), EDITED).unwrap();
+    index_repository(&fixture.path, false);
+
+    let mut client = Client::start(&fixture.path);
+    let _ = client.request(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
+    );
+    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    let changes = response_text(&client.request(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":50}}}"#,
+    ));
+
+    for expected in [
+        "changed_symbols_total=2",
+        " Function first src/lib.rs:5",
+        " Function second src/lib.rs:7",
+        "unmapped src/lib.rs:1-4,6",
+    ] {
+        assert!(changes.contains(expected), "missing {expected}: {changes}");
+    }
+    assert!(!changes.contains("unmapped src/lib.rs:1-7"), "{changes}");
+    client.close();
+}
+
+fn review_fixture_source(edited: bool) -> String {
+    let mut source = String::from(
+        "pub static ALIASES: &[u8] = include_bytes!(\"../tests/fixtures/alias-registry.v1.tsv\");\n\n",
+    );
+    for index in 0..14 {
+        let name = format!("changed_{index}_{}", "long_identifier_segment_".repeat(5));
+        if index < 3 {
+            let entry = format!("entry_{index}_{}", "long_identifier_segment_".repeat(5));
+            source.push_str(&format!("pub fn {entry}() {{ {name}(); }}\n\n"));
+        }
+        let value = if edited {
+            format!(
+                "{}{}",
+                "é".repeat(400),
+                if index == 13 {
+                    "LAST_PAGE_SENTINEL"
+                } else {
+                    ""
+                }
+            )
+        } else {
+            "x".repeat(800)
+        };
+        source.push_str(&format!("pub fn {name}() {{ let _ = \"{value}\"; }}\n"));
+        source.push_str("// unchanged separator one\n// unchanged separator two\n\n");
+    }
+    source
+}
+
+fn page_cursor(output: &str, label: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.strip_prefix(label)
+            .and_then(|value| value.strip_prefix('='))
+            .map(str::to_owned)
+    })
+}
+
+fn changes_page(client: &mut Client, id: u32, cursor: &str) -> String {
+    response_text(&client.request(&format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"changes","arguments":{{"depth":6,"max_nodes":50,"cursor":"{cursor}"}}}}}}"#,
+    )))
+}
+
+fn assert_page_accounting(
+    output: &str,
+    section: &str,
+    [
+        emitted_key,
+        partial_key,
+        total_key,
+        prior_key,
+        remaining_key,
+    ]: [&str; 5],
+    cursor_label: &str,
+) -> (usize, usize) {
+    let emitted = page_metric(output, section, "emitted_bytes");
+    let total = page_metric(output, section, "total_bytes");
+    let prior = page_metric(output, section, "prior_bytes");
+    let remaining = page_metric(output, section, "remaining_bytes");
+    assert_eq!(prior + emitted + remaining, total, "{output}");
+
+    let line = page_metadata_line(output, section);
+    let (start, end) = page_field(line, "byte_range").split_once("..").unwrap();
+    assert_eq!(start.parse::<usize>().unwrap(), prior, "{output}");
+    assert_eq!(end.parse::<usize>().unwrap(), prior + emitted, "{output}");
+
+    let emitted_records = page_metric(output, section, emitted_key);
+    let partial_records = page_metric(output, section, partial_key);
+    let total_records = page_metric(output, section, total_key);
+    let prior_records = page_metric(output, section, prior_key);
+    let remaining_records = page_metric(output, section, remaining_key);
+    assert_eq!(
+        prior_records + emitted_records + partial_records + remaining_records,
+        total_records,
+        "{output}"
+    );
+    assert_eq!(
+        page_field(line, "page_complete") == "true",
+        page_cursor(output, cursor_label).is_none(),
+        "{output}"
+    );
+    (total, total_records)
+}
+
+fn page_metric(output: &str, section: &str, key: &str) -> usize {
+    page_field(page_metadata_line(output, section), key)
+        .parse()
+        .unwrap()
+}
+
+fn page_metadata_line<'a>(output: &'a str, section: &str) -> &'a str {
+    output
+        .lines()
+        .find(|line| {
+            line.split_ascii_whitespace().next() == Some(section) && line.contains("emitted_bytes=")
+        })
+        .unwrap()
+}
+
+fn page_field<'a>(line: &'a str, key: &str) -> &'a str {
+    line.split_ascii_whitespace()
+        .find_map(|field| {
+            let (name, value) = field.split_once('=')?;
+            (name == key).then_some(value)
+        })
+        .unwrap()
 }
 
 #[test]

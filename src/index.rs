@@ -1,13 +1,16 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 
-use crate::git::{Language, PathRecord, Repository, Source, SourceFile, WorktreeChanges};
+use crate::git::{
+    ChangeStatus, ChangedPath, Language, Repository, Source, SourceFile, WorktreeChanges,
+};
 use crate::parse::{DefinitionKind, ParsedFile, RustParser};
 use crate::python::PythonParser;
 use crate::store::{
@@ -17,13 +20,15 @@ use crate::store::{
 
 const QUALIFIED_PATH_LIMIT: usize = 1024;
 const REVIEW_CONTEXT_BUDGET: usize = 8192;
-const REVIEW_GRAPH_RESERVE: usize = 3 * 1024;
-const REVIEW_MANIFEST_LIMIT: usize = 2 * 1024;
-const TRUNCATED: &str = "[truncated]\n";
+const INITIAL_FILES_BUDGET: usize = 2048;
+const INITIAL_DIFF_BUDGET: usize = 3584;
+const INITIAL_GRAPH_BUDGET: usize = 2432;
+const SECTION_OVERHEAD: usize = 704;
 
 #[derive(Clone)]
 pub struct Project {
     repository: Arc<Repository>,
+    review_snapshot: Arc<Mutex<Option<ReviewSnapshot>>>,
 }
 
 impl Project {
@@ -34,6 +39,7 @@ impl Project {
     pub fn open_cancelled(path: &Path, cancelled: &AtomicBool) -> Result<Self, String> {
         Ok(Self {
             repository: Arc::new(Repository::discover_cancelled(path, cancelled)?),
+            review_snapshot: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -78,97 +84,628 @@ impl Project {
         base: &str,
         depth: u32,
         max_nodes: u32,
+        cursor: Option<&str>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<String, String> {
         check_cancelled(&cancelled)?;
+        if let Some(cursor) = cursor {
+            let cursor = parse_review_cursor(cursor)?;
+            let snapshot = self
+                .review_snapshot
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let snapshot = snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.matches(base, depth, max_nodes))
+                .ok_or_else(|| "stale changes cursor".to_owned())?;
+            return render_section(snapshot, &cursor);
+        }
+
         let changes = self.repository.worktree_changes(base, &cancelled)?;
         if changes.is_empty() {
+            *self
+                .review_snapshot
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
             return Ok("no changes\n".into());
         }
         let graph = Store::open_reader(&self.repository.database)?
             .changes(&changes, depth, max_nodes, &cancelled)?;
-        Ok(review_context(
-            &change_manifest(&changes),
-            &changes.patch,
-            &graph,
-        ))
+        let snapshot = ReviewSnapshot::new(base, depth, max_nodes, changes, graph);
+        let output = review_context(&snapshot)?;
+        // ponytail: retain one bounded review snapshot; use a keyed LRU only if
+        // concurrent independent review paginations become a real requirement.
+        *self
+            .review_snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
+        Ok(output)
     }
 }
 
 fn change_manifest(changes: &WorktreeChanges) -> String {
     let mut output = String::new();
-    let separately_reported = changes
-        .records
-        .iter()
-        .filter_map(|record| match record {
-            PathRecord::Renamed(_, path) | PathRecord::Untracked(path) => Some(path.as_str()),
-            PathRecord::Deleted(_) => None,
-        })
-        .collect::<HashSet<_>>();
-    for file in changes
-        .files
-        .iter()
-        .filter(|file| !separately_reported.contains(file.path.as_str()))
-    {
-        output.push_str("changed ");
-        output.push_str(&file.path);
-        output.push('\n');
-    }
-    for record in &changes.records {
-        match record {
-            PathRecord::Deleted(path) => {
-                output.push_str("deleted ");
-                output.push_str(path);
-            }
-            PathRecord::Renamed(old, new) => {
-                output.push_str("renamed ");
-                output.push_str(old);
-                output.push_str(" -> ");
-                output.push_str(new);
-            }
-            PathRecord::Untracked(path) => {
-                output.push_str("untracked ");
-                output.push_str(path);
-            }
-        }
-        output.push('\n');
+    for path in &changes.paths {
+        change_path_line(&mut output, path);
     }
     if changes.skipped_paths > 0 {
         output.push_str("skipped ");
         output.push_str(&changes.skipped_paths.to_string());
-        output.push_str(" unsupported paths\n");
+        output.push_str(" unsafe paths\n");
     }
     output
 }
 
-fn review_context(manifest: &str, patch: &str, graph: &str) -> String {
-    const FILES_HEADER: &str = "files\n";
-    const DIFF_HEADER: &str = "diff\n";
-    const GRAPH_HEADER: &str = "graph\n";
-
-    let mut available =
-        REVIEW_CONTEXT_BUDGET - FILES_HEADER.len() - DIFF_HEADER.len() - GRAPH_HEADER.len();
-    let manifest = bounded_section(manifest, available.min(REVIEW_MANIFEST_LIMIT));
-    available -= manifest.len();
-    let patch_budget = available.saturating_sub(graph.len().min(REVIEW_GRAPH_RESERVE));
-    let patch = bounded_section(patch, patch_budget);
-    let graph = bounded_section(graph, available - patch.len());
-    format!("{FILES_HEADER}{manifest}{DIFF_HEADER}{patch}{GRAPH_HEADER}{graph}")
+fn change_path_line(output: &mut String, path: &ChangedPath) {
+    let support = match (
+        path.status == ChangeStatus::Renamed,
+        path.old_language.is_some(),
+        path.language.is_some(),
+    ) {
+        (true, true, false) => "supported-to-unsupported",
+        (true, false, true) => "unsupported-to-supported",
+        (_, _, true) => "supported",
+        _ => "unsupported",
+    };
+    match path.status {
+        ChangeStatus::Added => output.push_str("added "),
+        ChangeStatus::Modified => output.push_str("changed "),
+        ChangeStatus::Deleted => output.push_str("deleted "),
+        ChangeStatus::Renamed => output.push_str("renamed "),
+        ChangeStatus::TypeChanged => output.push_str("type-changed "),
+        ChangeStatus::Unmerged => output.push_str("unmerged "),
+        ChangeStatus::Untracked => output.push_str("untracked "),
+    }
+    output.push_str(support);
+    output.push(' ');
+    if let Some(old) = &path.old_path {
+        output.push_str(old);
+        output.push_str(" -> ");
+    }
+    output.push_str(&path.path);
+    if path.status == ChangeStatus::Modified {
+        output.push_str(" status=modified");
+    }
+    match (path.additions, path.deletions) {
+        (Some(additions), Some(deletions)) => {
+            output.push_str(&format!(" additions={additions} deletions={deletions}"));
+        }
+        _ => output.push_str(" additions=unknown deletions=unknown"),
+    }
+    output.push('\n');
 }
 
-fn bounded_section(value: &str, budget: usize) -> Cow<'_, str> {
-    if value.len() <= budget {
-        return Cow::Borrowed(value);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReviewSection {
+    Files,
+    Diff,
+    Graph,
+}
+
+impl ReviewSection {
+    const fn code(self) -> char {
+        match self {
+            Self::Files => 'f',
+            Self::Diff => 'd',
+            Self::Graph => 'g',
+        }
     }
-    let mut end = budget.saturating_sub(TRUNCATED.len());
+
+    const fn header(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::Diff => "diff",
+            Self::Graph => "graph",
+        }
+    }
+
+    const fn cursor_label(self) -> &'static str {
+        match self {
+            Self::Files => "files_next_cursor",
+            Self::Diff => "diff_next_cursor",
+            Self::Graph => "graph_next_cursor",
+        }
+    }
+}
+
+struct ReviewCursor {
+    section: ReviewSection,
+    offset: usize,
+    checksum: String,
+}
+
+struct ReviewSnapshot {
+    base: String,
+    depth: u32,
+    max_nodes: u32,
+    manifest: String,
+    changes: WorktreeChanges,
+    graph: String,
+    checksum: String,
+    file_ranges: Vec<Range<usize>>,
+    hunk_ranges: Vec<Range<usize>>,
+    flow_ranges: Vec<Range<usize>>,
+    patch_totals: String,
+    all_path_totals: String,
+    all_path_hunks: String,
+    complete_after_pagination: bool,
+}
+
+impl ReviewSnapshot {
+    fn new(
+        base: &str,
+        depth: u32,
+        max_nodes: u32,
+        changes: WorktreeChanges,
+        graph: String,
+    ) -> Self {
+        let manifest = change_manifest(&changes);
+        let checksum = review_snapshot(base, depth, max_nodes, &manifest, &changes.patch, &graph);
+        let file_ranges = line_ranges(&manifest, None);
+        let hunk_ranges = hunk_ranges(&changes.patch);
+        let flow_ranges = line_ranges(&graph, Some("flow "));
+        let all_path_hunks = change_hunk_totals(&changes, hunk_ranges.len());
+        let patch_totals = change_totals(
+            "patch",
+            changes.paths.iter().filter(|path| {
+                (path.language.is_some() || path.old_language.is_some())
+                    && path.status != ChangeStatus::Untracked
+            }),
+            0,
+        );
+        let all_path_totals =
+            change_totals("all_path", changes.paths.iter(), changes.skipped_paths);
+        let complete_after_pagination =
+            graph_review_complete(&graph) && change_content_complete(&changes);
+        Self {
+            base: base.into(),
+            depth,
+            max_nodes,
+            manifest,
+            changes,
+            graph,
+            checksum,
+            file_ranges,
+            hunk_ranges,
+            flow_ranges,
+            patch_totals,
+            all_path_totals,
+            all_path_hunks,
+            complete_after_pagination,
+        }
+    }
+
+    fn matches(&self, base: &str, depth: u32, max_nodes: u32) -> bool {
+        self.base == base && self.depth == depth && self.max_nodes == max_nodes
+    }
+
+    fn value(&self, section: ReviewSection) -> &str {
+        match section {
+            ReviewSection::Files => &self.manifest,
+            ReviewSection::Diff => &self.changes.patch,
+            ReviewSection::Graph => &self.graph,
+        }
+    }
+
+    fn ranges(&self, section: ReviewSection) -> &[Range<usize>] {
+        match section {
+            ReviewSection::Files => &self.file_ranges,
+            ReviewSection::Diff => &self.hunk_ranges,
+            ReviewSection::Graph => &self.flow_ranges,
+        }
+    }
+}
+
+struct Page<'a> {
+    start: usize,
+    end: usize,
+    text: &'a str,
+}
+
+fn review_context(snapshot: &ReviewSnapshot) -> Result<String, String> {
+    let (files, files_more) =
+        render_section_page(snapshot, ReviewSection::Files, 0, INITIAL_FILES_BUDGET)?;
+    let (diff, diff_more) =
+        render_section_page(snapshot, ReviewSection::Diff, 0, INITIAL_DIFF_BUDGET)?;
+    let (graph_page, graph_more) =
+        render_section_page(snapshot, ReviewSection::Graph, 0, INITIAL_GRAPH_BUDGET)?;
+    let output = format!(
+        "{files}{diff}{graph_page}review_complete={} review_complete_when_pages_exhausted={}\n",
+        !files_more && !diff_more && !graph_more && snapshot.complete_after_pagination,
+        snapshot.complete_after_pagination,
+    );
+    if output.len() > REVIEW_CONTEXT_BUDGET {
+        return Err("review context exceeds output budget".into());
+    }
+    Ok(output)
+}
+
+fn render_section(snapshot: &ReviewSnapshot, cursor: &ReviewCursor) -> Result<String, String> {
+    let expected = cursor_checksum(&snapshot.checksum, cursor.section, cursor.offset);
+    if cursor.checksum != expected {
+        return Err("stale changes cursor".into());
+    }
+    let completion = format!(
+        "review_complete_when_pages_exhausted={}\n",
+        snapshot.complete_after_pagination
+    );
+    let page_budget = REVIEW_CONTEXT_BUDGET
+        .checked_sub(completion.len())
+        .ok_or_else(|| "review completion metadata exceeds output budget".to_owned())?;
+    let (mut output, _) =
+        render_section_page(snapshot, cursor.section, cursor.offset, page_budget)?;
+    output.push_str(&completion);
+    if output.len() > REVIEW_CONTEXT_BUDGET {
+        return Err("review section exceeds output budget".into());
+    }
+    Ok(output)
+}
+
+fn render_section_page(
+    snapshot: &ReviewSnapshot,
+    section: ReviewSection,
+    offset: usize,
+    budget: usize,
+) -> Result<(String, bool), String> {
+    let value = snapshot.value(section);
+    let content_budget = budget
+        .checked_sub(SECTION_OVERHEAD)
+        .ok_or_else(|| "review section budget is too small".to_owned())?;
+    let page = page(value, offset, content_budget)?;
+    let more = page.end < value.len();
+    let emitted_bytes = page.end - page.start;
+    let starts_mid_line = page.start > 0 && value.as_bytes()[page.start - 1] != b'\n';
+    let ends_mid_line =
+        page.end < value.len() && page.end > 0 && value.as_bytes()[page.end - 1] != b'\n';
+    let framing_suffix_bytes = usize::from(!page.text.is_empty() && !page.text.ends_with('\n'));
+    let mut output = format!("{}\n", section.header());
+    match section {
+        ReviewSection::Files => {
+            let coverage = record_coverage(snapshot.ranges(section), &page);
+            output.push_str(&format!(
+                "files rename_detection=supported-only emitted_bytes={} total_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_entries={} partial_entries={} total_entries={} prior_entries={} remaining_entries={} page_complete={}\n",
+                emitted_bytes,
+                value.len(),
+                page.start,
+                page.end,
+                starts_mid_line,
+                ends_mid_line,
+                framing_suffix_bytes,
+                coverage.emitted,
+                coverage.partial,
+                coverage.total,
+                coverage.prior,
+                coverage.remaining,
+                !more
+            ));
+        }
+        ReviewSection::Diff => {
+            let coverage = record_coverage(snapshot.ranges(section), &page);
+            output.push_str(&format!(
+                "diff scope=supported-tracked emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_hunks={} partial_hunks={} total_hunks={} prior_hunks={} remaining_hunks={} {} {} {} page_complete={}\n",
+                emitted_bytes,
+                value.len(),
+                page.start,
+                value.len() - page.end,
+                page.start,
+                page.end,
+                starts_mid_line,
+                ends_mid_line,
+                framing_suffix_bytes,
+                coverage.emitted,
+                coverage.partial,
+                coverage.total,
+                coverage.prior,
+                coverage.remaining,
+                snapshot.patch_totals,
+                snapshot.all_path_totals,
+                snapshot.all_path_hunks,
+                !more
+            ));
+        }
+        ReviewSection::Graph => {
+            let coverage = record_coverage(snapshot.ranges(section), &page);
+            let analysis_complete = graph_flow_analysis_complete(&snapshot.graph);
+            let neighborhood_complete =
+                graph_summary_value(&snapshot.graph, "neighborhood_omitted") == Some("false");
+            let mapping_complete =
+                graph_summary_value(&snapshot.graph, "unmapped_ranges") == Some("0");
+            let flow_total = if analysis_complete {
+                coverage.total.to_string()
+            } else {
+                "unknown".into()
+            };
+            output.push_str(&format!(
+                "graph emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_flows={} partial_flows={} discovered_flows={} total_flows={} prior_flows={} remaining_discovered_flows={} page_complete={} analysis_complete={} neighborhood_complete={} mapping_complete={}\n",
+                emitted_bytes,
+                value.len(),
+                page.start,
+                value.len() - page.end,
+                page.start,
+                page.end,
+                starts_mid_line,
+                ends_mid_line,
+                framing_suffix_bytes,
+                coverage.emitted,
+                coverage.partial,
+                coverage.total,
+                flow_total,
+                coverage.prior,
+                coverage.remaining,
+                !more,
+                analysis_complete,
+                neighborhood_complete,
+                mapping_complete,
+            ));
+        }
+    }
+    output.push_str(page.text);
+    if !page.text.is_empty() && !page.text.ends_with('\n') {
+        output.push('\n');
+    }
+    if more {
+        output.push_str(section.cursor_label());
+        output.push('=');
+        output.push_str(&cursor_token(&snapshot.checksum, section, page.end));
+        output.push('\n');
+    }
+    if output.len() > budget {
+        return Err("review section exceeds output budget".into());
+    }
+    Ok((output, more))
+}
+
+fn page(value: &str, offset: usize, budget: usize) -> Result<Page<'_>, String> {
+    if value.is_empty() && offset == 0 {
+        return Ok(Page {
+            start: 0,
+            end: 0,
+            text: "",
+        });
+    }
+    if offset >= value.len() || !value.is_char_boundary(offset) {
+        return Err("invalid changes cursor".into());
+    }
+    let mut end = value.len().min(offset.saturating_add(budget));
     while !value.is_char_boundary(end) {
         end -= 1;
     }
-    end = value[..end].rfind('\n').map_or(0, |line| line + 1);
-    let mut output = String::with_capacity(end + TRUNCATED.len());
-    output.push_str(&value[..end]);
-    output.push_str(TRUNCATED);
-    Cow::Owned(output)
+    if end < value.len()
+        && let Some(newline) = value[offset..end].rfind('\n')
+    {
+        end = offset + newline + 1;
+    }
+    if end == offset {
+        return Err("review section cannot make progress".into());
+    }
+    Ok(Page {
+        start: offset,
+        end,
+        text: &value[offset..end],
+    })
+}
+
+fn review_snapshot(
+    base: &str,
+    depth: u32,
+    max_nodes: u32,
+    manifest: &str,
+    patch: &str,
+    graph: &str,
+) -> String {
+    let depth = depth.to_string();
+    let max_nodes = max_nodes.to_string();
+    let mut hash = blake3::Hasher::new();
+    for value in [
+        b"graphr changes v1".as_slice(),
+        base.as_bytes(),
+        depth.as_bytes(),
+        max_nodes.as_bytes(),
+        manifest.as_bytes(),
+        patch.as_bytes(),
+        graph.as_bytes(),
+    ] {
+        hash.update(&(value.len() as u64).to_le_bytes());
+        hash.update(value);
+    }
+    hash.finalize().to_hex().to_string()
+}
+
+fn cursor_checksum(snapshot: &str, section: ReviewSection, offset: usize) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(snapshot.as_bytes());
+    hash.update(&[section.code() as u8]);
+    hash.update(&offset.to_le_bytes());
+    hash.finalize().to_hex().to_string()
+}
+
+fn cursor_token(snapshot: &str, section: ReviewSection, offset: usize) -> String {
+    format!(
+        "v1:{}:{offset}:{}",
+        section.code(),
+        cursor_checksum(snapshot, section, offset)
+    )
+}
+
+fn parse_review_cursor(value: &str) -> Result<ReviewCursor, String> {
+    let mut parts = value.split(':');
+    let version = parts.next();
+    let section = match parts.next() {
+        Some("f") => ReviewSection::Files,
+        Some("d") => ReviewSection::Diff,
+        Some("g") => ReviewSection::Graph,
+        _ => return Err("invalid changes cursor".into()),
+    };
+    let offset = parts
+        .next()
+        .filter(|offset| !offset.is_empty() && offset.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|offset| offset.parse().ok())
+        .ok_or_else(|| "invalid changes cursor".to_owned())?;
+    let checksum = parts
+        .next()
+        .filter(|checksum| {
+            checksum.len() == 64
+                && checksum
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+        .ok_or_else(|| "invalid changes cursor".to_owned())?;
+    if version != Some("v1") || parts.next().is_some() {
+        return Err("invalid changes cursor".into());
+    }
+    Ok(ReviewCursor {
+        section,
+        offset,
+        checksum: checksum.into(),
+    })
+}
+
+fn change_totals<'a>(
+    scope: &str,
+    paths: impl Iterator<Item = &'a ChangedPath>,
+    unknown: usize,
+) -> String {
+    let (additions, deletions, unknown) = paths.fold(
+        (0_u64, 0_u64, unknown),
+        |(additions, deletions, unknown), path| match (path.additions, path.deletions) {
+            (Some(added), Some(deleted)) => (
+                additions.saturating_add(added),
+                deletions.saturating_add(deleted),
+                unknown,
+            ),
+            _ => (additions, deletions, unknown + 1),
+        },
+    );
+    if unknown == 0 {
+        format!("{scope}_additions={additions} {scope}_deletions={deletions}")
+    } else {
+        format!(
+            "{scope}_additions_at_least={additions} {scope}_deletions_at_least={deletions} {scope}_unknown_stats={unknown}"
+        )
+    }
+}
+
+fn change_hunk_totals(changes: &WorktreeChanges, patch_hunks: usize) -> String {
+    let mut total = patch_hunks;
+    let mut unknown = changes.skipped_paths;
+    for path in &changes.paths {
+        let captured = path.status != ChangeStatus::Untracked
+            && (path.language.is_some() || path.old_language.is_some())
+            && path.additions.is_some()
+            && path.deletions.is_some();
+        if captured {
+            continue;
+        }
+        if path.status == ChangeStatus::Untracked {
+            if let Some(additions) = path.additions {
+                total = total.saturating_add(usize::from(additions > 0));
+            } else {
+                unknown = unknown.saturating_add(1);
+            }
+        } else {
+            unknown = unknown.saturating_add(1);
+        }
+    }
+    if unknown == 0 {
+        format!("all_path_hunks={total}")
+    } else {
+        format!("all_path_hunks_at_least={total} all_path_unknown_hunk_paths={unknown}")
+    }
+}
+
+struct RecordCoverage {
+    total: usize,
+    prior: usize,
+    emitted: usize,
+    partial: usize,
+    remaining: usize,
+}
+
+fn record_coverage(ranges: &[Range<usize>], page: &Page<'_>) -> RecordCoverage {
+    let prior = ranges.partition_point(|range| range.end <= page.start);
+    let remaining_start = ranges.partition_point(|range| range.start < page.end);
+    let mut coverage = RecordCoverage {
+        total: ranges.len(),
+        prior,
+        emitted: 0,
+        partial: 0,
+        remaining: ranges.len() - remaining_start,
+    };
+    for range in &ranges[prior..remaining_start] {
+        if range.start >= page.start && range.end <= page.end {
+            coverage.emitted += 1;
+        } else {
+            coverage.partial += 1;
+        }
+    }
+    coverage
+}
+
+fn line_ranges(value: &str, prefix: Option<&str>) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    for line in value.split_inclusive('\n') {
+        let end = offset + line.len();
+        if prefix.is_none_or(|prefix| line.starts_with(prefix)) {
+            ranges.push(offset..end);
+        }
+        offset = end;
+    }
+    ranges
+}
+
+fn hunk_ranges(value: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut current = None;
+    let mut offset = 0;
+    for line in value.split_inclusive('\n') {
+        if line.starts_with("diff --git ") || line.starts_with("@@ ") {
+            if let Some(start) = current.take() {
+                ranges.push(start..offset);
+            }
+            if line.starts_with("@@ ") {
+                current = Some(offset);
+            }
+        }
+        offset += line.len();
+    }
+    if let Some(start) = current {
+        ranges.push(start..value.len());
+    }
+    ranges
+}
+
+fn graph_flow_analysis_complete(value: &str) -> bool {
+    graph_summary_value(value, "analysis_complete") == Some("true")
+}
+
+fn graph_summary_value<'a>(value: &'a str, name: &str) -> Option<&'a str> {
+    value
+        .lines()
+        .next()?
+        .split_ascii_whitespace()
+        .find_map(|field| {
+            let (key, value) = field.split_once('=')?;
+            (key == name).then_some(value)
+        })
+}
+
+fn graph_review_complete(value: &str) -> bool {
+    graph_flow_analysis_complete(value)
+        && graph_summary_value(value, "changed_symbols_omitted") == Some("0")
+        && graph_summary_value(value, "neighborhood_omitted") == Some("false")
+        && graph_summary_value(value, "unmapped_ranges") == Some("0")
+}
+
+fn change_content_complete(changes: &WorktreeChanges) -> bool {
+    changes.skipped_paths == 0
+        && changes.paths.iter().all(|path| {
+            path.language.is_some()
+                && (path.status != ChangeStatus::Renamed || path.old_language.is_some())
+                && path.status != ChangeStatus::Untracked
+                && path.additions.is_some()
+                && path.deletions.is_some()
+        })
 }
 
 fn build_index(
@@ -1551,51 +2088,333 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_context_keeps_diff_and_graph_inside_one_budget() {
+    fn review_context_pages_diff_and_graph_without_losing_utf8() {
+        let patch = format!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n{}sentinel-last-hunk\n",
+            "@@ -1 +1 @@\n-é old\n+é changed\n".repeat(400)
+        );
+        let graph = format!(
+            "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=300 direct_test_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
+            (0..300)
+                .map(|index| format!(
+                    "flow 0.1000 entry_{index}@src/lib.rs:1 -> changed@src/lib.rs:2\n"
+                ))
+                .collect::<String>()
+        );
+        let changes = WorktreeChanges {
+            files: vec![],
+            records: vec![],
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: "src/lib.rs".into(),
+                language: Some(Language::Rust),
+                additions: Some(400),
+                deletions: Some(400),
+            }],
+            patch,
+            skipped_paths: 0,
+        };
+        let snapshot = ReviewSnapshot::new("HEAD", 6, 50, changes, graph);
+        let initial = review_context(&snapshot).unwrap();
+        assert!(initial.len() <= REVIEW_CONTEXT_BUDGET);
+        assert!(initial.contains("emitted_entries=1 partial_entries=0 total_entries=1"));
+        assert!(initial.contains("rename_detection=supported-only"));
+        assert!(initial.contains("total_hunks=400"));
+        assert!(initial.contains("total_flows=300"));
+        assert!(
+            initial.contains("review_complete=false review_complete_when_pages_exhausted=true")
+        );
+        assert!(!initial.contains("[truncated]"));
+
+        let mut pages = initial.clone();
+        for label in ["diff_next_cursor", "graph_next_cursor"] {
+            let mut cursor = next_cursor(&initial, label);
+            for _ in 0..100 {
+                let Some(token) = cursor else { break };
+                let output =
+                    render_section(&snapshot, &parse_review_cursor(&token).unwrap()).unwrap();
+                assert!(output.len() <= REVIEW_CONTEXT_BUDGET);
+                assert!(output.is_char_boundary(output.len()));
+                assert!(!output.contains("[truncated]"));
+                assert!(output.contains("review_complete_when_pages_exhausted=true"));
+                cursor = next_cursor(&output, label);
+                pages.push_str(&output);
+            }
+            assert!(cursor.is_none(), "pagination did not finish");
+        }
+        assert!(pages.contains("sentinel-last-hunk"));
         assert_eq!(
-            review_context(
-                "changed src/lib.rs\n",
-                "-old\n+new\n",
-                "caller <- function run src/lib.rs:1\n"
-            ),
-            "files\nchanged src/lib.rs\ndiff\n-old\n+new\ngraph\ncaller <- function run src/lib.rs:1\n"
+            pages
+                .lines()
+                .filter(|line| line.starts_with("flow "))
+                .count(),
+            300
         );
 
-        let patch = "é changed\n".repeat(2_000);
-        let graph = format!(
-            "caller <- function run src/lib.rs:1\n{}",
-            "edge\n".repeat(2_000)
+        let mut stale = next_cursor(&initial, "diff_next_cursor").unwrap();
+        let replacement = if stale.ends_with('0') { "1" } else { "0" };
+        stale.replace_range(stale.len() - 1.., replacement);
+        assert_eq!(
+            render_section(&snapshot, &parse_review_cursor(&stale).unwrap()).unwrap_err(),
+            "stale changes cursor"
         );
-        let output = review_context("changed src/lib.rs\n", &patch, &graph);
-        assert!(output.len() <= REVIEW_CONTEXT_BUDGET, "{}", output.len());
-        assert!(output.starts_with("files\nchanged src/lib.rs\ndiff\n"));
-        assert!(output.contains("graph\ncaller <- function run"), "{output}");
-        assert_eq!(output.matches(TRUNCATED.trim()).count(), 2, "{output}");
+    }
+
+    #[test]
+    fn review_complete_rejects_omitted_changed_symbols() {
+        let changes = WorktreeChanges {
+            files: vec![],
+            records: vec![],
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: "src/lib.rs".into(),
+                language: Some(Language::Rust),
+                additions: Some(1),
+                deletions: Some(1),
+            }],
+            patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            skipped_paths: 0,
+        };
+        let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 direct_test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+
+        let snapshot = ReviewSnapshot::new("HEAD", 6, 50, changes, graph.into());
+        let output = review_context(&snapshot).unwrap();
+
+        assert!(output.contains("review_complete=false"), "{output}");
+        assert!(
+            output.contains("review_complete_when_pages_exhausted=false"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn cross_language_rename_is_explicit_and_incomplete() {
+        let changes = WorktreeChanges {
+            files: vec![],
+            records: vec![],
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Renamed,
+                old_path: Some("src/old.rs".into()),
+                old_language: Some(Language::Rust),
+                path: "tests/fixture.tsv".into(),
+                language: None,
+                additions: Some(0),
+                deletions: Some(0),
+            }],
+            patch: "diff --git a/src/old.rs b/tests/fixture.tsv\n".into(),
+            skipped_paths: 0,
+        };
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+
+        let snapshot = ReviewSnapshot::new("HEAD", 6, 50, changes, graph.into());
+        let output = review_context(&snapshot).unwrap();
+
+        assert!(
+            output.contains("renamed supported-to-unsupported src/old.rs -> tests/fixture.tsv"),
+            "{output}"
+        );
+        assert!(output.contains("review_complete=false"), "{output}");
+        assert!(
+            output.contains("review_complete_when_pages_exhausted=false"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn graph_completeness_reads_only_the_summary() {
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n  risk 0.0000 node src/analysis_complete=false.rs:1\n";
+        assert!(graph_flow_analysis_complete(graph));
+        assert!(graph_review_complete(graph));
+    }
+
+    #[test]
+    fn diff_metadata_separates_patch_and_all_path_totals() {
+        let changes = WorktreeChanges {
+            files: vec![],
+            records: vec![],
+            paths: vec![
+                ChangedPath {
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    old_language: None,
+                    path: "src/lib.rs".into(),
+                    language: Some(Language::Rust),
+                    additions: Some(436),
+                    deletions: Some(7),
+                },
+                ChangedPath {
+                    status: ChangeStatus::Untracked,
+                    old_path: None,
+                    old_language: None,
+                    path: "tests/fixture.tsv".into(),
+                    language: None,
+                    additions: Some(3),
+                    deletions: Some(0),
+                },
+            ],
+            patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            skipped_paths: 0,
+        };
+        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+
+        let snapshot = ReviewSnapshot::new("HEAD", 6, 50, changes, graph.into());
+        let output = review_context(&snapshot).unwrap();
+
+        assert!(
+            output.contains(
+                "patch_additions=436 patch_deletions=7 all_path_additions=439 all_path_deletions=7"
+            ),
+            "{output}"
+        );
+        assert!(output.contains("all_path_hunks=2"), "{output}");
+
+        let unknown = WorktreeChanges {
+            files: vec![],
+            records: vec![],
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Deleted,
+                old_path: None,
+                old_language: None,
+                path: "src/old.rs".into(),
+                language: Some(Language::Rust),
+                additions: None,
+                deletions: None,
+            }],
+            patch: String::new(),
+            skipped_paths: 0,
+        };
+        assert_eq!(
+            change_hunk_totals(&unknown, 0),
+            "all_path_hunks_at_least=0 all_path_unknown_hunk_paths=1"
+        );
     }
 
     #[test]
     fn change_manifest_preserves_every_path_and_status() {
         let changes = WorktreeChanges {
-            files: ["src/current.rs", "src/new.rs", "src/new_file.rs"]
-                .map(|path| crate::git::ChangedFile {
-                    path: path.into(),
-                    whole_file: false,
-                    spans: vec![],
-                    report_unmapped: true,
-                })
-                .into(),
-            records: vec![
-                PathRecord::Deleted("src/deleted.rs".into()),
-                PathRecord::Renamed("src/old.rs".into(), "src/new.rs".into()),
-                PathRecord::Untracked("src/new_file.rs".into()),
+            files: vec![],
+            records: vec![],
+            paths: vec![
+                ChangedPath {
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    old_language: None,
+                    path: "src/current.rs".into(),
+                    language: Some(Language::Rust),
+                    additions: Some(2),
+                    deletions: Some(1),
+                },
+                ChangedPath {
+                    status: ChangeStatus::Deleted,
+                    old_path: None,
+                    old_language: None,
+                    path: "src/deleted.rs".into(),
+                    language: Some(Language::Rust),
+                    additions: Some(0),
+                    deletions: Some(3),
+                },
+                ChangedPath {
+                    status: ChangeStatus::Renamed,
+                    old_path: Some("src/old.rs".into()),
+                    old_language: Some(Language::Rust),
+                    path: "src/new.rs".into(),
+                    language: Some(Language::Rust),
+                    additions: Some(0),
+                    deletions: Some(0),
+                },
+                ChangedPath {
+                    status: ChangeStatus::Untracked,
+                    old_path: None,
+                    old_language: None,
+                    path: "tests/fixture.tsv".into(),
+                    language: None,
+                    additions: Some(3),
+                    deletions: Some(0),
+                },
             ],
             patch: String::new(),
             skipped_paths: 2,
         };
         assert_eq!(
             change_manifest(&changes),
-            "changed src/current.rs\ndeleted src/deleted.rs\nrenamed src/old.rs -> src/new.rs\nuntracked src/new_file.rs\nskipped 2 unsupported paths\n"
+            "changed supported src/current.rs status=modified additions=2 deletions=1\ndeleted supported src/deleted.rs additions=0 deletions=3\nrenamed supported src/old.rs -> src/new.rs additions=0 deletions=0\nuntracked unsupported tests/fixture.tsv additions=3 deletions=0\nskipped 2 unsafe paths\n"
         );
+    }
+
+    #[test]
+    fn byte_pages_reconstruct_oversized_unicode_lines_exactly() {
+        let source = format!("first\n{}\nlast\n", "é".repeat(5_000));
+        let snapshot = ReviewSnapshot::new(
+            "HEAD",
+            6,
+            50,
+            WorktreeChanges {
+                files: vec![],
+                records: vec![],
+                paths: vec![ChangedPath {
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    old_language: None,
+                    path: "src/lib.rs".into(),
+                    language: Some(Language::Rust),
+                    additions: Some(1),
+                    deletions: Some(1),
+                }],
+                patch: source.clone(),
+                skipped_paths: 0,
+            },
+            "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n".into(),
+        );
+        let mut offset = 0;
+        let mut reconstructed = String::new();
+        while offset < source.len() {
+            let (rendered, more) = render_section_page(
+                &snapshot,
+                ReviewSection::Diff,
+                offset,
+                SECTION_OVERHEAD + 257,
+            )
+            .unwrap();
+            let metadata = rendered.lines().nth(1).unwrap();
+            let field = |name: &str| {
+                metadata
+                    .split_ascii_whitespace()
+                    .find_map(|field| field.strip_prefix(&format!("{name}=")))
+                    .unwrap()
+            };
+            let emitted = field("emitted_bytes").parse::<usize>().unwrap();
+            let (start, end) = field("byte_range").split_once("..").unwrap();
+            let start = start.parse::<usize>().unwrap();
+            let end = end.parse::<usize>().unwrap();
+            assert_eq!(start, offset);
+            assert_eq!(end - start, emitted);
+            let content_start = rendered.match_indices('\n').nth(1).unwrap().0 + 1;
+            let content_end = content_start + emitted;
+            assert!(rendered.is_char_boundary(content_end));
+            let content = &rendered[content_start..content_end];
+            assert_eq!(content, &source[start..end]);
+            let framing = field("framing_suffix_bytes").parse::<usize>().unwrap();
+            assert_eq!(framing, usize::from(!content.ends_with('\n')));
+            if framing == 1 {
+                assert_eq!(rendered.as_bytes().get(content_end), Some(&b'\n'));
+            }
+            reconstructed.push_str(content);
+            offset = end;
+            assert_eq!(more, offset < source.len());
+        }
+        assert_eq!(reconstructed, source);
+    }
+
+    fn next_cursor(output: &str, label: &str) -> Option<String> {
+        output.lines().find_map(|line| {
+            line.strip_prefix(label)
+                .and_then(|value| value.strip_prefix('='))
+                .map(str::to_owned)
+        })
     }
 
     #[test]

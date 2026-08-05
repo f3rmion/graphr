@@ -16,7 +16,8 @@ const STDOUT_LIMIT: usize = 64 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(30);
 const SOURCE_LIMIT: u64 = 2 * 1024 * 1024;
-const PATCH_CAPTURE_LIMIT: usize = 8 * 1024;
+const UNTRACKED_STATS_FILE_LIMIT: usize = 256;
+const UNTRACKED_STATS_BYTE_LIMIT: u64 = SOURCE_LIMIT;
 
 pub struct Repository {
     pub root: PathBuf,
@@ -84,17 +85,56 @@ pub enum PathRecord {
     Untracked(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ChangeStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    TypeChanged,
+    Unmerged,
+    Untracked,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ChangedPath {
+    pub status: ChangeStatus,
+    pub old_path: Option<String>,
+    pub old_language: Option<Language>,
+    pub path: String,
+    pub language: Option<Language>,
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct WorktreeChanges {
     pub files: Vec<ChangedFile>,
     pub records: Vec<PathRecord>,
+    pub paths: Vec<ChangedPath>,
     pub patch: String,
     pub skipped_paths: usize,
 }
 
+struct WorktreeCapture {
+    tracked: Vec<u8>,
+    inventory: Vec<u8>,
+    untracked: UntrackedSnapshot,
+}
+
+struct UntrackedSnapshot {
+    paths: Vec<ChangedPath>,
+    skipped_paths: usize,
+    signature: [u8; 32],
+}
+
 impl WorktreeChanges {
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.records.is_empty() && self.skipped_paths == 0
+        self.files.is_empty()
+            && self.records.is_empty()
+            && self.paths.is_empty()
+            && self.patch.is_empty()
+            && self.skipped_paths == 0
     }
 }
 
@@ -193,59 +233,90 @@ impl Repository {
     ) -> Result<WorktreeChanges, String> {
         validate_base(base)?;
         let revision = format!("{base}^{{commit}}");
-        let (tracked, untracked) = thread::scope(|scope| {
-            let untracked = scope.spawn(|| {
-                run(
+        let capture = || {
+            thread::scope(|scope| {
+                let untracked = scope.spawn(|| {
+                    let output = run(
+                        &self.root,
+                        &["ls-files", "--others", "--exclude-standard", "-z"],
+                        cancelled,
+                    )?;
+                    capture_untracked(&self.root, &output, cancelled)
+                });
+                let inventory = scope.spawn(|| {
+                    run(
+                        &self.root,
+                        &[
+                            "diff-index",
+                            "--raw",
+                            "-z",
+                            "--abbrev=64",
+                            "--no-renames",
+                            "--diff-filter=AMDTU",
+                            "--no-color",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--ignore-submodules=none",
+                            &revision,
+                        ],
+                        cancelled,
+                    )
+                });
+                let tracked = run(
                     &self.root,
                     &[
-                        "ls-files",
-                        "--others",
-                        "--exclude-standard",
+                        "diff-index",
+                        "--raw",
                         "-z",
+                        "--patch",
+                        "--unified=0",
+                        "--abbrev=64",
+                        "--find-renames=50%",
+                        "-l0",
+                        "--diff-filter=AMDR",
+                        "--diff-algorithm=myers",
+                        "--no-indent-heuristic",
+                        "-O/dev/null",
+                        "--no-color",
+                        "--src-prefix=a/",
+                        "--dst-prefix=b/",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--ignore-submodules=all",
+                        "--text",
+                        &revision,
                         "--",
                         "*.rs",
                         "*.py",
                     ],
                     cancelled,
-                )
-            });
-            let tracked = run(
-                &self.root,
-                &[
-                    "diff-index",
-                    "--raw",
-                    "-z",
-                    "--patch",
-                    "--unified=0",
-                    "--abbrev=64",
-                    "--find-renames=50%",
-                    "-l0",
-                    "--diff-filter=AMDR",
-                    "--diff-algorithm=myers",
-                    "--no-indent-heuristic",
-                    "-O/dev/null",
-                    "--no-color",
-                    "--src-prefix=a/",
-                    "--dst-prefix=b/",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--ignore-submodules=all",
-                    "--text",
-                    &revision,
-                    "--",
-                    "*.rs",
-                    "*.py",
-                ],
-                cancelled,
-            );
-            let untracked = untracked
-                .join()
-                .map_err(|_| "Git inventory worker panicked".to_owned())?;
-            Ok::<_, String>((tracked?, untracked?))
-        })?;
-        let tracked = parse_tracked_changes(&tracked, cancelled)?;
+                );
+                let untracked = untracked
+                    .join()
+                    .map_err(|_| "Git inventory worker panicked".to_owned())?;
+                let inventory = inventory
+                    .join()
+                    .map_err(|_| "Git metadata worker panicked".to_owned())?;
+                Ok::<_, String>(WorktreeCapture {
+                    tracked: tracked?,
+                    inventory: inventory?,
+                    untracked: untracked?,
+                })
+            })
+        };
+        // ponytail: two stable samples reject ordinary concurrent edits; use a
+        // filesystem snapshot if adversarial ABA mutations ever matter.
+        let first = capture()?;
+        let signature = worktree_signature(&first);
+        drop(first);
+        let outputs = capture()?;
+        if signature != worktree_signature(&outputs) {
+            return Err("Git working tree changed while reading; retry".into());
+        }
+        let tracked = parse_tracked_changes(&outputs.tracked, cancelled)?;
+        let inventory = parse_change_inventory(&outputs.inventory, cancelled)?;
         check_cancelled(cancelled)?;
-        merge_changes(tracked, &untracked, cancelled)
+        merge_changes(tracked, inventory, outputs.untracked, cancelled)
     }
 
     pub fn read_source(
@@ -257,58 +328,10 @@ impl Repository {
         if language_for_path(&source.path) != Some(source.language) {
             return Ok(None);
         }
-        let path = source.path.as_str();
-        let candidate = self.root.join(path);
-        let Ok(before) = fs::symlink_metadata(&candidate) else {
-            return Ok(None);
-        };
-        if !before.is_file() {
-            return Ok(None);
-        }
-        let Ok(canonical) = fs::canonicalize(&candidate) else {
-            return Ok(None);
-        };
-        let Ok(mut file) = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&candidate)
+        let Some(content) = read_regular_file(&self.root, &source.path, SOURCE_LIMIT, cancelled)?
         else {
             return Ok(None);
         };
-        let Ok(after) = file.metadata() else {
-            return Ok(None);
-        };
-        if canonical != candidate
-            || !after.is_file()
-            || before.dev() != after.dev()
-            || before.ino() != after.ino()
-            || after.len() > SOURCE_LIMIT
-        {
-            return Ok(None);
-        }
-        let mut content = Vec::with_capacity(after.len() as usize);
-        let Ok(_) = file
-            .by_ref()
-            .take(SOURCE_LIMIT + 1)
-            .read_to_end(&mut content)
-        else {
-            return Ok(None);
-        };
-        let finished = file
-            .metadata()
-            .map_err(|error| format!("cannot recheck source {path}: {error}"))?;
-        let current = fs::symlink_metadata(&candidate)
-            .map_err(|error| format!("cannot recheck source {path}: {error}"))?;
-        if !current.is_file()
-            || !same_file_version(&before, &finished)
-            || !same_file_version(&finished, &current)
-        {
-            return Err(format!("source changed while indexing: {path}"));
-        }
-        check_cancelled(cancelled)?;
-        if content.len() as u64 > SOURCE_LIMIT {
-            return Ok(None);
-        }
         let Ok(text) = String::from_utf8(content) else {
             return Ok(None);
         };
@@ -319,18 +342,244 @@ impl Repository {
     }
 }
 
-#[derive(Clone, Copy)]
+fn worktree_signature(outputs: &WorktreeCapture) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    for output in [&outputs.tracked, &outputs.inventory] {
+        hash.update(&(output.len() as u64).to_le_bytes());
+        hash.update(output);
+    }
+    hash.update(&outputs.untracked.signature);
+    *hash.finalize().as_bytes()
+}
+
+fn read_regular_file(
+    root: &Path,
+    path: &str,
+    limit: u64,
+    cancelled: &AtomicBool,
+) -> Result<Option<Vec<u8>>, String> {
+    check_cancelled(cancelled)?;
+    let candidate = root.join(path);
+    let Ok(before) = fs::symlink_metadata(&candidate) else {
+        return Ok(None);
+    };
+    if !before.is_file() || before.len() > limit {
+        return Ok(None);
+    }
+    let Ok(canonical) = fs::canonicalize(&candidate) else {
+        return Ok(None);
+    };
+    let Ok(mut file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&candidate)
+    else {
+        return Ok(None);
+    };
+    let Ok(after) = file.metadata() else {
+        return Ok(None);
+    };
+    if canonical != candidate
+        || !after.is_file()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || after.len() > limit
+    {
+        return Ok(None);
+    }
+    let mut content = Vec::with_capacity(after.len() as usize);
+    let Ok(_) = file
+        .by_ref()
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut content)
+    else {
+        return Ok(None);
+    };
+    let finished = file
+        .metadata()
+        .map_err(|error| format!("cannot recheck file {path}: {error}"))?;
+    let current = fs::symlink_metadata(&candidate)
+        .map_err(|error| format!("cannot recheck file {path}: {error}"))?;
+    if !current.is_file()
+        || !same_file_version(&before, &finished)
+        || !same_file_version(&finished, &current)
+    {
+        return Err(format!("file changed while reading: {path}"));
+    }
+    check_cancelled(cancelled)?;
+    if content.len() as u64 > limit {
+        Ok(None)
+    } else {
+        Ok(Some(content))
+    }
+}
+
+fn capture_untracked(
+    root: &Path,
+    input: &[u8],
+    cancelled: &AtomicBool,
+) -> Result<UntrackedSnapshot, String> {
+    if !input.is_empty() && !input.ends_with(&[0]) {
+        return Err("Git returned malformed untracked paths".into());
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(&(input.len() as u64).to_le_bytes());
+    hash.update(input);
+    let mut paths = Vec::new();
+    let mut skipped_paths = 0;
+    let mut files_left = UNTRACKED_STATS_FILE_LIMIT;
+    let mut bytes_left = UNTRACKED_STATS_BYTE_LIMIT;
+    if input.is_empty() {
+        return Ok(UntrackedSnapshot {
+            paths,
+            skipped_paths,
+            signature: *hash.finalize().as_bytes(),
+        });
+    }
+
+    for (index, raw_path) in input
+        .strip_suffix(&[0])
+        .expect("validated trailing NUL")
+        .split(|byte| *byte == 0)
+        .enumerate()
+    {
+        check_progress(index, cancelled)?;
+        if raw_path.is_empty() {
+            return Err("Git returned malformed untracked paths".into());
+        }
+        let Some(path) = parse_change_path(raw_path)? else {
+            skipped_paths += 1;
+            continue;
+        };
+        let before = safe_regular_metadata(root, &path);
+        let content = if before.is_some() && files_left > 0 && bytes_left > 0 {
+            files_left -= 1;
+            // ponytail: sample at most 256 files/2 MiB; raise these caps only if
+            // exact all-untracked statistics justify the filesystem exposure.
+            read_regular_file(root, &path, bytes_left, cancelled)?
+        } else {
+            None
+        };
+        let after = safe_regular_metadata(root, &path);
+        let regular = match (&before, &after) {
+            (Some(before), Some(after)) if same_file_version(before, after) => true,
+            (None, None) => false,
+            _ => return Err(format!("file changed while reading: {path}")),
+        };
+        hash.update(&[u8::from(regular)]);
+        if let Some(metadata) = &after {
+            hash_file_version(&mut hash, metadata);
+        }
+        let (additions, deletions) = if let Some(content) = content {
+            bytes_left -= content.len() as u64;
+            hash.update(&(content.len() as u64).to_le_bytes());
+            hash.update(&content);
+            if content.contains(&0) || std::str::from_utf8(&content).is_err() {
+                (None, None)
+            } else {
+                let lines = content.iter().filter(|byte| **byte == b'\n').count()
+                    + usize::from(!content.is_empty() && !content.ends_with(b"\n"));
+                let lines = u64::try_from(lines)
+                    .map_err(|_| "untracked line count exceeds range".to_owned())?;
+                (Some(lines), Some(0))
+            }
+        } else {
+            hash.update(&u64::MAX.to_le_bytes());
+            (None, None)
+        };
+        paths.push(ChangedPath {
+            status: ChangeStatus::Untracked,
+            old_path: None,
+            old_language: None,
+            path: path.clone(),
+            language: regular.then(|| language_for_path(&path)).flatten(),
+            additions,
+            deletions,
+        });
+    }
+    Ok(UntrackedSnapshot {
+        paths,
+        skipped_paths,
+        signature: *hash.finalize().as_bytes(),
+    })
+}
+
+fn safe_regular_metadata(root: &Path, path: &str) -> Option<fs::Metadata> {
+    let candidate = root.join(path);
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    (metadata.is_file()
+        && fs::canonicalize(&candidate).is_ok_and(|canonical| canonical == candidate))
+    .then_some(metadata)
+}
+
+fn hash_file_version(hash: &mut blake3::Hasher, metadata: &fs::Metadata) {
+    hash.update(&metadata.dev().to_le_bytes());
+    hash.update(&metadata.ino().to_le_bytes());
+    hash.update(&metadata.len().to_le_bytes());
+    hash.update(&metadata.mtime().to_le_bytes());
+    hash.update(&metadata.mtime_nsec().to_le_bytes());
+    hash.update(&metadata.ctime().to_le_bytes());
+    hash.update(&metadata.ctime_nsec().to_le_bytes());
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RawKind {
     Added,
     Modified,
     Deleted,
     Renamed,
+    TypeChanged,
+    Unmerged,
+}
+
+impl RawKind {
+    const fn status(self) -> ChangeStatus {
+        match self {
+            Self::Added => ChangeStatus::Added,
+            Self::Modified => ChangeStatus::Modified,
+            Self::Deleted => ChangeStatus::Deleted,
+            Self::Renamed => ChangeStatus::Renamed,
+            Self::TypeChanged => ChangeStatus::TypeChanged,
+            Self::Unmerged => ChangeStatus::Unmerged,
+        }
+    }
 }
 
 struct RawChange {
     kind: RawKind,
     old: Option<String>,
     new: Option<String>,
+    old_regular: bool,
+    new_regular: bool,
+}
+
+struct RawHeader {
+    kind: RawKind,
+    old_regular: bool,
+    new_regular: bool,
+}
+
+struct TrackedStat {
+    path: String,
+    additions: u64,
+    deletions: u64,
+}
+
+struct TrackedChanges {
+    files: Vec<ChangedFile>,
+    records: Vec<PathRecord>,
+    patch: String,
+    stats: Vec<TrackedStat>,
+    omitted_stats: HashSet<String>,
+}
+
+#[derive(Default)]
+struct PatchChange {
+    spans: Vec<LineSpan>,
+    additions: u64,
+    deletions: u64,
+    start: usize,
+    end: usize,
 }
 
 fn validate_base(base: &str) -> Result<(), String> {
@@ -345,12 +594,15 @@ fn validate_base(base: &str) -> Result<(), String> {
     }
 }
 
-fn parse_tracked_changes(
-    output: &[u8],
-    cancelled: &AtomicBool,
-) -> Result<(Vec<ChangedFile>, Vec<PathRecord>, String, usize), String> {
+fn parse_tracked_changes(output: &[u8], cancelled: &AtomicBool) -> Result<TrackedChanges, String> {
     if output.is_empty() {
-        return Ok((Vec::new(), Vec::new(), String::new(), 0));
+        return Ok(TrackedChanges {
+            files: Vec::new(),
+            records: Vec::new(),
+            patch: String::new(),
+            stats: Vec::new(),
+            omitted_stats: HashSet::new(),
+        });
     }
     let boundary = output
         .windows(2)
@@ -359,23 +611,83 @@ fn parse_tracked_changes(
     let raw = &output[..=boundary];
     let patch = &output[boundary + 2..];
     let raw = parse_raw_changes(raw, cancelled)?;
-    let skipped_paths = raw
-        .iter()
-        .filter(|change| match change.kind {
-            RawKind::Added | RawKind::Modified => change.new.is_none(),
-            RawKind::Deleted => change.old.is_none(),
-            RawKind::Renamed => change.old.is_none() || change.new.is_none(),
-        })
-        .count();
-    let hunks = parse_patch_hunks(patch, raw.len(), cancelled)?;
+    let patches = parse_patch_hunks(patch, raw.len(), cancelled)?;
     let mut files = Vec::new();
     let mut records = Vec::new();
+    let mut stats = Vec::new();
+    let mut omitted_stats = HashSet::new();
+    let mut filtered_patch = Vec::new();
 
-    for (index, (change, spans)) in raw.into_iter().zip(hunks).enumerate() {
+    for (index, (change, patch_change)) in raw.into_iter().zip(patches).enumerate() {
         check_progress(index, cancelled)?;
+        let PatchChange {
+            spans,
+            additions,
+            deletions,
+            start,
+            end,
+        } = patch_change;
+        let section_supported = match change.kind {
+            RawKind::Added | RawKind::Modified => change
+                .new
+                .as_ref()
+                .is_some_and(|path| change.new_regular && language_for_path(path).is_some()),
+            RawKind::Deleted => change
+                .old
+                .as_ref()
+                .is_some_and(|path| change.old_regular && language_for_path(path).is_some()),
+            RawKind::Renamed => match (&change.old, &change.new) {
+                (Some(old), Some(new)) => {
+                    change.old_regular
+                        && change.new_regular
+                        && language_for_path(old).is_some()
+                        && language_for_path(new).is_some()
+                }
+                _ => false,
+            },
+            RawKind::TypeChanged | RawKind::Unmerged => false,
+        };
+        let stat_path = match change.kind {
+            RawKind::Added | RawKind::Modified => change
+                .new
+                .as_ref()
+                .filter(|path| change.new_regular && language_for_path(path).is_some()),
+            RawKind::Renamed => change
+                .new
+                .as_ref()
+                .filter(|path| change.new_regular && language_for_path(path).is_some())
+                .or_else(|| {
+                    change
+                        .old
+                        .as_ref()
+                        .filter(|path| change.old_regular && language_for_path(path).is_some())
+                }),
+            RawKind::Deleted => change
+                .old
+                .as_ref()
+                .filter(|path| change.old_regular && language_for_path(path).is_some()),
+            RawKind::TypeChanged | RawKind::Unmerged => None,
+        };
+        if let Some(path) = stat_path {
+            if section_supported {
+                stats.push(TrackedStat {
+                    path: path.clone(),
+                    additions,
+                    deletions,
+                });
+            } else {
+                omitted_stats.insert(path.clone());
+            }
+        }
+        if section_supported {
+            filtered_patch.extend_from_slice(&patch[start..end]);
+        }
         match change.kind {
             RawKind::Added => {
-                if let Some(path) = change.new {
+                if let Some(path) = change
+                    .new
+                    .filter(|path| change.new_regular && language_for_path(path).is_some())
+                {
                     files.push(ChangedFile {
                         path,
                         whole_file: true,
@@ -385,7 +697,10 @@ fn parse_tracked_changes(
                 }
             }
             RawKind::Modified => {
-                if let Some(path) = change.new {
+                if let Some(path) = change
+                    .new
+                    .filter(|path| change.new_regular && language_for_path(path).is_some())
+                {
                     files.push(ChangedFile {
                         path,
                         whole_file: false,
@@ -395,12 +710,20 @@ fn parse_tracked_changes(
                 }
             }
             RawKind::Deleted => {
-                if let Some(path) = change.old {
+                if let Some(path) = change
+                    .old
+                    .filter(|path| change.old_regular && language_for_path(path).is_some())
+                {
                     records.push(PathRecord::Deleted(path));
                 }
             }
             RawKind::Renamed => match (change.old, change.new) {
-                (Some(old), Some(new)) => {
+                (Some(old), Some(new))
+                    if change.old_regular
+                        && change.new_regular
+                        && language_for_path(&old).is_some()
+                        && language_for_path(&new).is_some() =>
+                {
                     files.push(ChangedFile {
                         path: new.clone(),
                         whole_file: true,
@@ -409,32 +732,39 @@ fn parse_tracked_changes(
                     });
                     records.push(PathRecord::Renamed(old, new));
                 }
-                (Some(old), None) => records.push(PathRecord::Deleted(old)),
-                (None, Some(new)) => files.push(ChangedFile {
-                    path: new,
-                    whole_file: true,
-                    spans,
-                    report_unmapped: true,
-                }),
-                (None, None) => {}
+                (Some(old), new) if change.old_regular && language_for_path(&old).is_some() => {
+                    records.push(PathRecord::Deleted(old));
+                    if let Some(new) =
+                        new.filter(|path| change.new_regular && language_for_path(path).is_some())
+                    {
+                        files.push(ChangedFile {
+                            path: new,
+                            whole_file: true,
+                            spans,
+                            report_unmapped: true,
+                        });
+                    }
+                }
+                (_, Some(new)) if change.new_regular && language_for_path(&new).is_some() => {
+                    files.push(ChangedFile {
+                        path: new,
+                        whole_file: true,
+                        spans,
+                        report_unmapped: true,
+                    });
+                }
+                _ => {}
             },
+            RawKind::TypeChanged | RawKind::Unmerged => {}
         }
     }
-    Ok((files, records, capture_patch(patch), skipped_paths))
-}
-
-fn capture_patch(input: &[u8]) -> String {
-    if input.len() <= PATCH_CAPTURE_LIMIT {
-        return String::from_utf8_lossy(input).into_owned();
-    }
-    let prefix = &input[..PATCH_CAPTURE_LIMIT];
-    let end = prefix
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(prefix.len(), |index| index + 1);
-    let mut output = String::from_utf8_lossy(&prefix[..end]).into_owned();
-    output.push_str("[truncated]\n");
-    output
+    Ok(TrackedChanges {
+        files,
+        records,
+        patch: String::from_utf8_lossy(&filtered_patch).into_owned(),
+        stats,
+        omitted_stats,
+    })
 }
 
 fn parse_raw_changes(input: &[u8], cancelled: &AtomicBool) -> Result<Vec<RawChange>, String> {
@@ -451,38 +781,8 @@ fn parse_raw_changes(input: &[u8], cancelled: &AtomicBool) -> Result<Vec<RawChan
             }
             break;
         }
-        let fields = header
-            .strip_prefix(b":")
-            .ok_or_else(|| "Git returned malformed diff metadata".to_owned())?
-            .split(|byte| byte.is_ascii_whitespace())
-            .filter(|field| !field.is_empty())
-            .collect::<Vec<_>>();
-        if fields.len() != 5
-            || !fields[..2]
-                .iter()
-                .all(|mode| mode.len() == 6 && mode.iter().all(|byte| matches!(byte, b'0'..=b'7')))
-            || !fields[2..4].iter().all(|oid| valid_oid(oid))
-        {
-            return Err("Git returned malformed diff metadata".into());
-        }
-        let status = fields[4];
-        let kind = match status {
-            b"A" => RawKind::Added,
-            b"M" => RawKind::Modified,
-            b"D" => RawKind::Deleted,
-            score
-                if score.first() == Some(&b'R')
-                    && score.len() > 1
-                    && score[1..].iter().all(u8::is_ascii_digit)
-                    && std::str::from_utf8(&score[1..])
-                        .ok()
-                        .and_then(|score| score.parse::<u8>().ok())
-                        .is_some_and(|score| score <= 100) =>
-            {
-                RawKind::Renamed
-            }
-            _ => return Err("Git returned unsupported diff metadata".into()),
-        };
+        let header = parse_raw_header(header)?;
+        let kind = header.kind;
         let first = records
             .next()
             .filter(|path| !path.is_empty())
@@ -499,47 +799,363 @@ fn parse_raw_changes(input: &[u8], cancelled: &AtomicBool) -> Result<Vec<RawChan
         } else {
             (None, first)
         };
-        changes.push(RawChange { kind, old, new });
+        changes.push(RawChange {
+            kind,
+            old,
+            new,
+            old_regular: header.old_regular,
+            new_regular: header.new_regular,
+        });
     }
     Ok(changes)
+}
+
+fn parse_raw_header(header: &[u8]) -> Result<RawHeader, String> {
+    let fields = header
+        .strip_prefix(b":")
+        .ok_or_else(|| "Git returned malformed diff metadata".to_owned())?
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if fields.len() != 5
+        || !fields[..2]
+            .iter()
+            .all(|mode| mode.len() == 6 && mode.iter().all(|byte| matches!(byte, b'0'..=b'7')))
+        || !fields[2..4].iter().all(|oid| valid_oid(oid))
+    {
+        return Err("Git returned malformed diff metadata".into());
+    }
+    let kind = match fields[4] {
+        b"A" => RawKind::Added,
+        b"M" => RawKind::Modified,
+        b"D" => RawKind::Deleted,
+        b"T" => RawKind::TypeChanged,
+        b"U" => RawKind::Unmerged,
+        score
+            if score.first() == Some(&b'R')
+                && score.len() > 1
+                && score[1..].iter().all(u8::is_ascii_digit)
+                && std::str::from_utf8(&score[1..])
+                    .ok()
+                    .and_then(|score| score.parse::<u8>().ok())
+                    .is_some_and(|score| score <= 100) =>
+        {
+            RawKind::Renamed
+        }
+        _ => return Err("Git returned unsupported diff metadata".into()),
+    };
+    Ok(RawHeader {
+        kind,
+        old_regular: matches!(fields[0], b"100644" | b"100755"),
+        new_regular: matches!(fields[1], b"100644" | b"100755"),
+    })
+}
+
+fn parse_change_inventory(
+    input: &[u8],
+    cancelled: &AtomicBool,
+) -> Result<(Vec<ChangedPath>, usize), String> {
+    if input.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let raw = parse_raw_changes(input, cancelled)?;
+    let mut paths = Vec::with_capacity(raw.len());
+    let mut skipped = 0;
+    for (index, change) in raw.into_iter().enumerate() {
+        check_progress(index, cancelled)?;
+        let old_language = change
+            .old_regular
+            .then(|| change.old.as_deref().and_then(language_for_path))
+            .flatten();
+        let new_language = change
+            .new_regular
+            .then(|| change.new.as_deref().and_then(language_for_path))
+            .flatten();
+        let (status, old_path, old_language, path, language) = match change.kind {
+            RawKind::Added | RawKind::Modified | RawKind::TypeChanged | RawKind::Unmerged => {
+                let Some(path) = change.new else {
+                    skipped += 1;
+                    continue;
+                };
+                let language = if matches!(change.kind, RawKind::TypeChanged | RawKind::Unmerged) {
+                    None
+                } else {
+                    new_language
+                };
+                (change.kind.status(), None, None, path, language)
+            }
+            RawKind::Deleted => {
+                let Some(path) = change.old else {
+                    skipped += 1;
+                    continue;
+                };
+                (ChangeStatus::Deleted, None, None, path, old_language)
+            }
+            RawKind::Renamed => match (change.old, change.new) {
+                (Some(old), Some(new)) => (
+                    ChangeStatus::Renamed,
+                    Some(old),
+                    old_language,
+                    new,
+                    new_language,
+                ),
+                (None, Some(new)) => {
+                    skipped += 1;
+                    (ChangeStatus::Added, None, None, new, new_language)
+                }
+                (Some(old), None) => {
+                    skipped += 1;
+                    (ChangeStatus::Deleted, None, None, old, old_language)
+                }
+                (None, None) => {
+                    skipped += 2;
+                    continue;
+                }
+            },
+        };
+        paths.push(ChangedPath {
+            status,
+            old_path,
+            old_language,
+            language,
+            path,
+            additions: None,
+            deletions: None,
+        });
+    }
+    paths.sort_unstable_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.status.cmp(&right.status))
+            .then_with(|| left.old_path.cmp(&right.old_path))
+    });
+    paths.dedup();
+    Ok((paths, skipped))
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+enum SupportedProjection {
+    Current(String),
+    Deleted(String),
+    Renamed(String, String),
+}
+
+fn validate_supported_projection(
+    files: &[ChangedFile],
+    records: &[PathRecord],
+    paths: &[ChangedPath],
+) -> Result<(), String> {
+    let mut actual = files
+        .iter()
+        .map(|file| SupportedProjection::Current(file.path.clone()))
+        .collect::<Vec<_>>();
+    actual.extend(records.iter().filter_map(|record| match record {
+        PathRecord::Deleted(path) => Some(SupportedProjection::Deleted(path.clone())),
+        PathRecord::Renamed(old, new) => {
+            Some(SupportedProjection::Renamed(old.clone(), new.clone()))
+        }
+        PathRecord::Untracked(_) => None,
+    }));
+
+    let mut expected = Vec::new();
+    for path in paths {
+        match path.status {
+            ChangeStatus::Added | ChangeStatus::Modified if path.language.is_some() => {
+                expected.push(SupportedProjection::Current(path.path.clone()));
+            }
+            ChangeStatus::Deleted if path.language.is_some() => {
+                expected.push(SupportedProjection::Deleted(path.path.clone()));
+            }
+            ChangeStatus::Renamed => {
+                let old = path.old_path.as_deref();
+                let old_supported = path.old_language.is_some();
+                let new_supported = path.language.is_some();
+                match (old, old_supported, new_supported) {
+                    (Some(old), true, true) => {
+                        expected.push(SupportedProjection::Current(path.path.clone()));
+                        expected.push(SupportedProjection::Renamed(
+                            old.to_owned(),
+                            path.path.clone(),
+                        ));
+                    }
+                    (Some(old), true, false) => {
+                        expected.push(SupportedProjection::Deleted(old.to_owned()));
+                    }
+                    (_, false, true) => {
+                        expected.push(SupportedProjection::Current(path.path.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    actual.sort_unstable();
+    actual.dedup();
+    expected.sort_unstable();
+    expected.dedup();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err("Git change inventories disagree; retry".into())
+    }
+}
+
+fn apply_supported_stats(
+    paths: &mut [ChangedPath],
+    stats: Vec<TrackedStat>,
+    mut omitted: HashSet<String>,
+) -> Result<(), String> {
+    let mut by_path = HashMap::new();
+    for stat in stats {
+        if by_path
+            .insert(stat.path, (stat.additions, stat.deletions))
+            .is_some()
+        {
+            return Err("Git returned duplicate change statistics".into());
+        }
+    }
+    for path in paths {
+        let key = match path.status {
+            ChangeStatus::Added | ChangeStatus::Modified | ChangeStatus::Deleted
+                if path.language.is_some() =>
+            {
+                Some(path.path.as_str())
+            }
+            ChangeStatus::Renamed if path.language.is_some() => Some(path.path.as_str()),
+            ChangeStatus::Renamed if path.old_language.is_some() => path.old_path.as_deref(),
+            _ => None,
+        };
+        if let Some(key) = key {
+            if let Some((additions, deletions)) = by_path.remove(key) {
+                path.additions = Some(additions);
+                path.deletions = Some(deletions);
+            } else if !omitted.remove(key) {
+                return Err("Git change inventories disagree; retry".into());
+            }
+        }
+    }
+    if by_path.is_empty() && omitted.is_empty() {
+        Ok(())
+    } else {
+        Err("Git change inventories disagree; retry".into())
+    }
+}
+
+fn coalesce_supported_renames(
+    paths: &mut Vec<ChangedPath>,
+    records: &[PathRecord],
+) -> Result<(), String> {
+    let mut consumed = HashSet::new();
+    let mut renames = Vec::new();
+    for record in records {
+        let PathRecord::Renamed(old, new) = record else {
+            continue;
+        };
+        if paths.iter().any(|path| {
+            path.status == ChangeStatus::Renamed
+                && path.old_path.as_deref() == Some(old)
+                && path.path == *new
+        }) {
+            continue;
+        }
+        let deleted = paths.iter().enumerate().find(|(index, path)| {
+            !consumed.contains(index) && path.status == ChangeStatus::Deleted && path.path == *old
+        });
+        let added = paths.iter().enumerate().find(|(index, path)| {
+            !consumed.contains(index) && path.status == ChangeStatus::Added && path.path == *new
+        });
+        let (Some((deleted_index, deleted)), Some((added_index, added))) = (deleted, added) else {
+            return Err("Git change inventories disagree; retry".into());
+        };
+        consumed.insert(deleted_index);
+        consumed.insert(added_index);
+        renames.push(ChangedPath {
+            status: ChangeStatus::Renamed,
+            old_path: Some(old.clone()),
+            old_language: deleted.language,
+            path: new.clone(),
+            language: added.language,
+            additions: None,
+            deletions: None,
+        });
+    }
+    if !consumed.is_empty() {
+        *paths = paths
+            .drain(..)
+            .enumerate()
+            .filter_map(|(index, path)| (!consumed.contains(&index)).then_some(path))
+            .chain(renames)
+            .collect();
+    }
+    Ok(())
 }
 
 fn parse_patch_hunks(
     input: &[u8],
     file_count: usize,
     cancelled: &AtomicBool,
-) -> Result<Vec<Vec<LineSpan>>, String> {
+) -> Result<Vec<PatchChange>, String> {
     if file_count == 0 || !input.starts_with(b"diff --git ") || !input.ends_with(b"\n") {
         return Err("Git returned malformed patch metadata".into());
     }
-    let mut hunks: Vec<Vec<LineSpan>> = vec![Vec::new(); file_count];
-    let mut current = None;
+    let mut patches = (0..file_count)
+        .map(|_| PatchChange::default())
+        .collect::<Vec<_>>();
+    let mut current: Option<usize> = None;
     let mut sections = 0;
-    for (index, line) in input.split(|byte| *byte == b'\n').enumerate() {
+    let mut in_hunk = false;
+    let mut offset = 0;
+    for (index, segment) in input.split_inclusive(|byte| *byte == b'\n').enumerate() {
         check_progress(index, cancelled)?;
+        let line = segment.strip_suffix(b"\n").unwrap_or(segment);
         if line.starts_with(b"diff --git ") {
             if sections == file_count {
                 return Err("Git diff changed while reading it; retry".into());
             }
+            if let Some(previous) = current {
+                patches[previous].end = offset;
+            }
             current = Some(sections);
+            patches[sections].start = offset;
             sections += 1;
+            in_hunk = false;
         } else if line.starts_with(b"@@ ") {
             let current =
                 current.ok_or_else(|| "Git returned a hunk without file metadata".to_owned())?;
             let span = parse_hunk(line)?;
-            if hunks[current]
+            if patches[current]
+                .spans
                 .last()
                 .is_some_and(|previous| previous.end >= span.start)
             {
                 return Err("Git returned overlapping diff hunks".into());
             }
-            hunks[current].push(span);
+            patches[current].spans.push(span);
+            in_hunk = true;
+        } else if in_hunk {
+            let current = current.expect("hunk requires a current patch");
+            if line.starts_with(b"+") {
+                patches[current].additions = patches[current]
+                    .additions
+                    .checked_add(1)
+                    .ok_or_else(|| "Git patch additions exceed range".to_owned())?;
+            } else if line.starts_with(b"-") {
+                patches[current].deletions = patches[current]
+                    .deletions
+                    .checked_add(1)
+                    .ok_or_else(|| "Git patch deletions exceed range".to_owned())?;
+            }
         }
+        offset += segment.len();
     }
     if sections != file_count {
         return Err("Git diff changed while reading it; retry".into());
     }
-    Ok(hunks)
+    if let Some(current) = current {
+        patches[current].end = input.len();
+    }
+    Ok(patches)
 }
 
 fn parse_hunk(line: &[u8]) -> Result<LineSpan, String> {
@@ -605,36 +1221,34 @@ fn parse_decimal(input: &[u8]) -> Result<u64, String> {
 }
 
 fn merge_changes(
-    (mut files, mut records, patch, mut skipped_paths): (
-        Vec<ChangedFile>,
-        Vec<PathRecord>,
-        String,
-        usize,
-    ),
-    untracked: &[u8],
+    tracked: TrackedChanges,
+    (mut paths, mut skipped_paths): (Vec<ChangedPath>, usize),
+    untracked: UntrackedSnapshot,
     cancelled: &AtomicBool,
 ) -> Result<WorktreeChanges, String> {
-    if !untracked.is_empty() && !untracked.ends_with(&[0]) {
-        return Err("Git returned malformed untracked paths".into());
-    }
-    if let Some(paths) = untracked.strip_suffix(&[0]) {
-        for (index, path) in paths.split(|byte| *byte == 0).enumerate() {
-            check_progress(index, cancelled)?;
-            if path.is_empty() {
-                return Err("Git returned malformed untracked paths".into());
-            }
-            if let Some(path) = parse_change_path(path)? {
-                records.push(PathRecord::Untracked(path.clone()));
-                files.push(ChangedFile {
-                    path,
-                    whole_file: true,
-                    spans: Vec::new(),
-                    report_unmapped: true,
-                });
-            } else {
-                skipped_paths += 1;
-            }
+    let TrackedChanges {
+        mut files,
+        mut records,
+        patch,
+        stats,
+        omitted_stats,
+    } = tracked;
+    coalesce_supported_renames(&mut paths, &records)?;
+    validate_supported_projection(&files, &records, &paths)?;
+    apply_supported_stats(&mut paths, stats, omitted_stats)?;
+    skipped_paths += untracked.skipped_paths;
+    for (index, path) in untracked.paths.into_iter().enumerate() {
+        check_progress(index, cancelled)?;
+        if path.language.is_some() {
+            records.push(PathRecord::Untracked(path.path.clone()));
+            files.push(ChangedFile {
+                path: path.path.clone(),
+                whole_file: true,
+                spans: Vec::new(),
+                report_unmapped: true,
+            });
         }
+        paths.push(path);
     }
     check_cancelled(cancelled)?;
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
@@ -665,9 +1279,17 @@ fn merge_changes(
     records.sort_unstable();
     records.dedup();
     check_cancelled(cancelled)?;
+    paths.sort_unstable_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.status.cmp(&right.status))
+            .then_with(|| left.old_path.cmp(&right.old_path))
+    });
+    paths.dedup();
     Ok(WorktreeChanges {
         files: merged,
         records,
+        paths,
         patch,
         skipped_paths,
     })
@@ -688,7 +1310,7 @@ fn parse_change_path(input: &[u8]) -> Result<Option<String>, String> {
     {
         return Err("Git returned an unsafe changed path".into());
     }
-    Ok(language_for_path(path).map(|_| path.to_owned()))
+    Ok(Some(path.to_owned()))
 }
 
 fn parse_source_files(output: &[u8]) -> Result<SourceFiles, String> {
@@ -1000,14 +1622,241 @@ mod tests {
     }
 
     #[test]
-    fn captures_a_bounded_utf8_safe_patch() {
-        let mut patch = vec![b'x'; PATCH_CAPTURE_LIMIT + 1];
-        patch[1] = 0xff;
-        patch[PATCH_CAPTURE_LIMIT - 1] = b'\n';
-        let captured = capture_patch(&patch);
-        assert!(captured.contains('\u{fffd}'));
-        assert!(captured.ends_with("[truncated]\n"));
-        assert!(captured.len() <= PATCH_CAPTURE_LIMIT + "[truncated]\n".len() + 2);
+    fn retains_a_full_utf8_safe_patch() {
+        let mut output = format!(
+            ":100644 100644 {OID} {OID} M\0large.rs\0\0\
+             diff --git a/large.rs b/large.rs\n\
+             @@ -1 +1 @@\n-old\n+"
+        )
+        .into_bytes();
+        output.push(0xff);
+        output.extend(std::iter::repeat_n(b'x', 9 * 1024));
+        output.push(b'\n');
+
+        let tracked = parse_tracked_changes(&output, &AtomicBool::new(false)).unwrap();
+        assert!(tracked.patch.len() > 8 * 1024);
+        assert!(tracked.patch.contains('\u{fffd}'));
+        assert!(tracked.patch.ends_with("xxx\n"));
+        assert!(!tracked.patch.contains("[truncated]"));
+        assert_eq!(
+            (tracked.stats[0].additions, tracked.stats[0].deletions),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn inventory_keeps_non_content_statuses_unsupported() {
+        let zero = "0".repeat(OID.len());
+        let inventory = format!(
+            ":100644 120000 {OID} {OID} T\0typed.rs\0\
+             :000000 000000 {zero} {zero} U\0conflict.rs\0\
+             :160000 160000 {OID} {OID} M\0vendor/core.rs\0\
+             :000000 120000 {zero} {OID} A\0link.rs\0"
+        );
+        let (paths, skipped) =
+            parse_change_inventory(inventory.as_bytes(), &AtomicBool::new(false)).unwrap();
+
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| (path.path.as_str(), path.status, path.language))
+                .collect::<Vec<_>>(),
+            [
+                ("conflict.rs", ChangeStatus::Unmerged, None),
+                ("link.rs", ChangeStatus::Added, None),
+                ("typed.rs", ChangeStatus::TypeChanged, None),
+                ("vendor/core.rs", ChangeStatus::Modified, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_sided_unsafe_renames_keep_the_safe_endpoint() {
+        let mut inventory = format!(":100644 100644 {OID} {OID} R100\0").into_bytes();
+        inventory.extend_from_slice(b"bad\nname.txt\0safe.rs\0");
+        inventory
+            .extend_from_slice(format!(":100644 100644 {OID} {OID} R100\0safe.py\0").as_bytes());
+        inventory.extend_from_slice(b"\xff.py\0");
+
+        let (mut paths, skipped) =
+            parse_change_inventory(&inventory, &AtomicBool::new(false)).unwrap();
+        assert_eq!(skipped, 2);
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| (path.path.as_str(), path.status, path.language))
+                .collect::<Vec<_>>(),
+            [
+                ("safe.py", ChangeStatus::Deleted, Some(Language::Python)),
+                ("safe.rs", ChangeStatus::Added, Some(Language::Rust)),
+            ]
+        );
+        let files = vec![ChangedFile {
+            path: "safe.rs".into(),
+            whole_file: true,
+            spans: Vec::new(),
+            report_unmapped: true,
+        }];
+        let records = vec![PathRecord::Deleted("safe.py".into())];
+        validate_supported_projection(&files, &records, &paths).unwrap();
+        apply_supported_stats(
+            &mut paths,
+            vec![
+                TrackedStat {
+                    path: "safe.py".into(),
+                    additions: 0,
+                    deletions: 1,
+                },
+                TrackedStat {
+                    path: "safe.rs".into(),
+                    additions: 1,
+                    deletions: 0,
+                },
+            ],
+            HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| (path.additions, path.deletions))
+                .collect::<Vec<_>>(),
+            [(Some(0), Some(1)), (Some(1), Some(0))]
+        );
+    }
+
+    #[test]
+    fn tracked_patch_filters_every_unsupported_section() {
+        let zero = "0".repeat(OID.len());
+        let tracked = format!(
+            ":100644 100644 {OID} {OID} M\0good.rs\0\
+             :000000 120000 {zero} {OID} A\0link.rs\0\
+             :160000 160000 {OID} {OID} M\0vendor/core.rs\0\
+             :100644 120000 {OID} {OID} T\0typed.py\0\
+             :000000 000000 {zero} {zero} U\0conflict.rs\0\
+             :100644 100644 {OID} {OID} M\0notes.txt\0\
+             :100644 100644 {OID} {OID} M\0bad\nname.rs\0\0\
+             diff --git a/good.rs b/good.rs\n\
+             @@ -1 +1 @@\n-old\n+SAFE_PATCH\n\
+             diff --git a/link.rs b/link.rs\n\
+             @@ -0,0 +1 @@\n+SYMLINK_SECRET\n\
+             diff --git a/vendor/core.rs b/vendor/core.rs\n\
+             @@ -1 +1 @@\n-old\n+GITLINK_SECRET\n\
+             diff --git a/typed.py b/typed.py\n\
+             @@ -1 +1 @@\n-old\n+TYPE_SECRET\n\
+             diff --git a/conflict.rs b/conflict.rs\n\
+             @@ -1 +1 @@\n-old\n+UNMERGED_SECRET\n\
+             diff --git a/notes.txt b/notes.txt\n\
+             @@ -1 +1 @@\n-old\n+UNSUPPORTED_SECRET\n\
+             diff --git a/bad b/bad\n\
+             @@ -1 +1 @@\n-old\n+UNSAFE_SECRET\n"
+        );
+        let tracked = parse_tracked_changes(tracked.as_bytes(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(tracked.files.len(), 1);
+        assert_eq!(tracked.files[0].path, "good.rs");
+        assert!(tracked.records.is_empty());
+        assert_eq!(tracked.stats.len(), 1);
+        assert!(tracked.omitted_stats.is_empty());
+        assert!(tracked.patch.contains("SAFE_PATCH"));
+        for secret in [
+            "SYMLINK_SECRET",
+            "GITLINK_SECRET",
+            "TYPE_SECRET",
+            "UNMERGED_SECRET",
+            "UNSUPPORTED_SECRET",
+            "UNSAFE_SECRET",
+        ] {
+            assert!(!tracked.patch.contains(secret), "{secret} leaked");
+        }
+    }
+
+    #[test]
+    fn unsafe_rename_patch_is_filtered_without_claiming_stats() {
+        let tracked = format!(
+            ":100644 100644 {OID} {OID} R100\0safe.rs\0bad\nname.rs\0\0\
+             diff --git a/safe.rs b/bad\n\
+             @@ -1 +1 @@\n-old\n+UNSAFE_RENAME_SECRET\n"
+        );
+        let zero = "0".repeat(OID.len());
+        let mut inventory = format!(":100644 000000 {OID} {zero} D\0safe.rs\0").into_bytes();
+        inventory
+            .extend_from_slice(format!(":000000 100644 {zero} {OID} A\0bad\nname.rs\0").as_bytes());
+        let changes = merge_changes(
+            parse_tracked_changes(tracked.as_bytes(), &AtomicBool::new(false)).unwrap(),
+            parse_change_inventory(&inventory, &AtomicBool::new(false)).unwrap(),
+            UntrackedSnapshot {
+                paths: Vec::new(),
+                skipped_paths: 0,
+                signature: [0; 32],
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(changes.patch.is_empty());
+        assert_eq!(changes.skipped_paths, 1);
+        assert_eq!(changes.paths.len(), 1);
+        assert_eq!(changes.paths[0].path, "safe.rs");
+        assert_eq!(changes.paths[0].status, ChangeStatus::Deleted);
+        assert_eq!(changes.paths[0].additions, None);
+        assert_eq!(changes.paths[0].deletions, None);
+    }
+
+    #[test]
+    fn untracked_snapshot_hashes_the_content_used_for_stats() {
+        let root = temp_root("untracked-snapshot");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("fixture.tsv"), "one\n").unwrap();
+        std::os::unix::fs::symlink("fixture.tsv", root.join("link.rs")).unwrap();
+
+        let first =
+            capture_untracked(&root, b"fixture.tsv\0link.rs\0", &AtomicBool::new(false)).unwrap();
+        fs::write(root.join("fixture.tsv"), "two\n").unwrap();
+        let second =
+            capture_untracked(&root, b"fixture.tsv\0link.rs\0", &AtomicBool::new(false)).unwrap();
+
+        assert_eq!(first.paths[0].additions, second.paths[0].additions);
+        assert_ne!(first.signature, second.signature);
+        assert_eq!(second.paths[1].language, None);
+        assert_eq!(second.paths[1].additions, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inconsistent_supported_inventories_are_rejected() {
+        let path = ChangedPath {
+            status: ChangeStatus::Modified,
+            old_path: None,
+            old_language: None,
+            path: "changed.rs".into(),
+            language: Some(Language::Rust),
+            additions: Some(1),
+            deletions: Some(1),
+        };
+        assert!(validate_supported_projection(&[], &[], &[path]).is_err());
+
+        let changes = WorktreeChanges {
+            files: Vec::new(),
+            records: Vec::new(),
+            paths: Vec::new(),
+            patch: "diff --git a/changed.rs b/changed.rs\n".into(),
+            skipped_paths: 0,
+        };
+        assert!(!changes.is_empty());
+
+        let snapshot = |inventory| WorktreeCapture {
+            tracked: vec![b'a'],
+            inventory,
+            untracked: UntrackedSnapshot {
+                paths: Vec::new(),
+                skipped_paths: 0,
+                signature: [0; 32],
+            },
+        };
+        let first = snapshot(vec![b'b']);
+        let second = snapshot(vec![b'B']);
+        assert_ne!(worktree_signature(&first), worktree_signature(&second));
     }
 
     #[test]
@@ -1031,9 +1880,20 @@ mod tests {
              rename from old.rs\n\
              rename to renamed.rs\n"
         );
+        let inventory = format!(
+            ":000000 100644 {zero} {OID} A\0added.rs\0\
+             :100644 100644 {OID} {OID} M\0modified.rs\0\
+             :100644 000000 {OID} {zero} D\0deleted.rs\0\
+             :100644 000000 {OID} {zero} D\0old.rs\0\
+             :000000 100644 {zero} {OID} A\0renamed.rs\0"
+        );
+        let root = temp_root("changed-files");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("untracked.rs"), "fn untracked() {}\n").unwrap();
         let changes = merge_changes(
             parse_tracked_changes(tracked.as_bytes(), &cancelled).unwrap(),
-            b"untracked.rs\0",
+            parse_change_inventory(inventory.as_bytes(), &cancelled).unwrap(),
+            capture_untracked(&root, b"untracked.rs\0", &cancelled).unwrap(),
             &cancelled,
         )
         .unwrap();
@@ -1075,31 +1935,84 @@ mod tests {
                     PathRecord::Renamed("old.rs".into(), "renamed.rs".into()),
                     PathRecord::Untracked("untracked.rs".into()),
                 ],
+                paths: vec![
+                    ChangedPath {
+                        status: ChangeStatus::Added,
+                        old_path: None,
+                        old_language: None,
+                        path: "added.rs".into(),
+                        language: Some(Language::Rust),
+                        additions: Some(2),
+                        deletions: Some(0),
+                    },
+                    ChangedPath {
+                        status: ChangeStatus::Deleted,
+                        old_path: None,
+                        old_language: None,
+                        path: "deleted.rs".into(),
+                        language: Some(Language::Rust),
+                        additions: Some(0),
+                        deletions: Some(1),
+                    },
+                    ChangedPath {
+                        status: ChangeStatus::Modified,
+                        old_path: None,
+                        old_language: None,
+                        path: "modified.rs".into(),
+                        language: Some(Language::Rust),
+                        additions: Some(1),
+                        deletions: Some(3),
+                    },
+                    ChangedPath {
+                        status: ChangeStatus::Renamed,
+                        old_path: Some("old.rs".into()),
+                        old_language: Some(Language::Rust),
+                        path: "renamed.rs".into(),
+                        language: Some(Language::Rust),
+                        additions: Some(0),
+                        deletions: Some(0),
+                    },
+                    ChangedPath {
+                        status: ChangeStatus::Untracked,
+                        old_path: None,
+                        old_language: None,
+                        path: "untracked.rs".into(),
+                        language: Some(Language::Rust),
+                        additions: Some(1),
+                        deletions: Some(0),
+                    },
+                ],
                 patch: tracked.split_once("\0\0").unwrap().1.into(),
                 skipped_paths: 0,
             }
         );
         assert!(changes.patch.contains("-old\n+new\n"));
+        assert!(changes.patch.contains("rename from old.rs"));
+        fs::remove_dir_all(root).unwrap();
         assert!(
             parse_tracked_changes(&tracked.as_bytes()[..tracked.len() - 1], &cancelled).is_err()
         );
-        assert!(
-            merge_changes(
-                (Vec::new(), Vec::new(), String::new(), 0),
-                b"a.rs\0\0",
-                &cancelled
-            )
-            .is_err()
-        );
+        assert!(capture_untracked(&temp_root("missing"), b"a.rs\0\0", &cancelled).is_err());
         let skipped = merge_changes(
-            (Vec::new(), Vec::new(), String::new(), 0),
-            b"\xff.rs\0",
+            TrackedChanges {
+                files: Vec::new(),
+                records: Vec::new(),
+                patch: String::new(),
+                stats: Vec::new(),
+                omitted_stats: HashSet::new(),
+            },
+            (Vec::new(), 0),
+            capture_untracked(&temp_root("missing"), b"\xff.rs\0", &cancelled).unwrap(),
             &cancelled,
         )
         .unwrap();
         assert_eq!(skipped.skipped_paths, 1);
         assert!(!skipped.is_empty());
         assert!(parse_change_path(b"../not-rust.txt").is_err());
+        assert_eq!(
+            parse_change_path(b"not-source.txt").unwrap(),
+            Some("not-source.txt".into())
+        );
     }
 
     #[test]
@@ -1229,6 +2142,138 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn change_inventory_reports_unsupported_untracked_files_and_ignores_ignored_files() {
+        let root = temp_root("changes");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tests/fixtures")).unwrap();
+        fs::write(root.join("src/domain.rs"), "pub fn before() {}\n").unwrap();
+        fs::write(root.join("tests/fixtures/tracked.tsv"), "old\n").unwrap();
+        fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["add", "--", "."]);
+        test_git(
+            &root,
+            &[
+                "-c",
+                "user.name=Graphr Test",
+                "-c",
+                "user.email=graphr@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+
+        fs::write(
+            root.join("src/domain.rs"),
+            "pub fn after() {}\npub fn added() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/fixtures/alias-registry.v1.tsv"),
+            "one\ntwo\nthree",
+        )
+        .unwrap();
+        fs::write(root.join("tests/fixtures/tracked.tsv"), "new\nextra\n").unwrap();
+        fs::write(root.join("tests/fixtures/blob.bin"), [0, 1, 2]).unwrap();
+        fs::write(
+            root.join("tests/fixtures/large.data"),
+            vec![b'x'; SOURCE_LIMIT as usize + 1],
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("alias-registry.v1.tsv", root.join("tests/fixtures/link.rs"))
+            .unwrap();
+        fs::write(root.join("ignored.txt"), "ignored\n").unwrap();
+        fs::write(root.join("bad\nname.txt"), "unsafe\n").unwrap();
+
+        let repository = Repository {
+            root: fs::canonicalize(&root).unwrap(),
+            database: root.join(".git/graphr/index.db"),
+        };
+        let changes = repository
+            .worktree_changes("HEAD", &AtomicBool::new(false))
+            .unwrap();
+
+        assert_eq!(changes.skipped_paths, 1);
+        assert!(!changes.paths.iter().any(|path| path.path == "ignored.txt"));
+        assert_eq!(
+            changes
+                .paths
+                .iter()
+                .map(|path| {
+                    (
+                        path.path.as_str(),
+                        path.status,
+                        path.language,
+                        path.additions,
+                        path.deletions,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "src/domain.rs",
+                    ChangeStatus::Modified,
+                    Some(Language::Rust),
+                    Some(2),
+                    Some(1),
+                ),
+                (
+                    "tests/fixtures/alias-registry.v1.tsv",
+                    ChangeStatus::Untracked,
+                    None,
+                    Some(3),
+                    Some(0),
+                ),
+                (
+                    "tests/fixtures/blob.bin",
+                    ChangeStatus::Untracked,
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    "tests/fixtures/large.data",
+                    ChangeStatus::Untracked,
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    "tests/fixtures/link.rs",
+                    ChangeStatus::Untracked,
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    "tests/fixtures/tracked.tsv",
+                    ChangeStatus::Modified,
+                    None,
+                    None,
+                    None,
+                ),
+            ]
+        );
+        assert_eq!(changes.files.len(), 1);
+        assert_eq!(changes.files[0].path, "src/domain.rs");
+        assert!(changes.patch.contains("+pub fn added() {}"));
+        assert!(!changes.patch.contains("tracked.tsv"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
     }
 
     fn temp_root(label: &str) -> PathBuf {

@@ -23,11 +23,13 @@ Graphr detects Rust and Python sources automatically and exposes four MCP tools:
 - `index` reparses only dirty, untracked, or Git-OID-changed files.
 - `search` finds symbols and returns compact `node_ref` values.
 - `view` traverses callers, callees, and related tests up to six graph hops.
-- `changes` returns a bounded 8 KiB review context with the diff, risk-ranked changed symbols, affected static execution paths, and graph impact.
+- `changes` returns bounded 8 KiB review pages with every safe changed path, a count of skipped unsafe paths, the supported-source diff, risk-ranked changed symbols, affected static execution paths, and graph impact.
 
 Affected-flow discovery follows `CALLS` edges up to 15 hops. These are possible source-level call chains, not recorded runtime call stacks. Risk scores use flow, test, security-name, and caller signals; community and churn factors are not used.
 
-The server indexes when it starts. Run `index` after source changes. For reviews, start with `changes`; use `search` and `view` for targeted exploration when the result is truncated or contains an `unmapped PATH:LINES` range.
+The server indexes when it starts. Run `index` after source changes. For reviews, start with `changes` and pass every returned `files_next_cursor`, `diff_next_cursor`, and `graph_next_cursor` back as `cursor` until each section is complete. Those cursors read one immutable snapshot; a new cursorless call replaces it. Coverage is complete only when all cursors are exhausted and `review_complete_when_pages_exhausted=true`. Use `search` and `view` for exploration, not to fill review-page omissions.
+
+Rename detection is limited to supported regular Rust and Python sources. Unsupported renames are conservatively listed as separate additions and deletions.
 
 ## Codex review skill
 
@@ -37,7 +39,7 @@ Install the skill globally by entering this prompt in Codex:
 $skill-installer Install the graphr-review skill from https://github.com/f3rmion/graphr/tree/main/.agents/skills/graphr-review
 ```
 
-The skill selects the review base, makes one bounded `changes` call, permits one targeted fallback for explicit coverage gaps, and keeps the final review under 220 words.
+The skill selects the review base, exhausts the bounded `changes` continuation pages, permits one targeted fallback for explicit coverage gaps, and keeps the final review under 220 words.
 
 ## Token benchmark
 

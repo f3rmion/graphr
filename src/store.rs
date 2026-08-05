@@ -14,12 +14,11 @@ use crate::git::{ChangedFile, Language, LineSpan, PathRecord, WorktreeChanges};
 const SCHEMA_VERSION: i64 = 4;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
-const CHANGES_BUDGET: usize = 8192;
+// ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
+const CHANGE_ANALYSIS_LIMIT: usize = 500;
 const FLOW_DEPTH: u32 = 15;
 const FLOW_SCAN_LIMIT: usize = 500;
 const FLOW_QUERY_LIMIT: usize = 5_000;
-const FLOW_OUTPUT_BUDGET: usize = 2048;
-const FLOW_LINE_BUDGET: usize = 512;
 const TRUNCATED: &str = "[truncated]\n";
 const BUSY_LIMIT: Duration = Duration::from_secs(5);
 const BUSY_POLL: Duration = Duration::from_millis(5);
@@ -391,11 +390,24 @@ impl Store {
             return Err("invalid changes parameters".into());
         }
         check_cancelled(cancelled)?;
-        if changes.is_empty() {
+        if changes.is_empty() && changes.files.is_empty() && changes.records.is_empty() {
             return Ok("no changes\n".into());
         }
+        let deleted_paths_unanalyzed = changes
+            .records
+            .iter()
+            .filter(|record| matches!(record, PathRecord::Deleted(_)))
+            .count();
         if changes.files.is_empty() {
-            return Ok("no current symbols\n".into());
+            let flow_accounting = if deleted_paths_unanalyzed == 0 {
+                "flows_total=0"
+            } else {
+                "flows_discovered=0 flows_total=unknown"
+            };
+            return Ok(format!(
+                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} direct_test_gaps=0 analysis_complete={} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0\n",
+                deleted_paths_unanalyzed == 0,
+            ));
         }
         for file in &changes.files {
             validate_changed_file(file)?;
@@ -426,15 +438,14 @@ impl Store {
                     .iter()
                     .filter(|file| untracked.contains(file.path.as_str())),
             );
-        let mut lines = Vec::new();
-        let mut line_bytes = 0;
         let mut unmapped_lines = Vec::new();
+        let mut unmapped_range_count = 0_usize;
         let tx = self.connection.transaction().map_err(db_error)?;
         let state = read_state(&tx)?;
         let root_limit = max_nodes as usize;
-        let mut root_ids = Vec::with_capacity(root_limit);
+        let mut symbol_root_ids = Vec::with_capacity(root_limit);
+        let mut file_root_ids = Vec::new();
         let mut root_seen = HashSet::new();
-        let mut omitted = false;
         let mut symbols = tx
             .prepare(
                 "SELECT id, line_start, line_end FROM (
@@ -454,7 +465,7 @@ impl Store {
             .map_err(db_error)?;
         let mut file_nodes = tx
             .prepare(
-                "SELECT n.id
+                "SELECT n.id, n.line_end
                    FROM files f JOIN nodes n ON n.file_id=f.id
                   WHERE f.path=?1 AND n.kind='file'",
             )
@@ -462,9 +473,17 @@ impl Store {
 
         for file in files {
             check_cancelled(cancelled)?;
+            let file_node = file_nodes
+                .query_row([&file.path], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?))
+                })
+                .optional()
+                .map_err(db_error)?;
+            if file_node.is_some_and(|(id, line_end)| id <= 0 || line_end == 0) {
+                return Err("database file interval is invalid".into());
+            }
             let mut span_index = 0;
             let mut coverage = Vec::new();
-            let mut saw_symbol = false;
             let rows = symbols
                 .query_map([&file.path], |row| {
                     Ok((
@@ -480,7 +499,6 @@ impl Store {
                 if id <= 0 || line_start == 0 || line_end < line_start {
                     return Err("database change interval is invalid".into());
                 }
-                saw_symbol = true;
                 let interval = LineSpan {
                     start: u64::from(line_start) * 2,
                     end: u64::from(line_end) * 2,
@@ -499,48 +517,59 @@ impl Store {
                         .get(span_index)
                         .is_some_and(|span| span.start <= interval.end);
                 if changed && root_seen.insert(id) {
-                    if root_ids.len() < root_limit {
-                        root_ids.push(id);
-                    } else {
-                        omitted = true;
-                    }
+                    symbol_root_ids.push(id);
                 }
             }
 
+            let whole_span = file_node.map(|(_, line_end)| LineSpan {
+                start: 2,
+                end: u64::from(line_end) * 2,
+            });
+            let changed_spans = if file.whole_file && file.spans.is_empty() {
+                whole_span
+                    .as_ref()
+                    .map_or(file.spans.as_slice(), std::slice::from_ref)
+            } else {
+                &file.spans
+            };
+            let residual = unmapped_spans(changed_spans, &coverage);
             let unmapped = file.report_unmapped
-                && if file.spans.is_empty() {
-                    !file.whole_file || !saw_symbol
+                && if changed_spans.is_empty() {
+                    true
                 } else {
-                    has_unmapped_span(&file.spans, &coverage)
+                    !residual.is_empty()
                 };
             if unmapped {
-                if let Some(id) = file_nodes
-                    .query_row([&file.path], |row| row.get::<_, i64>(0))
-                    .optional()
-                    .map_err(db_error)?
+                if let Some((id, _)) = file_node
                     && root_seen.insert(id)
                 {
-                    if root_ids.len() < root_limit {
-                        root_ids.push(id);
-                    } else {
-                        omitted = true;
-                    }
+                    file_root_ids.push(id);
                 }
-                let Some(line) = unmapped_line(file, &coverage) else {
-                    return Ok(bounded(lines, CHANGES_BUDGET, true));
-                };
+                let line = unmapped_line(file, &residual)
+                    .ok_or_else(|| "unmapped line exceeds address space".to_owned())?;
                 unmapped_lines.push(line);
+                unmapped_range_count = unmapped_range_count.saturating_add(residual.len().max(1));
             }
         }
         drop(symbols);
         drop(file_nodes);
 
-        let mut roots = Vec::with_capacity(root_ids.len());
-        for id in root_ids {
-            check_cancelled(cancelled)?;
-            roots.push(load_node(&tx, id)?.ok_or_else(|| "changed node not found".to_owned())?);
-        }
-        let analysis = analyze_changed_roots(&tx, &roots, root_limit, cancelled)?;
+        let changed_symbols_total = symbol_root_ids.len();
+        let analysis_roots_total = changed_symbols_total.saturating_add(file_root_ids.len());
+        let mut analysis_ids = symbol_root_ids
+            .iter()
+            .take(CHANGE_ANALYSIS_LIMIT)
+            .copied()
+            .collect::<Vec<_>>();
+        analysis_ids.extend(
+            file_root_ids
+                .iter()
+                .take(CHANGE_ANALYSIS_LIMIT - analysis_ids.len())
+                .copied(),
+        );
+        let analysis_roots_omitted = analysis_roots_total.saturating_sub(analysis_ids.len());
+        let mut roots = load_nodes(&tx, &analysis_ids)?;
+        let analysis = analyze_changed_roots(&tx, &roots, CHANGE_ANALYSIS_LIMIT, cancelled)?;
         roots.sort_by(|left, right| {
             analysis
                 .risks
@@ -549,87 +578,84 @@ impl Store {
                 .cmp(&analysis.risks.get(&left.id).map_or(0, |risk| risk.score))
                 .then_with(|| left.id.cmp(&right.id))
         });
+        let root_neighborhood_omitted = roots.len() > root_limit || analysis_roots_omitted > 0;
+        roots.truncate(root_limit);
 
-        let mut output_full = false;
-        if !analysis.risks.is_empty() {
-            let overall = analysis
-                .risks
-                .values()
-                .map(|risk| risk.score)
-                .max()
-                .unwrap_or(0);
-            let gaps = analysis.risks.values().filter(|risk| risk.test_gap).count();
-            output_full = !push_change_line(
-                &mut lines,
-                &mut line_bytes,
-                format!(
-                    "risk overall={} changed={} flows={} gaps={}\n",
-                    score_text(overall),
-                    analysis.risks.len(),
-                    analysis.flows.len(),
-                    gaps
-                ),
-            );
-        }
+        let changed_symbols_emitted = roots
+            .iter()
+            .filter(|root| analysis.risks.contains_key(&root.id))
+            .count();
+        let changed_symbols_omitted = changed_symbols_total.saturating_sub(changed_symbols_emitted);
+        let mut lines = unmapped_lines;
         for root in &roots {
             let relation = analysis.risks.get(&root.id).map(|risk| {
                 format!(
                     "risk {}{}",
                     score_text(risk.score),
-                    if risk.test_gap { " test-gap" } else { "" }
+                    if risk.direct_test_gap {
+                        " direct-test-gap"
+                    } else {
+                        ""
+                    }
                 )
             });
-            let Some(line) = root.line(&state, relation.as_deref(), CHANGES_BUDGET)? else {
-                output_full = true;
-                break;
-            };
-            if !push_change_line(&mut lines, &mut line_bytes, line) {
-                output_full = true;
-                break;
-            }
+            let line = root
+                .line(&state, relation.as_deref(), usize::MAX)?
+                .ok_or_else(|| "changed root line exceeds address space".to_owned())?;
+            lines.push(line);
         }
-        if !omitted && !output_full && !roots.is_empty() {
-            omitted |= traverse_changes(
-                &tx,
-                &state,
-                &roots,
-                depth,
-                root_limit,
-                cancelled,
-                (&mut lines, &mut line_bytes),
-            )?;
-        }
-        for line in unmapped_lines {
-            if !push_change_line(&mut lines, &mut line_bytes, line) {
-                output_full = true;
-                break;
-            }
-        }
-        let mut flow_bytes = 0_usize;
-        let mut flow_omitted = analysis.omitted;
-        for flow in &analysis.flows {
-            let (line, truncated) = flow_line(flow)?;
-            flow_omitted |= truncated;
-            let Some(next_flow_bytes) = flow_bytes.checked_add(line.len()) else {
-                flow_omitted = true;
-                break;
-            };
-            if next_flow_bytes > FLOW_OUTPUT_BUDGET {
-                flow_omitted = true;
-                break;
-            }
-            if !push_change_line(&mut lines, &mut line_bytes, line) {
-                flow_omitted = true;
-                break;
-            }
-            flow_bytes = next_flow_bytes;
-        }
-        omitted |= output_full || flow_omitted;
-        if lines.is_empty() && !omitted {
-            Ok("no current symbols\n".into())
+        let neighborhood_omitted = if root_neighborhood_omitted {
+            true
+        } else if roots.is_empty() {
+            false
         } else {
-            Ok(bounded(lines, CHANGES_BUDGET, omitted))
+            traverse_changes(
+                &tx, &state, &roots, depth, root_limit, cancelled, &mut lines,
+            )?
+        };
+        for flow in &analysis.flows {
+            lines.push(flow_line(flow)?);
         }
+        let overall = analysis
+            .risks
+            .values()
+            .map(|risk| risk.score)
+            .max()
+            .unwrap_or(0);
+        let direct_test_gaps = analysis
+            .risks
+            .values()
+            .filter(|risk| risk.direct_test_gap)
+            .count();
+        let analysis_incomplete =
+            analysis.omitted || analysis_roots_omitted > 0 || deleted_paths_unanalyzed > 0;
+        let flow_accounting = if analysis_incomplete {
+            format!(
+                "flows_discovered={} flows_total=unknown",
+                analysis.flows.len()
+            )
+        } else {
+            format!("flows_total={}", analysis.flows.len())
+        };
+        lines.insert(
+            0,
+            format!(
+                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} direct_test_gaps={} analysis_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={}\n",
+                score_text(overall),
+                changed_symbols_total,
+                analysis.risks.len(),
+                changed_symbols_emitted,
+                changed_symbols_omitted,
+                flow_accounting,
+                direct_test_gaps,
+                !analysis_incomplete,
+                analysis_roots_omitted,
+                deleted_paths_unanalyzed,
+                neighborhood_omitted,
+                unmapped_range_count,
+            ),
+        );
+        Ok(lines.concat())
     }
 }
 
@@ -694,7 +720,7 @@ struct AffectedFlow {
 #[derive(Clone, Copy)]
 struct NodeRisk {
     score: u32,
-    test_gap: bool,
+    direct_test_gap: bool,
 }
 
 #[derive(Default)]
@@ -790,9 +816,8 @@ fn traverse_changes(
     depth: u32,
     max_nodes: usize,
     cancelled: &AtomicBool,
-    output: (&mut Vec<String>, &mut usize),
+    lines: &mut Vec<String>,
 ) -> Result<bool> {
-    let (lines, line_bytes) = output;
     let mut visited = roots.iter().map(|node| node.id).collect::<HashSet<_>>();
     let mut current = roots
         .iter()
@@ -836,15 +861,13 @@ fn traverse_changes(
                     if visited.contains(&node.id) {
                         continue;
                     }
-                    if level == depth || visited.len() == max_nodes {
+                    if level == depth || visited.len() >= max_nodes {
                         return Ok(true);
                     }
-                    let Some(line) = node.line(state, Some(relation), CHANGES_BUDGET)? else {
-                        return Ok(true);
-                    };
-                    if !push_change_line(lines, line_bytes, line) {
-                        return Ok(true);
-                    }
+                    let line = node
+                        .line(state, Some(relation), usize::MAX)?
+                        .ok_or_else(|| "changed neighbor line exceeds address space".to_owned())?;
+                    lines.push(line);
                     visited.insert(node.id);
                     next.push((node.id, node.kind == "type"));
                 }
@@ -867,8 +890,18 @@ fn analyze_changed_roots(
     max_flows: usize,
     cancelled: &AtomicBool,
 ) -> Result<ChangeAnalysis> {
-    let risk_root_count = roots.iter().filter(|node| node.kind != "file").count();
-    let (flow_roots, mut omitted) = changed_flow_roots(connection, roots, max_flows)?;
+    let risk_root_ids = roots
+        .iter()
+        .filter(|node| node.kind != "file")
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    let risk_root_count = risk_root_ids.len();
+    let risk_nodes = load_flow_nodes(connection, &risk_root_ids)?;
+    let risk_nodes = risk_nodes
+        .into_iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
+    let (flow_roots, mut omitted) = changed_flow_roots(connection, roots, max_flows, &risk_nodes)?;
     let flow_root_ids = flow_roots
         .iter()
         .map(|node| node.id)
@@ -914,15 +947,20 @@ fn analyze_changed_roots(
             .then_with(|| left.entry.id.cmp(&right.entry.id))
     });
 
+    let risk_counts = node_risk_counts(connection, &risk_root_ids)?;
     let mut risks = HashMap::with_capacity(risk_root_count);
     for root in roots.iter().filter(|node| node.kind != "file") {
         check_cancelled(cancelled)?;
-        let node = load_flow_node(connection, root.id)?;
+        let node = risk_nodes
+            .get(&root.id)
+            .ok_or_else(|| "flow node not found".to_owned())?;
         let flow_score = flows
             .iter()
             .filter(|flow| flow.changed.binary_search(&root.id).is_ok())
             .fold(0_u32, |score, flow| score.saturating_add(flow.criticality));
-        let (callers, tests, directly_tested) = node_risk_counts(connection, root.id)?;
+        let &(callers, tests, directly_tested) = risk_counts
+            .get(&root.id)
+            .ok_or_else(|| "node risk counts are missing".to_owned())?;
         risks.insert(
             root.id,
             NodeRisk {
@@ -932,7 +970,7 @@ fn analyze_changed_roots(
                     security_sensitive(&node.name, &node.qualified_name),
                     callers,
                 ),
-                test_gap: node.kind != "test" && !directly_tested,
+                direct_test_gap: node.kind != "test" && !directly_tested,
             },
         );
     }
@@ -948,6 +986,7 @@ fn changed_flow_roots(
     connection: &Connection,
     roots: &[RowNode],
     limit: usize,
+    risk_nodes: &HashMap<i64, FlowNode>,
 ) -> Result<(Vec<FlowNode>, bool)> {
     let mut nodes = Vec::new();
     let mut seen = HashSet::new();
@@ -968,7 +1007,12 @@ fn changed_flow_roots(
     for root in roots {
         if root.kind == "function" {
             if seen.insert(root.id) {
-                nodes.push(load_flow_node(connection, root.id)?);
+                nodes.push(
+                    risk_nodes
+                        .get(&root.id)
+                        .cloned()
+                        .ok_or_else(|| "flow node not found".to_owned())?,
+                );
             }
             continue;
         }
@@ -1118,18 +1162,36 @@ fn trace_flow(
     ))
 }
 
-fn load_flow_node(connection: &Connection, id: i64) -> Result<FlowNode> {
-    connection
-        .query_row(
-            "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start
-               FROM nodes n JOIN files f ON f.id=n.file_id
-              WHERE n.id=?1",
-            [id],
-            flow_node,
-        )
-        .optional()
+fn load_flow_nodes(connection: &Connection, ids: &[i64]) -> Result<Vec<FlowNode>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (1..=ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start
+           FROM nodes n JOIN files f ON f.id=n.file_id
+          WHERE n.id IN ({placeholders})"
+    );
+    let mut statement = connection.prepare(&sql).map_err(db_error)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(ids), flow_node)
+        .map_err(db_error)?;
+    let mut nodes = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(db_error)?
-        .ok_or_else(|| "flow node not found".to_owned())
+        .into_iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
+    ids.iter()
+        .map(|id| {
+            nodes
+                .remove(id)
+                .ok_or_else(|| "flow node not found".to_owned())
+        })
+        .collect()
 }
 
 fn load_flow_neighbors(
@@ -1246,46 +1308,71 @@ fn flow_criticality(
     };
     let external = (external_calls as f64 / 5.0).min(1.0);
     let security = (security_nodes as f64 / node_count as f64).min(1.0);
-    let test_gap = 1.0 - (tested_nodes as f64 / node_count as f64).min(1.0);
+    let direct_test_gap = 1.0 - (tested_nodes as f64 / node_count as f64).min(1.0);
     let depth = (f64::from(depth) / 10.0).min(1.0);
-    ((file_spread * 0.30 + external * 0.20 + security * 0.25 + test_gap * 0.15 + depth * 0.10)
+    ((file_spread * 0.30
+        + external * 0.20
+        + security * 0.25
+        + direct_test_gap * 0.15
+        + depth * 0.10)
         .clamp(0.0, 1.0)
         * 10_000.0)
         .round() as u32
 }
 
-fn node_risk_counts(connection: &Connection, id: i64) -> Result<(u32, u32, bool)> {
-    let (callers, tests, directly_tested) = connection
-        .query_row(
-            "SELECT
+fn node_risk_counts(
+    connection: &Connection,
+    ids: &[i64],
+) -> Result<HashMap<i64, (u32, u32, bool)>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let values = (1..=ids.len())
+        .map(|index| format!("(?{index})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "WITH changed(id) AS (VALUES {values})
+         SELECT changed.id,
                 (SELECT count(*) FROM edges
-                  WHERE target_id=?1 AND kind='CALLS'),
+                  WHERE target_id=changed.id AND kind='CALLS'),
                 (SELECT count(*) FROM (
                     SELECT source_id FROM edges
-                     WHERE target_id=?1 AND kind='TEST_CALLS'
+                     WHERE target_id=changed.id AND kind='TEST_CALLS'
                     UNION
                     SELECT test.source_id
                       FROM edges call JOIN edges test ON test.target_id=call.target_id
-                     WHERE call.source_id=?1 AND call.kind='CALLS'
+                     WHERE call.source_id=changed.id AND call.kind='CALLS'
                        AND test.kind='TEST_CALLS'
                 )),
                 EXISTS(SELECT 1 FROM edges
-                        WHERE target_id=?1 AND kind='TEST_CALLS')",
-            [id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, bool>(2)?,
-                ))
-            },
-        )
+                        WHERE target_id=changed.id AND kind='TEST_CALLS')
+           FROM changed"
+    );
+    let mut statement = connection.prepare(&sql).map_err(db_error)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(ids), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
         .map_err(db_error)?;
-    Ok((
-        u32::try_from(callers).map_err(|_| "caller count is invalid")?,
-        u32::try_from(tests).map_err(|_| "test count is invalid")?,
-        directly_tested,
-    ))
+    let mut counts = HashMap::with_capacity(ids.len());
+    for row in rows {
+        let (id, callers, tests, directly_tested) = row.map_err(db_error)?;
+        counts.insert(
+            id,
+            (
+                u32::try_from(callers).map_err(|_| "caller count is invalid")?,
+                u32::try_from(tests).map_err(|_| "test count is invalid")?,
+                directly_tested,
+            ),
+        );
+    }
+    Ok(counts)
 }
 
 fn risk_score(flow_score: u32, tests: u32, security: bool, callers: u32) -> u32 {
@@ -1333,7 +1420,7 @@ fn score_text(score: u32) -> String {
     format!("{}.{:04}", score / 10_000, score % 10_000)
 }
 
-fn flow_line(flow: &AffectedFlow) -> Result<(String, bool)> {
+fn flow_line(flow: &AffectedFlow) -> Result<String> {
     let changed = flow
         .nodes
         .iter()
@@ -1371,28 +1458,19 @@ fn flow_line(flow: &AffectedFlow) -> Result<(String, bool)> {
             .find(|node| node.id == id)
             .ok_or_else(|| "affected flow node is missing".to_owned())?;
         let mut step = String::new();
-        if !push_escaped(&mut step, &node.name, FLOW_LINE_BUDGET)
-            || !push_literal(&mut step, "@", FLOW_LINE_BUDGET)
-            || !push_escaped(&mut step, &node.path, FLOW_LINE_BUDGET)
-            || !push_literal(&mut step, &format!(":{}", node.line), FLOW_LINE_BUDGET)
+        if !push_escaped(&mut step, &node.name, usize::MAX)
+            || !push_literal(&mut step, "@", usize::MAX)
+            || !push_escaped(&mut step, &node.path, usize::MAX)
+            || !push_literal(&mut step, &format!(":{}", node.line), usize::MAX)
         {
-            if push_literal(&mut output, "...\n", FLOW_LINE_BUDGET) {
-                return Ok((output, true));
-            }
-            return Err("affected flow line exceeds output budget".into());
+            return Err("affected flow line exceeds address space".into());
         }
         let separator = if index == 0 { "" } else { " -> " };
-        if output.len() + separator.len() + step.len() + 1 > FLOW_LINE_BUDGET {
-            if !push_literal(&mut output, " -> ...\n", FLOW_LINE_BUDGET) {
-                return Err("affected flow line exceeds output budget".into());
-            }
-            return Ok((output, true));
-        }
         output.push_str(separator);
         output.push_str(&step);
     }
     output.push('\n');
-    Ok((output, false))
+    Ok(output)
 }
 
 fn validate_changed_file(file: &ChangedFile) -> Result<()> {
@@ -1419,70 +1497,94 @@ fn merge_span(spans: &mut Vec<LineSpan>, span: LineSpan) {
     }
 }
 
-fn has_unmapped_span(changes: &[LineSpan], coverage: &[LineSpan]) -> bool {
+fn unmapped_spans(changes: &[LineSpan], coverage: &[LineSpan]) -> Vec<LineSpan> {
+    let mut residual = Vec::new();
     let mut covered = 0;
-    changes.iter().any(|change| {
+    for change in changes {
         while coverage
             .get(covered)
             .is_some_and(|symbol| symbol.end < change.start)
         {
             covered += 1;
         }
-        coverage
-            .get(covered)
-            .is_none_or(|symbol| symbol.start > change.start || symbol.end < change.end)
-    })
+        let deletion_anchor = change.start == change.end && change.start % 2 == 1;
+        let mut cursor = Some(change.start);
+        let mut index = covered;
+        while let (Some(start), Some(symbol)) = (cursor, coverage.get(index)) {
+            if symbol.start > change.end {
+                break;
+            }
+            if start < symbol.start {
+                push_unmapped_span(
+                    &mut residual,
+                    LineSpan {
+                        start,
+                        end: change.end.min(symbol.start - 1),
+                    },
+                    deletion_anchor,
+                );
+            }
+            if symbol.end >= change.end {
+                cursor = None;
+                break;
+            }
+            cursor = Some(start.max(symbol.end + 1));
+            index += 1;
+        }
+        if let Some(start) = cursor
+            && start <= change.end
+        {
+            push_unmapped_span(
+                &mut residual,
+                LineSpan {
+                    start,
+                    end: change.end,
+                },
+                deletion_anchor,
+            );
+        }
+        covered = index;
+    }
+    residual
 }
 
-fn unmapped_line(file: &ChangedFile, coverage: &[LineSpan]) -> Option<String> {
+fn push_unmapped_span(residual: &mut Vec<LineSpan>, span: LineSpan, deletion_anchor: bool) {
+    if deletion_anchor {
+        residual.push(span);
+        return;
+    }
+    let Some(start) = span.start.checked_add(span.start % 2) else {
+        return;
+    };
+    let end = span.end - span.end % 2;
+    if start <= end {
+        residual.push(LineSpan { start, end });
+    }
+}
+
+fn unmapped_line(file: &ChangedFile, residual: &[LineSpan]) -> Option<String> {
     let mut output = String::from("unmapped ");
-    if !push_escaped(&mut output, &file.path, CHANGES_BUDGET) {
+    if !push_escaped(&mut output, &file.path, usize::MAX) {
         return None;
     }
-    let mut covered = 0;
     let mut locations = 0;
-    for change in &file.spans {
-        while coverage
-            .get(covered)
-            .is_some_and(|symbol| symbol.end < change.start)
-        {
-            covered += 1;
-        }
-        if coverage
-            .get(covered)
-            .is_some_and(|symbol| symbol.start <= change.start && symbol.end >= change.end)
-        {
-            continue;
-        }
-        let start = (change.start / 2).max(1);
-        let end = (change.end / 2).max(start);
+    for span in residual {
+        let start = (span.start / 2).max(1);
+        let end = (span.end / 2).max(start);
         let location = if start == end {
             format!("{}{start}", if locations == 0 { ':' } else { ',' })
         } else {
             format!("{}{start}-{end}", if locations == 0 { ':' } else { ',' })
         };
-        if !push_literal(&mut output, &location, CHANGES_BUDGET) {
+        if !push_literal(&mut output, &location, usize::MAX) {
             return None;
         }
         locations += 1;
     }
-    if locations == 0 && !push_literal(&mut output, ":1", CHANGES_BUDGET) {
+    if locations == 0 && !push_literal(&mut output, ":1", usize::MAX) {
         return None;
     }
-    push_literal(&mut output, "\n", CHANGES_BUDGET).then_some(output)
-}
-
-fn push_change_line(lines: &mut Vec<String>, bytes: &mut usize, line: String) -> bool {
-    let Some(total) = bytes.checked_add(line.len()) else {
-        return false;
-    };
-    if total > CHANGES_BUDGET {
-        false
-    } else {
-        *bytes = total;
-        lines.push(line);
-        true
-    }
+    push_literal(&mut output, "\n", usize::MAX).then_some(output)
 }
 
 fn load_stored_files(connection: &Connection) -> Result<HashMap<String, StoredFile>> {
@@ -2483,6 +2585,46 @@ fn load_node(connection: &Connection, id: i64) -> Result<Option<RowNode>> {
         .map_err(db_error)
 }
 
+fn load_nodes(connection: &Connection, ids: &[i64]) -> Result<Vec<RowNode>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (1..=ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT n.id, n.kind, n.name, f.path, n.line_start
+           FROM nodes n JOIN files f ON f.id=n.file_id
+          WHERE n.id IN ({placeholders})"
+    );
+    let mut statement = connection.prepare(&sql).map_err(db_error)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(ids), |row| {
+            Ok(RowNode {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                name: row.get(2)?,
+                path: row.get(3)?,
+                line: row.get(4)?,
+            })
+        })
+        .map_err(db_error)?;
+    let mut nodes = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?
+        .into_iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
+    ids.iter()
+        .map(|id| {
+            nodes
+                .remove(id)
+                .ok_or_else(|| "changed node not found".to_owned())
+        })
+        .collect()
+}
+
 fn load_neighbors(
     connection: &Connection,
     id: i64,
@@ -2992,13 +3134,15 @@ mod tests {
                 report_unmapped: false,
             }],
             records: vec![],
+            paths: vec![],
             patch: String::new(),
             skipped_paths: 0,
         };
         let output = store.changes(&changes, 6, 50, &cancelled).unwrap();
         assert!(output.contains(" n6 "), "{output}");
         assert!(!output.contains(" n7 "), "{output}");
-        assert!(output.contains(TRUNCATED.trim()), "{output}");
+        assert!(output.contains("neighborhood_omitted=true"), "{output}");
+        assert!(!output.contains(TRUNCATED.trim()), "{output}");
 
         assert!(
             store
@@ -3103,12 +3247,15 @@ mod tests {
                 PathRecord::Deleted("old.rs".into()),
                 PathRecord::Renamed("before.rs".into(), "after.rs".into()),
             ],
+            paths: vec![],
             patch: String::new(),
             skipped_paths: 0,
         };
         let output = store.changes(&changes, 1, 10, &cancelled).unwrap();
         assert!(
-            output.contains("risk overall=0.4200 changed=1 flows=1 gaps=0"),
+            output.contains(
+                "risk overall=0.4200 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown direct_test_gaps=0 analysis_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
+            ),
             "{output}"
         );
         assert!(output.contains("risk 0.4200"), "{output}");
@@ -3127,7 +3274,11 @@ mod tests {
         assert!(!output.contains(TRUNCATED.trim()), "{output}");
 
         let depth_zero = store.changes(&changes, 0, 10, &cancelled).unwrap();
-        assert!(depth_zero.contains(TRUNCATED.trim()), "{depth_zero}");
+        assert!(
+            depth_zero.contains("neighborhood_omitted=true"),
+            "{depth_zero}"
+        );
+        assert!(!depth_zero.contains(TRUNCATED.trim()), "{depth_zero}");
 
         let unmapped = WorktreeChanges {
             files: vec![ChangedFile {
@@ -3137,6 +3288,7 @@ mod tests {
                 report_unmapped: true,
             }],
             records: vec![],
+            paths: vec![],
             patch: String::new(),
             skipped_paths: 0,
         };
@@ -3164,6 +3316,7 @@ mod tests {
                 report_unmapped: false,
             }],
             records: vec![],
+            paths: vec![],
             patch: String::new(),
             skipped_paths: 0,
         };
@@ -3179,6 +3332,7 @@ mod tests {
                 report_unmapped: true,
             }],
             records: vec![],
+            paths: vec![],
             patch: String::new(),
             skipped_paths: 0,
         };
@@ -3196,7 +3350,11 @@ mod tests {
         assert!(output.contains(" root "), "{output}");
         assert!(output.contains("test <-"), "{output}");
         assert!(output.contains("caller <-"), "{output}");
-        assert!(output.contains(TRUNCATED.trim()), "{output}");
+        assert!(
+            output.contains("unmapped src/untracked-499.rs:1"),
+            "{output}"
+        );
+        assert!(!output.contains(TRUNCATED.trim()), "{output}");
     }
 
     #[test]
@@ -3209,10 +3367,21 @@ mod tests {
     }
 
     #[test]
-    fn partially_covered_hunks_remain_unmapped() {
-        let changed = LineSpan { start: 2, end: 14 };
-        let symbol = LineSpan { start: 4, end: 12 };
-        assert!(has_unmapped_span(&[changed], &[symbol]));
+    fn partially_covered_hunks_report_only_residual_lines() {
+        let changed = LineSpan { start: 2, end: 18 };
+        let coverage = [
+            LineSpan { start: 4, end: 8 },
+            LineSpan { start: 12, end: 16 },
+        ];
+        let residual = unmapped_spans(&[changed], &coverage);
+        assert_eq!(
+            residual,
+            [
+                LineSpan { start: 2, end: 2 },
+                LineSpan { start: 10, end: 10 },
+                LineSpan { start: 18, end: 18 },
+            ]
+        );
         assert_eq!(
             unmapped_line(
                 &ChangedFile {
@@ -3221,10 +3390,335 @@ mod tests {
                     spans: vec![changed],
                     report_unmapped: true,
                 },
-                &[symbol]
+                &residual,
             ),
-            Some("unmapped src/lib.rs:1-7\n".into())
+            Some("unmapped src/lib.rs:1,5,9\n".into())
         );
+    }
+
+    #[test]
+    fn adjacent_symbol_coverage_has_no_phantom_gap_and_deletions_keep_anchors() {
+        assert!(
+            unmapped_spans(
+                &[LineSpan { start: 2, end: 4 }],
+                &[LineSpan { start: 2, end: 2 }, LineSpan { start: 4, end: 4 },],
+            )
+            .is_empty()
+        );
+        assert!(
+            unmapped_spans(
+                &[LineSpan { start: 7, end: 7 }],
+                &[LineSpan { start: 4, end: 12 }],
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            unmapped_spans(
+                &[LineSpan { start: 13, end: 13 }],
+                &[LineSpan { start: 4, end: 12 }],
+            ),
+            [LineSpan { start: 13, end: 13 }]
+        );
+    }
+
+    #[test]
+    fn whole_file_changes_report_exact_non_symbol_ranges() {
+        let graph = |with_function: bool| Graph {
+            files: vec![FileInput {
+                path: "src/lib.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [0; 32],
+                parse_context: String::new(),
+                byte_size: 7,
+                replace: true,
+            }],
+            nodes: std::iter::once(NodeInput {
+                key: "file".into(),
+                file_key: "src/lib.rs".into(),
+                kind: NodeKind::File,
+                name: "src/lib.rs".into(),
+                qualified_name: "file".into(),
+                parent_key: None,
+                owner_key: None,
+                line_start: 1,
+                line_end: 7,
+                signature: String::new(),
+                keys: vec![],
+            })
+            .chain(with_function.then(|| function_node("only_symbol", 5)))
+            .collect(),
+            ..Graph::default()
+        };
+        let changes = || WorktreeChanges {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                whole_file: true,
+                spans: vec![],
+                report_unmapped: true,
+            }],
+            records: vec![PathRecord::Untracked("src/lib.rs".into())],
+            paths: vec![],
+            patch: String::new(),
+            skipped_paths: 0,
+        };
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let cancelled = AtomicBool::new(false);
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph(true), ())))
+            .unwrap();
+
+        let output = store.changes(&changes(), 0, 10, &cancelled).unwrap();
+        assert!(output.contains("unmapped src/lib.rs:1-4,6-7"), "{output}");
+
+        let renamed = WorktreeChanges {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                whole_file: true,
+                spans: vec![LineSpan { start: 2, end: 2 }],
+                report_unmapped: true,
+            }],
+            records: vec![PathRecord::Renamed(
+                "src/old.rs".into(),
+                "src/lib.rs".into(),
+            )],
+            paths: vec![],
+            patch: String::new(),
+            skipped_paths: 0,
+        };
+        let output = store.changes(&renamed, 0, 10, &cancelled).unwrap();
+        assert!(output.contains("unmapped src/lib.rs:1\n"), "{output}");
+        assert!(!output.contains("unmapped src/lib.rs:1-4,6-7"), "{output}");
+
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph(false), ())))
+            .unwrap();
+        let output = store.changes(&changes(), 0, 10, &cancelled).unwrap();
+        assert!(output.contains("unmapped src/lib.rs:1-7"), "{output}");
+        assert!(!output.contains("unmapped src/lib.rs:1\n"), "{output}");
+    }
+
+    #[test]
+    fn deleted_only_changes_report_incomplete_analysis() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let output = store
+            .changes(
+                &WorktreeChanges {
+                    files: vec![],
+                    records: vec![PathRecord::Deleted("src/removed.rs".into())],
+                    paths: vec![],
+                    patch: String::new(),
+                    skipped_paths: 0,
+                },
+                0,
+                10,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(
+            output.contains("flows_discovered=0 flows_total=unknown"),
+            "{output}"
+        );
+        assert!(output.contains("analysis_complete=false"), "{output}");
+        assert!(output.contains("deleted_paths_unanalyzed=1"), "{output}");
+    }
+
+    #[test]
+    fn mixed_hunk_maps_each_function_and_reports_only_syntax_glue() {
+        let mut first = function_node("first", 2);
+        first.line_end = 4;
+        let mut second = function_node("second", 6);
+        second.line_end = 8;
+        let graph = Graph {
+            files: vec![FileInput {
+                path: "src/lib.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [0; 32],
+                parse_context: String::new(),
+                byte_size: 9,
+                replace: true,
+            }],
+            nodes: vec![
+                NodeInput {
+                    key: "file".into(),
+                    file_key: "src/lib.rs".into(),
+                    kind: NodeKind::File,
+                    name: "src/lib.rs".into(),
+                    qualified_name: "file".into(),
+                    parent_key: None,
+                    owner_key: None,
+                    line_start: 1,
+                    line_end: 9,
+                    signature: String::new(),
+                    keys: vec![],
+                },
+                first,
+                second,
+            ],
+            ..Graph::default()
+        };
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let cancelled = AtomicBool::new(false);
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        let output = store
+            .changes(
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        whole_file: false,
+                        spans: vec![LineSpan { start: 2, end: 18 }],
+                        report_unmapped: true,
+                    }],
+                    records: vec![],
+                    paths: vec![],
+                    patch: String::new(),
+                    skipped_paths: 0,
+                },
+                0,
+                10,
+                &cancelled,
+            )
+            .unwrap();
+
+        assert!(output.contains(" Function first src/lib.rs:2"), "{output}");
+        assert!(output.contains(" Function second src/lib.rs:6"), "{output}");
+        assert!(output.contains("unmapped src/lib.rs:1,5,9"), "{output}");
+        assert!(!output.contains("unmapped src/lib.rs:1-9"), "{output}");
+    }
+
+    #[test]
+    fn changes_rank_every_root_before_emitting_the_node_limit() {
+        let graph = Graph {
+            files: vec![FileInput {
+                path: "src/lib.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [0; 32],
+                parse_context: String::new(),
+                byte_size: 51,
+                replace: true,
+            }],
+            nodes: (0_u32..50)
+                .map(|index| function_node(&format!("node_{index}"), index + 1))
+                .chain(std::iter::once(function_node("verify_token", 51)))
+                .collect(),
+            ..Graph::default()
+        };
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let cancelled = AtomicBool::new(false);
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        let output = store
+            .changes(
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        whole_file: true,
+                        spans: vec![],
+                        report_unmapped: false,
+                    }],
+                    records: vec![],
+                    paths: vec![],
+                    patch: String::new(),
+                    skipped_paths: 0,
+                },
+                0,
+                50,
+                &cancelled,
+            )
+            .unwrap();
+
+        assert!(
+            output.contains(
+                "changed_symbols_total=51 changed_symbols_analyzed=51 changed_symbols_emitted=50 changed_symbols_omitted=1 flows_total=0 direct_test_gaps=51 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0"
+            ),
+            "{output}"
+        );
+        assert!(output.contains(" direct-test-gap"), "{output}");
+        assert!(output.contains(" Function verify_token "), "{output}");
+        assert!(!output.contains(" Function node_49 "), "{output}");
+        assert!(output.contains("neighborhood_omitted=true"), "{output}");
+        assert!(!output.contains(" gaps="), "{output}");
+        assert!(!output.contains(TRUNCATED.trim()), "{output}");
+    }
+
+    #[test]
+    fn changes_bound_root_analysis_and_report_the_omission() {
+        let graph = Graph {
+            files: vec![FileInput {
+                path: "src/lib.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [0; 32],
+                parse_context: String::new(),
+                byte_size: 501,
+                replace: true,
+            }],
+            nodes: (0_u32..=500)
+                .map(|index| {
+                    let mut node = function_node(&format!("type_{index}"), index + 1);
+                    node.kind = NodeKind::Type;
+                    node
+                })
+                .collect(),
+            ..Graph::default()
+        };
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let cancelled = AtomicBool::new(false);
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        let output = store
+            .changes(
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        whole_file: true,
+                        spans: vec![],
+                        report_unmapped: false,
+                    }],
+                    records: vec![],
+                    paths: vec![],
+                    patch: String::new(),
+                    skipped_paths: 0,
+                },
+                0,
+                50,
+                &cancelled,
+            )
+            .unwrap();
+
+        assert!(
+            output.contains(
+                "changed_symbols_total=501 changed_symbols_analyzed=500 changed_symbols_emitted=50 changed_symbols_omitted=451 flows_discovered=0 flows_total=unknown"
+            ),
+            "{output}"
+        );
+        assert!(output.contains("analysis_complete=false"), "{output}");
+        assert!(output.contains("analysis_roots_omitted=1"), "{output}");
+        assert!(output.contains("neighborhood_omitted=true"), "{output}");
     }
 
     #[test]
@@ -3341,6 +3835,7 @@ mod tests {
                         report_unmapped: true,
                     }],
                     records: vec![],
+                    paths: vec![],
                     patch: String::new(),
                     skipped_paths: 0,
                 },
@@ -3479,6 +3974,7 @@ mod tests {
                         report_unmapped: false,
                     }],
                     records: vec![],
+                    paths: vec![],
                     patch: String::new(),
                     skipped_paths: 0,
                 },

@@ -84,6 +84,9 @@ struct ChangesParams {
     #[serde(default = "default_changes_max_nodes")]
     #[schemars(range(min = 1, max = 50))]
     max_nodes: u32,
+    #[serde(default)]
+    #[schemars(length(min = 1, max = 128))]
+    cursor: Option<String>,
 }
 
 impl Graphr {
@@ -167,7 +170,7 @@ impl Graphr {
     }
 
     #[tool(
-        description = "Return one bounded review context: diff, risk scores, affected static call paths, and graph impact up to 6 hops. Flow discovery traces CALLS up to 15 hops. Do not fan out to search/view unless it is truncated or unmapped",
+        description = "Return an initial or cursor-selected bounded review page: changed-file manifest, diff, risk scores, affected static call paths, and graph impact up to 6 hops. Flow discovery traces CALLS up to 15 hops. Follow every files, diff, and graph continuation cursor from the immutable snapshot before any fallback",
         input_schema = rmcp::handler::server::common::schema_for_input::<ChangesParams>()
             .expect("valid changes schema")
     )]
@@ -180,7 +183,13 @@ impl Graphr {
             .map_err(|_| "invalid changes parameters".to_owned())?;
         validate_changes(&params)?;
         self.exclusive_job(context, "changes busy", 8192, move |project, cancelled| {
-            project.changes_cancelled(&params.base, params.depth, params.max_nodes, cancelled)
+            project.changes_cancelled(
+                &params.base,
+                params.depth,
+                params.max_nodes,
+                params.cursor.as_deref(),
+                cancelled,
+            )
         })
         .await
     }
@@ -192,7 +201,7 @@ impl ServerHandler for Graphr {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("graphr", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "For reviews, call changes once with the review base and a depth from 0 through 6. It includes risk scores and affected static call paths, with flow discovery tracing CALLS up to 15 hops; these are possible source paths, not runtime call stacks. Do not fan out to search/view unless it reports truncated, untracked, or unmapped changes. For exploration, use search then view, whose depth ceiling is 6. The graph is indexed at startup; after edits, call index once before changes.",
+                "For reviews, call changes once without a cursor using the review base and a depth from 0 through 6, then exhaust every files, diff, and graph continuation token by calling changes with the same arguments and the exact cursor. The cursors share one immutable snapshot; do not start another cursorless changes call until they are exhausted. Coverage is complete only when all cursors are exhausted and review_complete_when_pages_exhausted=true. It includes risk scores and affected static call paths, with flow discovery tracing CALLS up to 15 hops; these are possible source paths, not runtime call stacks. Do not use search/view for review coverage. A stale or failing cursor or an explicit analysis omission means coverage is incomplete. The graph is indexed at startup; after edits, call index once before changes.",
             )
     }
 }
@@ -365,6 +374,14 @@ fn validate_changes(params: &ChangesParams) -> Result<(), String> {
     if !(1..=50).contains(&params.max_nodes) {
         return Err("max_nodes must be in 1..=50".into());
     }
+    if params.cursor.as_ref().is_some_and(|cursor| {
+        cursor.is_empty()
+            || cursor.len() > 128
+            || !cursor.is_ascii()
+            || cursor.chars().any(char::is_control)
+    }) {
+        return Err("invalid changes cursor".into());
+    }
     Ok(())
 }
 
@@ -437,6 +454,8 @@ mod tests {
         assert_eq!(changes["properties"]["depth"]["maximum"], 6);
         assert_eq!(changes["properties"]["max_nodes"]["minimum"], 1);
         assert_eq!(changes["properties"]["max_nodes"]["maximum"], 50);
+        assert_eq!(changes["properties"]["cursor"]["minLength"], 1);
+        assert_eq!(changes["properties"]["cursor"]["maxLength"], 128);
     }
 
     #[test]
@@ -446,12 +465,14 @@ mod tests {
         assert_eq!(defaults.base, "HEAD");
         assert_eq!(defaults.depth, 1);
         assert_eq!(defaults.max_nodes, 50);
+        assert_eq!(defaults.cursor, None);
         assert!(validate_changes(&defaults).is_ok());
         assert!(
             validate_changes(&ChangesParams {
                 base: "HEAD".into(),
                 depth: 6,
                 max_nodes: 50,
+                cursor: Some("a".repeat(128)),
             })
             .is_ok()
         );
@@ -461,21 +482,25 @@ mod tests {
                 base: " ".into(),
                 depth: 2,
                 max_nodes: 50,
+                cursor: None,
             },
             ChangesParams {
                 base: "-HEAD".into(),
                 depth: 2,
                 max_nodes: 50,
+                cursor: None,
             },
             ChangesParams {
                 base: "HEAD".into(),
                 depth: 7,
                 max_nodes: 50,
+                cursor: None,
             },
             ChangesParams {
                 base: "HEAD".into(),
                 depth: 2,
                 max_nodes: 0,
+                cursor: None,
             },
         ] {
             assert!(validate_changes(&invalid).is_err());
@@ -485,9 +510,21 @@ mod tests {
                 base: "a".repeat(257),
                 depth: 2,
                 max_nodes: 50,
+                cursor: None,
             })
             .is_err()
         );
+        for cursor in ["".into(), "a".repeat(129), "é".into(), "a\n".into()] {
+            assert!(
+                validate_changes(&ChangesParams {
+                    base: "HEAD".into(),
+                    depth: 2,
+                    max_nodes: 50,
+                    cursor: Some(cursor),
+                })
+                .is_err()
+            );
+        }
     }
 
     #[test]
