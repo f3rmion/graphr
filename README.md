@@ -6,8 +6,8 @@ stdio.
 Graphr is an independent Rust implementation inspired by [code-review-graph](https://github.com/tirth8205/code-review-graph) and its idea of using code graphs to focus AI review context. Credit and thanks go to @tirth8205 and the code-review-graph contributors for the nice project.
 
 ```text
-cargo build --locked --release
-target/release/graphr index /absolute/repository --rebuild
+cargo install graphr --locked
+graphr index /absolute/repository --rebuild
 ```
 
 Register the same binary with either client:
@@ -42,6 +42,7 @@ Isolated reviews of `rust-random/rand` commit `bb1262f7` used Codex CLI 0.146.0 
 The old workflow read the full diff, made two `changes` attempts plus 14 search/view calls, and re-read source. The fixed run made one `changes` call, zero search/view calls, and one bounded fallback for two named unmapped files. It used 52,116 fewer total tokens than plain Codex (-38.0%) and 212,419 fewer than unguided Graphr (-71.4%); uncached input fell 43.6% versus plain Codex.
 
 These are single stochastic trials on one small commit, and the guided prompt differs by invoking the skill, so the numbers are a directional workflow result rather than a universal performance claim.
+The token totals predate affected-flow and risk output; the current raw review text is 206 bytes larger, but no new end-to-end Codex trial has been run.
 
 ## Comparison with code-review-graph (CRG)
 
@@ -51,10 +52,10 @@ A common stdio MCP harness used warm indexes, 20 fresh starts, and 100 measured 
 
 | Metric | Graphr | CRG 2.3.7 | Graphr advantage |
 | --- | ---: | ---: | ---: |
-| Startup p50 / p95 | 31.835 / 32.266 ms | 521.904 / 537.368 ms | 16.39x / 16.65x faster |
-| Warm review call p50 / p95 | 6.148 / 6.867 ms | 11.720 / 12.787 ms | 1.91x / 1.86x faster |
-| Review text | 5,456 bytes | 39,783 bytes | 7.29x smaller |
-| MCP response | 5,695 bytes | 82,482 bytes | 14.48x smaller |
+| Startup p50 / p95 | 31.539 / 32.114 ms | 521.904 / 537.368 ms | 16.55x / 16.73x faster |
+| Warm review call p50 / p95 | 6.704 / 7.872 ms | 11.720 / 12.787 ms | 1.75x / 1.62x faster |
+| Review text | 5,662 bytes | 39,783 bytes | 7.03x smaller |
+| MCP response | 5,903 bytes | 82,482 bytes | 13.97x smaller |
 
 In a separate 20-run interleaved rebuild benchmark on the same checkout, bounded file-parsing workers reduced Graphr's p50 from 87.847 to 61.290 ms (-30.2%) and p95 from 97.689 to 64.871 ms (-33.6%). No-op indexing stayed effectively flat at 23.729 versus 23.822 ms p50.
 

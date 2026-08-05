@@ -3,7 +3,13 @@ name = "graphr"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
-publish = false
+description = "Fast, compact Rust and Python code graphs for AI code review over MCP stdio"
+license = "MIT"
+repository = "https://github.com/f3rmion/graphr"
+readme = "README.md"
+keywords = ["mcp", "code-review", "code-graph", "rust", "python"]
+categories = ["development-tools"]
+exclude = ["/.agents", "/AGENTS.md"]
 
 [dependencies]
 blake3 = "1.8.5"
