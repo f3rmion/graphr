@@ -15,6 +15,11 @@ const SCHEMA_VERSION: i64 = 4;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 const CHANGES_BUDGET: usize = 8192;
+const FLOW_DEPTH: u32 = 15;
+const FLOW_SCAN_LIMIT: usize = 500;
+const FLOW_QUERY_LIMIT: usize = 5_000;
+const FLOW_OUTPUT_BUDGET: usize = 2048;
+const FLOW_LINE_BUDGET: usize = 512;
 const TRUNCATED: &str = "[truncated]\n";
 const BUSY_LIMIT: Duration = Duration::from_secs(5);
 const BUSY_POLL: Duration = Duration::from_millis(5);
@@ -27,6 +32,33 @@ const SEARCH_SQL: &str = "SELECT n.id, n.kind, n.name, f.path, n.line_start
       WHERE nodes_fts MATCH ?1 AND (?2 IS NULL OR n.kind=?2)
       ORDER BY nodes_fts.rowid
       LIMIT ?3";
+const SECURITY_KEYWORDS: [&str; 25] = [
+    "auth",
+    "login",
+    "password",
+    "token",
+    "session",
+    "crypt",
+    "secret",
+    "credential",
+    "permission",
+    "sql",
+    "query",
+    "execute",
+    "connect",
+    "socket",
+    "request",
+    "http",
+    "sanitize",
+    "validate",
+    "encrypt",
+    "decrypt",
+    "hash",
+    "sign",
+    "verify",
+    "admin",
+    "privilege",
+];
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -290,7 +322,7 @@ impl Store {
     }
 
     pub fn view(&mut self, node_ref: &str, depth: u32, max_nodes: u32) -> Result<String> {
-        if depth > 3 || !(1..=50).contains(&max_nodes) || node_ref.len() > 128 {
+        if depth > 6 || !(1..=50).contains(&max_nodes) || node_ref.len() > 128 {
             return Err("invalid view parameters".into());
         }
         let (epoch, generation, root_id) = parse_ref(node_ref)?;
@@ -355,7 +387,7 @@ impl Store {
         max_nodes: u32,
         cancelled: &AtomicBool,
     ) -> Result<String> {
-        if depth > 3 || !(1..=50).contains(&max_nodes) {
+        if depth > 6 || !(1..=50).contains(&max_nodes) {
             return Err("invalid changes parameters".into());
         }
         check_cancelled(cancelled)?;
@@ -508,18 +540,56 @@ impl Store {
             check_cancelled(cancelled)?;
             roots.push(load_node(&tx, id)?.ok_or_else(|| "changed node not found".to_owned())?);
         }
+        let analysis = analyze_changed_roots(&tx, &roots, root_limit, cancelled)?;
+        roots.sort_by(|left, right| {
+            analysis
+                .risks
+                .get(&right.id)
+                .map_or(0, |risk| risk.score)
+                .cmp(&analysis.risks.get(&left.id).map_or(0, |risk| risk.score))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut output_full = false;
+        if !analysis.risks.is_empty() {
+            let overall = analysis
+                .risks
+                .values()
+                .map(|risk| risk.score)
+                .max()
+                .unwrap_or(0);
+            let gaps = analysis.risks.values().filter(|risk| risk.test_gap).count();
+            output_full = !push_change_line(
+                &mut lines,
+                &mut line_bytes,
+                format!(
+                    "risk overall={} changed={} flows={} gaps={}\n",
+                    score_text(overall),
+                    analysis.risks.len(),
+                    analysis.flows.len(),
+                    gaps
+                ),
+            );
+        }
         for root in &roots {
-            let Some(line) = root.line(&state, None, CHANGES_BUDGET)? else {
-                omitted = true;
+            let relation = analysis.risks.get(&root.id).map(|risk| {
+                format!(
+                    "risk {}{}",
+                    score_text(risk.score),
+                    if risk.test_gap { " test-gap" } else { "" }
+                )
+            });
+            let Some(line) = root.line(&state, relation.as_deref(), CHANGES_BUDGET)? else {
+                output_full = true;
                 break;
             };
             if !push_change_line(&mut lines, &mut line_bytes, line) {
-                omitted = true;
+                output_full = true;
                 break;
             }
         }
-        if !omitted && !roots.is_empty() {
-            omitted = traverse_changes(
+        if !omitted && !output_full && !roots.is_empty() {
+            omitted |= traverse_changes(
                 &tx,
                 &state,
                 &roots,
@@ -531,10 +601,30 @@ impl Store {
         }
         for line in unmapped_lines {
             if !push_change_line(&mut lines, &mut line_bytes, line) {
-                omitted = true;
+                output_full = true;
                 break;
             }
         }
+        let mut flow_bytes = 0_usize;
+        let mut flow_omitted = analysis.omitted;
+        for flow in &analysis.flows {
+            let (line, truncated) = flow_line(flow)?;
+            flow_omitted |= truncated;
+            let Some(next_flow_bytes) = flow_bytes.checked_add(line.len()) else {
+                flow_omitted = true;
+                break;
+            };
+            if next_flow_bytes > FLOW_OUTPUT_BUDGET {
+                flow_omitted = true;
+                break;
+            }
+            if !push_change_line(&mut lines, &mut line_bytes, line) {
+                flow_omitted = true;
+                break;
+            }
+            flow_bytes = next_flow_bytes;
+        }
+        omitted |= output_full || flow_omitted;
         if lines.is_empty() && !omitted {
             Ok("no current symbols\n".into())
         } else {
@@ -579,6 +669,39 @@ struct RowNode {
     name: String,
     path: String,
     line: u32,
+}
+
+#[derive(Clone)]
+struct FlowNode {
+    id: i64,
+    kind: String,
+    name: String,
+    qualified_name: String,
+    path: String,
+    line: u32,
+}
+
+struct AffectedFlow {
+    entry: FlowNode,
+    nodes: Vec<FlowNode>,
+    parents: HashMap<i64, i64>,
+    changed: Vec<i64>,
+    depth: u32,
+    file_count: usize,
+    criticality: u32,
+}
+
+#[derive(Clone, Copy)]
+struct NodeRisk {
+    score: u32,
+    test_gap: bool,
+}
+
+#[derive(Default)]
+struct ChangeAnalysis {
+    risks: HashMap<i64, NodeRisk>,
+    flows: Vec<AffectedFlow>,
+    omitted: bool,
 }
 
 impl RowNode {
@@ -736,6 +859,540 @@ fn traverse_changes(
         std::mem::swap(&mut current, &mut next);
     }
     Ok(false)
+}
+
+fn analyze_changed_roots(
+    connection: &Connection,
+    roots: &[RowNode],
+    max_flows: usize,
+    cancelled: &AtomicBool,
+) -> Result<ChangeAnalysis> {
+    let risk_root_count = roots.iter().filter(|node| node.kind != "file").count();
+    let (flow_roots, mut omitted) = changed_flow_roots(connection, roots, max_flows)?;
+    let flow_root_ids = flow_roots
+        .iter()
+        .map(|node| node.id)
+        .collect::<HashSet<_>>();
+    if risk_root_count == 0 && flow_root_ids.is_empty() {
+        return Ok(ChangeAnalysis::default());
+    }
+
+    // ponytail: a request-wide query ceiling keeps on-demand discovery simple;
+    // load an adjacency snapshot only if measured coverage needs a higher cap.
+    let mut query_budget = FLOW_QUERY_LIMIT;
+    let (entries, entries_omitted) = affected_entries(
+        connection,
+        &flow_roots,
+        max_flows,
+        &mut query_budget,
+        cancelled,
+    )?;
+    omitted |= entries_omitted;
+    let mut flows = Vec::with_capacity(entries.len());
+    for entry in entries {
+        check_cancelled(cancelled)?;
+        if query_budget == 0 {
+            omitted = true;
+            break;
+        }
+        let (flow, truncated) = trace_flow(
+            connection,
+            entry,
+            &flow_root_ids,
+            &mut query_budget,
+            cancelled,
+        )?;
+        omitted |= truncated;
+        if let Some(flow) = flow {
+            flows.push(flow);
+        }
+    }
+    flows.sort_by(|left, right| {
+        right
+            .criticality
+            .cmp(&left.criticality)
+            .then_with(|| left.entry.id.cmp(&right.entry.id))
+    });
+
+    let mut risks = HashMap::with_capacity(risk_root_count);
+    for root in roots.iter().filter(|node| node.kind != "file") {
+        check_cancelled(cancelled)?;
+        let node = load_flow_node(connection, root.id)?;
+        let flow_score = flows
+            .iter()
+            .filter(|flow| flow.changed.binary_search(&root.id).is_ok())
+            .fold(0_u32, |score, flow| score.saturating_add(flow.criticality));
+        let (callers, tests, directly_tested) = node_risk_counts(connection, root.id)?;
+        risks.insert(
+            root.id,
+            NodeRisk {
+                score: risk_score(
+                    flow_score,
+                    tests,
+                    security_sensitive(&node.name, &node.qualified_name),
+                    callers,
+                ),
+                test_gap: node.kind != "test" && !directly_tested,
+            },
+        );
+    }
+
+    Ok(ChangeAnalysis {
+        risks,
+        flows,
+        omitted,
+    })
+}
+
+fn changed_flow_roots(
+    connection: &Connection,
+    roots: &[RowNode],
+    limit: usize,
+) -> Result<(Vec<FlowNode>, bool)> {
+    let mut nodes = Vec::new();
+    let mut seen = HashSet::new();
+    let mut expanded_files = HashSet::new();
+    let mut omitted = false;
+    let mut file_nodes = connection
+        .prepare(
+            "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start
+               FROM nodes changed JOIN nodes n ON n.file_id=changed.file_id
+               JOIN files f ON f.id=n.file_id
+              WHERE changed.id=?1 AND n.kind='function'
+              ORDER BY n.id LIMIT ?2",
+        )
+        .map_err(db_error)?;
+    let fetch = i64::try_from(limit.saturating_add(1))
+        .map_err(|_| "flow root limit exceeds SQLite range")?;
+
+    for root in roots {
+        if root.kind == "function" {
+            if seen.insert(root.id) {
+                nodes.push(load_flow_node(connection, root.id)?);
+            }
+            continue;
+        }
+        if root.kind == "test" || !expanded_files.insert(root.path.as_str()) {
+            continue;
+        }
+        let rows = file_nodes
+            .query_map(params![root.id, fetch], flow_node)
+            .map_err(db_error)?;
+        for row in rows {
+            let node = row.map_err(db_error)?;
+            if !seen.insert(node.id) {
+                continue;
+            }
+            if nodes.len() == limit {
+                omitted = true;
+                break;
+            }
+            nodes.push(node);
+        }
+    }
+    Ok((nodes, omitted))
+}
+
+fn affected_entries(
+    connection: &Connection,
+    roots: &[FlowNode],
+    limit: usize,
+    query_budget: &mut usize,
+    cancelled: &AtomicBool,
+) -> Result<(Vec<FlowNode>, bool)> {
+    let mut entries = Vec::new();
+    let mut omitted = false;
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+
+    for start in roots.iter().filter(|node| node.kind != "test").cloned() {
+        if visited.insert(start.id) {
+            queue.push_back((start, 0_u32));
+        }
+    }
+
+    while let Some((current, depth)) = queue.pop_front() {
+        check_cancelled(cancelled)?;
+        if *query_budget == 0 {
+            omitted = true;
+            break;
+        }
+        *query_budget -= 1;
+        let remaining = FLOW_SCAN_LIMIT.saturating_sub(visited.len());
+        let (callers, more) = load_flow_neighbors(connection, current.id, true, remaining.max(1))?;
+        omitted |= more;
+
+        if current.kind == "function" && (callers.is_empty() || conventional_entry(&current.name)) {
+            if entries.len() == limit {
+                return Ok((entries, true));
+            }
+            entries.push(current.clone());
+        }
+        if depth == FLOW_DEPTH {
+            omitted |= callers.iter().any(|node| !visited.contains(&node.id));
+            continue;
+        }
+
+        for caller in callers {
+            if visited.contains(&caller.id) {
+                continue;
+            }
+            if visited.len() == FLOW_SCAN_LIMIT {
+                omitted = true;
+                queue.clear();
+                break;
+            }
+            visited.insert(caller.id);
+            queue.push_back((caller, depth + 1));
+        }
+    }
+    Ok((entries, omitted))
+}
+
+fn trace_flow(
+    connection: &Connection,
+    entry: FlowNode,
+    root_ids: &HashSet<i64>,
+    query_budget: &mut usize,
+    cancelled: &AtomicBool,
+) -> Result<(Option<AffectedFlow>, bool)> {
+    let mut nodes = vec![entry.clone()];
+    let mut parents = HashMap::new();
+    let mut visited = HashSet::from([entry.id]);
+    let mut queue = VecDeque::from([(entry.clone(), 0_u32)]);
+    let mut depth_reached = 0;
+    let mut omitted = false;
+
+    while let Some((current, depth)) = queue.pop_front() {
+        check_cancelled(cancelled)?;
+        if *query_budget == 0 {
+            omitted = true;
+            break;
+        }
+        *query_budget -= 1;
+        let remaining = FLOW_SCAN_LIMIT.saturating_sub(visited.len());
+        let (callees, more) = load_flow_neighbors(connection, current.id, false, remaining.max(1))?;
+        omitted |= more;
+        if depth == FLOW_DEPTH {
+            omitted |= callees.iter().any(|node| !visited.contains(&node.id));
+            continue;
+        }
+
+        for callee in callees {
+            if visited.contains(&callee.id) {
+                continue;
+            }
+            if visited.len() == FLOW_SCAN_LIMIT {
+                omitted = true;
+                queue.clear();
+                break;
+            }
+            visited.insert(callee.id);
+            parents.insert(callee.id, current.id);
+            depth_reached = depth_reached.max(depth + 1);
+            nodes.push(callee.clone());
+            queue.push_back((callee, depth + 1));
+        }
+    }
+
+    let mut changed = nodes
+        .iter()
+        .filter_map(|node| root_ids.contains(&node.id).then_some(node.id))
+        .collect::<Vec<_>>();
+    changed.sort_unstable();
+    if nodes.len() < 2 || changed.is_empty() {
+        return Ok((None, omitted));
+    }
+    let (criticality, file_count) = score_flow(connection, &nodes, depth_reached, cancelled)?;
+    Ok((
+        Some(AffectedFlow {
+            entry,
+            nodes,
+            parents,
+            changed,
+            depth: depth_reached,
+            file_count,
+            criticality,
+        }),
+        omitted,
+    ))
+}
+
+fn load_flow_node(connection: &Connection, id: i64) -> Result<FlowNode> {
+    connection
+        .query_row(
+            "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start
+               FROM nodes n JOIN files f ON f.id=n.file_id
+              WHERE n.id=?1",
+            [id],
+            flow_node,
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| "flow node not found".to_owned())
+}
+
+fn load_flow_neighbors(
+    connection: &Connection,
+    id: i64,
+    incoming: bool,
+    limit: usize,
+) -> Result<(Vec<FlowNode>, bool)> {
+    let sql = if incoming {
+        "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start
+           FROM edges e JOIN nodes n ON n.id=e.source_id
+           JOIN files f ON f.id=n.file_id
+          WHERE e.target_id=?1 AND e.kind='CALLS' AND n.kind='function'
+          ORDER BY n.id LIMIT ?2"
+    } else {
+        "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start
+           FROM edges e JOIN nodes n ON n.id=e.target_id
+           JOIN files f ON f.id=n.file_id
+          WHERE e.source_id=?1 AND e.kind='CALLS'
+          ORDER BY n.id LIMIT ?2"
+    };
+    let fetch = limit
+        .checked_add(1)
+        .ok_or_else(|| "flow neighbor limit overflow".to_owned())?;
+    let fetch = i64::try_from(fetch).map_err(|_| "flow neighbor limit exceeds SQLite range")?;
+    let mut statement = connection.prepare(sql).map_err(db_error)?;
+    let mut nodes = statement
+        .query_map(params![id, fetch], flow_node)
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?;
+    let more = nodes.len() > limit;
+    nodes.truncate(limit);
+    Ok((nodes, more))
+}
+
+fn flow_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowNode> {
+    Ok(FlowNode {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        name: row.get(2)?,
+        qualified_name: row.get(3)?,
+        path: row.get(4)?,
+        line: row.get(5)?,
+    })
+}
+
+fn score_flow(
+    connection: &Connection,
+    nodes: &[FlowNode],
+    depth: u32,
+    cancelled: &AtomicBool,
+) -> Result<(u32, usize)> {
+    if nodes.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut files = HashSet::new();
+    let mut security_nodes = 0_usize;
+    for node in nodes {
+        check_cancelled(cancelled)?;
+        files.insert(node.path.as_str());
+        security_nodes += usize::from(security_sensitive(&node.name, &node.qualified_name));
+    }
+    let placeholders = (1..=nodes.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let evidence = format!(
+        "SELECT
+            (SELECT count(*) FROM refs
+              WHERE kind='CALLS' AND resolved_target_id IS NULL
+                AND source_id IN ({placeholders})),
+            (SELECT count(DISTINCT target_id) FROM edges
+              WHERE kind='TEST_CALLS' AND target_id IN ({placeholders}))"
+    );
+    let (external_calls, tested_nodes) = connection
+        .query_row(
+            &evidence,
+            rusqlite::params_from_iter(nodes.iter().map(|node| node.id)),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(db_error)?;
+    let external_calls =
+        usize::try_from(external_calls).map_err(|_| "external call count is invalid")?;
+    let tested_nodes = usize::try_from(tested_nodes).map_err(|_| "tested node count is invalid")?;
+    Ok((
+        flow_criticality(
+            nodes.len(),
+            files.len(),
+            external_calls,
+            security_nodes,
+            tested_nodes,
+            depth,
+        ),
+        files.len(),
+    ))
+}
+
+fn flow_criticality(
+    node_count: usize,
+    file_count: usize,
+    external_calls: usize,
+    security_nodes: usize,
+    tested_nodes: usize,
+    depth: u32,
+) -> u32 {
+    if node_count == 0 {
+        return 0;
+    }
+    let file_spread = if file_count > 1 {
+        ((file_count - 1) as f64 / 4.0).min(1.0)
+    } else {
+        0.0
+    };
+    let external = (external_calls as f64 / 5.0).min(1.0);
+    let security = (security_nodes as f64 / node_count as f64).min(1.0);
+    let test_gap = 1.0 - (tested_nodes as f64 / node_count as f64).min(1.0);
+    let depth = (f64::from(depth) / 10.0).min(1.0);
+    ((file_spread * 0.30 + external * 0.20 + security * 0.25 + test_gap * 0.15 + depth * 0.10)
+        .clamp(0.0, 1.0)
+        * 10_000.0)
+        .round() as u32
+}
+
+fn node_risk_counts(connection: &Connection, id: i64) -> Result<(u32, u32, bool)> {
+    let (callers, tests, directly_tested) = connection
+        .query_row(
+            "SELECT
+                (SELECT count(*) FROM edges
+                  WHERE target_id=?1 AND kind='CALLS'),
+                (SELECT count(*) FROM (
+                    SELECT source_id FROM edges
+                     WHERE target_id=?1 AND kind='TEST_CALLS'
+                    UNION
+                    SELECT test.source_id
+                      FROM edges call JOIN edges test ON test.target_id=call.target_id
+                     WHERE call.source_id=?1 AND call.kind='CALLS'
+                       AND test.kind='TEST_CALLS'
+                )),
+                EXISTS(SELECT 1 FROM edges
+                        WHERE target_id=?1 AND kind='TEST_CALLS')",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .map_err(db_error)?;
+    Ok((
+        u32::try_from(callers).map_err(|_| "caller count is invalid")?,
+        u32::try_from(tests).map_err(|_| "test count is invalid")?,
+        directly_tested,
+    ))
+}
+
+fn risk_score(flow_score: u32, tests: u32, security: bool, callers: u32) -> u32 {
+    flow_score.min(2_500)
+        + 3_000_u32.saturating_sub(tests.min(5) * 500)
+        + u32::from(security) * 2_000
+        + callers.min(2) * 500
+}
+
+fn security_sensitive(name: &str, qualified_name: &str) -> bool {
+    let name = name.to_lowercase();
+    let qualified_name = qualified_name.to_lowercase();
+    SECURITY_KEYWORDS
+        .iter()
+        .any(|keyword| name.contains(keyword) || qualified_name.contains(keyword))
+}
+
+fn conventional_entry(name: &str) -> bool {
+    // ponytail: the index does not retain decorators; add decorator metadata
+    // when framework-wired handlers become a measured flow-coverage gap.
+    matches!(
+        name,
+        "main"
+            | "__main__"
+            | "handler"
+            | "handle"
+            | "lambda_handler"
+            | "upgrade"
+            | "downgrade"
+            | "lifespan"
+            | "get_db"
+            | "do_GET"
+            | "do_POST"
+            | "do_PUT"
+            | "do_DELETE"
+            | "do_PATCH"
+            | "do_HEAD"
+            | "do_OPTIONS"
+            | "log_message"
+    ) || name.starts_with("on_")
+        || name.starts_with("handle_")
+}
+
+fn score_text(score: u32) -> String {
+    format!("{}.{:04}", score / 10_000, score % 10_000)
+}
+
+fn flow_line(flow: &AffectedFlow) -> Result<(String, bool)> {
+    let changed = flow
+        .nodes
+        .iter()
+        .rev()
+        .find(|node| flow.changed.binary_search(&node.id).is_ok())
+        .map(|node| node.id)
+        .ok_or_else(|| "affected flow has no changed node".to_owned())?;
+    let mut route = vec![changed];
+    while route.last().copied() != Some(flow.entry.id) {
+        let current = *route.last().expect("route starts with changed node");
+        let parent = flow
+            .parents
+            .get(&current)
+            .copied()
+            .ok_or_else(|| "affected flow path is incomplete".to_owned())?;
+        if route.contains(&parent) || route.len() > FLOW_DEPTH as usize {
+            return Err("affected flow path is cyclic".into());
+        }
+        route.push(parent);
+    }
+    route.reverse();
+
+    let mut output = format!(
+        "flow {} depth={} nodes={} files={} changed={} ",
+        score_text(flow.criticality),
+        flow.depth,
+        flow.nodes.len(),
+        flow.file_count,
+        flow.changed.len()
+    );
+    for (index, id) in route.into_iter().enumerate() {
+        let node = flow
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .ok_or_else(|| "affected flow node is missing".to_owned())?;
+        let mut step = String::new();
+        if !push_escaped(&mut step, &node.name, FLOW_LINE_BUDGET)
+            || !push_literal(&mut step, "@", FLOW_LINE_BUDGET)
+            || !push_escaped(&mut step, &node.path, FLOW_LINE_BUDGET)
+            || !push_literal(&mut step, &format!(":{}", node.line), FLOW_LINE_BUDGET)
+        {
+            if push_literal(&mut output, "...\n", FLOW_LINE_BUDGET) {
+                return Ok((output, true));
+            }
+            return Err("affected flow line exceeds output budget".into());
+        }
+        let separator = if index == 0 { "" } else { " -> " };
+        if output.len() + separator.len() + step.len() + 1 > FLOW_LINE_BUDGET {
+            if !push_literal(&mut output, " -> ...\n", FLOW_LINE_BUDGET) {
+                return Err("affected flow line exceeds output budget".into());
+            }
+            return Ok((output, true));
+        }
+        output.push_str(separator);
+        output.push_str(&step);
+    }
+    output.push('\n');
+    Ok((output, false))
 }
 
 fn validate_changed_file(file: &ChangedFile) -> Result<()> {
@@ -2299,6 +2956,59 @@ mod tests {
     }
 
     #[test]
+    fn traversal_reaches_six_hops_but_not_seven() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let mut graph = single_node_graph("n0");
+        for index in 1_u32..=7 {
+            let key = format!("n{index}");
+            graph.nodes.push(function_node(&key, index + 1));
+            graph.edges.push(EdgeInput {
+                source_key: format!("n{}", index - 1),
+                target_key: key,
+                kind: EdgeKind::Calls,
+                support_count: 1,
+            });
+        }
+        let cancelled = AtomicBool::new(false);
+        let (state, _, ()) = store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        let output = store
+            .view(&format!("{}:{}:1", state.epoch, state.generation), 6, 50)
+            .unwrap();
+        assert!(output.contains(" n6 "), "{output}");
+        assert!(!output.contains(" n7 "), "{output}");
+        assert!(output.contains(TRUNCATED.trim()), "{output}");
+
+        let changes = WorktreeChanges {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                whole_file: false,
+                spans: vec![LineSpan { start: 2, end: 2 }],
+                report_unmapped: false,
+            }],
+            records: vec![],
+            patch: String::new(),
+            skipped_paths: 0,
+        };
+        let output = store.changes(&changes, 6, 50, &cancelled).unwrap();
+        assert!(output.contains(" n6 "), "{output}");
+        assert!(!output.contains(" n7 "), "{output}");
+        assert!(output.contains(TRUNCATED.trim()), "{output}");
+
+        assert!(
+            store
+                .view(&format!("{}:{}:1", state.epoch, state.generation), 7, 50)
+                .is_err()
+        );
+        assert!(store.changes(&changes, 7, 50, &cancelled).is_err());
+    }
+
+    #[test]
     fn changes_map_gaps_and_traverse_in_global_priority_order() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
@@ -2397,6 +3107,17 @@ mod tests {
             skipped_paths: 0,
         };
         let output = store.changes(&changes, 1, 10, &cancelled).unwrap();
+        assert!(
+            output.contains("risk overall=0.4200 changed=1 flows=1 gaps=0"),
+            "{output}"
+        );
+        assert!(output.contains("risk 0.4200"), "{output}");
+        assert!(
+            output.contains(
+                "flow 0.1200 depth=2 nodes=3 files=1 changed=1 caller@src/lib.rs:9 -> root@src/lib.rs:2"
+            ),
+            "{output}"
+        );
         let positions = [" root ", "test <-", "caller <-", "call ->", "import ->"]
             .map(|part| output.find(part).unwrap());
         assert!(
@@ -2421,7 +3142,34 @@ mod tests {
         };
         let output = store.changes(&unmapped, 0, 10, &cancelled).unwrap();
         assert!(output.contains(" File src/lib.rs src/lib.rs:1"), "{output}");
+        assert!(
+            output.contains("flow 0.1200 depth=2 nodes=3 files=1 changed=3"),
+            "{output}"
+        );
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.starts_with("flow "))
+                .count(),
+            1,
+            "{output}"
+        );
         assert!(output.contains("unmapped src/lib.rs:1"), "{output}");
+
+        let type_change = WorktreeChanges {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                whole_file: false,
+                spans: vec![LineSpan { start: 22, end: 22 }],
+                report_unmapped: false,
+            }],
+            records: vec![],
+            patch: String::new(),
+            skipped_paths: 0,
+        };
+        let output = store.changes(&type_change, 0, 10, &cancelled).unwrap();
+        assert!(output.contains(" Type imported src/lib.rs:11"), "{output}");
+        assert!(output.contains("flow 0.1200"), "{output}");
 
         let mut flooded = WorktreeChanges {
             files: vec![ChangedFile {
@@ -2449,6 +3197,15 @@ mod tests {
         assert!(output.contains("test <-"), "{output}");
         assert!(output.contains("caller <-"), "{output}");
         assert!(output.contains(TRUNCATED.trim()), "{output}");
+    }
+
+    #[test]
+    fn flow_and_risk_scores_match_crg_factors() {
+        assert_eq!(flow_criticality(4, 3, 2, 1, 2, 5), 4_175);
+        assert_eq!(risk_score(1_500, 3, true, 1), 5_500);
+        assert_eq!(risk_score(4_000, 5, true, 10), 6_000);
+        assert!(security_sensitive("verify_token", "crate::verify_token"));
+        assert!(!security_sensitive("render", "crate::render"));
     }
 
     #[test]

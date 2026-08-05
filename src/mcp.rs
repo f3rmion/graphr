@@ -65,7 +65,7 @@ impl SearchKind {
 struct ViewParams {
     node_ref: String,
     #[serde(default = "default_depth")]
-    #[schemars(range(min = 0, max = 3))]
+    #[schemars(range(min = 0, max = 6))]
     depth: u32,
     #[serde(default = "default_max_nodes")]
     #[schemars(range(min = 1, max = 50))]
@@ -79,7 +79,7 @@ struct ChangesParams {
     #[schemars(length(min = 1, max = 256))]
     base: String,
     #[serde(default = "default_changes_depth")]
-    #[schemars(range(min = 0, max = 3))]
+    #[schemars(range(min = 0, max = 6))]
     depth: u32,
     #[serde(default = "default_changes_max_nodes")]
     #[schemars(range(min = 1, max = 50))]
@@ -146,15 +146,15 @@ impl Graphr {
     }
 
     #[tool(
-        description = "Show a compact bounded neighborhood for a node_ref",
+        description = "Show a compact neighborhood for a node_ref up to 6 graph hops",
         input_schema = rmcp::handler::server::common::schema_for_input::<ViewParams>()
             .expect("valid view schema")
     )]
     async fn view(&self, Parameters(raw): Parameters<rmcp::serde_json::Value>) -> ToolResult {
         let params: ViewParams =
             rmcp::serde_json::from_value(raw).map_err(|_| "invalid view parameters".to_owned())?;
-        if params.depth > 3 {
-            return Err("depth must be in 0..=3".into());
+        if params.depth > 6 {
+            return Err("depth must be in 0..=6".into());
         }
         if !(1..=50).contains(&params.max_nodes) {
             return Err("max_nodes must be in 1..=50".into());
@@ -167,7 +167,7 @@ impl Graphr {
     }
 
     #[tool(
-        description = "Return one bounded review context: diff, changed symbols, callers, tests, and dependencies. Do not fan out to search/view unless it is truncated or unmapped",
+        description = "Return one bounded review context: diff, risk scores, affected static call paths, and graph impact up to 6 hops. Flow discovery traces CALLS up to 15 hops. Do not fan out to search/view unless it is truncated or unmapped",
         input_schema = rmcp::handler::server::common::schema_for_input::<ChangesParams>()
             .expect("valid changes schema")
     )]
@@ -192,7 +192,7 @@ impl ServerHandler for Graphr {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("graphr", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "For reviews, call changes once with the review base; do not fan out to search/view unless it reports truncated, untracked, or unmapped changes. For exploration, use search then view. The graph is indexed at startup; after edits, call index once before changes.",
+                "For reviews, call changes once with the review base and a depth from 0 through 6. It includes risk scores and affected static call paths, with flow discovery tracing CALLS up to 15 hops; these are possible source paths, not runtime call stacks. Do not fan out to search/view unless it reports truncated, untracked, or unmapped changes. For exploration, use search then view, whose depth ceiling is 6. The graph is indexed at startup; after edits, call index once before changes.",
             )
     }
 }
@@ -359,8 +359,8 @@ fn validate_changes(params: &ChangesParams) -> Result<(), String> {
     {
         return Err("invalid changes base".into());
     }
-    if params.depth > 3 {
-        return Err("depth must be in 0..=3".into());
+    if params.depth > 6 {
+        return Err("depth must be in 0..=6".into());
     }
     if !(1..=50).contains(&params.max_nodes) {
         return Err("max_nodes must be in 1..=50".into());
@@ -425,7 +425,7 @@ mod tests {
 
         let view = rmcp::serde_json::to_value(rmcp::schemars::schema_for!(ViewParams)).unwrap();
         assert_eq!(view["properties"]["depth"]["minimum"], 0);
-        assert_eq!(view["properties"]["depth"]["maximum"], 3);
+        assert_eq!(view["properties"]["depth"]["maximum"], 6);
         assert_eq!(view["properties"]["max_nodes"]["minimum"], 1);
         assert_eq!(view["properties"]["max_nodes"]["maximum"], 50);
 
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(changes["properties"]["base"]["minLength"], 1);
         assert_eq!(changes["properties"]["base"]["maxLength"], 256);
         assert_eq!(changes["properties"]["depth"]["minimum"], 0);
-        assert_eq!(changes["properties"]["depth"]["maximum"], 3);
+        assert_eq!(changes["properties"]["depth"]["maximum"], 6);
         assert_eq!(changes["properties"]["max_nodes"]["minimum"], 1);
         assert_eq!(changes["properties"]["max_nodes"]["maximum"], 50);
     }
@@ -447,6 +447,14 @@ mod tests {
         assert_eq!(defaults.depth, 1);
         assert_eq!(defaults.max_nodes, 50);
         assert!(validate_changes(&defaults).is_ok());
+        assert!(
+            validate_changes(&ChangesParams {
+                base: "HEAD".into(),
+                depth: 6,
+                max_nodes: 50,
+            })
+            .is_ok()
+        );
 
         for invalid in [
             ChangesParams {
@@ -461,7 +469,7 @@ mod tests {
             },
             ChangesParams {
                 base: "HEAD".into(),
-                depth: 4,
+                depth: 7,
                 max_nodes: 50,
             },
             ChangesParams {

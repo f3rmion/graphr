@@ -585,7 +585,7 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     assert!(indexed.contains("changed=6"), "{indexed}");
     let generation = database_generation(&fixture.path.join(".git/graphr/index.db"));
     let changed = client.request(
-        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"changes","arguments":{"depth":1,"max_nodes":50}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"changes","arguments":{"depth":6,"max_nodes":50}}}"#,
     );
     let text = response_text(&changed);
     for expected in [
@@ -598,6 +598,8 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         "moved_symbol",
         "first_untracked",
         "second_untracked",
+        "risk overall=",
+        "flow ",
         "test <-",
         "caller <-",
     ] {
@@ -620,14 +622,14 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         generation
     );
     let repeated = client.request(
-        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"changes","arguments":{"depth":1,"max_nodes":50}}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"changes","arguments":{"depth":6,"max_nodes":50}}}"#,
     );
     assert_eq!(response_text(&repeated), text);
 
     for invalid in [
         r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"changes","arguments":{"base":"-HEAD"}}}"#,
         r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"changes","arguments":{"base":"missing"}}}"#,
-        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"changes","arguments":{"depth":4}}}"#,
+        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"changes","arguments":{"depth":7}}}"#,
         r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"changes","arguments":{"max_nodes":0}}}"#,
         r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"changes","arguments":{"base":"HEAD..HEAD"}}}"#,
     ] {
@@ -921,7 +923,7 @@ fn rust_index_search_view_over_mcp() {
     for invalid in [
         r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search","arguments":{"query":"dispatch","kind":"method"}}}"#,
         r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search","arguments":{"query":" ","limit":0}}}"#,
-        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"view","arguments":{"node_ref":"bad","depth":4}}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"view","arguments":{"node_ref":"bad","depth":7}}}"#,
     ] {
         let response = client.request(invalid);
         assert!(tool_failed(&response), "{response}");
@@ -985,7 +987,7 @@ fn rust_index_search_view_over_mcp() {
     let node_ref = search_text.split_whitespace().next().unwrap().to_owned();
 
     let view = client.request(&format!(
-        r#"{{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":2,"max_nodes":30}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":6,"max_nodes":30}}}}}}"#
     ));
     assert!(view.contains("dispatch"), "{view}");
     assert!(view.contains("register"), "{view}");
