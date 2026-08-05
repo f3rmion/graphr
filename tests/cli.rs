@@ -7,7 +7,10 @@ fn version_is_stable() {
         .output()
         .unwrap();
     assert!(version.status.success());
-    assert_eq!(String::from_utf8(version.stdout).unwrap(), "graphr 0.1.0\n");
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap(),
+        format!("graphr {}\n", env!("CARGO_PKG_VERSION"))
+    );
     assert!(version.stderr.is_empty());
 }
 
