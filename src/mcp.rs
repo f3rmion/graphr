@@ -82,6 +82,7 @@ struct ChangesParams {
     #[serde(default = "default_changes_depth")]
     #[schemars(range(min = 0, max = 6))]
     depth: u32,
+    /// Maximum graph records per response page; cursors continue the snapshot.
     #[serde(default = "default_changes_max_nodes")]
     #[schemars(range(min = 1, max = 50))]
     max_nodes: u32,
@@ -191,7 +192,7 @@ impl Graphr {
     }
 
     #[tool(
-        description = "Return an initial or cursor-selected bounded review page: changed-file manifest, tracked and untracked source diff, risk scores, affected static call paths, and graph impact up to 6 hops. Cargo-vendored changes collapse to package boundaries by default; use dependency_mode=full for internals. Flow discovery traces CALLS up to 15 hops. Follow every files, diff, and graph continuation cursor from the immutable snapshot before any fallback",
+        description = "Return an initial or cursor-selected bounded review page: changed-file manifest, tracked and untracked source diff, explained risk scores, affected static call paths, and graph impact up to 6 hops. max_nodes bounds graph records per page; graph cursors continue the immutable snapshot. Cargo-vendored changes collapse to package boundaries by default; use dependency_mode=full for internals. Flow discovery traces CALLS up to 15 hops. Follow every files, diff, and graph continuation cursor before any fallback",
         input_schema = rmcp::handler::server::common::schema_for_input::<ChangesParams>()
             .expect("valid changes schema")
     )]
@@ -223,7 +224,7 @@ impl ServerHandler for Graphr {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("graphr", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "For reviews, call changes once without a cursor using the review base, dependency_mode, and a depth from 0 through 6, then exhaust every files, diff, and graph continuation token by calling changes with the same arguments and the exact cursor. dependency_mode defaults to boundary, which accounts for .cargo/vendor changes as package boundaries without analyzing internals; use full only when dependency internals are review scope. The cursors share one immutable snapshot; do not start another cursorless changes call until they are exhausted. Coverage is complete only when all cursors are exhausted and review_complete_when_pages_exhausted=true. It includes tracked and untracked Rust/Python diffs, risk scores, and affected static call paths, with flow discovery tracing CALLS up to 15 hops; these are possible source paths, not runtime call stacks. Do not use search/view for review coverage. A stale or failing cursor or an explicit analysis omission means coverage is incomplete. The graph is indexed at startup; after edits, call index once before changes.",
+                "For reviews, call changes once without a cursor using the review base, dependency_mode, and a depth from 0 through 6, then exhaust every files, diff, and graph continuation token by calling changes with the same arguments and the exact cursor. max_nodes bounds graph records per page, not snapshot coverage. dependency_mode defaults to boundary, which accounts for .cargo/vendor changes as package boundaries without analyzing internals; use full only when dependency internals are review scope. The cursors share one immutable snapshot; do not start another cursorless changes call until they are exhausted. review_complete_when_pages_exhausted reports Graphr-native completeness after all cursors; unsupported paths remain incomplete because external fallback is outside the snapshot. It includes tracked and untracked Rust/Python diffs, risk direction, component scores and rationale, and affected static call paths, with flow discovery tracing CALLS up to 15 hops; these are possible source paths, not runtime call stacks. Follow any explicit coverage remediation. A stale or failing cursor or an explicit analysis omission means coverage is incomplete. The graph is indexed at startup; after edits, call index once before changes.",
             )
     }
 }

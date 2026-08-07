@@ -295,6 +295,7 @@ struct ReviewSnapshot {
     checksum: String,
     file_ranges: Vec<Range<usize>>,
     hunk_ranges: Vec<Range<usize>>,
+    graph_record_ranges: Vec<Range<usize>>,
     flow_ranges: Vec<Range<usize>>,
     patch_totals: String,
     all_path_totals: String,
@@ -323,6 +324,7 @@ impl ReviewSnapshot {
         );
         let file_ranges = line_ranges(&manifest, None);
         let hunk_ranges = hunk_ranges(&changes.patch);
+        let graph_record_ranges = line_ranges(&graph, None);
         let flow_ranges = line_ranges(&graph, Some("flow "));
         let all_path_hunks = change_hunk_totals(&changes, hunk_ranges.len(), dependency_mode);
         let patch_totals = change_totals(
@@ -348,6 +350,7 @@ impl ReviewSnapshot {
             checksum,
             file_ranges,
             hunk_ranges,
+            graph_record_ranges,
             flow_ranges,
             patch_totals,
             all_path_totals,
@@ -442,6 +445,16 @@ fn render_section_page(
         .checked_sub(SECTION_OVERHEAD)
         .ok_or_else(|| "review section budget is too small".to_owned())?;
     let page = page(value, offset, content_budget)?;
+    let page = if section == ReviewSection::Graph {
+        limit_page_records(
+            value,
+            page,
+            &snapshot.graph_record_ranges,
+            snapshot.max_nodes as usize,
+        )
+    } else {
+        page
+    };
     let more = page.end < value.len();
     let emitted_bytes = page.end - page.start;
     let starts_mid_line = page.start > 0 && value.as_bytes()[page.start - 1] != b'\n';
@@ -497,6 +510,7 @@ fn render_section_page(
         }
         ReviewSection::Graph => {
             let coverage = record_coverage(snapshot.ranges(section), &page);
+            let records = record_coverage(&snapshot.graph_record_ranges, &page);
             let analysis_complete = graph_flow_analysis_complete(&snapshot.graph);
             let neighborhood_complete =
                 graph_summary_value(&snapshot.graph, "neighborhood_omitted") == Some("false");
@@ -508,7 +522,7 @@ fn render_section_page(
                 "unknown".into()
             };
             output.push_str(&format!(
-                "graph emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_flows={} partial_flows={} discovered_flows={} total_flows={} prior_flows={} remaining_discovered_flows={} page_complete={} analysis_complete={} neighborhood_complete={} mapping_complete={}\n",
+                "graph emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} page_record_limit={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} emitted_flows={} partial_flows={} discovered_flows={} total_flows={} prior_flows={} remaining_discovered_flows={} page_complete={} analysis_complete={} neighborhood_complete={} mapping_complete={}\n",
                 emitted_bytes,
                 value.len(),
                 page.start,
@@ -518,6 +532,12 @@ fn render_section_page(
                 starts_mid_line,
                 ends_mid_line,
                 framing_suffix_bytes,
+                snapshot.max_nodes,
+                records.emitted,
+                records.partial,
+                records.total,
+                records.prior,
+                records.remaining,
                 coverage.emitted,
                 coverage.partial,
                 coverage.total,
@@ -575,6 +595,27 @@ fn page(value: &str, offset: usize, budget: usize) -> Result<Page<'_>, String> {
         end,
         text: &value[offset..end],
     })
+}
+
+fn limit_page_records<'a>(
+    value: &'a str,
+    page: Page<'a>,
+    ranges: &[Range<usize>],
+    limit: usize,
+) -> Page<'a> {
+    let first = ranges.partition_point(|range| range.end <= page.start);
+    let Some(last) = first
+        .checked_add(limit)
+        .and_then(|end| ranges.get(end.saturating_sub(1)))
+    else {
+        return page;
+    };
+    let end = page.end.min(last.end);
+    Page {
+        start: page.start,
+        end,
+        text: &value[page.start..end],
+    }
 }
 
 fn review_snapshot(
@@ -2202,7 +2243,7 @@ mod tests {
             "@@ -1 +1 @@\n-é old\n+é changed\n".repeat(400)
         );
         let graph = format!(
-            "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=300 direct_test_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
+            "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=300 test_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
             (0..300)
                 .map(|index| format!(
                     "flow 0.1000 entry_{index}@src/lib.rs:1 -> changed@src/lib.rs:2\n"
@@ -2273,6 +2314,60 @@ mod tests {
     }
 
     #[test]
+    fn max_nodes_limits_each_graph_page_not_the_snapshot() {
+        let graph = format!(
+            "risk overall=0.3000 changed_symbols_total=6 changed_symbols_analyzed=6 changed_symbols_emitted=6 changed_symbols_omitted=0 flows_total=0 test_gaps=6 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
+            (0..6)
+                .map(|index| format!("  risk 0.3000 node-{index}\n"))
+                .collect::<String>()
+        );
+        let snapshot = ReviewSnapshot::new(
+            "HEAD",
+            6,
+            2,
+            DependencyMode::Boundary,
+            WorktreeChanges {
+                files: vec![],
+                records: vec![],
+                paths: vec![ChangedPath {
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    old_language: None,
+                    path: "src/lib.rs".into(),
+                    language: Some(Language::Rust),
+                    additions: Some(1),
+                    deletions: Some(1),
+                }],
+                patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
+                skipped_paths: 0,
+            },
+            graph,
+        );
+        let initial = review_context(&snapshot).unwrap();
+        assert!(
+            initial.contains("page_record_limit=2 emitted_records=2"),
+            "{initial}"
+        );
+        assert!(initial.contains("node-0"), "{initial}");
+        assert!(!initial.contains("node-1"), "{initial}");
+
+        let mut pages = initial.clone();
+        let mut cursor = next_cursor(&initial, "graph_next_cursor");
+        while let Some(token) = cursor {
+            let output = render_section(&snapshot, &parse_review_cursor(&token).unwrap()).unwrap();
+            assert!(
+                output.lines().filter(|line| line.contains("node-")).count() <= 2,
+                "{output}"
+            );
+            cursor = next_cursor(&output, "graph_next_cursor");
+            pages.push_str(&output);
+        }
+        for index in 0..6 {
+            assert!(pages.contains(&format!("node-{index}")), "{pages}");
+        }
+    }
+
+    #[test]
     fn review_complete_rejects_omitted_changed_symbols() {
         let changes = WorktreeChanges {
             files: vec![],
@@ -2289,7 +2384,7 @@ mod tests {
             patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 direct_test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             "HEAD",
@@ -2325,7 +2420,7 @@ mod tests {
             patch: "diff --git a/src/old.rs b/tests/fixture.tsv\n".into(),
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             "HEAD",
@@ -2350,7 +2445,7 @@ mod tests {
 
     #[test]
     fn graph_completeness_reads_only_the_summary() {
-        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n  risk 0.0000 node src/analysis_complete=false.rs:1\n";
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n  risk 0.0000 node src/analysis_complete=false.rs:1\n";
         assert!(graph_flow_analysis_complete(graph));
         assert!(graph_review_complete(graph));
     }
@@ -2383,7 +2478,7 @@ mod tests {
             patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             "HEAD",
@@ -2441,7 +2536,7 @@ mod tests {
             patch: "diff --git a/src/new.rs b/src/new.rs\n@@ -0,0 +1 @@\n+fn new() {}\n".into(),
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 test_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
         let output = review_context(&ReviewSnapshot::new(
             "HEAD",
             0,
@@ -2539,7 +2634,7 @@ mod tests {
                 patch: source.clone(),
                 skipped_paths: 0,
             },
-            "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 direct_test_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n".into(),
+            "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n".into(),
         );
         let mut offset = 0;
         let mut reconstructed = String::new();

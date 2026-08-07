@@ -620,7 +620,15 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     assert!(
         text.lines().any(|line| {
             line.contains("Function first_untracked src/untracked.rs:1")
-                && !line.contains("direct-test-gap")
+                && !line.contains("test-gap")
+        }),
+        "{text}"
+    );
+    assert!(
+        text.lines().any(|line| {
+            line.contains("Function second_untracked src/untracked.rs:2")
+                && line.contains("indirect-test-covered")
+                && !line.contains("test-gap")
         }),
         "{text}"
     );
@@ -642,7 +650,8 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         "{changed}"
     );
     let graph = text.split_once("graph\n").unwrap().1;
-    assert!(graph.contains("unmapped src/lib.rs"), "{changed}");
+    assert!(graph.contains("file-mapped src/lib.rs"), "{changed}");
+    assert!(graph.contains("unmapped_ranges=0"), "{changed}");
     assert!(!graph.contains("removed_symbol"), "{changed}");
     assert!(!graph.contains("ignored_symbol"), "{changed}");
     assert!(text.len() <= 8192, "{}", text.len());
@@ -670,8 +679,9 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     let bounded = client.request(
         r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":1}}}"#,
     );
-    assert!(bounded.contains("changed_symbols_omitted=5"), "{bounded}");
-    assert!(bounded.contains("neighborhood_omitted=true"), "{bounded}");
+    assert!(bounded.contains("changed_symbols_omitted=0"), "{bounded}");
+    assert!(bounded.contains("neighborhood_omitted=false"), "{bounded}");
+    assert!(bounded.contains("graph_next_cursor="), "{bounded}");
     assert!(!bounded.contains("[truncated]"), "{bounded}");
     assert!(bounded.len() <= 8192, "{bounded}");
     client.close();
@@ -1028,7 +1038,7 @@ fn changes_pages_complete_inventory_diff_and_flows() {
 }
 
 #[test]
-fn changes_reports_only_residual_lines_in_a_mixed_rust_hunk() {
+fn changes_file_maps_non_symbol_ranges_in_a_mixed_rust_hunk() {
     const EDITED: &str = "use std::fmt::Debug;\nconst FLAG: bool = true;\nmacro_rules! identity { ($value:expr) => { $value }; }\n// syntax glue\npub fn first() { let _: bool = identity!(FLAG); }\n\npub fn second() { let _ = std::any::type_name::<dyn Debug>(); }\n";
 
     let fixture = Fixture::new();
@@ -1066,11 +1076,21 @@ fn changes_reports_only_residual_lines_in_a_mixed_rust_hunk() {
         "changed_symbols_total=2",
         " Function first src/lib.rs:5",
         " Function second src/lib.rs:7",
-        "unmapped src/lib.rs:1-4,6",
+        "file-mapped src/lib.rs:1-4,6",
+        "risk_direction=higher-is-riskier",
+        "risk_components=flow:",
+        "risk_rationale=",
     ] {
         assert!(changes.contains(expected), "missing {expected}: {changes}");
     }
-    assert!(!changes.contains("unmapped src/lib.rs:1-7"), "{changes}");
+    assert!(changes.contains("mapping_complete=true"), "{changes}");
+    assert!(changes.contains("neighborhood_complete=true"), "{changes}");
+    assert!(
+        changes.contains("review_complete_when_pages_exhausted=true"),
+        "{changes}"
+    );
+    assert!(changes.contains("coverage status=complete"), "{changes}");
+    assert!(!changes.contains("file-mapped src/lib.rs:1-7"), "{changes}");
     client.close();
 }
 

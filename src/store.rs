@@ -415,11 +415,22 @@ impl Store {
             } else {
                 "flows_discovered=0 flows_total=unknown"
             };
-            return Ok(format!(
-                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} direct_test_gaps=0 analysis_complete={} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 dependency_analysis={}\n",
+            let mut output = format!(
+                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} test_gaps=0 analysis_complete={} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 dependency_analysis={} {}\n",
                 deleted_paths_unanalyzed == 0,
                 dependency_analysis(dependency_mode),
+                risk_metadata(None),
+            );
+            output.push_str(&coverage_diagnostics(
+                0,
+                false,
+                false,
+                false,
+                0,
+                deleted_paths_unanalyzed,
+                depth,
             ));
+            return Ok(output);
         }
         for file in &changes.files {
             validate_changed_file(file)?;
@@ -459,10 +470,10 @@ impl Store {
             );
         let mut unmapped_lines = Vec::new();
         let mut unmapped_range_count = 0_usize;
+        let mut file_mapped_range_count = 0_usize;
         let tx = self.connection.transaction().map_err(db_error)?;
         let state = read_state(&tx)?;
-        let root_limit = max_nodes as usize;
-        let mut symbol_root_ids = Vec::with_capacity(root_limit);
+        let mut symbol_root_ids = Vec::with_capacity(CHANGE_ANALYSIS_LIMIT);
         let mut file_root_ids = Vec::new();
         let mut root_seen = HashSet::new();
         let mut symbols = tx
@@ -559,15 +570,19 @@ impl Store {
                     !residual.is_empty()
                 };
             if unmapped {
-                if let Some((id, _)) = file_node
-                    && root_seen.insert(id)
-                {
-                    file_root_ids.push(id);
-                }
                 let line = unmapped_line(file, &residual)
                     .ok_or_else(|| "unmapped line exceeds address space".to_owned())?;
-                unmapped_lines.push(line);
-                unmapped_range_count = unmapped_range_count.saturating_add(residual.len().max(1));
+                let ranges = residual.len().max(1);
+                if let Some((id, _)) = file_node {
+                    if root_seen.insert(id) {
+                        file_root_ids.push(id);
+                    }
+                    unmapped_lines.push(line.replacen("unmapped ", "file-mapped ", 1));
+                    file_mapped_range_count = file_mapped_range_count.saturating_add(ranges);
+                } else {
+                    unmapped_lines.push(line);
+                    unmapped_range_count = unmapped_range_count.saturating_add(ranges);
+                }
             }
         }
         drop(symbols);
@@ -603,8 +618,7 @@ impl Store {
                 .cmp(&analysis.risks.get(&left.id).map_or(0, |risk| risk.score))
                 .then_with(|| left.id.cmp(&right.id))
         });
-        let root_neighborhood_omitted = roots.len() > root_limit || analysis_roots_omitted > 0;
-        roots.truncate(root_limit);
+        let root_neighborhood_omitted = analysis_roots_omitted > 0;
 
         let changed_symbols_emitted = roots
             .iter()
@@ -617,8 +631,10 @@ impl Store {
                 format!(
                     "risk {}{}",
                     score_text(risk.score),
-                    if risk.direct_test_gap {
-                        " direct-test-gap"
+                    if risk.test_gap {
+                        " test-gap"
+                    } else if risk.indirect_test_covered {
+                        " indirect-test-covered"
                     } else {
                         ""
                     }
@@ -638,7 +654,7 @@ impl Store {
                 &tx,
                 &state,
                 &roots,
-                (depth, root_limit),
+                (depth, CHANGE_ANALYSIS_LIMIT),
                 dependency_mode,
                 cancelled,
                 &mut lines,
@@ -653,14 +669,16 @@ impl Store {
             .map(|risk| risk.score)
             .max()
             .unwrap_or(0);
-        let direct_test_gaps = analysis
+        let top_risk = analysis
             .risks
-            .values()
-            .filter(|risk| risk.direct_test_gap)
-            .count();
-        let analysis_incomplete =
-            analysis.omitted || analysis_roots_omitted > 0 || deleted_paths_unanalyzed > 0;
-        let flow_accounting = if analysis_incomplete {
+            .iter()
+            .min_by_key(|(id, risk)| (std::cmp::Reverse(risk.score), **id))
+            .map(|(_, risk)| risk);
+        let test_gaps = analysis.risks.values().filter(|risk| risk.test_gap).count();
+        let flow_incomplete =
+            analysis.flow_omitted || analysis_roots_omitted > 0 || deleted_paths_unanalyzed > 0;
+        let analysis_incomplete = flow_incomplete || analysis.test_mapping_omitted;
+        let flow_accounting = if flow_incomplete {
             format!(
                 "flows_discovered={} flows_total=unknown",
                 analysis.flows.len()
@@ -670,21 +688,35 @@ impl Store {
         };
         lines.insert(
             0,
+            coverage_diagnostics(
+                unmapped_range_count,
+                neighborhood_omitted,
+                analysis.flow_omitted,
+                analysis.test_mapping_omitted,
+                analysis_roots_omitted,
+                deleted_paths_unanalyzed,
+                depth,
+            ),
+        );
+        lines.insert(
+            0,
             format!(
-                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} direct_test_gaps={} analysis_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} dependency_analysis={}\n",
+                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} test_gaps={} analysis_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} dependency_analysis={} {}\n",
                 score_text(overall),
                 changed_symbols_total,
                 analysis.risks.len(),
                 changed_symbols_emitted,
                 changed_symbols_omitted,
                 flow_accounting,
-                direct_test_gaps,
+                test_gaps,
                 !analysis_incomplete,
                 analysis_roots_omitted,
                 deleted_paths_unanalyzed,
                 neighborhood_omitted,
                 unmapped_range_count,
+                file_mapped_range_count,
                 dependency_analysis(dependency_mode),
+                risk_metadata(top_risk),
             ),
         );
         Ok(lines.concat())
@@ -752,14 +784,23 @@ struct AffectedFlow {
 #[derive(Clone, Copy)]
 struct NodeRisk {
     score: u32,
-    direct_test_gap: bool,
+    flow_component: u32,
+    test_component: u32,
+    security_component: u32,
+    caller_component: u32,
+    test_node: bool,
+    test_gap: bool,
+    indirect_test_covered: bool,
 }
+
+type NodeRiskCounts = HashMap<i64, (u32, u32, bool)>;
 
 #[derive(Default)]
 struct ChangeAnalysis {
     risks: HashMap<i64, NodeRisk>,
     flows: Vec<AffectedFlow>,
-    omitted: bool,
+    flow_omitted: bool,
+    test_mapping_omitted: bool,
 }
 
 impl RowNode {
@@ -852,6 +893,7 @@ fn traverse_changes(
 ) -> Result<bool> {
     let (depth, max_nodes) = limits;
     let mut visited = roots.iter().map(|node| node.id).collect::<HashSet<_>>();
+    let node_limit = visited.len().saturating_add(max_nodes);
     let mut current = roots
         .iter()
         .map(|node| (node.id, node.kind == "type"))
@@ -861,7 +903,7 @@ fn traverse_changes(
     let mut dependency_packages = HashSet::new();
     let mut dependency_omitted = false;
 
-    for level in 0..=depth {
+    for _ in 0..depth {
         next.clear();
         for (relation, types_only, sql) in CHANGE_NEIGHBORS {
             let mut statement = connection.prepare(sql).map_err(db_error)?;
@@ -912,16 +954,13 @@ fn traverse_changes(
                         ));
                         continue;
                     }
-                    if row_budget == 0 {
-                        return Ok(true);
-                    }
-                    row_budget -= 1;
                     if visited.contains(&node.id) {
                         continue;
                     }
-                    if level == depth || visited.len() >= max_nodes {
+                    if row_budget == 0 || visited.len() >= node_limit {
                         return Ok(true);
                     }
+                    row_budget -= 1;
                     let line = node
                         .line(state, Some(relation), usize::MAX)?
                         .ok_or_else(|| "changed neighbor line exceeds address space".to_owned())?;
@@ -960,7 +999,8 @@ fn analyze_changed_roots(
         .into_iter()
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
-    let (flow_roots, mut omitted) = changed_flow_roots(connection, roots, max_flows, &risk_nodes)?;
+    let (flow_roots, mut flow_omitted) =
+        changed_flow_roots(connection, roots, max_flows, &risk_nodes)?;
     let flow_root_ids = flow_roots
         .iter()
         .map(|node| node.id)
@@ -980,12 +1020,12 @@ fn analyze_changed_roots(
         dependency_mode,
         cancelled,
     )?;
-    omitted |= entries_omitted;
+    flow_omitted |= entries_omitted;
     let mut flows = Vec::with_capacity(entries.len());
     for entry in entries {
         check_cancelled(cancelled)?;
         if query_budget == 0 {
-            omitted = true;
+            flow_omitted = true;
             break;
         }
         let (flow, truncated) = trace_flow(
@@ -996,7 +1036,7 @@ fn analyze_changed_roots(
             dependency_mode,
             cancelled,
         )?;
-        omitted |= truncated;
+        flow_omitted |= truncated;
         if let Some(flow) = flow {
             flows.push(flow);
         }
@@ -1008,7 +1048,7 @@ fn analyze_changed_roots(
             .then_with(|| left.entry.id.cmp(&right.entry.id))
     });
 
-    let risk_counts = node_risk_counts(connection, &risk_root_ids)?;
+    let (risk_counts, risk_counts_omitted) = node_risk_counts(connection, &risk_root_ids)?;
     let mut risks = HashMap::with_capacity(risk_root_count);
     for root in roots.iter().filter(|node| node.kind != "file") {
         check_cancelled(cancelled)?;
@@ -1022,24 +1062,26 @@ fn analyze_changed_roots(
         let &(callers, tests, directly_tested) = risk_counts
             .get(&root.id)
             .ok_or_else(|| "node risk counts are missing".to_owned())?;
+        let is_test = node.kind == "test";
         risks.insert(
             root.id,
-            NodeRisk {
-                score: risk_score(
-                    flow_score,
-                    tests,
-                    security_sensitive(&node.name, &node.qualified_name),
-                    callers,
-                ),
-                direct_test_gap: node.kind != "test" && !directly_tested,
-            },
+            node_risk(
+                flow_score,
+                if is_test { 5 } else { tests },
+                security_sensitive(&node.name, &node.qualified_name),
+                callers,
+                is_test,
+                !is_test && tests == 0,
+                !is_test && tests > 0 && !directly_tested,
+            ),
         );
     }
 
     Ok(ChangeAnalysis {
         risks,
         flows,
-        omitted,
+        flow_omitted,
+        test_mapping_omitted: risk_counts_omitted,
     })
 }
 
@@ -1476,33 +1518,39 @@ fn flow_criticality(
         .round() as u32
 }
 
-fn node_risk_counts(
-    connection: &Connection,
-    ids: &[i64],
-) -> Result<HashMap<i64, (u32, u32, bool)>> {
+fn node_risk_counts(connection: &Connection, ids: &[i64]) -> Result<(NodeRiskCounts, bool)> {
     if ids.is_empty() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), false));
     }
     let values = (1..=ids.len())
         .map(|index| format!("(?{index})"))
         .collect::<Vec<_>>()
         .join(",");
+    let caller_limit = FLOW_QUERY_LIMIT
+        .checked_add(1)
+        .ok_or_else(|| "caller traversal limit overflow".to_owned())?;
     let sql = format!(
-        "WITH changed(id) AS (VALUES {values})
+        "WITH RECURSIVE changed(id) AS (VALUES {values}),
+         callers(changed_id, node_id) AS (
+             SELECT id, id FROM changed
+             UNION
+             SELECT callers.changed_id AS changed_id, edges.source_id AS node_id
+               FROM callers JOIN edges ON edges.target_id=callers.node_id
+              WHERE edges.kind='CALLS'
+              ORDER BY changed_id, node_id
+              LIMIT {caller_limit}
+         )
          SELECT changed.id,
                 (SELECT count(*) FROM edges
                   WHERE target_id=changed.id AND kind='CALLS'),
-                (SELECT count(*) FROM (
-                    SELECT source_id FROM edges
-                     WHERE target_id=changed.id AND kind='TEST_CALLS'
-                    UNION
-                    SELECT test.source_id
-                      FROM edges call JOIN edges test ON test.target_id=call.target_id
-                     WHERE call.source_id=changed.id AND call.kind='CALLS'
-                       AND test.kind='TEST_CALLS'
-                )),
+                (SELECT count(DISTINCT test.source_id)
+                   FROM callers
+                   JOIN edges test ON test.target_id=callers.node_id
+                                  AND test.kind='TEST_CALLS'
+                  WHERE callers.changed_id=changed.id),
                 EXISTS(SELECT 1 FROM edges
-                        WHERE target_id=changed.id AND kind='TEST_CALLS')
+                        WHERE target_id=changed.id AND kind='TEST_CALLS'),
+                (SELECT count(*) FROM callers) > {FLOW_QUERY_LIMIT}
            FROM changed"
     );
     let mut statement = connection.prepare(&sql).map_err(db_error)?;
@@ -1513,12 +1561,15 @@ fn node_risk_counts(
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, bool>(3)?,
+                row.get::<_, bool>(4)?,
             ))
         })
         .map_err(db_error)?;
     let mut counts = HashMap::with_capacity(ids.len());
+    let mut omitted = false;
     for row in rows {
-        let (id, callers, tests, directly_tested) = row.map_err(db_error)?;
+        let (id, callers, tests, directly_tested, callers_omitted) = row.map_err(db_error)?;
+        omitted |= callers_omitted;
         counts.insert(
             id,
             (
@@ -1528,14 +1579,32 @@ fn node_risk_counts(
             ),
         );
     }
-    Ok(counts)
+    Ok((counts, omitted))
 }
 
-fn risk_score(flow_score: u32, tests: u32, security: bool, callers: u32) -> u32 {
-    flow_score.min(2_500)
-        + 3_000_u32.saturating_sub(tests.min(5) * 500)
-        + u32::from(security) * 2_000
-        + callers.min(2) * 500
+fn node_risk(
+    flow_score: u32,
+    tests: u32,
+    security: bool,
+    callers: u32,
+    test_node: bool,
+    test_gap: bool,
+    indirect_test_covered: bool,
+) -> NodeRisk {
+    let flow_component = flow_score.min(2_500);
+    let test_component = 3_000_u32.saturating_sub(tests.min(5) * 500);
+    let security_component = u32::from(security) * 2_000;
+    let caller_component = callers.min(2) * 500;
+    NodeRisk {
+        score: flow_component + test_component + security_component + caller_component,
+        flow_component,
+        test_component,
+        security_component,
+        caller_component,
+        test_node,
+        test_gap,
+        indirect_test_covered,
+    }
 }
 
 fn security_sensitive(name: &str, qualified_name: &str) -> bool {
@@ -1574,6 +1643,84 @@ fn conventional_entry(name: &str) -> bool {
 
 fn score_text(score: u32) -> String {
     format!("{}.{:04}", score / 10_000, score % 10_000)
+}
+
+fn risk_metadata(risk: Option<&NodeRisk>) -> String {
+    let Some(risk) = risk else {
+        return "risk_direction=higher-is-riskier risk_components=flow:0.0000,tests:0.0000,security:0.0000,callers:0.0000 risk_rationale=no-symbol-risk".into();
+    };
+    let mut rationale = if risk.test_node {
+        "changed-test".to_owned()
+    } else if risk.test_gap {
+        "no-test-coverage".to_owned()
+    } else if risk.indirect_test_covered {
+        "indirect-test-coverage".to_owned()
+    } else {
+        "direct-test-coverage".to_owned()
+    };
+    for (present, label) in [
+        (risk.flow_component > 0, "affected-flow"),
+        (risk.security_component > 0, "security-sensitive"),
+        (risk.caller_component > 0, "caller-impact"),
+    ] {
+        if present {
+            rationale.push('+');
+            rationale.push_str(label);
+        }
+    }
+    format!(
+        "risk_direction=higher-is-riskier risk_components=flow:{},tests:{},security:{},callers:{} risk_rationale={rationale}",
+        score_text(risk.flow_component),
+        score_text(risk.test_component),
+        score_text(risk.security_component),
+        score_text(risk.caller_component),
+    )
+}
+
+fn coverage_diagnostics(
+    unmapped_ranges: usize,
+    neighborhood_omitted: bool,
+    flow_analysis_omitted: bool,
+    test_mapping_omitted: bool,
+    analysis_roots_omitted: usize,
+    deleted_paths_unanalyzed: usize,
+    depth: u32,
+) -> String {
+    let mut output = String::new();
+    if unmapped_ranges > 0 {
+        output.push_str(&format!(
+            "coverage category=mapping status=incomplete items={unmapped_ranges} remediation=call-index-then-restart-changes\n"
+        ));
+    }
+    if neighborhood_omitted {
+        output.push_str(&format!(
+            "coverage category=neighborhood status=incomplete items=unknown remediation=call-view-on-each-emitted-changed-node-ref depth={depth} max_nodes=50\n"
+        ));
+    }
+    if flow_analysis_omitted {
+        output.push_str(
+            "coverage category=flow-analysis status=incomplete items=unknown remediation=narrow-review-base-and-restart-changes\n",
+        );
+    }
+    if test_mapping_omitted {
+        output.push_str(
+            "coverage category=test-mapping status=incomplete items=unknown remediation=narrow-review-base-and-restart-changes\n",
+        );
+    }
+    if analysis_roots_omitted > 0 {
+        output.push_str(&format!(
+            "coverage category=analysis-roots status=incomplete items={analysis_roots_omitted} remediation=narrow-review-base-and-restart-changes\n"
+        ));
+    }
+    if deleted_paths_unanalyzed > 0 {
+        output.push_str(&format!(
+            "coverage category=deleted-paths status=incomplete items={deleted_paths_unanalyzed} remediation=review-corresponding-diff-pages\n"
+        ));
+    }
+    if output.is_empty() {
+        output.push_str("coverage status=complete remediation=none\n");
+    }
+    output
 }
 
 const fn dependency_analysis(mode: DependencyMode) -> &'static str {
@@ -3352,7 +3499,8 @@ mod tests {
             .unwrap();
         assert!(output.contains(" n6 "), "{output}");
         assert!(!output.contains(" n7 "), "{output}");
-        assert!(output.contains("neighborhood_omitted=true"), "{output}");
+        assert!(output.contains("neighborhood_omitted=false"), "{output}");
+        assert!(output.contains("coverage status=complete"), "{output}");
         assert!(!output.contains(TRUNCATED.trim()), "{output}");
 
         assert!(
@@ -3471,7 +3619,7 @@ mod tests {
             .unwrap();
         assert!(
             output.contains(
-                "risk overall=0.4200 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown direct_test_gaps=0 analysis_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
+                "risk overall=0.4200 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown test_gaps=0 analysis_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
             ),
             "{output}"
         );
@@ -3494,7 +3642,7 @@ mod tests {
             .changes(&changes, 0, 10, DependencyMode::Boundary, &cancelled)
             .unwrap();
         assert!(
-            depth_zero.contains("neighborhood_omitted=true"),
+            depth_zero.contains("neighborhood_omitted=false"),
             "{depth_zero}"
         );
         assert!(!depth_zero.contains(TRUNCATED.trim()), "{depth_zero}");
@@ -3527,7 +3675,8 @@ mod tests {
             1,
             "{output}"
         );
-        assert!(output.contains("unmapped src/lib.rs:1"), "{output}");
+        assert!(output.contains("file-mapped src/lib.rs:1"), "{output}");
+        assert!(output.contains("unmapped_ranges=0"), "{output}");
 
         let type_change = WorktreeChanges {
             files: vec![ChangedFile {
@@ -3579,16 +3728,76 @@ mod tests {
             output.contains("unmapped src/untracked-499.rs:1"),
             "{output}"
         );
+        assert!(
+            output.contains("coverage category=mapping status=incomplete items=500 remediation=call-index-then-restart-changes"),
+            "{output}"
+        );
         assert!(!output.contains(TRUNCATED.trim()), "{output}");
     }
 
     #[test]
     fn flow_and_risk_scores_match_crg_factors() {
         assert_eq!(flow_criticality(4, 3, 2, 1, 2, 5), 4_175);
-        assert_eq!(risk_score(1_500, 3, true, 1), 5_500);
-        assert_eq!(risk_score(4_000, 5, true, 10), 6_000);
+        let risk = node_risk(1_500, 3, true, 1, false, false, true);
+        assert_eq!(risk.score, 5_500);
+        assert_eq!(
+            (
+                risk.flow_component,
+                risk.test_component,
+                risk.security_component,
+                risk.caller_component,
+            ),
+            (1_500, 1_500, 2_000, 500)
+        );
+        assert_eq!(
+            node_risk(4_000, 5, true, 10, false, false, false).score,
+            6_000
+        );
+        let changed_test = node_risk(0, 5, false, 0, true, false, false);
+        assert!(
+            risk_metadata(Some(&changed_test)).contains("risk_rationale=changed-test"),
+            "{}",
+            risk_metadata(Some(&changed_test))
+        );
         assert!(security_sensitive("verify_token", "crate::verify_token"));
         assert!(!security_sensitive("render", "crate::render"));
+    }
+
+    #[test]
+    fn indirect_test_mapping_stops_at_the_request_budget() {
+        let mut graph = single_node_graph("changed");
+        for index in 0..=FLOW_QUERY_LIMIT {
+            let name = format!("caller_{index:04}");
+            graph.nodes.push(function_node(&name, index as u32 + 2));
+            graph.edges.push(EdgeInput {
+                source_key: name,
+                target_key: "changed".into(),
+                kind: EdgeKind::Calls,
+                support_count: 1,
+            });
+        }
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let cancelled = AtomicBool::new(false);
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        let changed_id = store
+            .connection
+            .query_row("SELECT id FROM nodes WHERE name='changed'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        let (counts, omitted) = node_risk_counts(&store.connection, &[changed_id]).unwrap();
+
+        assert!(omitted);
+        assert_eq!(counts[&changed_id].0, (FLOW_QUERY_LIMIT + 1) as u32);
+        assert!(coverage_diagnostics(0, false, false, omitted, 0, 0, 1).contains(
+            "coverage category=test-mapping status=incomplete items=unknown remediation=narrow-review-base-and-restart-changes"
+        ));
     }
 
     #[test]
@@ -3647,7 +3856,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_file_changes_report_exact_non_symbol_ranges() {
+    fn whole_file_changes_map_exact_non_symbol_ranges_to_the_file() {
         let graph = |with_function: bool| Graph {
             files: vec![FileInput {
                 path: "src/lib.rs".into(),
@@ -3699,7 +3908,12 @@ mod tests {
         let output = store
             .changes(&changes(), 0, 10, DependencyMode::Boundary, &cancelled)
             .unwrap();
-        assert!(output.contains("unmapped src/lib.rs:1-4,6-7"), "{output}");
+        assert!(
+            output.contains("file-mapped src/lib.rs:1-4,6-7"),
+            "{output}"
+        );
+        assert!(output.contains("unmapped_ranges=0"), "{output}");
+        assert!(output.contains("file_mapped_ranges=2"), "{output}");
 
         let renamed = WorktreeChanges {
             files: vec![ChangedFile {
@@ -3719,8 +3933,11 @@ mod tests {
         let output = store
             .changes(&renamed, 0, 10, DependencyMode::Boundary, &cancelled)
             .unwrap();
-        assert!(output.contains("unmapped src/lib.rs:1\n"), "{output}");
-        assert!(!output.contains("unmapped src/lib.rs:1-4,6-7"), "{output}");
+        assert!(output.contains("file-mapped src/lib.rs:1\n"), "{output}");
+        assert!(
+            !output.contains("file-mapped src/lib.rs:1-4,6-7"),
+            "{output}"
+        );
 
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph(false), ())))
@@ -3728,8 +3945,8 @@ mod tests {
         let output = store
             .changes(&changes(), 0, 10, DependencyMode::Boundary, &cancelled)
             .unwrap();
-        assert!(output.contains("unmapped src/lib.rs:1-7"), "{output}");
-        assert!(!output.contains("unmapped src/lib.rs:1\n"), "{output}");
+        assert!(output.contains("file-mapped src/lib.rs:1-7"), "{output}");
+        assert!(!output.contains("file-mapped src/lib.rs:1\n"), "{output}");
     }
 
     #[test]
@@ -3759,10 +3976,14 @@ mod tests {
         );
         assert!(output.contains("analysis_complete=false"), "{output}");
         assert!(output.contains("deleted_paths_unanalyzed=1"), "{output}");
+        assert!(
+            output.contains("coverage category=deleted-paths status=incomplete items=1 remediation=review-corresponding-diff-pages"),
+            "{output}"
+        );
     }
 
     #[test]
-    fn mixed_hunk_maps_each_function_and_reports_only_syntax_glue() {
+    fn mixed_hunk_maps_functions_and_syntax_glue() {
         let mut first = function_node("first", 2);
         first.line_end = 4;
         let mut second = function_node("second", 6);
@@ -3828,12 +4049,13 @@ mod tests {
 
         assert!(output.contains(" Function first src/lib.rs:2"), "{output}");
         assert!(output.contains(" Function second src/lib.rs:6"), "{output}");
-        assert!(output.contains("unmapped src/lib.rs:1,5,9"), "{output}");
-        assert!(!output.contains("unmapped src/lib.rs:1-9"), "{output}");
+        assert!(output.contains("file-mapped src/lib.rs:1,5,9"), "{output}");
+        assert!(!output.contains("file-mapped src/lib.rs:1-9"), "{output}");
+        assert!(output.contains("coverage status=complete"), "{output}");
     }
 
     #[test]
-    fn changes_rank_every_root_before_emitting_the_node_limit() {
+    fn changes_emit_every_ranked_root_within_the_analysis_limit() {
         let graph = Graph {
             files: vec![FileInput {
                 path: "src/lib.rs".into(),
@@ -3882,16 +4104,70 @@ mod tests {
 
         assert!(
             output.contains(
-                "changed_symbols_total=51 changed_symbols_analyzed=51 changed_symbols_emitted=50 changed_symbols_omitted=1 flows_total=0 direct_test_gaps=51 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0"
+                "changed_symbols_total=51 changed_symbols_analyzed=51 changed_symbols_emitted=51 changed_symbols_omitted=0 flows_total=0 test_gaps=51 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0"
             ),
             "{output}"
         );
-        assert!(output.contains(" direct-test-gap"), "{output}");
+        assert!(output.contains(" test-gap"), "{output}");
         assert!(output.contains(" Function verify_token "), "{output}");
-        assert!(!output.contains(" Function node_49 "), "{output}");
-        assert!(output.contains("neighborhood_omitted=true"), "{output}");
+        assert!(output.contains(" Function node_49 "), "{output}");
+        assert!(output.contains("neighborhood_omitted=false"), "{output}");
         assert!(!output.contains(" gaps="), "{output}");
         assert!(!output.contains(TRUNCATED.trim()), "{output}");
+    }
+
+    #[test]
+    fn changed_roots_do_not_spend_the_neighborhood_limit() {
+        let mut graph = single_node_graph("changed_00");
+        for index in 1_u32..43 {
+            graph
+                .nodes
+                .push(function_node(&format!("changed_{index:02}"), index + 1));
+        }
+        for index in 0_u32..8 {
+            let name = format!("neighbor_{index}");
+            graph.nodes.push(function_node(&name, 100 + index));
+            graph.edges.push(EdgeInput {
+                source_key: "changed_00".into(),
+                target_key: name,
+                kind: EdgeKind::Calls,
+                support_count: 1,
+            });
+        }
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            rebuild: false,
+        };
+        let cancelled = AtomicBool::new(false);
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        let output = store
+            .changes(
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        whole_file: false,
+                        spans: vec![LineSpan { start: 2, end: 86 }],
+                        report_unmapped: false,
+                    }],
+                    records: vec![],
+                    paths: vec![],
+                    patch: String::new(),
+                    skipped_paths: 0,
+                },
+                1,
+                50,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+
+        assert!(output.contains("changed_symbols_total=43"), "{output}");
+        assert!(output.contains("neighbor_7 src/lib.rs:107"), "{output}");
+        assert!(output.contains("neighborhood_omitted=false"), "{output}");
+        assert!(output.contains("coverage status=complete"), "{output}");
     }
 
     #[test]
@@ -3947,13 +4223,17 @@ mod tests {
 
         assert!(
             output.contains(
-                "changed_symbols_total=501 changed_symbols_analyzed=500 changed_symbols_emitted=50 changed_symbols_omitted=451 flows_discovered=0 flows_total=unknown"
+                "changed_symbols_total=501 changed_symbols_analyzed=500 changed_symbols_emitted=500 changed_symbols_omitted=1 flows_discovered=0 flows_total=unknown"
             ),
             "{output}"
         );
         assert!(output.contains("analysis_complete=false"), "{output}");
         assert!(output.contains("analysis_roots_omitted=1"), "{output}");
         assert!(output.contains("neighborhood_omitted=true"), "{output}");
+        assert!(
+            output.contains("coverage category=analysis-roots status=incomplete items=1 remediation=narrow-review-base-and-restart-changes"),
+            "{output}"
+        );
     }
 
     #[test]
