@@ -1834,6 +1834,11 @@ fn call_keys(
         let target = join_path(module, name);
         keys.push(format!("rust:function:{target}"));
         keys.push(item_key(&target));
+        if let Some(prefix) = glob_import_binding(&bindings.imports, source, module_index) {
+            let target = join_path(prefix, name);
+            keys.push(format!("rust:function:{target}"));
+            keys.push(item_key(&target));
+        }
         return dedup_keys(keys);
     }
 
@@ -1846,8 +1851,9 @@ fn call_keys(
     }
 
     let first = parts[0];
-    let absolute_owner = match import_binding(&bindings.imports, source, module_index, first) {
-        Some(Binding::Unique(path)) => Some(if parts.len() == 2 {
+    let mut owners = Vec::with_capacity(2);
+    match import_binding(&bindings.imports, source, module_index, first) {
+        Some(Binding::Unique(path)) => owners.push(if parts.len() == 2 {
             path.clone()
         } else {
             join_path(path, &parts[1..parts.len() - 1].join("::"))
@@ -1855,10 +1861,19 @@ fn call_keys(
         Some(Binding::Ambiguous) => {
             return vec![format!("rust:ambiguous-import:{owner}::{method}")];
         }
-        None => normalize_relative(&owner, module, root),
-    };
-    let mut keys = Vec::with_capacity(3);
-    if let Some(owner) = absolute_owner {
+        None => {
+            if let Some(local) = normalize_relative(&owner, module, root) {
+                owners.push(local);
+            }
+            if !matches!(first, "crate" | "self" | "super")
+                && let Some(prefix) = glob_import_binding(&bindings.imports, source, module_index)
+            {
+                owners.push(join_path(prefix, &owner));
+            }
+        }
+    }
+    let mut keys = Vec::with_capacity(owners.len().saturating_mul(3));
+    for owner in owners {
         let target = join_path(&owner, method);
         keys.push(format!("rust:function:{target}"));
         keys.push(format!("rust:method:{target}"));
@@ -1915,6 +1930,17 @@ fn import_binding<'a>(
         })
 }
 
+fn glob_import_binding(
+    imports: &ImportBindings,
+    source: usize,
+    module: Option<usize>,
+) -> Option<&str> {
+    match import_binding(imports, source, module, "*") {
+        Some(Binding::Unique(path)) => Some(path),
+        Some(Binding::Ambiguous) | None => None,
+    }
+}
+
 fn source_scope<'a>(
     source: usize,
     parsed: &ParsedFile,
@@ -1952,6 +1978,11 @@ fn use_binding(raw: &str, module: &str, root: &str) -> Option<(String, String)> 
         .map_or((raw.trim(), None), |(path, alias)| {
             (path.trim(), Some(alias.trim()))
         });
+    if alias.is_none()
+        && let Some(prefix) = path.strip_suffix("::*")
+    {
+        return Some(("*".into(), normalize_relative(prefix, module, root)?));
+    }
     let absolute = normalize_use(path, module, root)?;
     let alias = alias.or_else(|| absolute.rsplit("::").next())?;
     let alias = alias.strip_prefix("r#").unwrap_or(alias).to_owned();
@@ -3602,6 +3633,58 @@ fn call(job: Job) {
         assert!(graph.refs.iter().any(|reference| {
             reference.keys.first() == Some(&"rust:function:root".into())
                 && reference.resolved_target_key.is_some()
+        }));
+    }
+
+    #[test]
+    fn resolves_one_module_glob_after_lexical_candidates() {
+        let sources = [Source {
+            path: "src/lib.rs".into(),
+            text: r#"
+pub fn verify_chain() {}
+pub fn public_entry() {}
+pub struct AuditRecord;
+impl AuditRecord { pub fn build() {} }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn verify_chain() {}
+    #[test]
+    fn checks_chain() {
+        verify_chain();
+        public_entry();
+        AuditRecord::build();
+    }
+}
+"#
+            .into(),
+        }];
+        let graph = build_graph(&sources, &AtomicBool::new(false)).unwrap();
+        let node = |key: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.keys.iter().any(|candidate| candidate == key))
+                .unwrap()
+        };
+        let test = node("rust:function:tests::checks_chain");
+
+        for target in [
+            node("rust:function:tests::verify_chain"),
+            node("rust:function:public_entry"),
+            node("rust:method:AuditRecord::build"),
+        ] {
+            assert!(graph.refs.iter().any(|reference| {
+                reference.source_key == test.key
+                    && reference.resolved_target_key.as_deref() == Some(target.key.as_str())
+            }));
+        }
+
+        let outer = node("rust:function:verify_chain");
+        assert!(!graph.refs.iter().any(|reference| {
+            reference.source_key == test.key
+                && reference.resolved_target_key.as_deref() == Some(outer.key.as_str())
         }));
     }
 
