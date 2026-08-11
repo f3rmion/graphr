@@ -48,9 +48,9 @@ token is emitted on a standalone `name=value` line, where `name` is one of
 verbatim with the original arguments.
 
 Clients must continue until all four cursor names are absent and then require
-`review_complete_when_pages_exhausted=true` for complete coverage. The initial
-page's `review_complete=false` is an explicit incomplete-consumption signal,
-not a terminal result.
+`review_complete_when_pages_exhausted=true` for complete coverage.
+`review_complete=false` is never terminal: follow any cursors, then report
+incomplete coverage if none remain and the terminal predicate is false.
 
 ### Issue 2: Missing static test paths through public entry points
 

@@ -305,11 +305,11 @@ Start `target/debug/graphr serve "$audit_repro/repo"` in a terminal session. Sen
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{"base":"165e3f7","depth":6,"max_nodes":50,"dependency_mode":"boundary"}}}
 ```
 
-For every returned `graph_next_cursor=name` line, send another `changes`
+For every returned `files_next_cursor`, `diff_next_cursor`,
+`artifacts_next_cursor`, or `graph_next_cursor` line, send another `changes`
 request with `base`, `depth`, `max_nodes`, and `dependency_mode` unchanged and
 `cursor` set to the complete text after the first `=`. Increment the JSON-RPC
-request ID each time. Stop only when a response has no `graph_next_cursor`
-line.
+request ID each time. Stop only when all four cursor names are absent.
 
 Expected after concatenating graph pages:
 
@@ -351,7 +351,7 @@ git commit -m "fix(rust): resolve calls through module globs"
 After the paragraph beginning `The server indexes when it starts`, add concise prose with these exact rules:
 
 ```text
-Each continuation token is emitted on its own `name=value` line. Split on the first `=`, preserve the complete value unchanged, and pass it back with the original arguments. Continue until all four cursor names are absent. `analysis_complete` is local to the graph or artifact analyzer; `review_complete=false` means the current response has not exhausted all pages; whole-change coverage is complete only after all cursors are absent and `review_complete_when_pages_exhausted=true`.
+Each continuation token is emitted on its own `name=value` line. Split on the first `=`, preserve the complete value unchanged, and pass it back with the original arguments. Continue until all four cursor names are absent. `analysis_complete` is local to the graph or artifact analyzer; `review_complete=false` means do not conclude: follow every cursor present, then report incomplete coverage unless all cursors are absent and `review_complete_when_pages_exhausted=true`.
 ```
 
 Do not introduce a JSON cursor example: the line grammar is deliberately plain text.
