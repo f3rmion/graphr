@@ -1,4 +1,3 @@
-#[allow(dead_code)] // Capture integration lands in the following task.
 mod artifact;
 mod git;
 mod index;

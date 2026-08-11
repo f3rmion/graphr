@@ -319,11 +319,11 @@ impl ReviewSnapshot {
             max_nodes,
             dependency_mode,
             &manifest,
-            &changes.patch,
+            &changes.source_patch,
             &graph,
         );
         let file_ranges = line_ranges(&manifest, None);
-        let hunk_ranges = hunk_ranges(&changes.patch);
+        let hunk_ranges = hunk_ranges(&changes.source_patch);
         let graph_record_ranges = line_ranges(&graph, None);
         let flow_ranges = line_ranges(&graph, Some("flow "));
         let all_path_hunks = change_hunk_totals(&changes, hunk_ranges.len(), dependency_mode);
@@ -375,7 +375,7 @@ impl ReviewSnapshot {
     fn value(&self, section: ReviewSection) -> &str {
         match section {
             ReviewSection::Files => &self.manifest,
-            ReviewSection::Diff => &self.changes.patch,
+            ReviewSection::Diff => &self.changes.source_patch,
             ReviewSection::Graph => &self.graph,
         }
     }
@@ -2262,7 +2262,8 @@ mod tests {
                 additions: Some(400),
                 deletions: Some(400),
             }],
-            patch,
+            source_patch: patch,
+            artifacts: Default::default(),
             skipped_paths: 0,
         };
         let snapshot = ReviewSnapshot::new("HEAD", 6, 50, DependencyMode::Boundary, changes, graph);
@@ -2338,7 +2339,9 @@ mod tests {
                     additions: Some(1),
                     deletions: Some(1),
                 }],
-                patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
+                source_patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"
+                    .into(),
+                artifacts: Default::default(),
                 skipped_paths: 0,
             },
             graph,
@@ -2381,7 +2384,8 @@ mod tests {
                 additions: Some(1),
                 deletions: Some(1),
             }],
-            patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            source_patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            artifacts: Default::default(),
             skipped_paths: 0,
         };
         let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
@@ -2417,7 +2421,8 @@ mod tests {
                 additions: Some(0),
                 deletions: Some(0),
             }],
-            patch: "diff --git a/src/old.rs b/tests/fixture.tsv\n".into(),
+            source_patch: "diff --git a/src/old.rs b/tests/fixture.tsv\n".into(),
+            artifacts: Default::default(),
             skipped_paths: 0,
         };
         let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
@@ -2475,7 +2480,8 @@ mod tests {
                     deletions: Some(0),
                 },
             ],
-            patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            source_patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            artifacts: Default::default(),
             skipped_paths: 0,
         };
         let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
@@ -2510,7 +2516,8 @@ mod tests {
                 additions: None,
                 deletions: None,
             }],
-            patch: String::new(),
+            source_patch: String::new(),
+            artifacts: Default::default(),
             skipped_paths: 0,
         };
         assert_eq!(
@@ -2533,7 +2540,9 @@ mod tests {
                 additions: Some(1),
                 deletions: Some(0),
             }],
-            patch: "diff --git a/src/new.rs b/src/new.rs\n@@ -0,0 +1 @@\n+fn new() {}\n".into(),
+            source_patch: "diff --git a/src/new.rs b/src/new.rs\n@@ -0,0 +1 @@\n+fn new() {}\n"
+                .into(),
+            artifacts: Default::default(),
             skipped_paths: 0,
         };
         let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 test_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
@@ -2602,7 +2611,8 @@ mod tests {
                     deletions: Some(0),
                 },
             ],
-            patch: String::new(),
+            source_patch: String::new(),
+            artifacts: Default::default(),
             skipped_paths: 2,
         };
         assert_eq!(
@@ -2631,7 +2641,8 @@ mod tests {
                     additions: Some(1),
                     deletions: Some(1),
                 }],
-                patch: source.clone(),
+                source_patch: source.clone(),
+                artifacts: Default::default(),
                 skipped_paths: 0,
             },
             "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n".into(),

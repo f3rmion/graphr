@@ -11,6 +11,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::artifact::{AnalyzerKind, analyze, analyzer_kind};
+
 const STDOUT_LIMIT: usize = 64 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -142,14 +144,87 @@ pub struct WorktreeChanges {
     pub files: Vec<ChangedFile>,
     pub records: Vec<PathRecord>,
     pub paths: Vec<ChangedPath>,
-    pub patch: String,
+    pub source_patch: String,
+    pub artifacts: ArtifactReview,
     pub skipped_paths: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactOmission {
+    Binary,
+    InvalidUtf8,
+    Oversized,
+    NonRegular,
+    TypeChanged,
+    Unmerged,
+}
+
+impl ArtifactOmission {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::InvalidUtf8 => "invalid-utf8",
+            Self::Oversized => "oversized",
+            Self::NonRegular => "non-regular",
+            Self::TypeChanged => "type-changed",
+            Self::Unmerged => "unmerged",
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ArtifactFile {
+    pub path: String,
+    pub analyzer: AnalyzerKind,
+    pub diff_complete: bool,
+    pub analysis_complete: bool,
+    pub omission: Option<ArtifactOmission>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct ArtifactReview {
+    pub files: Vec<ArtifactFile>,
+    pub analysis: String,
+    pub patch: String,
+}
+
+impl ArtifactReview {
+    pub fn file(&self, path: &str) -> Option<&ArtifactFile> {
+        self.files
+            .binary_search_by_key(&path, |file| file.path.as_str())
+            .ok()
+            .map(|index| &self.files[index])
+    }
+
+    pub fn is_complete(&self) -> bool {
+        debug_assert!(
+            self.files
+                .iter()
+                .all(|file| self.file(&file.path).is_some())
+        );
+        self.files
+            .iter()
+            .all(|file| file.diff_complete && file.analysis_complete)
+    }
+
+    pub fn analysis_complete(&self) -> bool {
+        self.files.iter().all(|file| file.analysis_complete)
+    }
 }
 
 struct WorktreeCapture {
     tracked: Vec<u8>,
+    artifacts: TrackedArtifactSnapshot,
     inventory: Vec<u8>,
     untracked: UntrackedSnapshot,
+}
+
+#[derive(Default)]
+struct TrackedArtifactSnapshot {
+    review: ArtifactReview,
+    stats: Vec<TrackedStat>,
+    renames: Vec<(String, String)>,
+    signature: [u8; 32],
 }
 
 struct UntrackedSnapshot {
@@ -164,7 +239,8 @@ impl WorktreeChanges {
         self.files.is_empty()
             && self.records.is_empty()
             && self.paths.is_empty()
-            && self.patch.is_empty()
+            && self.source_patch.is_empty()
+            && self.artifacts == ArtifactReview::default()
             && self.skipped_paths == 0
     }
 }
@@ -328,6 +404,38 @@ impl Repository {
                 if dependency_mode == DependencyMode::Boundary {
                     tracked_args.push(":(glob,exclude).cargo/vendor/*/**");
                 }
+                let mut artifact_args = vec![
+                    "diff-index",
+                    "--raw",
+                    "-z",
+                    "--patch",
+                    "--unified=0",
+                    "--abbrev=64",
+                    "--find-renames=50%",
+                    "-l0",
+                    "--diff-filter=AMDR",
+                    "--diff-algorithm=myers",
+                    "--no-indent-heuristic",
+                    "-O/dev/null",
+                    "--no-color",
+                    "--src-prefix=a/",
+                    "--dst-prefix=b/",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--ignore-submodules=all",
+                    revision.as_str(),
+                    "--",
+                    ".",
+                    ":(exclude)*.rs",
+                    ":(exclude)*.py",
+                ];
+                if dependency_mode == DependencyMode::Boundary {
+                    artifact_args.push(":(glob,exclude).cargo/vendor/*/**");
+                }
+                let artifacts = scope.spawn(move || {
+                    let output = run(&self.root, &artifact_args, cancelled)?;
+                    capture_tracked_artifacts(&self.root, &output, cancelled)
+                });
                 let tracked = run(&self.root, &tracked_args, cancelled);
                 let untracked = untracked
                     .join()
@@ -335,8 +443,12 @@ impl Repository {
                 let inventory = inventory
                     .join()
                     .map_err(|_| "Git metadata worker panicked".to_owned())?;
+                let artifacts = artifacts
+                    .join()
+                    .map_err(|_| "Git artifact worker panicked".to_owned())?;
                 Ok::<_, String>(WorktreeCapture {
                     tracked: tracked?,
+                    artifacts: artifacts?,
                     inventory: inventory?,
                     untracked: untracked?,
                 })
@@ -356,6 +468,7 @@ impl Repository {
         check_cancelled(cancelled)?;
         merge_changes(
             tracked,
+            outputs.artifacts,
             inventory,
             outputs.untracked,
             dependency_mode,
@@ -392,6 +505,15 @@ fn worktree_signature(outputs: &WorktreeCapture) -> [u8; 32] {
         hash.update(&(output.len() as u64).to_le_bytes());
         hash.update(output);
     }
+    hash.update(&(outputs.artifacts.review.patch.len() as u64).to_le_bytes());
+    hash.update(outputs.artifacts.review.patch.as_bytes());
+    hash.update(&(outputs.artifacts.review.analysis.len() as u64).to_le_bytes());
+    hash.update(outputs.artifacts.review.analysis.as_bytes());
+    hash.update(&[
+        u8::from(outputs.artifacts.review.is_complete()),
+        u8::from(outputs.artifacts.review.analysis_complete()),
+    ]);
+    hash.update(&outputs.artifacts.signature);
     hash.update(&outputs.untracked.signature);
     *hash.finalize().as_bytes()
 }
@@ -670,12 +792,16 @@ struct RawChange {
     kind: RawKind,
     old: Option<String>,
     new: Option<String>,
+    old_oid: Option<String>,
+    new_oid: Option<String>,
     old_regular: bool,
     new_regular: bool,
 }
 
 struct RawHeader {
     kind: RawKind,
+    old_oid: Option<String>,
+    new_oid: Option<String>,
     old_regular: bool,
     new_regular: bool,
 }
@@ -888,6 +1014,248 @@ fn parse_tracked_changes(output: &[u8], cancelled: &AtomicBool) -> Result<Tracke
     })
 }
 
+fn capture_tracked_artifacts(
+    root: &Path,
+    output: &[u8],
+    cancelled: &AtomicBool,
+) -> Result<TrackedArtifactSnapshot, String> {
+    let mut hash = blake3::Hasher::new();
+    hash.update(&(output.len() as u64).to_le_bytes());
+    hash.update(output);
+    if output.is_empty() {
+        return Ok(TrackedArtifactSnapshot {
+            review: ArtifactReview::default(),
+            stats: Vec::new(),
+            renames: Vec::new(),
+            signature: *hash.finalize().as_bytes(),
+        });
+    }
+    let boundary = output
+        .windows(2)
+        .position(|bytes| bytes == b"\0\0")
+        .ok_or_else(|| "Git returned malformed artifact diff metadata".to_owned())?;
+    let raw = parse_raw_changes(&output[..=boundary], cancelled)?;
+    let patch = &output[boundary + 2..];
+    let patches = parse_patch_hunks(patch, raw.len(), cancelled)?;
+    let mut files = Vec::new();
+    let mut analysis = Vec::new();
+    let mut filtered_patch = String::new();
+    let mut stats = Vec::new();
+    let mut renames = Vec::new();
+
+    for (index, (change, patch_change)) in raw.into_iter().zip(patches).enumerate() {
+        check_progress(index, cancelled)?;
+        if let Some(new_oid) = &change.new_oid {
+            hash.update(new_oid.as_bytes());
+        }
+        let path = match change.kind {
+            RawKind::Added | RawKind::Modified | RawKind::TypeChanged | RawKind::Unmerged => {
+                change.new.as_deref()
+            }
+            RawKind::Deleted => change.old.as_deref(),
+            RawKind::Renamed => match (change.old.as_deref(), change.new.as_deref()) {
+                (Some(old), Some(new)) => {
+                    renames.push((old.to_owned(), new.to_owned()));
+                    Some(new)
+                }
+                _ => None,
+            },
+        };
+        let Some(path) = path else {
+            continue;
+        };
+        let section = &patch[patch_change.start..patch_change.end];
+        let binary = section
+            .windows(b"Binary files ".len())
+            .any(|window| window == b"Binary files ")
+            || section
+                .windows(b"GIT binary patch".len())
+                .any(|window| window == b"GIT binary patch");
+        let (diff_complete, mut omission) = if binary {
+            if let Some(metadata) = binary_patch_metadata(section) {
+                if filtered_patch.len().saturating_add(metadata.len()) > STDOUT_LIMIT {
+                    return Err("Git output exceeded its limit".into());
+                }
+                filtered_patch.push_str(metadata);
+            }
+            (false, Some(ArtifactOmission::Binary))
+        } else if let Ok(section) = std::str::from_utf8(section) {
+            if filtered_patch.len().saturating_add(section.len()) > STDOUT_LIMIT {
+                return Err("Git output exceeded its limit".into());
+            }
+            filtered_patch.push_str(section);
+            stats.push(TrackedStat {
+                path: path.to_owned(),
+                additions: patch_change.additions,
+                deletions: patch_change.deletions,
+            });
+            (true, None)
+        } else {
+            (false, Some(ArtifactOmission::InvalidUtf8))
+        };
+        let analyzer = analyzer_kind(path);
+        let mut analysis_complete = false;
+        if omission.is_none() {
+            omission = match change.kind {
+                RawKind::TypeChanged => Some(ArtifactOmission::TypeChanged),
+                RawKind::Unmerged => Some(ArtifactOmission::Unmerged),
+                _ if (matches!(
+                    change.kind,
+                    RawKind::Modified | RawKind::Deleted | RawKind::Renamed
+                ) && !change.old_regular)
+                    || (matches!(
+                        change.kind,
+                        RawKind::Added | RawKind::Modified | RawKind::Renamed
+                    ) && !change.new_regular) =>
+                {
+                    Some(ArtifactOmission::NonRegular)
+                }
+                _ => None,
+            };
+        }
+        if omission.is_none() {
+            let mut old_text = None;
+            let mut new_text = None;
+            if analyzer != AnalyzerKind::Generic {
+                if matches!(
+                    change.kind,
+                    RawKind::Modified | RawKind::Deleted | RawKind::Renamed
+                ) {
+                    let old = old_semantic_text(root, change.old_oid.as_deref(), cancelled)?;
+                    hash_semantic_input(&mut hash, b"old", &old);
+                    match old {
+                        Ok(text) => old_text = Some(text),
+                        Err(reason) => omission = Some(reason),
+                    }
+                }
+                if matches!(
+                    change.kind,
+                    RawKind::Added | RawKind::Modified | RawKind::Renamed
+                ) {
+                    let new = current_semantic_text(root, path, cancelled)?;
+                    hash_semantic_input(&mut hash, b"new", &new);
+                    match new {
+                        Ok(text) => new_text = Some(text),
+                        Err(reason) if omission.is_none() => omission = Some(reason),
+                        Err(_) => {}
+                    }
+                }
+            }
+            if omission.is_none() {
+                let result = analyze(path, old_text.as_deref(), new_text.as_deref())?;
+                hash.update(result.kind.as_str().as_bytes());
+                hash.update(&(result.output.len() as u64).to_le_bytes());
+                hash.update(result.output.as_bytes());
+                if !result.output.is_empty() {
+                    analysis.push(result.output);
+                }
+                analysis_complete = true;
+            }
+        }
+        if let Some(reason) = omission {
+            hash.update(reason.as_str().as_bytes());
+        }
+        files.push(ArtifactFile {
+            path: path.to_owned(),
+            analyzer,
+            diff_complete,
+            analysis_complete,
+            omission,
+        });
+    }
+    files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    analysis.sort_unstable();
+    let analysis = analysis.join("\n");
+    if filtered_patch.len().saturating_add(analysis.len()) > STDOUT_LIMIT {
+        return Err("Git output exceeded its limit".into());
+    }
+    Ok(TrackedArtifactSnapshot {
+        review: ArtifactReview {
+            files,
+            analysis,
+            patch: filtered_patch,
+        },
+        stats,
+        renames,
+        signature: *hash.finalize().as_bytes(),
+    })
+}
+
+fn binary_patch_metadata(section: &[u8]) -> Option<&str> {
+    let marker = [b"Binary files ".as_slice(), b"GIT binary patch".as_slice()]
+        .into_iter()
+        .filter_map(|marker| {
+            section
+                .windows(marker.len())
+                .position(|window| window == marker)
+        })
+        .min()?;
+    let end = section[marker..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(section.len(), |end| marker + end + 1);
+    std::str::from_utf8(&section[..end]).ok()
+}
+
+fn old_semantic_text(
+    root: &Path,
+    oid: Option<&str>,
+    cancelled: &AtomicBool,
+) -> Result<Result<String, ArtifactOmission>, String> {
+    let Some(oid) = oid else {
+        return Ok(Err(ArtifactOmission::NonRegular));
+    };
+    Ok(semantic_text(run(
+        root,
+        &["cat-file", "blob", oid],
+        cancelled,
+    )?))
+}
+
+fn current_semantic_text(
+    root: &Path,
+    path: &str,
+    cancelled: &AtomicBool,
+) -> Result<Result<String, ArtifactOmission>, String> {
+    let Some(metadata) = safe_regular_metadata(root, path) else {
+        return Ok(Err(ArtifactOmission::NonRegular));
+    };
+    if metadata.len() > SOURCE_LIMIT {
+        return Ok(Err(ArtifactOmission::Oversized));
+    }
+    let Some(content) = read_regular_file(root, path, SOURCE_LIMIT, cancelled)? else {
+        return Ok(Err(ArtifactOmission::NonRegular));
+    };
+    Ok(semantic_text(content))
+}
+
+fn semantic_text(content: Vec<u8>) -> Result<String, ArtifactOmission> {
+    if content.len() as u64 > SOURCE_LIMIT {
+        Err(ArtifactOmission::Oversized)
+    } else if content.contains(&0) {
+        Err(ArtifactOmission::Binary)
+    } else {
+        String::from_utf8(content).map_err(|_| ArtifactOmission::InvalidUtf8)
+    }
+}
+
+fn hash_semantic_input(
+    hash: &mut blake3::Hasher,
+    side: &[u8],
+    input: &Result<String, ArtifactOmission>,
+) {
+    hash.update(side);
+    match input {
+        Ok(text) => {
+            hash.update(&(text.len() as u64).to_le_bytes());
+            hash.update(text.as_bytes());
+        }
+        Err(reason) => {
+            hash.update(reason.as_str().as_bytes());
+        }
+    };
+}
+
 fn parse_raw_changes(input: &[u8], cancelled: &AtomicBool) -> Result<Vec<RawChange>, String> {
     if !input.ends_with(&[0]) {
         return Err("Git returned malformed diff metadata".into());
@@ -924,6 +1292,8 @@ fn parse_raw_changes(input: &[u8], cancelled: &AtomicBool) -> Result<Vec<RawChan
             kind,
             old,
             new,
+            old_oid: header.old_oid,
+            new_oid: header.new_oid,
             old_regular: header.old_regular,
             new_regular: header.new_regular,
         });
@@ -967,6 +1337,14 @@ fn parse_raw_header(header: &[u8]) -> Result<RawHeader, String> {
     };
     Ok(RawHeader {
         kind,
+        old_oid: fields[2]
+            .iter()
+            .any(|byte| *byte != b'0')
+            .then(|| String::from_utf8(fields[2].to_vec()).expect("validated ASCII object ID")),
+        new_oid: fields[3]
+            .iter()
+            .any(|byte| *byte != b'0')
+            .then(|| String::from_utf8(fields[3].to_vec()).expect("validated ASCII object ID")),
         old_regular: matches!(fields[0], b"100644" | b"100755"),
         new_regular: matches!(fields[1], b"100644" | b"100755"),
     })
@@ -1055,13 +1433,13 @@ fn parse_change_inventory(
 }
 
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
-enum SupportedProjection {
+enum SourceProjection {
     Current(String),
     Deleted(String),
     Renamed(String, String),
 }
 
-fn validate_supported_projection(
+fn validate_source_projection(
     files: &[ChangedFile],
     records: &[PathRecord],
     paths: &[ChangedPath],
@@ -1069,13 +1447,11 @@ fn validate_supported_projection(
 ) -> Result<(), String> {
     let mut actual = files
         .iter()
-        .map(|file| SupportedProjection::Current(file.path.clone()))
+        .map(|file| SourceProjection::Current(file.path.clone()))
         .collect::<Vec<_>>();
     actual.extend(records.iter().filter_map(|record| match record {
-        PathRecord::Deleted(path) => Some(SupportedProjection::Deleted(path.clone())),
-        PathRecord::Renamed(old, new) => {
-            Some(SupportedProjection::Renamed(old.clone(), new.clone()))
-        }
+        PathRecord::Deleted(path) => Some(SourceProjection::Deleted(path.clone())),
+        PathRecord::Renamed(old, new) => Some(SourceProjection::Renamed(old.clone(), new.clone())),
         PathRecord::Untracked(_) => None,
     }));
 
@@ -1087,10 +1463,10 @@ fn validate_supported_projection(
         }
         match path.status {
             ChangeStatus::Added | ChangeStatus::Modified if path.language.is_some() => {
-                expected.push(SupportedProjection::Current(path.path.clone()));
+                expected.push(SourceProjection::Current(path.path.clone()));
             }
             ChangeStatus::Deleted if path.language.is_some() => {
-                expected.push(SupportedProjection::Deleted(path.path.clone()));
+                expected.push(SourceProjection::Deleted(path.path.clone()));
             }
             ChangeStatus::Renamed => {
                 let old = path.old_path.as_deref();
@@ -1098,17 +1474,14 @@ fn validate_supported_projection(
                 let new_supported = path.language.is_some();
                 match (old, old_supported, new_supported) {
                     (Some(old), true, true) => {
-                        expected.push(SupportedProjection::Current(path.path.clone()));
-                        expected.push(SupportedProjection::Renamed(
-                            old.to_owned(),
-                            path.path.clone(),
-                        ));
+                        expected.push(SourceProjection::Current(path.path.clone()));
+                        expected.push(SourceProjection::Renamed(old.to_owned(), path.path.clone()));
                     }
                     (Some(old), true, false) => {
-                        expected.push(SupportedProjection::Deleted(old.to_owned()));
+                        expected.push(SourceProjection::Deleted(old.to_owned()));
                     }
                     (_, false, true) => {
-                        expected.push(SupportedProjection::Current(path.path.clone()));
+                        expected.push(SourceProjection::Current(path.path.clone()));
                     }
                     _ => {}
                 }
@@ -1127,10 +1500,11 @@ fn validate_supported_projection(
     }
 }
 
-fn apply_supported_stats(
+fn apply_captured_stats(
     paths: &mut [ChangedPath],
     stats: Vec<TrackedStat>,
     mut omitted: HashSet<String>,
+    captured: &HashSet<String>,
     dependency_mode: DependencyMode,
 ) -> Result<(), String> {
     let mut by_path = HashMap::new();
@@ -1147,23 +1521,51 @@ fn apply_supported_stats(
         {
             continue;
         }
-        let key = match path.status {
+        let mut keys = Vec::with_capacity(2);
+        match path.status {
             ChangeStatus::Added | ChangeStatus::Modified | ChangeStatus::Deleted
-                if path.language.is_some() =>
+                if captured.contains(&path.path) =>
             {
-                Some(path.path.as_str())
+                keys.push(path.path.as_str());
             }
-            ChangeStatus::Renamed if path.language.is_some() => Some(path.path.as_str()),
-            ChangeStatus::Renamed if path.old_language.is_some() => path.old_path.as_deref(),
-            _ => None,
-        };
-        if let Some(key) = key {
+            ChangeStatus::Renamed => {
+                if captured.contains(&path.path) {
+                    keys.push(path.path.as_str());
+                }
+                if let Some(old) = path
+                    .old_path
+                    .as_deref()
+                    .filter(|old| captured.contains(*old))
+                    && Some(old) != keys.first().copied()
+                {
+                    keys.push(old);
+                }
+            }
+            _ => {}
+        }
+        let has_keys = !keys.is_empty();
+        let mut totals = Some((0_u64, 0_u64));
+        for key in keys {
             if let Some((additions, deletions)) = by_path.remove(key) {
-                path.additions = Some(additions);
-                path.deletions = Some(deletions);
+                if let Some((total_additions, total_deletions)) = &mut totals {
+                    *total_additions = total_additions
+                        .checked_add(additions)
+                        .ok_or_else(|| "Git patch additions exceed range".to_owned())?;
+                    *total_deletions = total_deletions
+                        .checked_add(deletions)
+                        .ok_or_else(|| "Git patch deletions exceed range".to_owned())?;
+                }
             } else if !omitted.remove(key) {
                 return Err("Git change inventories disagree; retry".into());
+            } else {
+                totals = None;
             }
+        }
+        if let Some((additions, deletions)) = totals
+            && has_keys
+        {
+            path.additions = Some(additions);
+            path.deletions = Some(deletions);
         }
     }
     if by_path.is_empty() && omitted.is_empty() {
@@ -1173,16 +1575,13 @@ fn apply_supported_stats(
     }
 }
 
-fn coalesce_supported_renames(
+fn coalesce_renames(
     paths: &mut Vec<ChangedPath>,
-    records: &[PathRecord],
+    rename_pairs: &[(String, String)],
 ) -> Result<(), String> {
     let mut consumed = HashSet::new();
     let mut renames = Vec::new();
-    for record in records {
-        let PathRecord::Renamed(old, new) = record else {
-            continue;
-        };
+    for (old, new) in rename_pairs {
         if paths.iter().any(|path| {
             path.status == ChangeStatus::Renamed
                 && path.old_path.as_deref() == Some(old)
@@ -1353,6 +1752,7 @@ fn parse_decimal(input: &[u8]) -> Result<u64, String> {
 
 fn merge_changes(
     tracked: TrackedChanges,
+    artifacts: TrackedArtifactSnapshot,
     inventory: (Vec<ChangedPath>, usize),
     untracked: UntrackedSnapshot,
     dependency_mode: DependencyMode,
@@ -1366,9 +1766,36 @@ fn merge_changes(
         stats,
         omitted_stats,
     } = tracked;
-    coalesce_supported_renames(&mut paths, &records)?;
-    validate_supported_projection(&files, &records, &paths, dependency_mode)?;
-    apply_supported_stats(&mut paths, stats, omitted_stats, dependency_mode)?;
+    let TrackedArtifactSnapshot {
+        review: artifact_review,
+        stats: artifact_stats,
+        renames: artifact_renames,
+        signature: _,
+    } = artifacts;
+    let captured = stats
+        .iter()
+        .map(|stat| stat.path.clone())
+        .chain(omitted_stats.iter().cloned())
+        .chain(artifact_stats.iter().map(|stat| stat.path.clone()))
+        .collect::<HashSet<_>>();
+    let mut all_stats = stats;
+    all_stats.extend(artifact_stats);
+    let mut rename_pairs = artifact_renames;
+    rename_pairs.extend(records.iter().filter_map(|record| match record {
+        PathRecord::Renamed(old, new) => Some((old.clone(), new.clone())),
+        _ => None,
+    }));
+    rename_pairs.sort_unstable();
+    rename_pairs.dedup();
+    coalesce_renames(&mut paths, &rename_pairs)?;
+    validate_source_projection(&files, &records, &paths, dependency_mode)?;
+    apply_captured_stats(
+        &mut paths,
+        all_stats,
+        omitted_stats,
+        &captured,
+        dependency_mode,
+    )?;
     let UntrackedSnapshot {
         paths: untracked_paths,
         patch: untracked_patch,
@@ -1392,7 +1819,13 @@ fn merge_changes(
         paths.push(path);
     }
     let untracked_patch = String::from_utf8_lossy(&untracked_patch);
-    if patch.len().saturating_add(untracked_patch.len()) > STDOUT_LIMIT {
+    if patch
+        .len()
+        .saturating_add(untracked_patch.len())
+        .saturating_add(artifact_review.patch.len())
+        .saturating_add(artifact_review.analysis.len())
+        > STDOUT_LIMIT
+    {
         return Err("Git output exceeded its limit".into());
     }
     patch.push_str(&untracked_patch);
@@ -1436,7 +1869,8 @@ fn merge_changes(
         files: merged,
         records,
         paths,
-        patch,
+        source_patch: patch,
+        artifacts: artifact_review,
         skipped_paths,
     })
 }
@@ -1811,6 +2245,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_raw_header_retains_nonzero_oids() {
+        let zero = "0".repeat(OID.len());
+        let modified =
+            parse_raw_header(format!(":100644 100644 {OID} {OID} M").as_bytes()).unwrap();
+        assert_eq!(modified.old_oid.as_deref(), Some(OID));
+        assert_eq!(modified.new_oid.as_deref(), Some(OID));
+
+        let added = parse_raw_header(format!(":000000 100644 {zero} {OID} A").as_bytes()).unwrap();
+        assert_eq!(added.old_oid, None);
+        assert_eq!(added.new_oid.as_deref(), Some(OID));
+    }
+
+    #[test]
     fn retains_a_full_utf8_safe_patch() {
         let mut output = format!(
             ":100644 100644 {OID} {OID} M\0large.rs\0\0\
@@ -1888,8 +2335,8 @@ mod tests {
             report_unmapped: true,
         }];
         let records = vec![PathRecord::Deleted("safe.py".into())];
-        validate_supported_projection(&files, &records, &paths, DependencyMode::Boundary).unwrap();
-        apply_supported_stats(
+        validate_source_projection(&files, &records, &paths, DependencyMode::Boundary).unwrap();
+        apply_captured_stats(
             &mut paths,
             vec![
                 TrackedStat {
@@ -1904,6 +2351,7 @@ mod tests {
                 },
             ],
             HashSet::new(),
+            &HashSet::from(["safe.py".into(), "safe.rs".into()]),
             DependencyMode::Boundary,
         )
         .unwrap();
@@ -1914,6 +2362,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(Some(0), Some(1)), (Some(1), Some(0))]
         );
+    }
+
+    #[test]
+    fn captured_stats_combine_source_artifact_rename_endpoints() {
+        let mut paths = vec![ChangedPath {
+            status: ChangeStatus::Renamed,
+            old_path: Some("old.rs".into()),
+            old_language: Some(Language::Rust),
+            path: "new.txt".into(),
+            language: None,
+            additions: None,
+            deletions: None,
+        }];
+        let result = apply_captured_stats(
+            &mut paths,
+            vec![
+                TrackedStat {
+                    path: "old.rs".into(),
+                    additions: 0,
+                    deletions: 2,
+                },
+                TrackedStat {
+                    path: "new.txt".into(),
+                    additions: 3,
+                    deletions: 0,
+                },
+            ],
+            HashSet::new(),
+            &HashSet::from(["old.rs".into(), "new.txt".into()]),
+            DependencyMode::Boundary,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!((paths[0].additions, paths[0].deletions), (Some(3), Some(2)));
     }
 
     #[test]
@@ -1974,6 +2456,7 @@ mod tests {
             .extend_from_slice(format!(":000000 100644 {zero} {OID} A\0bad\nname.rs\0").as_bytes());
         let changes = merge_changes(
             parse_tracked_changes(tracked.as_bytes(), &AtomicBool::new(false)).unwrap(),
+            TrackedArtifactSnapshot::default(),
             parse_change_inventory(&inventory, &AtomicBool::new(false)).unwrap(),
             UntrackedSnapshot {
                 paths: Vec::new(),
@@ -1986,7 +2469,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(changes.patch.is_empty());
+        assert!(changes.source_patch.is_empty());
         assert_eq!(changes.skipped_paths, 1);
         assert_eq!(changes.paths.len(), 1);
         assert_eq!(changes.paths[0].path, "safe.rs");
@@ -2090,21 +2573,21 @@ mod tests {
             additions: Some(1),
             deletions: Some(1),
         };
-        assert!(
-            validate_supported_projection(&[], &[], &[path], DependencyMode::Boundary).is_err()
-        );
+        assert!(validate_source_projection(&[], &[], &[path], DependencyMode::Boundary).is_err());
 
         let changes = WorktreeChanges {
             files: Vec::new(),
             records: Vec::new(),
             paths: Vec::new(),
-            patch: "diff --git a/changed.rs b/changed.rs\n".into(),
+            source_patch: "diff --git a/changed.rs b/changed.rs\n".into(),
+            artifacts: Default::default(),
             skipped_paths: 0,
         };
         assert!(!changes.is_empty());
 
         let snapshot = |inventory| WorktreeCapture {
             tracked: vec![b'a'],
+            artifacts: TrackedArtifactSnapshot::default(),
             inventory,
             untracked: UntrackedSnapshot {
                 paths: Vec::new(),
@@ -2172,6 +2655,7 @@ mod tests {
         );
         let changes = merge_changes(
             parse_tracked_changes(tracked.as_bytes(), &cancelled).unwrap(),
+            TrackedArtifactSnapshot::default(),
             parse_change_inventory(inventory.as_bytes(), &cancelled).unwrap(),
             untracked,
             DependencyMode::Boundary,
@@ -2263,18 +2747,19 @@ mod tests {
                         deletions: Some(0),
                     },
                 ],
-                patch: expected_patch,
+                source_patch: expected_patch,
+                artifacts: Default::default(),
                 skipped_paths: 0,
             }
         );
-        assert!(changes.patch.contains("-old\n+new\n"));
-        assert!(changes.patch.contains("rename from old.rs"));
+        assert!(changes.source_patch.contains("-old\n+new\n"));
+        assert!(changes.source_patch.contains("rename from old.rs"));
         assert!(
             changes
-                .patch
+                .source_patch
                 .contains("diff --git a/untracked.rs b/untracked.rs")
         );
-        assert!(changes.patch.contains("+fn untracked() {}"));
+        assert!(changes.source_patch.contains("+fn untracked() {}"));
         fs::remove_dir_all(root).unwrap();
         assert!(
             parse_tracked_changes(&tracked.as_bytes()[..tracked.len() - 1], &cancelled).is_err()
@@ -2297,6 +2782,7 @@ mod tests {
                 stats: Vec::new(),
                 omitted_stats: HashSet::new(),
             },
+            TrackedArtifactSnapshot::default(),
             (Vec::new(), 0),
             capture_untracked(
                 &temp_root("missing"),
@@ -2558,15 +3044,88 @@ mod tests {
                     "tests/fixtures/tracked.tsv",
                     ChangeStatus::Modified,
                     None,
-                    None,
-                    None,
+                    Some(2),
+                    Some(1),
                 ),
             ]
         );
         assert_eq!(changes.files.len(), 1);
         assert_eq!(changes.files[0].path, "src/domain.rs");
-        assert!(changes.patch.contains("+pub fn added() {}"));
-        assert!(!changes.patch.contains("tracked.tsv"));
+        assert!(changes.source_patch.contains("+pub fn added() {}"));
+        assert!(!changes.source_patch.contains("tracked.tsv"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tracked_artifacts_are_separate_analyzed_and_classified() {
+        let root = temp_root("tracked-artifacts");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn before() {}\n").unwrap();
+        fs::write(root.join("README.md"), "See [REQ-1](docs/old.md).\n").unwrap();
+        fs::write(root.join("data.tsv"), "id\tvalue\na\told\n").unwrap();
+        fs::write(root.join("docs/old.txt"), "plain\n").unwrap();
+        fs::write(root.join("docs/deleted.txt"), "deleted\n").unwrap();
+        fs::write(root.join("blob.bin"), [0, 1, 2]).unwrap();
+        fs::write(root.join("large.md"), vec![b'a'; SOURCE_LIMIT as usize + 1]).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["add", "--", "."]);
+        test_git(
+            &root,
+            &[
+                "-c",
+                "user.name=Graphr Test",
+                "-c",
+                "user.email=graphr@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+
+        fs::write(root.join("src/lib.rs"), "pub fn after() {}\n").unwrap();
+        fs::write(root.join("README.md"), "See [REQ-2](docs/new.md).\n").unwrap();
+        fs::write(root.join("data.tsv"), "id\tvalue\na\tnew\n").unwrap();
+        fs::rename(root.join("docs/old.txt"), root.join("docs/new.txt")).unwrap();
+        fs::remove_file(root.join("docs/deleted.txt")).unwrap();
+        fs::write(root.join("docs/added.txt"), "added\n").unwrap();
+        test_git(&root, &["add", "--", "docs/added.txt", "docs/new.txt"]);
+        fs::write(root.join("blob.bin"), [0, 3, 4]).unwrap();
+        fs::write(root.join("large.md"), vec![b'b'; SOURCE_LIMIT as usize + 1]).unwrap();
+
+        let repository = Repository {
+            root: fs::canonicalize(&root).unwrap(),
+            database: root.join(".git/graphr/index.db"),
+        };
+        let changes = repository
+            .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
+            .unwrap();
+
+        assert!(changes.source_patch.contains("src/lib.rs"));
+        assert!(!changes.source_patch.contains("README.md"));
+        assert!(changes.artifacts.patch.contains("README.md"));
+        assert!(changes.artifacts.patch.contains("data.tsv"));
+        assert!(changes.artifacts.patch.contains("docs/new.txt"));
+        assert!(changes.artifacts.patch.contains("docs/deleted.txt"));
+        assert!(changes.artifacts.patch.contains("docs/added.txt"));
+        assert!(!changes.artifacts.patch.contains("src/lib.rs"));
+        assert!(changes.artifacts.analysis.contains("REQ-1"));
+        assert!(changes.artifacts.analysis.contains("REQ-2"));
+        assert_eq!(
+            changes.artifacts.file("blob.bin").unwrap().omission,
+            Some(ArtifactOmission::Binary)
+        );
+        let large = changes.artifacts.file("large.md").unwrap();
+        assert!(large.diff_complete);
+        assert!(!large.analysis_complete);
+        assert_eq!(large.omission, Some(ArtifactOmission::Oversized));
+        assert!(changes.paths.iter().any(|path| {
+            path.status == ChangeStatus::Renamed
+                && path.old_path.as_deref() == Some("docs/old.txt")
+                && path.path == "docs/new.txt"
+        }));
 
         fs::remove_dir_all(root).unwrap();
     }
