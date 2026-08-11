@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::artifact::{AnalyzerKind, analyze, analyzer_kind};
+use crate::workspace::{ErrorCode, OperationError};
 
 const STDOUT_LIMIT: usize = 64 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
@@ -20,7 +21,12 @@ const SOURCE_LIMIT: u64 = 2 * 1024 * 1024;
 
 pub struct Repository {
     pub root: PathBuf,
-    pub database: PathBuf,
+    pub git_dir: PathBuf,
+    pub common_git_dir: PathBuf,
+    pub index_path: PathBuf,
+    pub branch: Option<String>,
+    pub head_oid: String,
+    pub object_format: String,
 }
 
 pub struct Source {
@@ -245,49 +251,192 @@ impl WorktreeChanges {
 }
 
 impl Repository {
-    pub fn discover_cancelled(path: &Path, cancelled: &AtomicBool) -> Result<Self, String> {
-        validate_utf8(path, "project path")?;
-        let path = fs::canonicalize(path)
-            .map_err(|error| format!("cannot resolve project path: {error}"))?;
+    pub fn discover_cancelled(path: &Path, cancelled: &AtomicBool) -> Result<Self, OperationError> {
+        Self::discover(path, cancelled, false)
+    }
+
+    pub fn discover_for_project_cancelled(
+        path: &Path,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, OperationError> {
+        Self::discover(path, cancelled, true)
+    }
+
+    fn discover(
+        path: &Path,
+        cancelled: &AtomicBool,
+        allow_unborn_head: bool,
+    ) -> Result<Self, OperationError> {
+        validate_discovery_path(path)?;
+        let path = fs::canonicalize(path).map_err(|_| {
+            OperationError::new(ErrorCode::RootUnknown, "requested root does not exist")
+                .with_path("root", path)
+        })?;
         if !path.is_dir() {
-            return Err("project path is not a directory".into());
+            return Err(OperationError::new(
+                ErrorCode::RootUnknown,
+                "requested root is not a directory",
+            )
+            .with_path("root", &path));
         }
-        validate_utf8(&path, "project path")?;
+        validate_discovery_path(&path)?;
 
-        let root = parse_path(&run(
-            &path,
-            &["rev-parse", "--path-format=absolute", "--show-toplevel"],
-            cancelled,
-        )?)?;
-        let root =
-            fs::canonicalize(root).map_err(|error| format!("cannot resolve Git root: {error}"))?;
-        if !path.starts_with(&root) {
-            return Err("Git returned a root outside the project path".into());
+        let root = parse_path(
+            &run(
+                &path,
+                &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+                cancelled,
+            )
+            .map_err(git_metadata_error)?,
+        )
+        .map_err(git_metadata_error)?;
+        let root = fs::canonicalize(root).map_err(|_| {
+            OperationError::new(ErrorCode::GitMetadataInvalid, "cannot resolve Git root")
+        })?;
+        if path != root {
+            return Err(OperationError::new(
+                ErrorCode::RootNotWorktree,
+                "requested root is not a Git worktree root",
+            )
+            .with_path("root", &path));
         }
 
-        let git_dir = parse_path(&run(
+        let git_dir = parse_path(
+            &run(
+                &root,
+                &["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
+                cancelled,
+            )
+            .map_err(git_metadata_error)?,
+        )
+        .map_err(git_metadata_error)?;
+        let git_dir = fs::canonicalize(git_dir).map_err(|_| {
+            OperationError::new(
+                ErrorCode::GitMetadataInvalid,
+                "cannot resolve Git directory",
+            )
+        })?;
+        validate_git_directory(&git_dir)?;
+        let common_git_dir = parse_path(
+            &run(
+                &root,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                cancelled,
+            )
+            .map_err(git_metadata_error)?,
+        )
+        .map_err(git_metadata_error)?;
+        let common_git_dir = fs::canonicalize(common_git_dir).map_err(|_| {
+            OperationError::new(
+                ErrorCode::GitMetadataInvalid,
+                "cannot resolve common Git directory",
+            )
+        })?;
+        validate_git_directory(&common_git_dir)?;
+        if !git_dir.starts_with(&common_git_dir) {
+            return Err(OperationError::new(
+                ErrorCode::GitMetadataInvalid,
+                "worktree Git directory is outside common Git directory",
+            )
+            .with_path("git_dir", &git_dir));
+        }
+        let index_path = parse_path(
+            &run(
+                &root,
+                &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+                cancelled,
+            )
+            .map_err(git_metadata_error)?,
+        )
+        .map_err(git_metadata_error)?;
+        let index_parent = index_path.parent().ok_or_else(|| {
+            OperationError::new(
+                ErrorCode::GitMetadataInvalid,
+                "Git index path has no parent",
+            )
+        })?;
+        let index_parent = fs::canonicalize(index_parent).map_err(|_| {
+            OperationError::new(
+                ErrorCode::GitMetadataInvalid,
+                "cannot resolve Git index parent",
+            )
+        })?;
+        if !index_parent.is_dir() || !index_parent.starts_with(&git_dir) {
+            return Err(OperationError::new(
+                ErrorCode::GitMetadataInvalid,
+                "Git index parent is outside worktree Git directory",
+            )
+            .with_path("index_parent", &index_parent));
+        }
+        let index_path = index_parent.join(index_path.file_name().ok_or_else(|| {
+            OperationError::new(
+                ErrorCode::GitMetadataInvalid,
+                "Git index path has no file name",
+            )
+        })?);
+        let object_format = parse_value(
+            &run(&root, &["rev-parse", "--show-object-format"], cancelled)
+                .map_err(git_metadata_error)?,
+        )
+        .map_err(git_metadata_error)?;
+        if !matches!(object_format.as_str(), "sha1" | "sha256") {
+            return Err(OperationError::new(
+                ErrorCode::GitMetadataInvalid,
+                "Git returned an unsupported object format",
+            ));
+        }
+        let branch = run_git(
             &root,
-            &["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            true,
+            false,
+            Instant::now() + DEADLINE,
+            STDOUT_LIMIT,
             cancelled,
-        )?)?;
-        let git_dir = fs::canonicalize(git_dir)
-            .map_err(|error| format!("cannot resolve Git directory: {error}"))?;
-        let database = parse_path(&run(
+        )
+        .map_err(git_metadata_error)?;
+        let branch = (!branch.is_empty())
+            .then(|| parse_value(&branch))
+            .transpose()
+            .map_err(git_metadata_error)?;
+        let head_oid = match run(
             &root,
-            &[
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                "graphr/index.db",
-            ],
+            &["rev-parse", "--verify", "HEAD^{commit}"],
             cancelled,
-        )?)?;
-        if database != git_dir.join("graphr/index.db") {
-            return Err("Git returned an unsafe database path".into());
+        ) {
+            Ok(output) => parse_value(&output).map_err(git_metadata_error)?,
+            Err(error) if allow_unborn_head && error.contains("Needed a single revision") => {
+                String::new()
+            }
+            Err(error) if error.contains("cancelled") => {
+                return Err(OperationError::new(
+                    ErrorCode::JobCancelled,
+                    "Git operation cancelled",
+                ));
+            }
+            Err(_) => {
+                return Err(OperationError::new(
+                    ErrorCode::RefNotFound,
+                    "HEAD does not name a commit",
+                ));
+            }
+        };
+        if !head_oid.is_empty() && !valid_oid(head_oid.as_bytes()) {
+            return Err(OperationError::new(
+                ErrorCode::GitMetadataInvalid,
+                "Git returned an invalid HEAD object ID",
+            ));
         }
-        validate_database_path(&git_dir, &database)?;
 
-        Ok(Self { root, database })
+        Ok(Self {
+            root,
+            git_dir,
+            common_git_dir,
+            index_path,
+            branch,
+            head_oid,
+            object_format,
+        })
     }
 
     pub fn source_files(&self, cancelled: &AtomicBool) -> Result<SourceFiles, String> {
@@ -2237,37 +2386,57 @@ fn same_file_version(left: &fs::Metadata, right: &fs::Metadata) -> bool {
         && left.ctime_nsec() == right.ctime_nsec()
 }
 
-fn validate_database_path(git_dir: &Path, database: &Path) -> Result<(), String> {
-    let parent = database
-        .parent()
-        .ok_or_else(|| "database path has no parent".to_owned())?;
-    if parent.exists() {
-        let metadata = fs::symlink_metadata(parent)
-            .map_err(|error| format!("cannot inspect database directory: {error}"))?;
-        let canonical = fs::canonicalize(parent)
-            .map_err(|error| format!("cannot resolve database directory: {error}"))?;
-        if !metadata.is_dir() || canonical != git_dir.join("graphr") {
-            return Err("database directory is not a safe Git directory".into());
-        }
+fn validate_discovery_path(path: &Path) -> Result<(), OperationError> {
+    if !path.is_absolute() {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "requested root must be an absolute path",
+        ));
     }
-    if database.exists() {
-        let metadata = fs::symlink_metadata(database)
-            .map_err(|error| format!("cannot inspect database path: {error}"))?;
-        if !metadata.is_file() {
-            return Err("database path is not a regular file".into());
-        }
+    let value = path.to_str().ok_or_else(|| {
+        OperationError::new(
+            ErrorCode::InvalidParameters,
+            "requested root is not valid UTF-8",
+        )
+    })?;
+    if value.chars().any(char::is_control) {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "requested root contains control characters",
+        ));
     }
     Ok(())
 }
 
-fn validate_utf8(path: &Path, label: &str) -> Result<(), String> {
-    let path = path
-        .to_str()
-        .ok_or_else(|| format!("{label} is not valid UTF-8"))?;
-    if path.chars().any(char::is_control) {
-        Err(format!("{label} contains control characters"))
+fn validate_git_directory(path: &Path) -> Result<(), OperationError> {
+    let metadata = fs::metadata(path).map_err(|_| {
+        OperationError::new(
+            ErrorCode::GitMetadataInvalid,
+            "cannot inspect Git directory",
+        )
+        .with_path("git_dir", path)
+    })?;
+    if !metadata.is_dir() {
+        return Err(OperationError::new(
+            ErrorCode::GitMetadataInvalid,
+            "Git path is not a directory",
+        )
+        .with_path("git_dir", path));
+    }
+    validate_discovery_path(path).map_err(|_| {
+        OperationError::new(
+            ErrorCode::GitMetadataInvalid,
+            "Git path is not a valid absolute path",
+        )
+        .with_path("git_dir", path)
+    })
+}
+
+fn git_metadata_error(error: String) -> OperationError {
+    if error.contains("cancelled") {
+        OperationError::new(ErrorCode::JobCancelled, "Git operation cancelled")
     } else {
-        Ok(())
+        OperationError::new(ErrorCode::GitMetadataInvalid, "Git metadata is invalid")
     }
 }
 
@@ -2278,7 +2447,21 @@ fn parse_path(output: &[u8]) -> Result<PathBuf, String> {
     if value.is_empty() || value.chars().any(char::is_control) {
         Err("Git path is empty or contains control characters".into())
     } else {
-        Ok(PathBuf::from(value))
+        let path = PathBuf::from(value);
+        path.is_absolute()
+            .then_some(path)
+            .ok_or_else(|| "Git path is not absolute".into())
+    }
+}
+
+fn parse_value(output: &[u8]) -> Result<String, String> {
+    let value = std::str::from_utf8(output)
+        .map_err(|_| "Git value is not valid UTF-8".to_owned())?
+        .trim_end_matches(['\r', '\n']);
+    if value.is_empty() || value.chars().any(char::is_control) {
+        Err("Git value is empty or contains control characters".into())
+    } else {
+        Ok(value.to_owned())
     }
 }
 
@@ -2337,6 +2520,7 @@ fn run_git(
         .args(args)
         .env("LC_ALL", "C")
         .env("GIT_PAGER", "cat")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
@@ -3338,10 +3522,7 @@ mod tests {
         fs::write(root.join("src/untracked.rs"), "fn untracked() {}\n").unwrap();
         fs::write(root.join("src/untracked.py"), "def untracked(): pass\n").unwrap();
 
-        let repository = Repository {
-            root: fs::canonicalize(&root).unwrap(),
-            database: root.join(".git/graphr/index.db"),
-        };
+        let repository = test_repository(&root);
         let cancelled = AtomicBool::new(false);
         let inventory = repository.source_files(&cancelled).unwrap();
         assert_eq!(
@@ -3421,10 +3602,7 @@ mod tests {
         fs::write(root.join("ignored.txt"), "ignored\n").unwrap();
         fs::write(root.join("bad\nname.txt"), "unsafe\n").unwrap();
 
-        let repository = Repository {
-            root: fs::canonicalize(&root).unwrap(),
-            database: root.join(".git/graphr/index.db"),
-        };
+        let repository = test_repository(&root);
         let changes = repository
             .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
             .unwrap();
@@ -3583,10 +3761,7 @@ mod tests {
         fs::write(root.join("blob.bin"), [0, 3, 4]).unwrap();
         fs::write(root.join("large.md"), vec![b'b'; SOURCE_LIMIT as usize + 1]).unwrap();
 
-        let repository = Repository {
-            root: fs::canonicalize(&root).unwrap(),
-            database: root.join(".git/graphr/index.db"),
-        };
+        let repository = test_repository(&root);
         let changes = repository
             .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
             .unwrap();
@@ -3641,12 +3816,9 @@ mod tests {
         );
         fs::write(root.join("forced.dat"), b"new\0value\n").unwrap();
 
-        let changes = Repository {
-            root: fs::canonicalize(&root).unwrap(),
-            database: root.join(".git/graphr/index.db"),
-        }
-        .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
-        .unwrap();
+        let changes = test_repository(&root)
+            .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
+            .unwrap();
         let file = changes.artifacts.file("forced.dat").unwrap();
 
         assert!(!file.diff_complete);
@@ -3682,12 +3854,9 @@ mod tests {
         )
         .unwrap();
 
-        let changes = Repository {
-            root: fs::canonicalize(&root).unwrap(),
-            database: root.join(".git/graphr/index.db"),
-        }
-        .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
-        .unwrap();
+        let changes = test_repository(&root)
+            .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
+            .unwrap();
         let file = changes.artifacts.file("notes.txt").unwrap();
 
         assert!(file.diff_complete);
@@ -3742,12 +3911,9 @@ mod tests {
         test_git(&root, &["update-index", "--add", "--cacheinfo", &cacheinfo]);
         fs::create_dir(root.join("gitlink.rs")).unwrap();
 
-        let changes = Repository {
-            root: fs::canonicalize(&root).unwrap(),
-            database: root.join(".git/graphr/index.db"),
-        }
-        .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
-        .unwrap();
+        let changes = test_repository(&root)
+            .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
+            .unwrap();
 
         for (path, omission) in [
             ("link.rs", ArtifactOmission::NonRegular),
@@ -3789,12 +3955,9 @@ mod tests {
         fs::rename(root.join("old.md"), root.join("new.txt")).unwrap();
         test_git(&root, &["add", "-A"]);
 
-        let changes = Repository {
-            root: fs::canonicalize(&root).unwrap(),
-            database: root.join(".git/graphr/index.db"),
-        }
-        .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
-        .unwrap();
+        let changes = test_repository(&root)
+            .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
+            .unwrap();
 
         assert!(
             changes.artifacts.analysis.contains(
@@ -3831,12 +3994,9 @@ mod tests {
         fs::rename(root.join("old.txt"), root.join("new.md")).unwrap();
         test_git(&root, &["add", "-A"]);
 
-        let changes = Repository {
-            root: fs::canonicalize(&root).unwrap(),
-            database: root.join(".git/graphr/index.db"),
-        }
-        .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
-        .unwrap();
+        let changes = test_repository(&root)
+            .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
+            .unwrap();
 
         assert!(
             changes
@@ -3858,6 +4018,20 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{:?}", output.stderr);
+    }
+
+    fn test_repository(root: &Path) -> Repository {
+        let root = fs::canonicalize(root).unwrap();
+        let git_dir = root.join(".git");
+        Repository {
+            root,
+            common_git_dir: git_dir.clone(),
+            index_path: git_dir.join("index"),
+            git_dir,
+            branch: None,
+            head_oid: OID.into(),
+            object_format: "sha1".into(),
+        }
     }
 
     fn temp_root(label: &str) -> PathBuf {

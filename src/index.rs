@@ -40,7 +40,10 @@ impl Project {
 
     pub fn open_cancelled(path: &Path, cancelled: &AtomicBool) -> Result<Self, String> {
         Ok(Self {
-            repository: Arc::new(Repository::discover_cancelled(path, cancelled)?),
+            repository: Arc::new(
+                Repository::discover_for_project_cancelled(path, cancelled)
+                    .map_err(|error| error.to_string())?,
+            ),
             review_snapshot: Arc::new(Mutex::new(None)),
         })
     }
@@ -55,7 +58,8 @@ impl Project {
         cancelled: Arc<AtomicBool>,
     ) -> Result<String, String> {
         check_cancelled(&cancelled)?;
-        let mut store = Store::open(&self.repository.database, rebuild, &cancelled)?;
+        let database = self.repository.git_dir.join("graphr/index.db");
+        let mut store = Store::open(&database, rebuild, &cancelled)?;
         let (state, changed, skipped) = store.index_with(&cancelled, |full, existing| {
             build_index(&self.repository, &cancelled, full, existing)
         })?;
@@ -74,11 +78,13 @@ impl Project {
             Some("test") => Some(NodeKind::Test),
             Some(_) => return Err("kind must be file, type, function, or test".into()),
         };
-        Store::open_reader(&self.repository.database)?.search(query, kind, limit)
+        Store::open_reader(&self.repository.git_dir.join("graphr/index.db"))?
+            .search(query, kind, limit)
     }
 
     pub fn view(&self, node_ref: &str, depth: u32, max_nodes: u32) -> Result<String, String> {
-        Store::open_reader(&self.repository.database)?.view(node_ref, depth, max_nodes)
+        Store::open_reader(&self.repository.git_dir.join("graphr/index.db"))?
+            .view(node_ref, depth, max_nodes)
     }
 
     pub fn changes_cancelled(
@@ -114,7 +120,7 @@ impl Project {
                 .unwrap_or_else(|error| error.into_inner()) = None;
             return Ok("no changes\n".into());
         }
-        let graph = Store::open_reader(&self.repository.database)?.changes(
+        let graph = Store::open_reader(&self.repository.git_dir.join("graphr/index.db"))?.changes(
             &changes,
             depth,
             max_nodes,

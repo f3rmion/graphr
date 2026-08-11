@@ -5,6 +5,7 @@ mod mcp;
 mod parse;
 mod python;
 mod store;
+pub mod workspace;
 
 use std::env;
 use std::ffi::OsString;
