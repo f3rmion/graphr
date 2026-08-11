@@ -588,11 +588,21 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"changes","arguments":{"depth":6,"max_nodes":50}}}"#,
     );
     let text = response_text(&changed);
+    let mut complete = text.clone();
+    let mut graph_cursor = page_cursor(&text, "graph_next_cursor");
+    let mut continuation_id = 12;
+    while let Some(token) = graph_cursor {
+        let page = changes_page(&mut client, continuation_id, &token);
+        continuation_id += 1;
+        assert!(page.len() <= 8192, "{}", page.len());
+        graph_cursor = page_cursor(&page, "graph_next_cursor");
+        complete.push_str(&page);
+    }
     for expected in [
-        "changed supported src/lib.rs",
-        "deleted supported src/removed.rs",
-        "renamed supported src/moved.rs -> src/renamed.rs",
-        "untracked supported src/untracked.rs",
+        "changed source rust src/lib.rs",
+        "deleted source rust src/removed.rs",
+        "renamed source rust src/moved.rs -> src/renamed.rs",
+        "untracked source rust src/untracked.rs",
         "target",
         "helper",
         "moved_symbol",
@@ -604,18 +614,21 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         "test <-",
         "caller <-",
     ] {
-        assert!(text.contains(expected), "missing {expected}: {changed}");
+        assert!(
+            complete.contains(expected),
+            "missing {expected}: {complete}"
+        );
     }
     assert!(text.contains("+    helper();"), "{changed}");
     assert!(text.contains("@@ -0,0 +1,4 @@"), "{changed}");
     assert!(
-        text.lines().any(|line| {
+        complete.lines().any(|line| {
             line.starts_with("flow ")
                 && line.contains(
                     "first_untracked@src/untracked.rs:1 -> second_untracked@src/untracked.rs:2",
                 )
         }),
-        "{text}"
+        "{complete}"
     );
     assert!(
         text.lines().any(|line| {
@@ -765,10 +778,10 @@ fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
     for expected in [
         "dependency_mode=boundary",
         "dependency-boundary root=.cargo/vendor packages=2 files=5 path_digest=",
-        "dependency-package name=cpufeatures files=3 supported_sources=1 checksum_files=1",
-        "dependency-package name=sha2 files=2 supported_sources=1 checksum_files=1",
-        "changed supported .cargo/vendor/build.rs status=modified",
-        "untracked supported src/canonical.rs",
+        "dependency-package name=cpufeatures files=3 source_files=1 checksum_files=1",
+        "dependency-package name=sha2 files=2 source_files=1 checksum_files=1",
+        "changed source rust .cargo/vendor/build.rs status=modified",
+        "untracked source rust src/canonical.rs",
         "diff --git a/.cargo/vendor/build.rs b/.cargo/vendor/build.rs",
         "diff --git a/src/canonical.rs b/src/canonical.rs",
         "dependency_analysis=collapsed",
@@ -804,9 +817,9 @@ fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
     ));
     for expected in [
         "dependency_mode=full",
-        "changed supported .cargo/vendor/sha2/src/lib.rs status=modified",
+        "changed source rust .cargo/vendor/sha2/src/lib.rs status=modified",
         "diff --git a/.cargo/vendor/sha2/src/lib.rs b/.cargo/vendor/sha2/src/lib.rs",
-        "untracked supported .cargo/vendor/cpufeatures/src/lib.rs",
+        "untracked source rust .cargo/vendor/cpufeatures/src/lib.rs",
         "diff --git a/.cargo/vendor/cpufeatures/src/lib.rs b/.cargo/vendor/cpufeatures/src/lib.rs",
         "dependency_analysis=full",
     ] {
@@ -838,6 +851,12 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         review_fixture_source(false),
     )
     .unwrap();
+    fs::write(
+        fixture.path.join("README.md"),
+        "# Review\n\nREQ-1\n\n[Old spec](specs/old.md)\n\n```rust\nfn old() {}\n```\n",
+    )
+    .unwrap();
+    fs::write(fixture.path.join("settings.toml"), "old=true\n").unwrap();
     init_git(&fixture.path);
     git(&fixture.path, &["add", "--", "."]);
     git(
@@ -857,31 +876,51 @@ fn changes_pages_complete_inventory_diff_and_flows() {
 
     fs::write(fixture.path.join("src/lib.rs"), review_fixture_source(true)).unwrap();
     fs::write(
-        fixture.path.join("tests/fixtures/alias-registry.v1.tsv"),
-        "one\ntwo\nthree\n",
+        fixture.path.join("README.md"),
+        "# Review\n\nREQ-2\n\n[New spec](specs/new.md)\n\n```rust\nfn new() {}\n```\n",
     )
     .unwrap();
+    fs::write(fixture.path.join("settings.toml"), "old=false\n").unwrap();
+    let tsv = format!(
+        "id\tvalue\n{}last\tLAST_ARTIFACT_SENTINEL\n",
+        (0..48)
+            .map(|index| format!("row-{index}\t{}\n", "value".repeat(16)))
+            .collect::<String>()
+    );
+    fs::write(
+        fixture.path.join("tests/fixtures/alias-registry.v1.tsv"),
+        tsv,
+    )
+    .unwrap();
+    fs::write(fixture.path.join("image.bin"), b"image\0binary\n").unwrap();
     fs::write(fixture.path.join("tests/fixtures/ignored.txt"), "ignored\n").unwrap();
     index_repository(&fixture.path, false);
 
     let mut client = Client::start(&fixture.path);
-    let _ = client.request(
+    let initialized = client.request(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
+    );
+    assert!(
+        initialized.contains("artifacts_next_cursor"),
+        "{initialized}"
     );
     client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
     let initial = response_text(&client.request(
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{"depth":6,"max_nodes":50}}}"#,
     ));
     for expected in [
-        "changed supported src/lib.rs status=modified additions=14 deletions=14",
-        "untracked unsupported tests/fixtures/alias-registry.v1.tsv additions=3 deletions=0",
+        "changed source rust src/lib.rs",
+        "changed artifact text README.md analyzer=markdown",
+        "changed artifact text settings.toml analyzer=generic",
+        "untracked artifact text tests/fixtures/alias-registry.v1.tsv analyzer=tsv",
+        "untracked artifact omitted image.bin analyzer=generic reason=binary",
+        "markdown path=\"README.md\"",
+        "artifacts_next_cursor=",
+        "review_complete_when_pages_exhausted=false",
         "total_hunks=14",
-        "all_path_hunks=15",
-        "all_path_additions=17 all_path_deletions=14",
         "changed_symbols_total=14",
         "flows_total=3",
         "review_complete=false",
-        "review_complete_when_pages_exhausted=false",
     ] {
         assert!(initial.contains(expected), "missing {expected}: {initial}");
     }
@@ -911,6 +950,18 @@ fn changes_pages_complete_inventory_diff_and_flows() {
             "remaining_discovered_flows",
         ],
         "graph_next_cursor",
+    );
+    let artifact_totals = assert_page_accounting(
+        &initial,
+        "artifacts",
+        [
+            "emitted_records",
+            "partial_records",
+            "total_records",
+            "prior_records",
+            "remaining_records",
+        ],
+        "artifacts_next_cursor",
     );
     assert_eq!(page_metric(&initial, "graph", "total_flows"), 3);
 
@@ -971,6 +1022,40 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         14,
         "{diff_pages}"
     );
+
+    let mut artifact_pages = initial.clone();
+    let mut cursor = page_cursor(&initial, "artifacts_next_cursor");
+    while let Some(token) = cursor {
+        let page = changes_page(&mut client, next_id, &token);
+        next_id += 1;
+        assert!(page.len() <= 8192, "{}", page.len());
+        assert!(page.starts_with("artifacts\n"), "{page}");
+        assert!(
+            page.contains("review_complete_when_pages_exhausted=false"),
+            "{page}"
+        );
+        assert_eq!(
+            assert_page_accounting(
+                &page,
+                "artifacts",
+                [
+                    "emitted_records",
+                    "partial_records",
+                    "total_records",
+                    "prior_records",
+                    "remaining_records",
+                ],
+                "artifacts_next_cursor",
+            ),
+            artifact_totals
+        );
+        cursor = page_cursor(&page, "artifacts_next_cursor");
+        artifact_pages.push_str(&page);
+    }
+    assert!(artifact_pages.contains("key_basis=first-column"));
+    assert!(artifact_pages.contains("LAST_ARTIFACT_SENTINEL"));
+    assert!(artifact_pages.contains("diff --git a/README.md b/README.md"));
+    assert!(artifact_pages.contains("diff --git a/settings.toml b/settings.toml"));
 
     let mut graph_pages = initial.clone();
     let mut cursor = page_cursor(&initial, "graph_next_cursor");

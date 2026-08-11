@@ -20,14 +20,14 @@ claude mcp add --scope project graphr -- graphr serve /absolute/repository
 
 Graphr detects Rust and Python sources automatically and exposes four MCP tools:
 
-- `index` reparses only dirty, untracked, or Git-OID-changed files.
+- `index` reparses only dirty, untracked, or Git-OID-changed Rust and Python files.
 - `search` finds symbols and returns compact `node_ref` values.
 - `view` traverses callers, callees, and related tests up to six graph hops.
-- `changes` returns bounded 8 KiB review pages with every safe changed path, a count of skipped unsafe paths, tracked and untracked supported-source diffs, risk-ranked changed symbols, affected static execution paths, and graph impact. `.cargo/vendor` changes collapse to deterministic package boundaries by default; pass `dependency_mode="full"` to inspect dependency internals.
+- `changes` returns bounded 8 KiB review pages with every changed path, Rust and Python source diffs, bounded non-source text diffs, Markdown/TSV semantics, explicit artifact omissions, risk-ranked changed symbols, affected static execution paths, and graph impact. `.cargo/vendor` changes collapse to deterministic package boundaries by default; pass `dependency_mode="full"` to inspect dependency internals.
 
 Affected-flow discovery follows `CALLS` edges up to 15 hops. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale; community and churn factors are not used.
 
-The server indexes when it starts. Run `index` after source changes. For reviews, start with `changes` and pass every returned `files_next_cursor`, `diff_next_cursor`, and `graph_next_cursor` back as `cursor` with the same arguments until each section is complete. `max_nodes` bounds graph records per page rather than the immutable snapshot, so graph cursors continue larger neighborhoods and changed-symbol inventories. Non-symbol source ranges map to their indexed file node and are reported as `file-mapped`; truly unresolved coverage is categorized with an explicit remediation. `review_complete_when_pages_exhausted` reports Graphr-native completeness after all cursors; a review workflow may separately resolve unsupported paths with a bounded fallback.
+The server indexes when it starts. Run `index` only after Rust or Python source edits made in the current session. For reviews, call `changes` once without a cursor, then pass every returned `files_next_cursor`, `diff_next_cursor`, `artifacts_next_cursor`, and `graph_next_cursor` back verbatim as `cursor` with the same arguments until each section is complete. Artifact text and semantics belong to that immutable snapshot. `max_nodes` changes graph page size, never snapshot coverage. Non-symbol source ranges map to their indexed file node and are reported as `file-mapped`; targeted `search` or `view` remediation is named for unresolved graph coverage. Binary, oversized, unsafe, non-regular, type-changed, unmerged, and other explicit artifact omissions keep `review_complete_when_pages_exhausted=false`. This is complete artifact coverage; Rust and Python remain the only indexed source languages.
 
 Rename detection is limited to supported regular Rust and Python sources. Unsupported renames are conservatively listed as separate additions and deletions.
 
@@ -39,7 +39,7 @@ Install the skill globally by entering this prompt in Codex:
 $skill-installer Install the graphr-review skill from https://github.com/f3rmion/graphr/tree/main/.agents/skills/graphr-review
 ```
 
-The skill selects the review base, exhausts the bounded `changes` continuation pages, permits one targeted fallback for explicit coverage gaps, and keeps the final review under 220 words.
+The skill selects the review base, exhausts every bounded `changes` continuation page, follows targeted graph remediation, and keeps the final review under 220 words.
 
 ## Token benchmark
 
