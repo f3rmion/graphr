@@ -2446,6 +2446,9 @@ mod tests {
     use super::*;
     use crate::artifact::AnalyzerKind;
     use crate::git::{ArtifactFile, ArtifactOmission, ArtifactReview};
+    use crate::workspace::{AllowedRoots, ErrorCode};
+    use std::fs;
+    use std::process::Command;
 
     fn complete_artifact(path: &str, analyzer: AnalyzerKind) -> ArtifactFile {
         ArtifactFile {
@@ -2455,6 +2458,47 @@ mod tests {
             analysis_complete: true,
             omission: None,
         }
+    }
+
+    #[test]
+    fn legacy_project_accepts_subdirectory_while_workspace_rejects_it() {
+        let root = std::env::temp_dir().join(format!(
+            "graphr-index-subdirectory-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "user.name", "Graphr Test"]);
+        test_git(&root, &["config", "user.email", "graphr@example.invalid"]);
+        fs::write(root.join("baseline.txt"), "baseline\n").unwrap();
+        test_git(&root, &["add", "--", "baseline.txt"]);
+        test_git(&root, &["commit", "--quiet", "-m", "baseline"]);
+
+        assert!(Project::open(&nested).is_ok());
+        assert_eq!(
+            AllowedRoots::new(vec![root.clone()])
+                .unwrap()
+                .inspect(&nested, &AtomicBool::new(false))
+                .unwrap_err()
+                .code,
+            ErrorCode::RootNotWorktree
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
     }
 
     #[test]

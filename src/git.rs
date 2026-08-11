@@ -265,7 +265,7 @@ impl Repository {
     fn discover(
         path: &Path,
         cancelled: &AtomicBool,
-        allow_unborn_head: bool,
+        legacy_project: bool,
     ) -> Result<Self, OperationError> {
         validate_discovery_path(path)?;
         let path = fs::canonicalize(path).map_err(|_| {
@@ -293,7 +293,7 @@ impl Repository {
         let root = fs::canonicalize(root).map_err(|_| {
             OperationError::new(ErrorCode::GitMetadataInvalid, "cannot resolve Git root")
         })?;
-        if path != root {
+        if path != root && !legacy_project {
             return Err(OperationError::new(
                 ErrorCode::RootNotWorktree,
                 "requested root is not a Git worktree root",
@@ -405,7 +405,7 @@ impl Repository {
             cancelled,
         ) {
             Ok(output) => parse_value(&output).map_err(git_metadata_error)?,
-            Err(error) if allow_unborn_head && error.contains("Needed a single revision") => {
+            Err(error) if legacy_project && error.contains("Needed a single revision") => {
                 String::new()
             }
             Err(error) if error.contains("cancelled") => {
