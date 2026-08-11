@@ -538,7 +538,7 @@ fn flatten_use(
                     paths.push(binding);
                 }
             }
-            "use_wildcard" => {}
+            "use_wildcard" => paths.push(join_use(&prefix, text(node, source))?),
             "self" if !prefix.is_empty() => paths.push(prefix),
             _ => paths.push(join_use(&prefix, text(node, source))?),
         }
@@ -840,6 +840,32 @@ fn detached() {}
         assert_eq!(
             RustParser::new().unwrap().parse(&source).unwrap_err(),
             "Rust import path exceeds 1024 bytes"
+        );
+    }
+
+    #[test]
+    fn retains_module_and_block_wildcard_import_paths() {
+        let parsed = RustParser::new()
+            .unwrap()
+            .parse(
+                r#"
+mod tests {
+    use super::*;
+    fn check() {
+        use crate::support::*;
+    }
+}
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            parsed
+                .imports
+                .iter()
+                .map(|import| (import.path.as_str(), import.block_local))
+                .collect::<Vec<_>>(),
+            [("super::*", false), ("crate::support::*", true)]
         );
     }
 
