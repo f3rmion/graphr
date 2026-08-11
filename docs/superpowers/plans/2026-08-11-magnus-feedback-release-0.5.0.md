@@ -430,7 +430,7 @@ and `superpowers:verification-before-completion` before any success claim.
 Resolve the plan commit as the review base:
 
 ```text
-git log -1 --format=%H -- docs/superpowers/plans/2026-08-11-magnus-feedback-release-0.5.0.md
+git log --diff-filter=A -1 --format=%H -- docs/superpowers/plans/2026-08-11-magnus-feedback-release-0.5.0.md
 ```
 
 Invoke `$graphr-review` on the current branch using that commit as `base`.
