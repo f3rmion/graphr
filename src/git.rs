@@ -2843,32 +2843,23 @@ mod tests {
     }
 
     #[test]
-    fn untracked_capture_has_no_fallback_file_cap() {
-        let root = temp_root("untracked-patch-sample");
+    fn untracked_artifacts_have_no_fallback_sampling_caps() {
+        const FILE_SIZE: usize = 8_193;
+        const FILE_COUNT: usize = 257;
+
+        let root = temp_root("untracked-artifact-caps");
         fs::create_dir_all(&root).unwrap();
-        assert!(
-            Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        fs::write(root.join(".gitattributes"), "*.rs filter=replace\n").unwrap();
-        assert!(
-            Command::new("git")
-                .args(["config", "filter.replace.clean", "sh -c 'printf FILTERED'",])
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success()
-        );
+        test_git(&root, &["init", "--quiet"]);
+        assert!(FILE_COUNT * FILE_SIZE > SOURCE_LIMIT as usize);
         let mut input = Vec::new();
-        fs::write(root.join("empty.rs"), "").unwrap();
-        input.extend_from_slice(b"empty.rs\0");
-        for index in 0..=256 {
-            let path = format!("file-{index:03}.rs");
-            fs::write(root.join(&path), format!("fn value_{index}() {{}}\n")).unwrap();
+        for index in 0..FILE_COUNT {
+            let path = format!("file-{index:03}.txt");
+            let mut content = vec![b'x'; FILE_SIZE];
+            content[FILE_SIZE - 1] = b'\n';
+            if index == FILE_COUNT - 1 {
+                content[..9].copy_from_slice(b"FINAL-256");
+            }
+            fs::write(root.join(&path), content).unwrap();
             input.extend_from_slice(path.as_bytes());
             input.push(0);
         }
@@ -2882,15 +2873,60 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(snapshot.paths.len(), 258);
-        assert_eq!(snapshot.paths[0].additions, Some(0));
+        assert_eq!(snapshot.paths.len(), FILE_COUNT);
+        assert!(snapshot.source_patch.is_empty());
         assert_eq!(snapshot.paths.last().unwrap().additions, Some(1));
-        let patch = String::from_utf8_lossy(&snapshot.source_patch);
-        assert!(!patch.contains("FILTERED"));
-        assert!(!patch.lines().any(|line| line.starts_with("index ")));
-        assert!(patch.contains("diff --git a/empty.rs b/empty.rs"));
-        assert!(patch.contains("diff --git a/file-256.rs b/file-256.rs"));
-        assert!(patch.contains("+fn value_256() {}"));
+        assert_eq!(snapshot.paths.last().unwrap().deletions, Some(0));
+        assert!(
+            snapshot
+                .artifacts
+                .file("file-256.txt")
+                .is_some_and(|file| file.diff_complete && file.analysis_complete)
+        );
+        assert!(
+            snapshot
+                .artifacts
+                .patch
+                .contains("diff --git a/file-256.txt b/file-256.txt")
+        );
+        assert!(snapshot.artifacts.patch.contains("+FINAL-256"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn untracked_artifact_per_file_limit_is_inclusive() {
+        let root = temp_root("untracked-artifact-limit");
+        fs::create_dir_all(&root).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        fs::write(root.join("at-limit.txt"), vec![b'x'; SOURCE_LIMIT as usize]).unwrap();
+        fs::write(
+            root.join("over-limit.txt"),
+            vec![b'x'; SOURCE_LIMIT as usize + 1],
+        )
+        .unwrap();
+
+        let snapshot = capture_untracked(
+            &root,
+            b"at-limit.txt\0over-limit.txt\0",
+            DependencyMode::Boundary,
+            true,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.paths[0].additions, Some(1));
+        assert_eq!(snapshot.paths[0].deletions, Some(0));
+        let at_limit = snapshot.artifacts.file("at-limit.txt").unwrap();
+        assert!(at_limit.diff_complete);
+        assert!(at_limit.analysis_complete);
+        assert_eq!(at_limit.omission, None);
+        assert!(snapshot.artifacts.patch.contains("at-limit.txt"));
+        assert_eq!(
+            snapshot.artifacts.file("over-limit.txt").unwrap().omission,
+            Some(ArtifactOmission::Oversized)
+        );
+        assert_eq!(snapshot.paths[1].additions, None);
+        assert_eq!(snapshot.paths[1].deletions, None);
         fs::remove_dir_all(root).unwrap();
     }
 
