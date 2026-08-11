@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -154,6 +155,7 @@ pub struct Graph {
     pub edges: Vec<EdgeInput>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct State {
     pub epoch: String,
     pub generation: i64,
@@ -233,6 +235,59 @@ impl Store {
             connection,
             rebuild: false,
         })
+    }
+
+    #[allow(dead_code)] // Task 4 switches publication to sealed images.
+    pub fn seal(self, cancelled: &AtomicBool) -> Result<State> {
+        check_cancelled(cancelled)?;
+        if !self.connection.is_autocommit() {
+            return Err("database has uncommitted work".into());
+        }
+        let state = read_state_cancelled(&self.connection, cancelled)?;
+        let (busy, _, _): (i64, i64, i64) = retry_sqlite(cancelled, || {
+            self.connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+        })?;
+        if busy != 0 {
+            return Err("database WAL checkpoint is busy".into());
+        }
+        retry_sqlite(cancelled, || {
+            self.connection.execute_batch(
+                "PRAGMA journal_mode=DELETE;
+                 PRAGMA synchronous=FULL;",
+            )
+        })?;
+        let mode: String = self
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(db_error)?;
+        if mode != "delete" {
+            return Err("database did not leave WAL mode".into());
+        }
+        require_integrity(&self.connection)?;
+        check_cancelled(cancelled)?;
+        let path = self
+            .connection
+            .path()
+            .map(PathBuf::from)
+            .ok_or_else(|| "database has no filesystem path".to_owned())?;
+        self.connection
+            .close()
+            .map_err(|(_, error)| format!("cannot close database: {error}"))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| format!("cannot open sealed database: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("cannot sync sealed database: {error}"))?;
+        let wal = sqlite_sidecar(&path, "-wal");
+        if fs::metadata(&wal).is_ok_and(|metadata| metadata.len() != 0) {
+            return Err("sealed database still has WAL content".into());
+        }
+        Ok(state)
     }
 
     pub fn index_with<T>(
@@ -721,6 +776,50 @@ impl Store {
         );
         Ok(lines.concat())
     }
+}
+
+#[allow(dead_code)] // Task 4 validates images while loading the snapshot catalog.
+pub fn validate_image(path: &Path) -> Result<State> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect database {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err("database image is not a regular file".into());
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let connection = Connection::open_with_flags(path, flags)
+        .map_err(|error| format!("cannot open database {}: {error}", path.display()))?;
+    connection.busy_timeout(Duration::ZERO).map_err(db_error)?;
+    verify_sqlite()?;
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(db_error)?;
+    if version != SCHEMA_VERSION {
+        return Err("database schema mismatch; run index --rebuild".into());
+    }
+    let state = read_state(&connection)?;
+    require_integrity(&connection)?;
+    Ok(state)
+}
+
+#[allow(dead_code)]
+fn require_integrity(connection: &Connection) -> Result<()> {
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(db_error)?;
+    if integrity == "ok" {
+        Ok(())
+    } else {
+        Err("database integrity check failed".into())
+    }
+}
+
+#[allow(dead_code)]
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 impl NodeKind {
@@ -3280,6 +3379,43 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sealed_image_is_single_file_and_read_only() {
+        let root = std::env::temp_dir().join(format!(
+            "graphr-sealed-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store::open(&path, false, &cancelled).unwrap();
+        let (indexed, _, ()) = store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((single_node_graph("sealed"), ()))
+            })
+            .unwrap();
+
+        let sealed = store.seal(&cancelled).unwrap();
+
+        assert_eq!(sealed, indexed);
+        assert_eq!(validate_image(&path).unwrap(), indexed);
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            [std::ffi::OsString::from("graph.db")]
+        );
+        let reader = Store::open_reader(&path).unwrap();
+        assert!(reader.connection.execute("DELETE FROM state", []).is_err());
+        drop(reader);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn literal_queries_do_not_expose_fts_syntax() {

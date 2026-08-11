@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
@@ -12,12 +12,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::artifact::{AnalyzerKind, analyze, analyzer_kind};
-use crate::workspace::{ErrorCode, OperationError};
+use crate::workspace::{ErrorCode, OperationError, SnapshotTarget};
 
 const STDOUT_LIMIT: usize = 64 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(30);
 const SOURCE_LIMIT: u64 = 2 * 1024 * 1024;
+const OVERSIZED_BLOB: &str = "Git blob exceeds the source size limit";
 
 pub struct Repository {
     pub root: PathBuf,
@@ -78,16 +79,62 @@ impl Language {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub struct SourceFile {
-    pub path: String,
-    pub git_oid: Option<String>,
-    pub language: Language,
+pub enum SourceContent {
+    GitBlob(String),
+    Captured {
+        relative_path: PathBuf,
+        digest: [u8; 32],
+    },
 }
 
-pub struct SourceFiles {
-    pub files: Vec<SourceFile>,
+pub struct CapturedSource {
+    pub path: String,
+    pub language: Language,
+    pub git_oid: Option<String>,
+    pub content_key: String,
+    pub parse_context: String,
+    pub content: SourceContent,
+}
+
+pub struct SourceSnapshot {
+    pub capture_root: PathBuf,
+    pub files: Vec<CapturedSource>,
     pub skipped: usize,
+}
+
+pub(crate) struct BlobReader {
+    child: Option<Child>,
+    input: Option<BufWriter<ChildStdin>>,
+    responses: mpsc::Receiver<Result<BlobResponse, String>>,
+    response_thread: Option<thread::JoinHandle<()>>,
+    stderr_thread: Option<thread::JoinHandle<Result<Vec<u8>, String>>>,
+    overflow: mpsc::Receiver<()>,
+}
+
+struct BlobResponse {
+    oid: String,
+    content: Vec<u8>,
+}
+
+struct TargetInventory {
+    sources: BTreeMap<String, (Language, InventoryContent)>,
+    cargo_manifests: BTreeSet<String>,
+    unmerged_paths: BTreeSet<String>,
+    skipped: usize,
+}
+
+enum InventoryContent {
+    GitBlob(String),
+    Captured {
+        relative_path: PathBuf,
+        digest: [u8; 32],
+    },
+}
+
+#[derive(Clone, Copy)]
+enum InventoryKind {
+    Source(Language),
+    CargoManifest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -392,6 +439,7 @@ impl Repository {
             false,
             Instant::now() + DEADLINE,
             STDOUT_LIMIT,
+            None,
             cancelled,
         )
         .map_err(git_metadata_error)?;
@@ -439,46 +487,100 @@ impl Repository {
         })
     }
 
-    pub fn source_files(&self, cancelled: &AtomicBool) -> Result<SourceFiles, String> {
-        let output = run(
-            &self.root,
-            &[
-                "ls-files",
-                "--cached",
-                "--modified",
-                "--deleted",
-                "--others",
-                "--stage",
-                "-v",
-                "-z",
-                "--exclude-standard",
-                "--",
-                "*.rs",
-                "*.py",
-            ],
-            cancelled,
-        )?;
-        check_cancelled(cancelled)?;
-        let mut inventory = parse_source_files(&output)?;
-        let mut files = Vec::with_capacity(inventory.files.len());
-        for source in inventory.files {
-            check_cancelled(cancelled)?;
-            let candidate = self.root.join(&source.path);
-            match fs::symlink_metadata(&candidate) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => inventory.skipped += 1,
-                Ok(metadata)
-                    if metadata.is_file()
-                        && metadata.len() <= SOURCE_LIMIT
-                        && fs::canonicalize(&candidate).is_ok_and(|path| path == candidate) =>
-                {
-                    files.push(source);
-                }
-                Ok(_) => inventory.skipped += 1,
-            }
+    pub fn capture_sources(
+        &self,
+        head_oid: &str,
+        target: &SnapshotTarget,
+        capture_root: &Path,
+        cancelled: &AtomicBool,
+    ) -> Result<SourceSnapshot, OperationError> {
+        validate_capture_root(capture_root)?;
+        if matches!(target, SnapshotTarget::Commit) && !valid_lower_oid(head_oid.as_bytes()) {
+            return Err(OperationError::new(
+                ErrorCode::InvalidParameters,
+                "head object ID is invalid",
+            ));
         }
-        inventory.files = files;
-        Ok(inventory)
+        let inventory = match target {
+            SnapshotTarget::Commit => {
+                let output = run(
+                    &self.root,
+                    &["ls-tree", "-r", "-z", "--full-tree", head_oid],
+                    cancelled,
+                )
+                .map_err(capture_error)?;
+                parse_tree_inventory(&output).map_err(capture_error)?
+            }
+            SnapshotTarget::Index | SnapshotTarget::Worktree { .. } => {
+                let copied_index = capture_index(
+                    &self.index_path,
+                    capture_root,
+                    self.head_oid.is_empty(),
+                    cancelled,
+                )?;
+                let output = run_with_index(
+                    &self.root,
+                    &["ls-files", "--stage", "-z"],
+                    &copied_index,
+                    cancelled,
+                )
+                .map_err(capture_error)?;
+                let mut inventory = parse_index_inventory(&output).map_err(capture_error)?;
+                if let SnapshotTarget::Worktree { include_untracked } = target {
+                    overlay_worktree(
+                        self,
+                        &copied_index,
+                        *include_untracked,
+                        capture_root,
+                        &mut inventory,
+                        cancelled,
+                    )?;
+                }
+                inventory
+            }
+        };
+
+        let mut files = inventory
+            .sources
+            .into_iter()
+            .map(|(path, (language, content))| {
+                let (git_oid, content_key, content) = match content {
+                    InventoryContent::GitBlob(oid) => {
+                        (Some(oid.clone()), oid.clone(), SourceContent::GitBlob(oid))
+                    }
+                    InventoryContent::Captured {
+                        relative_path,
+                        digest,
+                    } => (
+                        None,
+                        blake3::Hash::from_bytes(digest).to_hex().to_string(),
+                        SourceContent::Captured {
+                            relative_path,
+                            digest,
+                        },
+                    ),
+                };
+                CapturedSource {
+                    path,
+                    language,
+                    git_oid,
+                    content_key,
+                    parse_context: String::new(),
+                    content,
+                }
+            })
+            .collect::<Vec<_>>();
+        crate::index::assign_parse_contexts(&mut files, &inventory.cargo_manifests);
+        debug_assert!(files.windows(2).all(|pair| pair[0].path < pair[1].path));
+        Ok(SourceSnapshot {
+            capture_root: capture_root.to_owned(),
+            files,
+            skipped: inventory.skipped,
+        })
+    }
+
+    pub(crate) fn blob_reader(&self) -> Result<BlobReader, String> {
+        BlobReader::spawn(&self.root)
     }
 
     pub fn worktree_changes(
@@ -487,7 +589,7 @@ impl Repository {
         dependency_mode: DependencyMode,
         cancelled: &AtomicBool,
     ) -> Result<WorktreeChanges, String> {
-        validate_base(base)?;
+        validate_revision(base)?;
         let revision = format!("{base}^{{commit}}");
         let capture = |include_untracked_patch| {
             thread::scope(|scope| {
@@ -623,27 +725,363 @@ impl Repository {
             cancelled,
         )
     }
+}
 
-    pub fn read_source(
-        &self,
-        source: &SourceFile,
+impl BlobReader {
+    fn spawn(root: &Path) -> Result<Self, String> {
+        let mut command = git_command(root, false, None);
+        command
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot start Git blob reader: {error}"))?;
+        let input = BufWriter::new(child.stdin.take().expect("piped stdin"));
+        let output = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (response_tx, responses) = mpsc::channel();
+        let response_thread = thread::spawn(move || {
+            let mut output = BufReader::new(output);
+            loop {
+                let response = read_blob_response(&mut output);
+                let stop = response.is_err();
+                if response_tx.send(response).is_err() || stop {
+                    break;
+                }
+            }
+        });
+        let (overflow_tx, overflow) = mpsc::channel();
+        let stderr_thread = thread::spawn(move || {
+            read_capped(stderr, STDERR_LIMIT, overflow_tx).map_err(|error| error.to_string())
+        });
+        Ok(Self {
+            child: Some(child),
+            input: Some(input),
+            responses,
+            response_thread: Some(response_thread),
+            stderr_thread: Some(stderr_thread),
+            overflow,
+        })
+    }
+
+    pub(crate) fn read(
+        &mut self,
+        oid: &str,
         cancelled: &AtomicBool,
-    ) -> Result<Option<Source>, String> {
-        check_cancelled(cancelled)?;
-        if language_for_path(&source.path) != Some(source.language) {
-            return Ok(None);
+    ) -> Result<Option<Vec<u8>>, String> {
+        if !valid_lower_oid(oid.as_bytes()) {
+            return Err("invalid Git blob object ID".into());
         }
-        let Some(content) = read_regular_file(&self.root, &source.path, SOURCE_LIMIT, cancelled)?
-        else {
-            return Ok(None);
+        check_cancelled(cancelled)?;
+        let result = (|| {
+            let input = self
+                .input
+                .as_mut()
+                .ok_or_else(|| "Git blob reader is closed".to_owned())?;
+            input
+                .write_all(oid.as_bytes())
+                .and_then(|()| input.write_all(b"\n"))
+                .and_then(|()| input.flush())
+                .map_err(|error| format!("cannot request Git blob: {error}"))?;
+            let deadline = Instant::now() + DEADLINE;
+            loop {
+                check_cancelled(cancelled)?;
+                if self.overflow.try_recv().is_ok() {
+                    return Err("Git output exceeded its limit".into());
+                }
+                if Instant::now() >= deadline {
+                    return Err("Git blob read timed out".into());
+                }
+                match self.responses.recv_timeout(Duration::from_millis(5)) {
+                    Ok(Ok(response)) if response.oid == oid => return Ok(Some(response.content)),
+                    Ok(Ok(_)) => return Err("Git returned the wrong blob object ID".into()),
+                    Ok(Err(error)) if error == OVERSIZED_BLOB => return Ok(None),
+                    Ok(Err(error)) => return Err(error),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err("Git blob reader stopped".into());
+                    }
+                }
+            }
+        })();
+        if !matches!(result, Ok(Some(_))) {
+            self.shutdown();
+        }
+        result
+    }
+
+    fn shutdown(&mut self) {
+        self.input.take();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(handle) = self.response_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for BlobReader {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn read_blob_response(output: &mut impl Read) -> Result<BlobResponse, String> {
+    const HEADER_LIMIT: usize = 256;
+    let mut header = Vec::with_capacity(64);
+    loop {
+        let mut byte = [0];
+        output
+            .read_exact(&mut byte)
+            .map_err(|error| format!("cannot read Git blob header: {error}"))?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        if header.len() == HEADER_LIMIT {
+            return Err("Git blob header exceeded its limit".into());
+        }
+        header.push(byte[0]);
+    }
+    let fields = std::str::from_utf8(&header)
+        .map_err(|_| "Git returned a malformed blob header".to_owned())?
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>();
+    if fields.len() != 3 || !valid_lower_oid(fields[0].as_bytes()) || fields[1] != "blob" {
+        return Err("Git returned a malformed blob header".into());
+    }
+    let length = fields[2]
+        .parse::<u64>()
+        .ok()
+        .filter(|length| *length <= SOURCE_LIMIT)
+        .ok_or_else(|| OVERSIZED_BLOB.to_owned())?;
+    let mut content = vec![0; length as usize];
+    output
+        .read_exact(&mut content)
+        .map_err(|error| format!("cannot read Git blob: {error}"))?;
+    let mut delimiter = [0];
+    output
+        .read_exact(&mut delimiter)
+        .map_err(|error| format!("cannot read Git blob delimiter: {error}"))?;
+    if delimiter != *b"\n" {
+        return Err("Git returned a malformed blob delimiter".into());
+    }
+    Ok(BlobResponse {
+        oid: fields[0].to_owned(),
+        content,
+    })
+}
+
+pub(crate) fn read_captured_source(
+    capture_root: &Path,
+    relative_path: &Path,
+    digest: &[u8; 32],
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    if relative_path.is_absolute()
+        || !relative_path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err("captured source path is unsafe".into());
+    }
+    let path = relative_path
+        .to_str()
+        .ok_or_else(|| "captured source path is not valid UTF-8".to_owned())?;
+    let content = read_regular_file(capture_root, path, SOURCE_LIMIT, cancelled)?
+        .ok_or_else(|| "captured source is missing or invalid".to_owned())?;
+    if blake3::hash(&content).as_bytes() != digest {
+        return Err("captured source digest mismatch".into());
+    }
+    Ok(content)
+}
+
+fn validate_capture_root(path: &Path) -> Result<(), OperationError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        OperationError::new(
+            ErrorCode::InvalidParameters,
+            "capture directory does not exist",
+        )
+        .with_path("capture_root", path)
+    })?;
+    if !path.is_absolute()
+        || !metadata.is_dir()
+        || metadata.mode() & 0o077 != 0
+        || fs::canonicalize(path).ok().as_deref() != Some(path)
+    {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "capture directory is not a private canonical directory",
+        )
+        .with_path("capture_root", path));
+    }
+    Ok(())
+}
+
+fn capture_index(
+    index_path: &Path,
+    capture_root: &Path,
+    allow_missing: bool,
+    cancelled: &AtomicBool,
+) -> Result<PathBuf, OperationError> {
+    let parent = index_path.parent().ok_or_else(|| {
+        OperationError::new(ErrorCode::GitMetadataInvalid, "Git index has no parent")
+    })?;
+    let name = index_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            OperationError::new(ErrorCode::GitMetadataInvalid, "Git index name is invalid")
+        })?;
+    let destination = capture_root.join("index");
+    let content = match read_regular_file(parent, name, STDOUT_LIMIT as u64, cancelled)
+        .map_err(capture_error)?
+    {
+        Some(content) => content,
+        None if allow_missing && !index_path.exists() => return Ok(destination),
+        None => {
+            return Err(OperationError::new(
+                ErrorCode::CaptureChanged,
+                "Git index cannot be captured",
+            ));
+        }
+    };
+    write_private_file(&destination, &content).map_err(capture_error)?;
+    Ok(destination)
+}
+
+fn overlay_worktree(
+    repository: &Repository,
+    copied_index: &Path,
+    include_untracked: bool,
+    capture_root: &Path,
+    inventory: &mut TargetInventory,
+    cancelled: &AtomicBool,
+) -> Result<(), OperationError> {
+    let dirty = run_with_index(
+        &repository.root,
+        &["ls-files", "--modified", "--deleted", "-z"],
+        copied_index,
+        cancelled,
+    )
+    .map_err(capture_error)?;
+    let (dirty, dirty_skipped) = parse_inventory_paths(&dirty).map_err(capture_error)?;
+    inventory.skipped += dirty_skipped;
+    let untracked = if include_untracked {
+        let (paths, skipped) = parse_inventory_paths(
+            &run_with_index(
+                &repository.root,
+                &["ls-files", "--others", "--exclude-standard", "-z"],
+                copied_index,
+                cancelled,
+            )
+            .map_err(capture_error)?,
+        )
+        .map_err(capture_error)?;
+        inventory.skipped += skipped;
+        paths
+    } else {
+        BTreeSet::new()
+    };
+    let selected = dirty
+        .iter()
+        .chain(untracked.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let capture_directory = capture_root.join("sources");
+    if selected
+        .iter()
+        .any(|path| language_for_path(path).is_some())
+    {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&capture_directory)
+            .map_err(|error| capture_error(format!("cannot create capture directory: {error}")))?;
+    }
+    for (ordinal, path) in selected.iter().enumerate() {
+        check_cancelled(cancelled).map_err(capture_error)?;
+        if inventory.unmerged_paths.contains(path) {
+            continue;
+        }
+        let Some(kind) = inventory_kind(path) else {
+            continue;
         };
-        let Ok(text) = String::from_utf8(content) else {
-            return Ok(None);
-        };
-        Ok(Some(Source {
-            path: source.path.clone(),
-            text,
-        }))
+        match kind {
+            InventoryKind::CargoManifest => {
+                if safe_regular_metadata(&repository.root, path).is_some() {
+                    inventory.cargo_manifests.insert(path.clone());
+                } else {
+                    inventory.cargo_manifests.remove(path);
+                }
+            }
+            InventoryKind::Source(language) => {
+                inventory.sources.remove(path);
+                match read_regular_file(&repository.root, path, SOURCE_LIMIT, cancelled)
+                    .map_err(capture_error)?
+                {
+                    Some(content) => {
+                        let digest = *blake3::hash(&content).as_bytes();
+                        let relative_path =
+                            PathBuf::from("sources").join(format!("{ordinal:016x}"));
+                        write_private_file(&capture_root.join(&relative_path), &content)
+                            .map_err(capture_error)?;
+                        inventory.sources.insert(
+                            path.clone(),
+                            (
+                                language,
+                                InventoryContent::Captured {
+                                    relative_path,
+                                    digest,
+                                },
+                            ),
+                        );
+                    }
+                    None => {
+                        if fs::symlink_metadata(repository.root.join(path)).is_ok() {
+                            inventory.skipped += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn write_private_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("cannot create private capture file: {error}"))?;
+    file.write_all(content)
+        .map_err(|error| format!("cannot write private capture file: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("cannot sync private capture file: {error}"))
+}
+
+fn capture_error(error: String) -> OperationError {
+    if error.contains("cancelled") {
+        OperationError::new(ErrorCode::JobCancelled, "source capture cancelled")
+    } else if error.contains("changed while reading") {
+        OperationError::new(ErrorCode::CaptureChanged, "source changed during capture")
+    } else if error.starts_with("cannot create private")
+        || error.starts_with("cannot write private")
+        || error.starts_with("cannot sync private")
+        || error.starts_with("cannot create capture")
+    {
+        OperationError::new(ErrorCode::Internal, error)
+    } else {
+        OperationError::new(ErrorCode::GitMetadataInvalid, error)
     }
 }
 
@@ -702,8 +1140,7 @@ fn read_regular_file(
         return Ok(None);
     }
     let mut content = Vec::with_capacity(after.len() as usize);
-    let Ok(_) = file
-        .by_ref()
+    let Ok(_) = Read::by_ref(&mut file)
         .take(limit.saturating_add(1))
         .read_to_end(&mut content)
     else {
@@ -971,6 +1408,7 @@ fn untracked_patch(
         true,
         deadline,
         STDOUT_LIMIT,
+        None,
         cancelled,
     )?;
     // A no-index diff outside the repository always hashes with SHA-1. The
@@ -1068,13 +1506,13 @@ struct PatchChange {
     end: usize,
 }
 
-fn validate_base(base: &str) -> Result<(), String> {
-    if base.trim().is_empty()
-        || base.len() > 256
-        || base.trim_start().starts_with('-')
-        || base.chars().any(char::is_control)
+fn validate_revision(revision: &str) -> Result<(), String> {
+    if revision.trim().is_empty()
+        || revision.len() > 256
+        || revision.trim_start().starts_with('-')
+        || revision.chars().any(char::is_control)
     {
-        Err("invalid changes base".into())
+        Err("invalid Git revision".into())
     } else {
         Ok(())
     }
@@ -2258,83 +2696,181 @@ fn parse_change_path(input: &[u8]) -> Result<Option<String>, String> {
     Ok(Some(path.to_owned()))
 }
 
-fn parse_source_files(output: &[u8]) -> Result<SourceFiles, String> {
-    if !output.is_empty() && !output.ends_with(&[0]) {
-        return Err("Git returned malformed file inventory".into());
-    }
-    let mut candidates = HashMap::<(String, Language), Option<String>>::new();
-    let mut unsupported = HashSet::new();
-
+fn parse_tree_inventory(output: &[u8]) -> Result<TargetInventory, String> {
+    validate_nul_inventory(output)?;
+    let mut inventory = TargetInventory {
+        sources: BTreeMap::new(),
+        cargo_manifests: BTreeSet::new(),
+        unmerged_paths: BTreeSet::new(),
+        skipped: 0,
+    };
     for record in nul_records(output) {
-        if let Some(raw_path) = record.strip_prefix(b"? ") {
-            let Some((path, language)) = parse_source_path(raw_path) else {
-                unsupported.insert(raw_path.to_vec());
-                continue;
-            };
-            candidates.insert((path, language), None);
-            continue;
-        }
         let tab = record
             .iter()
             .position(|byte| *byte == b'\t')
-            .ok_or_else(|| "Git returned malformed index metadata".to_owned())?;
-        let raw_path = &record[tab + 1..];
-        let Some((path, language)) = parse_source_path(raw_path) else {
-            unsupported.insert(raw_path.to_vec());
-            continue;
-        };
+            .ok_or_else(|| "Git returned malformed tree metadata".to_owned())?;
         let fields = record[..tab]
             .split(|byte| byte.is_ascii_whitespace())
             .filter(|field| !field.is_empty())
             .collect::<Vec<_>>();
-        if fields.len() != 4
-            || fields[0].len() != 1
-            || !fields[0][0].is_ascii_alphabetic()
-            || fields[1].len() != 6
-            || !fields[1].iter().all(u8::is_ascii_digit)
-            || !valid_oid(fields[2])
-            || !matches!(fields[3], b"0" | b"1" | b"2" | b"3")
+        if fields.len() != 3
+            || fields[0].len() != 6
+            || !fields[0].iter().all(u8::is_ascii_digit)
+            || !matches!(fields[1], b"blob" | b"commit")
+            || !valid_lower_oid(fields[2])
+        {
+            return Err("Git returned malformed tree metadata".into());
+        }
+        let Some((path, kind)) = parse_inventory_path(&record[tab + 1..], &mut inventory.skipped)?
+        else {
+            continue;
+        };
+        let regular = fields[1] == b"blob" && matches!(fields[0], b"100644" | b"100755");
+        match kind {
+            InventoryKind::Source(language) if regular => {
+                let oid = std::str::from_utf8(fields[2])
+                    .expect("validated lowercase object ID")
+                    .to_owned();
+                if inventory
+                    .sources
+                    .insert(path, (language, InventoryContent::GitBlob(oid)))
+                    .is_some()
+                {
+                    return Err("Git returned duplicate tree paths".into());
+                }
+            }
+            InventoryKind::Source(_) => inventory.skipped += 1,
+            InventoryKind::CargoManifest if regular => {
+                inventory.cargo_manifests.insert(path);
+            }
+            InventoryKind::CargoManifest => {}
+        }
+    }
+    Ok(inventory)
+}
+
+fn parse_index_inventory(output: &[u8]) -> Result<TargetInventory, String> {
+    validate_nul_inventory(output)?;
+    let mut entries = BTreeMap::<String, (InventoryKind, Vec<(u8, Vec<u8>, String)>)>::new();
+    let mut skipped = 0;
+    for record in nul_records(output) {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| "Git returned malformed index metadata".to_owned())?;
+        let fields = record[..tab]
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        if fields.len() != 3
+            || fields[0].len() != 6
+            || !fields[0].iter().all(u8::is_ascii_digit)
+            || !valid_lower_oid(fields[1])
+            || !matches!(fields[2], b"0" | b"1" | b"2" | b"3")
         {
             return Err("Git returned malformed index metadata".into());
         }
-        let git_oid = (fields[0] == b"H"
-            && (fields[1] == b"100644" || fields[1] == b"100755")
-            && fields[3] == b"0")
-            .then(|| {
-                std::str::from_utf8(fields[2])
-                    .expect("validated ASCII object ID")
-                    .to_owned()
-            });
-        candidates
-            .entry((path, language))
-            .and_modify(|oid| *oid = None)
-            .or_insert(git_oid);
+        let Some((path, kind)) = parse_inventory_path(&record[tab + 1..], &mut skipped)? else {
+            continue;
+        };
+        let stage = fields[2][0] - b'0';
+        let mode = fields[0].to_vec();
+        let oid = std::str::from_utf8(fields[1])
+            .expect("validated lowercase object ID")
+            .to_owned();
+        entries
+            .entry(path)
+            .and_modify(|(_, values)| values.push((stage, mode.clone(), oid.clone())))
+            .or_insert((kind, vec![(stage, mode, oid)]));
     }
 
-    let mut files = candidates
-        .into_iter()
-        .map(|((path, language), git_oid)| SourceFile {
-            path,
-            git_oid,
-            language,
+    let mut inventory = TargetInventory {
+        sources: BTreeMap::new(),
+        cargo_manifests: BTreeSet::new(),
+        unmerged_paths: BTreeSet::new(),
+        skipped,
+    };
+    for (path, (kind, entries)) in entries {
+        let Some((_, mode, oid)) = entries
+            .as_slice()
+            .first()
+            .filter(|(stage, _, _)| entries.len() == 1 && *stage == 0)
+        else {
+            if matches!(kind, InventoryKind::Source(_)) {
+                inventory.skipped += 1;
+            }
+            inventory.unmerged_paths.insert(path);
+            continue;
+        };
+        let regular = matches!(mode.as_slice(), b"100644" | b"100755");
+        match kind {
+            InventoryKind::Source(language) if regular => {
+                inventory
+                    .sources
+                    .insert(path, (language, InventoryContent::GitBlob(oid.clone())));
+            }
+            InventoryKind::Source(_) => inventory.skipped += 1,
+            InventoryKind::CargoManifest if regular => {
+                inventory.cargo_manifests.insert(path);
+            }
+            InventoryKind::CargoManifest => {}
+        }
+    }
+    Ok(inventory)
+}
+
+fn parse_inventory_paths(output: &[u8]) -> Result<(BTreeSet<String>, usize), String> {
+    validate_nul_inventory(output)?;
+    let mut paths = BTreeSet::new();
+    let mut skipped = 0;
+    for record in nul_records(output) {
+        if let Some((path, _)) = parse_inventory_path(record, &mut skipped)? {
+            paths.insert(path);
+        }
+    }
+    Ok((paths, skipped))
+}
+
+fn parse_inventory_path(
+    raw_path: &[u8],
+    skipped: &mut usize,
+) -> Result<Option<(String, InventoryKind)>, String> {
+    let Ok(path) = std::str::from_utf8(raw_path) else {
+        if raw_path.ends_with(b".rs") || raw_path.ends_with(b".py") {
+            *skipped += 1;
+        }
+        return Ok(None);
+    };
+    let Some(path) = parse_change_path(path.as_bytes())? else {
+        if path.ends_with(".rs") || path.ends_with(".py") {
+            *skipped += 1;
+        }
+        return Ok(None);
+    };
+    Ok(inventory_kind(&path).map(|kind| (path, kind)))
+}
+
+fn inventory_kind(path: &str) -> Option<InventoryKind> {
+    language_for_path(path)
+        .map(InventoryKind::Source)
+        .or_else(|| {
+            (path == "Cargo.toml" || path.ends_with("/Cargo.toml"))
+                .then_some(InventoryKind::CargoManifest)
         })
-        .collect::<Vec<_>>();
-    files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
-    Ok(SourceFiles {
-        files,
-        skipped: unsupported.len(),
-    })
+}
+
+fn validate_nul_inventory(output: &[u8]) -> Result<(), String> {
+    if !output.is_empty() && !output.ends_with(&[0]) {
+        Err("Git returned malformed file inventory".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn nul_records(input: &[u8]) -> impl Iterator<Item = &[u8]> {
     input
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
-}
-
-fn parse_source_path(input: &[u8]) -> Option<(String, Language)> {
-    let path = std::str::from_utf8(input).ok()?;
-    language_for_path(path).map(|language| (path.to_owned(), language))
 }
 
 fn language_for_path(path: &str) -> Option<Language> {
@@ -2358,6 +2894,13 @@ fn language_for_path(path: &str) -> Option<Language> {
 
 fn valid_oid(oid: &[u8]) -> bool {
     matches!(oid.len(), 40 | 64) && oid.iter().all(u8::is_ascii_hexdigit)
+}
+
+fn valid_lower_oid(oid: &[u8]) -> bool {
+    matches!(oid.len(), 40 | 64)
+        && oid
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
@@ -2465,6 +3008,45 @@ fn parse_value(output: &[u8]) -> Result<String, String> {
     }
 }
 
+pub(crate) fn resolve_commit(
+    root: &Path,
+    revision: &str,
+    label: &str,
+    cancelled: &AtomicBool,
+) -> Result<String, OperationError> {
+    validate_revision(revision).map_err(|_| {
+        OperationError::new(
+            ErrorCode::InvalidParameters,
+            format!("invalid {label} revision"),
+        )
+    })?;
+    let expression = format!("{revision}^{{commit}}");
+    let output =
+        run(root, &["rev-parse", "--verify", &expression], cancelled).map_err(|error| {
+            if error.contains("cancelled") {
+                OperationError::new(ErrorCode::JobCancelled, "Git operation cancelled")
+            } else {
+                OperationError::new(
+                    ErrorCode::RefNotFound,
+                    format!("{label} revision does not name a commit"),
+                )
+            }
+        })?;
+    let oid = parse_value(&output).map_err(|_| {
+        OperationError::new(
+            ErrorCode::GitMetadataInvalid,
+            format!("Git returned an invalid {label} object ID"),
+        )
+    })?;
+    if !valid_lower_oid(oid.as_bytes()) {
+        return Err(OperationError::new(
+            ErrorCode::GitMetadataInvalid,
+            format!("Git returned an invalid {label} object ID"),
+        ));
+    }
+    Ok(oid)
+}
+
 fn run(cwd: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Vec<u8>, String> {
     run_git(
         cwd,
@@ -2473,6 +3055,7 @@ fn run(cwd: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Vec<u8>, Str
         false,
         Instant::now() + DEADLINE,
         STDOUT_LIMIT,
+        None,
         cancelled,
     )
 }
@@ -2490,10 +3073,30 @@ fn run_with_limit(
         false,
         Instant::now() + DEADLINE,
         stdout_limit,
+        None,
         cancelled,
     )
 }
 
+fn run_with_index(
+    cwd: &Path,
+    args: &[&str],
+    index_file: &Path,
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    run_git(
+        cwd,
+        args,
+        false,
+        false,
+        Instant::now() + DEADLINE,
+        STDOUT_LIMIT,
+        Some(index_file),
+        cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // One optional index preserves the shared safe runner.
 fn run_git(
     cwd: &Path,
     args: &[&str],
@@ -2501,6 +3104,7 @@ fn run_git(
     isolate_repository: bool,
     deadline: Instant,
     stdout_limit: usize,
+    index_file: Option<&Path>,
     cancelled: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     if cancelled.load(Ordering::Relaxed) {
@@ -2509,45 +3113,13 @@ fn run_git(
     if Instant::now() >= deadline {
         return Err("Git timed out".into());
     }
-    let mut command = Command::new("git");
-    command.args(["--no-pager", "-c", "core.fsmonitor=false"]);
-    if isolate_repository {
-        command.args(["-c", "core.attributesFile=/dev/null"]);
-    }
+    let mut command = git_command(cwd, isolate_repository, index_file);
     command
-        .arg("-C")
-        .arg(cwd)
         .args(args)
-        .env("LC_ALL", "C")
-        .env("GIT_PAGER", "cat")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("GIT_CONFIG_NOSYSTEM")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_ATTR_NOSYSTEM")
-        .env_remove("GIT_LITERAL_PATHSPECS")
-        .env_remove("GIT_GLOB_PATHSPECS")
-        .env_remove("GIT_NOGLOB_PATHSPECS")
-        .env_remove("GIT_ICASE_PATHSPECS");
-    if isolate_repository {
-        command
-            .env("GIT_DIR", "/dev/null")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_ATTR_NOSYSTEM", "1");
-    } else {
-        command.env_remove("GIT_DIR");
-    }
-    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
         .spawn()
         .map_err(|error| format!("cannot start Git: {error}"))?;
 
@@ -2602,6 +3174,48 @@ fn run_git(
     }
 }
 
+fn git_command(cwd: &Path, isolate_repository: bool, index_file: Option<&Path>) -> Command {
+    let mut command = Command::new("git");
+    command.args(["--no-pager", "-c", "core.fsmonitor=false"]);
+    if isolate_repository {
+        command.args(["-c", "core.attributesFile=/dev/null"]);
+    }
+    command
+        .arg("-C")
+        .arg(cwd)
+        .env("LC_ALL", "C")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_NOSYSTEM")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_ATTR_NOSYSTEM")
+        .env_remove("GIT_LITERAL_PATHSPECS")
+        .env_remove("GIT_GLOB_PATHSPECS")
+        .env_remove("GIT_NOGLOB_PATHSPECS")
+        .env_remove("GIT_ICASE_PATHSPECS");
+    if let Some(index_file) = index_file {
+        command.env("GIT_INDEX_FILE", index_file);
+    } else {
+        command.env_remove("GIT_INDEX_FILE");
+    }
+    if isolate_repository {
+        command
+            .env("GIT_DIR", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1");
+    } else {
+        command.env_remove("GIT_DIR");
+    }
+    command
+}
+
 fn read_capped(
     mut reader: impl Read,
     limit: usize,
@@ -2642,8 +3256,232 @@ fn sanitize(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::build_snapshot_for_test;
+    use crate::workspace::SnapshotTarget;
 
     const OID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn unmerged_index_sources_are_omitted_and_counted_once() {
+        let output = format!(
+            "100644 {OID} 1\tconflict.rs\0\
+             100644 {OID} 2\tconflict.rs\0\
+             100644 {OID} 3\tconflict.rs\0"
+        );
+
+        let inventory = parse_index_inventory(output.as_bytes()).unwrap();
+
+        assert!(inventory.sources.is_empty());
+        assert_eq!(inventory.skipped, 1);
+    }
+
+    #[test]
+    fn worktree_capture_does_not_readd_an_unmerged_source() {
+        let root = initialized_repository("worktree-unmerged");
+        fs::write(root.join("conflict.rs"), "fn base() {}\n").unwrap();
+        test_git(&root, &["add", "--", "conflict.rs"]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        test_git(&root, &["switch", "--quiet", "-c", "side"]);
+        fs::write(root.join("conflict.rs"), "fn side() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "side"]);
+        test_git(&root, &["switch", "--quiet", "main"]);
+        fs::write(root.join("conflict.rs"), "fn main() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "main"]);
+        let merge = Command::new("git")
+            .args(["merge", "--quiet", "side"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(!merge.status.success());
+
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let capture_root = private_dir("worktree-unmerged-output");
+        let snapshot = repository
+            .capture_sources(
+                &repository.head_oid,
+                &SnapshotTarget::Worktree {
+                    include_untracked: false,
+                },
+                &capture_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert!(snapshot.files.is_empty());
+        assert_eq!(snapshot.skipped, 1);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(capture_root).unwrap();
+    }
+
+    #[test]
+    fn commit_inventory_ignores_non_source_gitlinks() {
+        let output = format!(
+            "160000 commit {OID}\tvendor\0\
+             100644 blob {OID}\tsrc/lib.rs\0"
+        );
+
+        let inventory = parse_tree_inventory(output.as_bytes()).unwrap();
+
+        assert_eq!(inventory.sources.len(), 1);
+        assert!(inventory.sources.contains_key("src/lib.rs"));
+        assert_eq!(inventory.skipped, 0);
+    }
+
+    #[test]
+    fn commit_capture_reads_an_unchecked_out_branch() {
+        let root = initialized_repository("commit-capture");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn main_only() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "main"]);
+        test_git(&root, &["switch", "--quiet", "-c", "feature"]);
+        fs::write(root.join("src/feature.rs"), "pub fn feature_only() {}\n").unwrap();
+        test_git(&root, &["add", "--", "src/feature.rs"]);
+        test_git(&root, &["commit", "--quiet", "-m", "feature"]);
+        let feature_oid = git_output(&root, &["rev-parse", "HEAD"]);
+        test_git(&root, &["switch", "--quiet", "main"]);
+
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let capture_root = private_dir("commit-capture-output");
+        let sources = repository
+            .capture_sources(
+                &feature_oid,
+                &SnapshotTarget::Commit,
+                &capture_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let graph =
+            build_snapshot_for_test(&repository, &sources, &AtomicBool::new(false)).unwrap();
+
+        assert!(sources.files.iter().any(|file| {
+            file.path == "src/feature.rs" && matches!(file.content, SourceContent::GitBlob(_))
+        }));
+        assert!(graph.nodes.iter().any(|node| node.name == "feature_only"));
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.name == "main_only" && node.file_key == "src/feature.rs")
+        );
+        fs::remove_dir_all(capture_root).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn index_capture_reads_the_worktree_specific_index() {
+        let fixture_root = temp_root("linked-index");
+        let main = fixture_root.join("main");
+        let linked = fixture_root.join("linked");
+        fs::create_dir_all(main.join("src")).unwrap();
+        test_git(&main, &["init", "--quiet", "--initial-branch=main"]);
+        test_git(&main, &["config", "user.name", "Graphr Test"]);
+        test_git(&main, &["config", "user.email", "graphr@example.invalid"]);
+        fs::write(main.join("src/lib.rs"), "pub fn baseline() {}\n").unwrap();
+        test_git(&main, &["add", "--", "."]);
+        test_git(&main, &["commit", "--quiet", "-m", "baseline"]);
+        test_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+        fs::write(main.join("src/main_staged.rs"), "fn main_staged() {}\n").unwrap();
+        test_git(&main, &["add", "--", "src/main_staged.rs"]);
+        fs::write(
+            linked.join("src/linked_staged.rs"),
+            "fn linked_staged() {}\n",
+        )
+        .unwrap();
+        test_git(&linked, &["add", "--", "src/linked_staged.rs"]);
+
+        let repository = Repository::discover_cancelled(&linked, &AtomicBool::new(false)).unwrap();
+        let capture_root = private_dir("linked-index-output");
+        let sources = repository
+            .capture_sources(
+                &repository.head_oid,
+                &SnapshotTarget::Index,
+                &capture_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let paths = sources
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"src/linked_staged.rs"));
+        assert!(!paths.contains(&"src/main_staged.rs"));
+        test_git(
+            &main,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        fs::remove_dir_all(capture_root).unwrap();
+        fs::remove_dir_all(fixture_root).unwrap();
+    }
+
+    #[test]
+    fn worktree_capture_freezes_dirty_and_optional_untracked_sources() {
+        let root = initialized_repository("worktree-capture");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn clean() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "baseline"]);
+        fs::write(root.join("src/lib.rs"), "pub fn dirty_before() {}\n").unwrap();
+        fs::write(root.join("src/untracked.rs"), "pub fn untracked() {}\n").unwrap();
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+
+        let excluded_root = private_dir("worktree-untracked-excluded");
+        let excluded = repository
+            .capture_sources(
+                &repository.head_oid,
+                &SnapshotTarget::Worktree {
+                    include_untracked: false,
+                },
+                &excluded_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(
+            !excluded
+                .files
+                .iter()
+                .any(|file| file.path == "src/untracked.rs")
+        );
+
+        let included_root = private_dir("worktree-untracked-included");
+        let included = repository
+            .capture_sources(
+                &repository.head_oid,
+                &SnapshotTarget::Worktree {
+                    include_untracked: true,
+                },
+                &included_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn dirty_after() {}\n").unwrap();
+        let graph =
+            build_snapshot_for_test(&repository, &included, &AtomicBool::new(false)).unwrap();
+
+        assert!(graph.nodes.iter().any(|node| node.name == "dirty_before"));
+        assert!(graph.nodes.iter().any(|node| node.name == "untracked"));
+        assert!(!graph.nodes.iter().any(|node| node.name == "dirty_after"));
+        fs::remove_dir_all(excluded_root).unwrap();
+        fs::remove_dir_all(included_root).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn rejects_malformed_git_paths() {
@@ -3442,120 +4280,6 @@ mod tests {
     }
 
     #[test]
-    fn inventory_only_exposes_clean_regular_stage_zero_oids() {
-        let output = format!(
-            "H 100644 {OID} 0\tb.rs\0H 100755 {OID} 0\ta.rs\0h 100644 {OID} 0\tc.rs\0H 100644 {OID} 1\td.rs\0H 120000 {OID} 0\te.rs\0C 100755 {OID} 0\ta.rs\0? f.rs\0"
-        );
-        let inventory = parse_source_files(output.as_bytes()).unwrap();
-
-        assert_eq!(
-            inventory.files,
-            [
-                ("a.rs", None),
-                ("b.rs", Some(OID)),
-                ("c.rs", None),
-                ("d.rs", None),
-                ("e.rs", None),
-                ("f.rs", None),
-            ]
-            .map(|(path, oid)| SourceFile {
-                path: path.into(),
-                git_oid: oid.map(str::to_owned),
-                language: Language::Rust,
-            })
-        );
-        assert_eq!(inventory.skipped, 0);
-    }
-
-    #[test]
-    fn inventory_sorts_deduplicates_and_rejects_unsafe_paths() {
-        let mut output = format!(
-            "H 100644 {OID} 0\tz.rs\0H 100644 {OID} 0\tz.rs\0H 100644 {OID} 0\t../bad.rs\0? nested/a.py\0? nested/a.py\0? not-source.txt\0? bad\nname.rs\0"
-        )
-        .into_bytes();
-        output.extend_from_slice(b"? \xff.rs\0");
-        let inventory = parse_source_files(&output).unwrap();
-
-        assert_eq!(
-            inventory.files,
-            [
-                SourceFile {
-                    path: "nested/a.py".into(),
-                    git_oid: None,
-                    language: Language::Python,
-                },
-                SourceFile {
-                    path: "z.rs".into(),
-                    git_oid: None,
-                    language: Language::Rust,
-                },
-            ]
-        );
-        assert_eq!(inventory.skipped, 4);
-        assert!(parse_source_files(b"broken").is_err());
-        assert!(parse_source_files(b"broken\0").is_err());
-    }
-
-    #[test]
-    fn git_inventory_and_secure_reader_cover_clean_dirty_and_untracked() {
-        let root = temp_root("inventory");
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/clean.rs"), "fn clean() {}\n").unwrap();
-        fs::write(root.join("src/dirty.rs"), "fn before() {}\n").unwrap();
-        assert!(
-            Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .args(["add", "--", "src/clean.rs", "src/dirty.rs"])
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        fs::write(root.join("src/dirty.rs"), "fn after() {}\n").unwrap();
-        fs::write(root.join("src/untracked.rs"), "fn untracked() {}\n").unwrap();
-        fs::write(root.join("src/untracked.py"), "def untracked(): pass\n").unwrap();
-
-        let repository = test_repository(&root);
-        let cancelled = AtomicBool::new(false);
-        let inventory = repository.source_files(&cancelled).unwrap();
-        assert_eq!(
-            inventory
-                .files
-                .iter()
-                .map(|file| (file.path.as_str(), file.git_oid.is_some()))
-                .collect::<Vec<_>>(),
-            [
-                ("src/clean.rs", true),
-                ("src/dirty.rs", false),
-                ("src/untracked.py", false),
-                ("src/untracked.rs", false),
-            ]
-        );
-        let dirty = inventory
-            .files
-            .iter()
-            .find(|file| file.path == "src/dirty.rs")
-            .unwrap();
-        assert_eq!(
-            repository
-                .read_source(dirty, &cancelled)
-                .unwrap()
-                .unwrap()
-                .text,
-            "fn after() {}\n"
-        );
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn change_inventory_captures_untracked_artifacts_and_ignores_ignored_files() {
         let root = temp_root("changes");
         fs::create_dir_all(root.join("src")).unwrap();
@@ -4018,6 +4742,33 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{:?}", output.stderr);
+    }
+
+    fn initialized_repository(label: &str) -> PathBuf {
+        let root = temp_root(label);
+        fs::create_dir_all(&root).unwrap();
+        test_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        test_git(&root, &["config", "user.name", "Graphr Test"]);
+        test_git(&root, &["config", "user.email", "graphr@example.invalid"]);
+        root
+    }
+
+    fn private_dir(label: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = temp_root(label);
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        fs::canonicalize(root).unwrap()
+    }
+
+    fn git_output(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     fn test_repository(root: &Path) -> Repository {

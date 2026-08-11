@@ -1,6 +1,8 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
 use std::ops::Range;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -9,8 +11,9 @@ use std::sync::{
 use std::thread;
 
 use crate::git::{
-    ArtifactReview, ChangeStatus, ChangedPath, DependencyMode, Language, Repository, Source,
-    SourceFile, WorktreeChanges, changed_dependency_package,
+    ArtifactReview, CapturedSource, ChangeStatus, ChangedPath, DependencyMode, Language,
+    Repository, Source, SourceContent, SourceSnapshot, WorktreeChanges, changed_dependency_package,
+    read_captured_source,
 };
 use crate::parse::{DefinitionKind, ParsedFile, RustParser};
 use crate::python::PythonParser;
@@ -18,6 +21,7 @@ use crate::store::{
     EdgeInput, EdgeKind, FileInput, Graph, NodeInput, NodeKind, RefInput, RefKind, Store,
     TraitImplementationInput,
 };
+use crate::workspace::SnapshotTarget;
 
 const QUALIFIED_PATH_LIMIT: usize = 1024;
 const REVIEW_CONTEXT_BUDGET: usize = 8192;
@@ -26,6 +30,15 @@ const INITIAL_DIFF_BUDGET: usize = 2432;
 const INITIAL_ARTIFACTS_BUDGET: usize = 1920;
 const INITIAL_GRAPH_BUDGET: usize = 1920;
 const SECTION_OVERHEAD: usize = 704;
+static LEGACY_CAPTURE_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct IndexStats {
+    pub files_total: usize,
+    pub files_reused: usize,
+    pub files_parsed: usize,
+    pub files_skipped: usize,
+}
 
 #[derive(Clone)]
 pub struct Project {
@@ -60,12 +73,31 @@ impl Project {
         check_cancelled(&cancelled)?;
         let database = self.repository.git_dir.join("graphr/index.db");
         let mut store = Store::open(&database, rebuild, &cancelled)?;
-        let (state, changed, skipped) = store.index_with(&cancelled, |full, existing| {
-            build_index(&self.repository, &cancelled, full, existing)
+        let capture = LegacyCapture::create(&self.repository.git_dir.join("graphr"))?;
+        let sources = self
+            .repository
+            .capture_sources(
+                &self.repository.head_oid,
+                &SnapshotTarget::Worktree {
+                    include_untracked: true,
+                },
+                &capture.path,
+                &cancelled,
+            )
+            .map_err(|error| error.to_string())?;
+        let (state, changed, stats) = store.index_with(&cancelled, |full, existing| {
+            build_index(
+                &self.repository,
+                &sources,
+                &cancelled,
+                full,
+                existing,
+                |_, _, _| {},
+            )
         })?;
         Ok(format!(
             "indexed generation={} changed={} skipped={}",
-            state.generation, changed, skipped
+            state.generation, changed, stats.files_skipped
         ))
     }
 
@@ -136,6 +168,34 @@ impl Project {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
         Ok(output)
+    }
+}
+
+struct LegacyCapture {
+    path: PathBuf,
+}
+
+impl LegacyCapture {
+    fn create(parent: &Path) -> Result<Self, String> {
+        let path = parent.join(format!(
+            ".capture-{}-{}",
+            std::process::id(),
+            LEGACY_CAPTURE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|error| format!("cannot create source capture: {error}"))?;
+        Ok(Self {
+            path: fs::canonicalize(path)
+                .map_err(|error| format!("cannot resolve source capture: {error}"))?,
+        })
+    }
+}
+
+impl Drop for LegacyCapture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -1008,36 +1068,34 @@ fn change_content_complete(changes: &WorktreeChanges, dependency_mode: Dependenc
 
 fn build_index(
     repository: &Repository,
+    sources: &SourceSnapshot,
     cancelled: &AtomicBool,
     full: bool,
     existing: &HashMap<String, crate::store::StoredFile>,
-) -> Result<(Graph, usize), String> {
-    let inventory = repository.source_files(cancelled)?;
-    let mut skipped = inventory.skipped;
-    let mut targets = TargetLayout::discover(&repository.root);
-    let mut outputs = (0..inventory.files.len())
-        .map(|_| None)
-        .collect::<Vec<Option<Graph>>>();
+    progress: impl Fn(usize, usize, usize) + Sync,
+) -> Result<(Graph, IndexStats), String> {
+    let total = sources.files.len();
+    let mut stats = IndexStats {
+        files_total: total,
+        files_reused: 0,
+        files_parsed: 0,
+        files_skipped: sources.skipped,
+    };
+    progress(0, total, 0);
+    let mut outputs = (0..total).map(|_| None).collect::<Vec<Option<Graph>>>();
     let mut pending = Vec::new();
-    for (index, file) in inventory.files.iter().enumerate() {
+    for (index, file) in sources.files.iter().enumerate() {
         check_cancelled(cancelled)?;
-        let rust_target = (file.language == Language::Rust).then(|| targets.for_path(&file.path));
-        let parse_context = match file.language {
-            Language::Rust => rust_target
-                .as_ref()
-                .expect("Rust source has a Rust target")
-                .parse_context(),
-            Language::Python => String::new(),
-        };
+        let rust_target = (file.language == Language::Rust)
+            .then(|| TargetPath::from_parse_context(&file.parse_context))
+            .transpose()?;
         let old = existing.get(&file.path);
         if !full
             && old.is_some_and(|old| {
                 old.language == file.language
-                    && old.parse_context == parse_context
-                    && file
-                        .git_oid
-                        .as_ref()
-                        .is_some_and(|oid| old.git_oid.as_ref() == Some(oid))
+                    && old.parse_context == file.parse_context
+                    && old.git_oid == file.git_oid
+                    && stored_content_key(old) == file.content_key
             })
         {
             let old = old.expect("checked above");
@@ -1047,18 +1105,19 @@ fn build_index(
                 language: file.language,
                 git_oid: file.git_oid.clone(),
                 content_hash: old.content_hash,
-                parse_context,
+                parse_context: file.parse_context.clone(),
                 byte_size: old.byte_size,
                 replace: false,
             });
             outputs[index] = Some(graph);
+            stats.files_reused += 1;
+            progress(stats.files_reused, total, stats.files_reused);
             continue;
         }
         pending.push(FileWork {
             index,
             file,
             rust_target,
-            parse_context,
         });
     }
 
@@ -1070,42 +1129,58 @@ fn build_index(
     if workers == 1 {
         let mut rust_parser = None;
         let mut python_parser = None;
+        let mut blob_reader = None;
+        let mut completed = stats.files_reused;
         for work in &pending {
             match build_file(
                 repository,
+                sources,
                 cancelled,
-                full,
-                existing,
                 work,
                 &mut rust_parser,
                 &mut python_parser,
+                &mut blob_reader,
             )? {
-                Some(graph) => outputs[work.index] = Some(graph),
-                None => skipped += 1,
+                Some(graph) => {
+                    outputs[work.index] = Some(graph);
+                    stats.files_parsed += 1;
+                }
+                None => stats.files_skipped += 1,
             }
+            completed += 1;
+            progress(completed, total, stats.files_reused);
         }
     } else {
         let next = AtomicUsize::new(0);
+        let completed = AtomicUsize::new(stats.files_reused);
+        let progress_lock = Mutex::new(());
         let parts = thread::scope(|scope| {
             let handles = (0..workers)
                 .map(|_| {
                     scope.spawn(|| {
                         let mut rust_parser = None;
                         let mut python_parser = None;
+                        let mut blob_reader = None;
                         let mut parts = Vec::new();
                         while let Some(work) = pending.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            parts.push((
-                                work.index,
-                                build_file(
-                                    repository,
-                                    cancelled,
-                                    full,
-                                    existing,
-                                    work,
-                                    &mut rust_parser,
-                                    &mut python_parser,
-                                )?,
-                            ));
+                            let part = build_file(
+                                repository,
+                                sources,
+                                cancelled,
+                                work,
+                                &mut rust_parser,
+                                &mut python_parser,
+                                &mut blob_reader,
+                            )?;
+                            parts.push((work.index, part));
+                            let _guard = progress_lock
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            progress(
+                                completed.fetch_add(1, Ordering::Relaxed) + 1,
+                                total,
+                                stats.files_reused,
+                            );
                         }
                         Ok::<_, String>(parts)
                     })
@@ -1123,8 +1198,11 @@ fn build_index(
         })?;
         for (index, part) in parts {
             match part {
-                Some(graph) => outputs[index] = Some(graph),
-                None => skipped += 1,
+                Some(graph) => {
+                    outputs[index] = Some(graph);
+                    stats.files_parsed += 1;
+                }
+                None => stats.files_skipped += 1,
             }
         }
     }
@@ -1142,74 +1220,116 @@ fn build_index(
     if full {
         resolve(&mut graph, cancelled)?;
     }
-    Ok((graph, skipped))
+    Ok((graph, stats))
+}
+
+fn stored_content_key(file: &crate::store::StoredFile) -> String {
+    file.git_oid.clone().unwrap_or_else(|| {
+        blake3::Hash::from_bytes(file.content_hash)
+            .to_hex()
+            .to_string()
+    })
 }
 
 struct FileWork<'a> {
     index: usize,
-    file: &'a SourceFile,
+    file: &'a CapturedSource,
     rust_target: Option<TargetPath>,
-    parse_context: String,
 }
 
 fn build_file(
     repository: &Repository,
+    sources: &SourceSnapshot,
     cancelled: &AtomicBool,
-    full: bool,
-    existing: &HashMap<String, crate::store::StoredFile>,
     work: &FileWork<'_>,
     rust_parser: &mut Option<RustParser>,
     python_parser: &mut Option<PythonParser>,
+    blob_reader: &mut Option<crate::git::BlobReader>,
 ) -> Result<Option<Graph>, String> {
-    let Some(source) = repository.read_source(work.file, cancelled)? else {
+    let content = match &work.file.content {
+        SourceContent::GitBlob(oid) => {
+            if work.file.git_oid.as_deref() != Some(oid) || work.file.content_key != *oid {
+                return Err("captured Git source identity mismatch".into());
+            }
+            if blob_reader.is_none() {
+                *blob_reader = Some(repository.blob_reader()?);
+            }
+            let content = blob_reader
+                .as_mut()
+                .expect("initialized above")
+                .read(oid, cancelled)?;
+            let Some(content) = content else {
+                *blob_reader = None;
+                return Ok(None);
+            };
+            content
+        }
+        SourceContent::Captured {
+            relative_path,
+            digest,
+        } => read_captured_source(&sources.capture_root, relative_path, digest, cancelled)?,
+    };
+    let Ok(text) = String::from_utf8(content) else {
         return Ok(None);
+    };
+    let source = Source {
+        path: work.file.path.clone(),
+        text,
     };
     let content_hash = *blake3::hash(source.text.as_bytes()).as_bytes();
     let byte_size = u64::try_from(source.text.len())
         .map_err(|_| "source byte size exceeds supported range".to_owned())?;
-    let old = existing.get(&work.file.path);
-    let changed = full
-        || old.is_none_or(|old| {
-            old.language != work.file.language
-                || old.content_hash != content_hash
-                || old.parse_context != work.parse_context
-        });
     let mut graph = Graph::default();
     graph.files.push(FileInput {
         path: work.file.path.clone(),
         language: work.file.language,
         git_oid: work.file.git_oid.clone(),
         content_hash,
-        parse_context: work.parse_context.clone(),
+        parse_context: work.file.parse_context.clone(),
         byte_size,
-        replace: changed,
+        replace: true,
     });
-    if changed {
-        match work.file.language {
-            Language::Rust => {
-                if rust_parser.is_none() {
-                    *rust_parser = Some(RustParser::new()?);
-                }
-                add_rust_file(
-                    &mut graph,
-                    &source,
-                    work.rust_target.as_ref().expect("checked above"),
-                    rust_parser.as_mut().expect("initialized above"),
-                )?;
+    match work.file.language {
+        Language::Rust => {
+            if rust_parser.is_none() {
+                *rust_parser = Some(RustParser::new()?);
             }
-            Language::Python => {
-                if python_parser.is_none() {
-                    *python_parser = Some(PythonParser::new()?);
-                }
-                crate::python::add_file(
-                    &mut graph,
-                    &source,
-                    python_parser.as_mut().expect("initialized above"),
-                )?;
+            add_rust_file(
+                &mut graph,
+                &source,
+                work.rust_target.as_ref().expect("checked above"),
+                rust_parser.as_mut().expect("initialized above"),
+            )?;
+        }
+        Language::Python => {
+            if python_parser.is_none() {
+                *python_parser = Some(PythonParser::new()?);
             }
+            crate::python::add_file(
+                &mut graph,
+                &source,
+                python_parser.as_mut().expect("initialized above"),
+            )?;
         }
     }
     Ok(Some(graph))
+}
+
+#[cfg(test)]
+pub(crate) fn build_snapshot_for_test(
+    repository: &Repository,
+    sources: &SourceSnapshot,
+    cancelled: &AtomicBool,
+) -> Result<Graph, String> {
+    build_index(
+        repository,
+        sources,
+        cancelled,
+        true,
+        &HashMap::new(),
+        |_, _, _| {},
+    )
+    .map(|(graph, _)| graph)
 }
 
 #[cfg(test)]
@@ -2078,6 +2198,22 @@ impl TargetPath {
     fn parse_context(&self) -> String {
         format!("{}:{}{}", self.root.len(), self.root, self.module)
     }
+
+    fn from_parse_context(context: &str) -> Result<Self, String> {
+        let (length, value) = context
+            .split_once(':')
+            .ok_or_else(|| "captured Rust parse context is invalid".to_owned())?;
+        let root_length = length
+            .parse::<usize>()
+            .ok()
+            .filter(|length| *length <= value.len() && value.is_char_boundary(*length))
+            .ok_or_else(|| "captured Rust parse context is invalid".to_owned())?;
+        let (root, module) = value.split_at(root_length);
+        Ok(Self {
+            root: root.to_owned(),
+            module: module.to_owned(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2088,32 +2224,35 @@ struct PackageLayout {
 }
 
 struct TargetLayout {
-    repository: Option<PathBuf>,
     packages: HashMap<String, PackageLayout>,
 }
 
 impl TargetLayout {
-    fn discover(repository: &Path) -> Self {
-        Self {
-            repository: Some(repository.to_owned()),
-            packages: HashMap::new(),
-        }
-    }
-
-    #[cfg(test)]
-    fn from_sources(sources: &[Source]) -> Self {
+    fn from_inventory<'a>(
+        source_paths: impl IntoIterator<Item = &'a str>,
+        cargo_manifest_paths: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
         let mut packages = HashMap::<String, PackageLayout>::new();
         packages.entry(String::new()).or_default().exists = true;
-        for source in sources {
+        for path in cargo_manifest_paths {
+            let package = if path == "Cargo.toml" {
+                Some("")
+            } else {
+                path.strip_suffix("/Cargo.toml")
+            };
+            if let Some(package) = package {
+                packages.entry(package.to_owned()).or_default().exists = true;
+            }
+        }
+        for path in source_paths {
             for (suffix, library) in [("src/lib.rs", true), ("src/main.rs", false)] {
-                let package = if source.path == suffix {
+                let package = if path == suffix {
                     Some("")
                 } else {
-                    source.path.strip_suffix(&format!("/{suffix}"))
+                    path.strip_suffix(&format!("/{suffix}"))
                 };
                 if let Some(package) = package {
                     let package = packages.entry(package.to_owned()).or_default();
-                    package.exists = true;
                     if library {
                         package.library = true;
                     } else {
@@ -2122,10 +2261,28 @@ impl TargetLayout {
                 }
             }
         }
-        Self {
-            repository: None,
-            packages,
-        }
+        Self { packages }
+    }
+
+    #[cfg(test)]
+    fn from_sources(sources: &[Source]) -> Self {
+        let manifests = sources
+            .iter()
+            .filter_map(|source| {
+                ["src/lib.rs", "src/main.rs"]
+                    .into_iter()
+                    .find_map(|suffix| {
+                        source
+                            .path
+                            .strip_suffix(&format!("/{suffix}"))
+                            .map(|package| format!("{package}/Cargo.toml"))
+                    })
+            })
+            .collect::<Vec<_>>();
+        Self::from_inventory(
+            sources.iter().map(|source| source.path.as_str()),
+            manifests.iter().map(String::as_str),
+        )
     }
 
     fn for_path(&mut self, path: &str) -> TargetPath {
@@ -2171,21 +2328,23 @@ impl TargetLayout {
     }
 
     fn package(&mut self, package: &str) -> PackageLayout {
-        if let Some(layout) = self.packages.get(package) {
-            return *layout;
-        }
-        let Some(repository) = &self.repository else {
-            return PackageLayout::default();
+        self.packages.get(package).copied().unwrap_or_default()
+    }
+}
+
+pub(crate) fn assign_parse_contexts(
+    files: &mut [CapturedSource],
+    cargo_manifest_paths: &BTreeSet<String>,
+) {
+    let mut targets = TargetLayout::from_inventory(
+        files.iter().map(|file| file.path.as_str()),
+        cargo_manifest_paths.iter().map(String::as_str),
+    );
+    for file in files {
+        file.parse_context = match file.language {
+            Language::Rust => targets.for_path(&file.path).parse_context(),
+            Language::Python => String::new(),
         };
-        let root = repository.join(package);
-        let exists = package.is_empty() || root.join("Cargo.toml").is_file();
-        let layout = PackageLayout {
-            exists,
-            library: exists && root.join("src/lib.rs").is_file(),
-            main: exists && root.join("src/main.rs").is_file(),
-        };
-        self.packages.insert(package.to_owned(), layout);
-        layout
     }
 }
 
@@ -2489,6 +2648,204 @@ mod tests {
             ErrorCode::RootNotWorktree
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_project_indexes_an_unborn_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "graphr-index-unborn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        fs::write(root.join("src/lib.rs"), "pub fn unborn() {}\n").unwrap();
+
+        let output = Project::open(&root).unwrap().index(false).unwrap();
+
+        assert!(output.contains("changed=1"), "{output}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_project_skips_an_oversized_clean_git_blob() {
+        let root = std::env::temp_dir().join(format!(
+            "graphr-index-oversized-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "user.name", "Graphr Test"]);
+        test_git(&root, &["config", "user.email", "graphr@example.invalid"]);
+        fs::write(root.join("a-large.rs"), vec![b'x'; 2 * 1024 * 1024 + 1]).unwrap();
+        fs::write(root.join("z-small.rs"), "pub fn retained() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "baseline"]);
+
+        let project = Project::open(&root).unwrap();
+        let output = project.index(false).unwrap();
+
+        assert!(output.contains("changed=1"), "{output}");
+        assert!(output.contains("skipped=1"), "{output}");
+        assert!(
+            project
+                .search("retained", None, 20)
+                .unwrap()
+                .contains("retained")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn index_progress_counts_reuse_before_pending_parse_completion() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "graphr-index-progress-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "user.name", "Graphr Test"]);
+        test_git(&root, &["config", "user.email", "graphr@example.invalid"]);
+        fs::write(root.join("a.rs"), "fn first() {}\n").unwrap();
+        fs::write(root.join("b.rs"), "fn reused() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "baseline"]);
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let first_capture = root.join("first-capture");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&first_capture)
+            .unwrap();
+        let first = repository
+            .capture_sources(
+                &repository.head_oid,
+                &SnapshotTarget::Commit,
+                &first_capture,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let mut store =
+            Store::open(&root.join("graph/index.db"), false, &AtomicBool::new(false)).unwrap();
+        store
+            .index_with(&AtomicBool::new(false), |full, existing| {
+                build_index(
+                    &repository,
+                    &first,
+                    &AtomicBool::new(false),
+                    full,
+                    existing,
+                    |_, _, _| {},
+                )
+            })
+            .unwrap();
+
+        fs::write(root.join("a.rs"), "fn second() {}\n").unwrap();
+        let second_capture = root.join("second-capture");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&second_capture)
+            .unwrap();
+        let second = repository
+            .capture_sources(
+                &repository.head_oid,
+                &SnapshotTarget::Worktree {
+                    include_untracked: false,
+                },
+                &second_capture,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let events = Mutex::new(Vec::new());
+        store
+            .index_with(&AtomicBool::new(false), |full, existing| {
+                build_index(
+                    &repository,
+                    &second,
+                    &AtomicBool::new(false),
+                    full,
+                    existing,
+                    |done, total, reused| events.lock().unwrap().push((done, total, reused)),
+                )
+            })
+            .unwrap();
+
+        assert_eq!(
+            events.into_inner().unwrap(),
+            [(0, 2, 0), (1, 2, 1), (2, 2, 1)]
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parallel_index_progress_stays_monotonic_when_the_first_callback_is_delayed() {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::time::Duration;
+
+        let root = std::env::temp_dir().join(format!(
+            "graphr-index-parallel-progress-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "user.name", "Graphr Test"]);
+        test_git(&root, &["config", "user.email", "graphr@example.invalid"]);
+        for index in 0..8 {
+            fs::write(
+                root.join(format!("file-{index}.rs")),
+                format!("pub fn file_{index}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "baseline"]);
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let capture = root.join("capture");
+        fs::DirBuilder::new().mode(0o700).create(&capture).unwrap();
+        let sources = repository
+            .capture_sources(
+                &repository.head_oid,
+                &SnapshotTarget::Commit,
+                &capture,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let events = Mutex::new(Vec::new());
+
+        build_index(
+            &repository,
+            &sources,
+            &AtomicBool::new(false),
+            true,
+            &HashMap::new(),
+            |done, _, _| {
+                if done == 1 {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                events.lock().unwrap().push(done);
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.into_inner().unwrap(), (0..=8).collect::<Vec<_>>());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4068,5 +4425,32 @@ mod tests {
             })
             .collect::<Vec<_>>();
         TargetLayout::from_sources(&sources)
+    }
+
+    #[test]
+    fn target_layout_uses_captured_inventory_not_live_files() {
+        let fixture = std::env::temp_dir().join(format!(
+            "graphr-target-layout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(fixture.join("src")).unwrap();
+        fs::write(
+            fixture.join("Cargo.toml"),
+            "[package]\nname='live'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(fixture.join("src/lib.rs"), "pub mod worker;\n").unwrap();
+
+        let mut layout = TargetLayout::from_inventory(["src/worker.rs"], std::iter::empty());
+
+        assert_eq!(
+            layout.for_path("src/worker.rs").parse_context(),
+            "22:@file:13:src/worker.rs@file:13:src/worker.rs"
+        );
+        fs::remove_dir_all(fixture).unwrap();
     }
 }

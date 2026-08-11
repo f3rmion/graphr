@@ -4,7 +4,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use crate::git::Repository;
+use crate::git::{DependencyMode, Repository, resolve_commit};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +51,11 @@ impl OperationError {
         self.details.insert(key.into(), path.display().to_string());
         self
     }
+
+    pub(crate) fn with_detail(mut self, key: &str, value: impl Into<String>) -> Self {
+        self.details.insert(key.into(), value.into());
+        self
+    }
 }
 
 impl std::fmt::Display for OperationError {
@@ -73,6 +78,34 @@ pub struct RootIdentity {
     pub object_format: String,
     pub branch: Option<String>,
     pub head_oid: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SnapshotTarget {
+    Commit,
+    Index,
+    Worktree { include_untracked: bool },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexRequest {
+    pub worktree_root: PathBuf,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub target: SnapshotTarget,
+    pub dependency_mode: DependencyMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedIndexRequest {
+    pub root: RootIdentity,
+    pub base_ref: String,
+    pub base_oid: String,
+    pub head_ref: String,
+    pub head_oid: String,
+    pub target: SnapshotTarget,
+    pub dependency_mode: DependencyMode,
 }
 
 #[derive(Clone)]
@@ -187,6 +220,33 @@ impl AllowedRoots {
     }
 }
 
+pub fn resolve_request(
+    roots: &AllowedRoots,
+    request: IndexRequest,
+    cancelled: &AtomicBool,
+) -> Result<ResolvedIndexRequest, OperationError> {
+    let root = roots.inspect(&request.worktree_root, cancelled)?;
+    let base_oid = resolve_commit(&root.worktree_root, &request.base_ref, "base", cancelled)?;
+    let head_oid = resolve_commit(&root.worktree_root, &request.head_ref, "head", cancelled)?;
+    if !matches!(request.target, SnapshotTarget::Commit) && head_oid != root.head_oid {
+        return Err(OperationError::new(
+            ErrorCode::HeadWorktreeMismatch,
+            "resolved head does not match worktree HEAD",
+        )
+        .with_detail("resolved_head_oid", &head_oid)
+        .with_detail("worktree_head_oid", &root.head_oid));
+    }
+    Ok(ResolvedIndexRequest {
+        root,
+        base_ref: request.base_ref,
+        base_oid,
+        head_ref: request.head_ref,
+        head_oid,
+        target: request.target,
+        dependency_mode: request.dependency_mode,
+    })
+}
+
 fn validate_path(path: &Path, label: &str) -> Result<(), OperationError> {
     if !path.is_absolute() {
         return Err(OperationError::new(
@@ -276,7 +336,122 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::AtomicBool;
 
-    use super::{AllowedRoots, ErrorCode};
+    use crate::git::DependencyMode;
+
+    use super::{AllowedRoots, ErrorCode, IndexRequest, SnapshotTarget, resolve_request};
+
+    #[test]
+    fn resolve_request_pins_base_and_head_oids() {
+        let root = temp_root("resolve-request");
+        fs::create_dir_all(&root).unwrap();
+        test_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        test_git(&root, &["config", "user.name", "Graphr Test"]);
+        test_git(&root, &["config", "user.email", "graphr@example.invalid"]);
+        fs::write(root.join("base.rs"), "fn base() {}\n").unwrap();
+        test_git(&root, &["add", "--", "base.rs"]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        test_git(&root, &["switch", "--quiet", "-c", "feature"]);
+        fs::write(root.join("head.rs"), "fn head() {}\n").unwrap();
+        test_git(&root, &["add", "--", "head.rs"]);
+        test_git(&root, &["commit", "--quiet", "-m", "head"]);
+        test_git(&root, &["switch", "--quiet", "main"]);
+
+        let expected_base = git_required_line(&root, &["rev-parse", "main^{commit}"]);
+        let expected_head = git_required_line(&root, &["rev-parse", "feature^{commit}"]);
+        let roots = AllowedRoots::new(vec![root.clone()]).unwrap();
+        let resolved = resolve_request(
+            &roots,
+            IndexRequest {
+                worktree_root: root.clone(),
+                base_ref: "main".into(),
+                head_ref: "feature".into(),
+                target: SnapshotTarget::Commit,
+                dependency_mode: DependencyMode::Boundary,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.base_oid, expected_base);
+        assert_eq!(resolved.head_oid, expected_head);
+        assert_eq!(resolved.base_ref, "main");
+        assert_eq!(resolved.head_ref, "feature");
+        assert_eq!(
+            resolved.root.worktree_root,
+            fs::canonicalize(&root).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_request_rejects_a_head_that_differs_from_the_worktree() {
+        let root = temp_root("head-mismatch");
+        fs::create_dir_all(&root).unwrap();
+        test_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        test_git(&root, &["config", "user.name", "Graphr Test"]);
+        test_git(&root, &["config", "user.email", "graphr@example.invalid"]);
+        fs::write(root.join("source.rs"), "fn first() {}\n").unwrap();
+        test_git(&root, &["add", "--", "source.rs"]);
+        test_git(&root, &["commit", "--quiet", "-m", "first"]);
+        fs::write(root.join("source.rs"), "fn second() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "second"]);
+        let worktree_head = git_required_line(&root, &["rev-parse", "HEAD"]);
+        let resolved_head = git_required_line(&root, &["rev-parse", "HEAD~1"]);
+        let roots = AllowedRoots::new(vec![root.clone()]).unwrap();
+
+        let error = resolve_request(
+            &roots,
+            IndexRequest {
+                worktree_root: root.clone(),
+                base_ref: "HEAD~1".into(),
+                head_ref: "HEAD~1".into(),
+                target: SnapshotTarget::Index,
+                dependency_mode: DependencyMode::Boundary,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::HeadWorktreeMismatch);
+        assert_eq!(error.details["resolved_head_oid"], resolved_head);
+        assert_eq!(error.details["worktree_head_oid"], worktree_head);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_request_rejects_invalid_revision_text_before_git() {
+        let root = temp_root("invalid-revisions");
+        fs::create_dir_all(&root).unwrap();
+        test_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        test_git(&root, &["config", "user.name", "Graphr Test"]);
+        test_git(&root, &["config", "user.email", "graphr@example.invalid"]);
+        fs::write(root.join("source.rs"), "fn source() {}\n").unwrap();
+        test_git(&root, &["add", "--", "source.rs"]);
+        test_git(&root, &["commit", "--quiet", "-m", "source"]);
+        let roots = AllowedRoots::new(vec![root.clone()]).unwrap();
+
+        for revision in [
+            String::new(),
+            "-option".into(),
+            "x".repeat(257),
+            "bad\nref".into(),
+        ] {
+            let error = resolve_request(
+                &roots,
+                IndexRequest {
+                    worktree_root: root.clone(),
+                    base_ref: revision,
+                    head_ref: "HEAD".into(),
+                    target: SnapshotTarget::Commit,
+                    dependency_mode: DependencyMode::Boundary,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidParameters);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn inspect_reports_common_and_per_worktree_identity() {
