@@ -313,9 +313,13 @@ line.
 
 Expected after concatenating graph pages:
 
-- The risk lines for `genesis_hash`, `verify_chain`, `validate_audit_chain_id`, `validate_text`, and `record_hash` do not contain `test-gap`.
+- The risk lines for `genesis_hash`, `verify_chain`, `validate_audit_chain_id`, `validate_text`, and `record_hash` do not contain `no-static-test-path` when a resolved static path exists, and state `test_path_confidence=heuristic` plus `test_path_provenance=resolved-static-call-graph`.
 - Covered non-direct helpers may contain `indirect-test-covered`.
 - `analysis_complete=true`, `changed_symbols_omitted=0`, and `review_complete_when_pages_exhausted=true` remain unchanged.
+
+Human acceptance: the 0.5.0 module-glob fix and honest provenance are the
+accepted scope. General Rust call extraction inside macro token trees and
+inferred receiver typing are deferred to 0.6.0.
 
 Use only the temporary clone for this reproduction; do not index or modify the source repository.
 
@@ -519,7 +523,7 @@ Record these exact evidence points in the final handoff, one per issue:
 
 ```text
 #1: README/MCP/skill document standalone name=value cursor parsing and the terminal predicate.
-#2: The exact 165e3f7..ebee315 reproduction no longer labels the five named covered symbols test-gap.
+#2: The exact 165e3f7..ebee315 reproduction resolves the five named covered symbols where a static path exists, while retaining heuristic confidence and resolved-static-call-graph provenance; macro token-tree extraction and inferred receiver typing are deferred to 0.6.0.
 #3: Documentation distinguishes analyzer-local analysis_complete from whole-change review_complete_when_pages_exhausted, with artifact omissions enumerated.
 #4: README/MCP document one server per bound worktree and the temporary checkout workflow.
 ```

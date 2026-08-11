@@ -5,8 +5,9 @@
 Magnus reported four issues after reviewing the committed range
 `165e3f7..ebee315` from `infinite-rfq-platform`. The range adds a 1,051-line
 Rust audit module, a two-line Rust change, two Markdown documents, and one TSV
-fixture. Current Graphr reproduces the reported `test_gaps=32`, including five
-symbols that the audit tests exercise directly or through public entry points.
+fixture. The prior report raised 32 unresolved static test paths, including
+five symbols that the audit tests exercise directly or through public entry
+points.
 
 The complete-artifact-coverage work already supplies independent artifact
 pages, Markdown and TSV analysis, explicit artifact omissions, and separate
@@ -51,7 +52,7 @@ Clients must continue until all four cursor names are absent and then require
 page's `review_complete=false` is an explicit incomplete-consumption signal,
 not a terminal result.
 
-### Issue 2: False `test-gap` results through public entry points
+### Issue 2: Missing static test paths through public entry points
 
 The exact reproduction uses an inline `tests` module with `use super::*`.
 Graphr currently discards `use_wildcard` syntax, so calls such as
@@ -69,7 +70,11 @@ invalid, or block-local glob imports add no fallback candidates.
 
 This change supplies the missing exact edges; the existing transitive mapping
 then marks covered helpers as direct or `indirect-test-covered` and discounts
-the existing test risk component. Risk weights do not change.
+the existing heuristic test-path risk component. Risk output states
+`test_path_confidence=heuristic` and
+`test_path_provenance=resolved-static-call-graph`; it does not validate the
+absence of runtime tests. General Rust call extraction inside macro token trees
+and inferred receiver typing are deferred to 0.6.0. Risk weights do not change.
 
 ### Issue 3: Separate native analysis from whole-change coverage
 
@@ -118,7 +123,8 @@ Use test-driven development:
 3. Run the focused tests red, implement the minimum parser/index changes, and
    rerun them green.
 4. Re-run Graphr against `165e3f7..ebee315` and verify that the five named audit
-   symbols are no longer reported as `test-gap` when a static test path exists.
+   symbols have resolved static paths when available, with the heuristic
+   confidence and provenance fields above.
 5. Update README, MCP instructions, and the bundled review skill where the
    client contract is stated.
 6. Bump `Cargo.toml` and `Cargo.lock` from 0.4.0 to 0.5.0.
