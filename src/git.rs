@@ -1164,12 +1164,7 @@ fn capture_tracked_artifacts(
             continue;
         };
         let section = &patch[patch_change.start..patch_change.end];
-        let binary = section
-            .windows(b"Binary files ".len())
-            .any(|window| window == b"Binary files ")
-            || section
-                .windows(b"GIT binary patch".len())
-                .any(|window| window == b"GIT binary patch");
+        let binary = section.contains(&0) || binary_patch_marker(section).is_some();
         let (diff_complete, mut omission) = if binary {
             if let Some(metadata) = binary_patch_metadata(section) {
                 if filtered_patch.len().saturating_add(metadata.len()) > STDOUT_LIMIT {
@@ -1327,19 +1322,24 @@ fn record_artifact_analysis(
 }
 
 fn binary_patch_metadata(section: &[u8]) -> Option<&str> {
-    let marker = [b"Binary files ".as_slice(), b"GIT binary patch".as_slice()]
-        .into_iter()
-        .filter_map(|marker| {
-            section
-                .windows(marker.len())
-                .position(|window| window == marker)
-        })
-        .min()?;
+    let marker = binary_patch_marker(section)?;
     let end = section[marker..]
         .iter()
         .position(|byte| *byte == b'\n')
         .map_or(section.len(), |end| marker + end + 1);
     std::str::from_utf8(&section[..end]).ok()
+}
+
+fn binary_patch_marker(section: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    for line in section.split_inclusive(|byte| *byte == b'\n') {
+        let text = line.strip_suffix(b"\n").unwrap_or(line);
+        if text.starts_with(b"Binary files ") || text == b"GIT binary patch" {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn old_semantic_text(
@@ -2068,10 +2068,10 @@ fn finalize_artifact_omissions(
         let omission = match path.status {
             ChangeStatus::TypeChanged => ArtifactOmission::TypeChanged,
             ChangeStatus::Unmerged => ArtifactOmission::Unmerged,
+            _ if path.language.is_none() => ArtifactOmission::NonRegular,
             _ => continue,
         };
-        if language_for_path(&path.path).is_some()
-            || !matches!(parse_change_path(path.path.as_bytes()), Ok(Some(_)))
+        if !matches!(parse_change_path(path.path.as_bytes()), Ok(Some(_)))
             || dependency_mode == DependencyMode::Boundary
                 && dependency_package(&path.path).is_some()
             || review.files.iter().any(|file| file.path == path.path)
@@ -2517,7 +2517,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_keeps_non_content_statuses_unsupported() {
+    fn tracked_nonregular_and_conflict_inventory_gets_omissions() {
         let zero = "0".repeat(OID.len());
         let inventory = format!(
             ":100644 120000 {OID} {OID} T\0typed.rs\0\
@@ -2541,6 +2541,21 @@ mod tests {
                 ("vendor/core.rs", ChangeStatus::Modified, None),
             ]
         );
+
+        let mut review = ArtifactReview::default();
+        finalize_artifact_omissions(&paths, &mut review, DependencyMode::Boundary);
+        for (path, omission) in [
+            ("conflict.rs", ArtifactOmission::Unmerged),
+            ("link.rs", ArtifactOmission::NonRegular),
+            ("typed.rs", ArtifactOmission::TypeChanged),
+            ("vendor/core.rs", ArtifactOmission::NonRegular),
+        ] {
+            assert_eq!(
+                review.file(path).unwrap().omission,
+                Some(omission),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -2641,7 +2656,7 @@ mod tests {
                 status: ChangeStatus::TypeChanged,
                 old_path: None,
                 old_language: None,
-                path: "typed.txt".into(),
+                path: "typed.rs".into(),
                 language: None,
                 additions: None,
                 deletions: None,
@@ -2650,22 +2665,78 @@ mod tests {
                 status: ChangeStatus::Unmerged,
                 old_path: None,
                 old_language: None,
-                path: "conflict.txt".into(),
+                path: "conflict.py".into(),
+                language: None,
+                additions: None,
+                deletions: None,
+            },
+            ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: "link.rs".into(),
+                language: None,
+                additions: None,
+                deletions: None,
+            },
+            ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: "covered.rs".into(),
+                language: None,
+                additions: None,
+                deletions: None,
+            },
+            ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: "regular.rs".into(),
+                language: Some(Language::Rust),
+                additions: Some(1),
+                deletions: Some(1),
+            },
+            ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: ".cargo/vendor/pkg/link.rs".into(),
                 language: None,
                 additions: None,
                 deletions: None,
             },
         ];
-        let mut review = ArtifactReview::default();
+        let mut review = ArtifactReview {
+            files: vec![ArtifactFile {
+                path: "covered.rs".into(),
+                analyzer: AnalyzerKind::Generic,
+                diff_complete: false,
+                analysis_complete: false,
+                omission: Some(ArtifactOmission::Binary),
+            }],
+            ..ArtifactReview::default()
+        };
         finalize_artifact_omissions(&paths, &mut review, DependencyMode::Boundary);
         assert_eq!(
-            review.file("typed.txt").unwrap().omission,
+            review.file("typed.rs").unwrap().omission,
             Some(ArtifactOmission::TypeChanged)
         );
         assert_eq!(
-            review.file("conflict.txt").unwrap().omission,
+            review.file("conflict.py").unwrap().omission,
             Some(ArtifactOmission::Unmerged)
         );
+        assert_eq!(
+            review.file("link.rs").unwrap().omission,
+            Some(ArtifactOmission::NonRegular)
+        );
+        assert_eq!(
+            review.file("covered.rs").unwrap().omission,
+            Some(ArtifactOmission::Binary)
+        );
+        assert!(review.file("regular.rs").is_none());
+        assert!(review.file(".cargo/vendor/pkg/link.rs").is_none());
+        assert_eq!(review.files.len(), 4);
     }
 
     #[test]
@@ -3544,6 +3615,154 @@ mod tests {
                 && path.path == "docs/new.txt"
         }));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tracked_forced_text_nul_is_binary() {
+        let root = temp_root("forced-text-nul");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".gitattributes"), "forced.dat diff\n").unwrap();
+        fs::write(root.join("forced.dat"), b"old\0value\n").unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["add", "--", "."]);
+        test_git(
+            &root,
+            &[
+                "-c",
+                "user.name=Graphr Test",
+                "-c",
+                "user.email=graphr@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+        fs::write(root.join("forced.dat"), b"new\0value\n").unwrap();
+
+        let changes = Repository {
+            root: fs::canonicalize(&root).unwrap(),
+            database: root.join(".git/graphr/index.db"),
+        }
+        .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
+        .unwrap();
+        let file = changes.artifacts.file("forced.dat").unwrap();
+
+        assert!(!file.diff_complete);
+        assert!(!file.analysis_complete);
+        assert_eq!(file.omission, Some(ArtifactOmission::Binary));
+        assert!(!changes.artifacts.patch.as_bytes().contains(&0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tracked_text_marker_phrases_remain_text() {
+        let root = temp_root("text-binary-markers");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("notes.txt"), "before\n").unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["add", "--", "."]);
+        test_git(
+            &root,
+            &[
+                "-c",
+                "user.name=Graphr Test",
+                "-c",
+                "user.email=graphr@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+        fs::write(
+            root.join("notes.txt"),
+            "Binary files are ordinary text\nGIT binary patch is ordinary text\n",
+        )
+        .unwrap();
+
+        let changes = Repository {
+            root: fs::canonicalize(&root).unwrap(),
+            database: root.join(".git/graphr/index.db"),
+        }
+        .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
+        .unwrap();
+        let file = changes.artifacts.file("notes.txt").unwrap();
+
+        assert!(file.diff_complete);
+        assert!(file.analysis_complete);
+        assert_eq!(file.omission, None);
+        assert!(
+            changes
+                .artifacts
+                .patch
+                .contains("+Binary files are ordinary text")
+        );
+        assert!(
+            changes
+                .artifacts
+                .patch
+                .contains("+GIT binary patch is ordinary text")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tracked_source_extension_nonregular_paths_have_omissions() {
+        let root = temp_root("tracked-source-nonregular");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("target-a"), "a\n").unwrap();
+        fs::write(root.join("target-b"), "b\n").unwrap();
+        std::os::unix::fs::symlink("target-a", root.join("link.rs")).unwrap();
+        fs::write(root.join("typed.py"), "regular\n").unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["add", "--", "."]);
+        test_git(
+            &root,
+            &[
+                "-c",
+                "user.name=Graphr Test",
+                "-c",
+                "user.email=graphr@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+        fs::remove_file(root.join("link.rs")).unwrap();
+        std::os::unix::fs::symlink("target-b", root.join("link.rs")).unwrap();
+        fs::remove_file(root.join("typed.py")).unwrap();
+        std::os::unix::fs::symlink("target-a", root.join("typed.py")).unwrap();
+        let head =
+            String::from_utf8(run(&root, &["rev-parse", "HEAD"], &AtomicBool::new(false)).unwrap())
+                .unwrap();
+        let cacheinfo = format!("160000,{},gitlink.rs", head.trim());
+        test_git(&root, &["update-index", "--add", "--cacheinfo", &cacheinfo]);
+        fs::create_dir(root.join("gitlink.rs")).unwrap();
+
+        let changes = Repository {
+            root: fs::canonicalize(&root).unwrap(),
+            database: root.join(".git/graphr/index.db"),
+        }
+        .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
+        .unwrap();
+
+        for (path, omission) in [
+            ("link.rs", ArtifactOmission::NonRegular),
+            ("typed.py", ArtifactOmission::TypeChanged),
+            ("gitlink.rs", ArtifactOmission::NonRegular),
+        ] {
+            let file = changes
+                .artifacts
+                .file(path)
+                .unwrap_or_else(|| panic!("missing {path}: {:?}", changes.paths));
+            assert!(!file.diff_complete, "{path}");
+            assert!(!file.analysis_complete, "{path}");
+            assert_eq!(file.omission, Some(omission), "{path}");
+        }
+        assert!(changes.files.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -23,13 +23,13 @@ Graphr detects Rust and Python sources automatically and exposes four MCP tools:
 - `index` reparses only dirty, untracked, or Git-OID-changed Rust and Python files.
 - `search` finds symbols and returns compact `node_ref` values.
 - `view` traverses callers, callees, and related tests up to six graph hops.
-- `changes` returns bounded 8 KiB review pages with every changed path, Rust and Python source diffs, bounded non-source text diffs, Markdown/TSV semantics, explicit artifact omissions, risk-ranked changed symbols, affected static execution paths, and graph impact. `.cargo/vendor` changes collapse to deterministic package boundaries by default; pass `dependency_mode="full"` to inspect dependency internals.
+- `changes` returns bounded 8 KiB review pages with every safe changed path, an aggregate count of unsafe paths, Rust and Python source diffs, bounded non-source text diffs, Markdown/TSV semantics, explicit artifact omissions, risk-ranked changed symbols, affected static execution paths, and graph impact. `.cargo/vendor` changes collapse to deterministic package boundaries by default; pass `dependency_mode="full"` to inspect dependency internals.
 
 Affected-flow discovery follows `CALLS` edges up to 15 hops. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale; community and churn factors are not used.
 
 The server indexes when it starts. Run `index` only after Rust or Python source edits made in the current session. For reviews, call `changes` once without a cursor, then pass every returned `files_next_cursor`, `diff_next_cursor`, `artifacts_next_cursor`, and `graph_next_cursor` back verbatim as `cursor` with the same arguments until each section is complete. Artifact text and semantics belong to that immutable snapshot. `max_nodes` changes graph page size, never snapshot coverage. Non-symbol source ranges map to their indexed file node and are reported as `file-mapped`; targeted `search` or `view` remediation is named for unresolved graph coverage. Binary, oversized, unsafe, non-regular, type-changed, unmerged, and other explicit artifact omissions keep `review_complete_when_pages_exhausted=false`. This is complete artifact coverage; Rust and Python remain the only indexed source languages.
 
-Rename detection is limited to supported regular Rust and Python sources. Unsupported renames are conservatively listed as separate additions and deletions.
+Rename detection runs independently within regular Rust/Python source diffs and within non-source artifact diffs. Renames crossing those streams are conservatively represented as a deletion plus an addition.
 
 ## Codex review skill
 
@@ -51,13 +51,13 @@ Isolated reviews of `rust-random/rand` commit `bb1262f7` used Codex CLI 0.146.0 
 | Unguided Graphr | 294,000 | 248,064 | 45,936 | 3,388 | 297,388 | 7/10 |
 | Graphr + `$graphr-review` | 82,244 | 64,256 | 17,988 | 2,725 | 84,969 | 9/10 |
 
-The unguided run read the full diff, made two `changes` calls and 14 `search`/`view` calls, and re-read source. The guided run made one `changes` call, no `search`/`view` calls, and one bounded fallback for two unmapped files. It used 52,116 fewer total tokens than plain Codex (-38.0%) and 212,419 fewer than unguided Graphr (-71.4%); uncached input fell 43.6% versus plain Codex.
+This benchmark predates complete artifact coverage. In that historical run, the unguided mode read the full diff, made two `changes` calls and 14 `search`/`view` calls, and re-read source; the guided mode made one `changes` call, no `search`/`view` calls, and one bounded fallback for two unmapped files. It used 52,116 fewer total tokens than plain Codex (-38.0%) and 212,419 fewer than unguided Graphr (-71.4%); uncached input fell 43.6% versus plain Codex.
 
 Each mode was measured once on one small commit, and the guided mode included additional skill instructions, so the results are directional. Token counts were collected before affected-flow and risk fields; for this fixture, those fields add 206 bytes to the raw response.
 
 ## Comparison with code-review-graph (CRG)
 
-The same commit was evaluated against an eight-item, source-verified review checklist. Graphr's raw `changes` response scored 5/8, CRG 2.3.7 `detect_changes` scored 2.5/8, and CRG's larger `get_review_context` scored 3.5/8. Graphr identified both changed paths, all seven changed functions, the RNG substitutions, and the deterministic seed/assertion behavior while excluding an unchanged nested function. Both tools missed public re-export and related-test evidence in bounded context; macro-generated Criterion registration required a targeted source fallback.
+This comparison also predates complete artifact coverage. The same commit was evaluated against an eight-item, source-verified review checklist. Graphr's raw `changes` response scored 5/8, CRG 2.3.7 `detect_changes` scored 2.5/8, and CRG's larger `get_review_context` scored 3.5/8. Graphr identified both changed paths, all seven changed functions, the RNG substitutions, and the deterministic seed/assertion behavior while excluding an unchanged nested function. Both tools missed public re-export and related-test evidence in bounded context; macro-generated Criterion registration required a targeted source fallback in that historical run.
 
 A common stdio MCP harness used warm indexes, 20 fresh starts, and 100 measured calls after warmup:
 

@@ -350,7 +350,10 @@ fn requirement_tokens(line: &str) -> Vec<String> {
             continue;
         }
         let start = index;
-        while index < bytes.len() && bytes[index].is_ascii_uppercase() {
+        while index < bytes.len()
+            && (bytes[index].is_ascii_uppercase()
+                || index > start && (bytes[index].is_ascii_digit() || bytes[index] == b'_'))
+        {
             index += 1;
         }
         let prefix_end = index;
@@ -832,6 +835,51 @@ mod tests {
         assert!(analysis.output.contains("issue=unclosed-fence"));
         assert!(analysis.output.contains("REQ-9"));
         assert!(!analysis.output.contains('\t'));
+    }
+
+    #[test]
+    fn markdown_requirement_prefix_accepts_digits_and_underscores() {
+        let analysis = analyze("README.md", None, Some("REQ_2-17\n")).unwrap();
+        assert!(
+            analysis
+                .output
+                .contains("kind=requirement value=\"REQ_2-17\"")
+        );
+    }
+
+    #[test]
+    fn markdown_requirement_tokens_accept_punctuation_boundaries() {
+        let analysis = analyze("README.md", None, Some("(A-1), [R2-3]; REQ_2-17.\n")).unwrap();
+        for value in ["A-1", "R2-3", "REQ_2-17"] {
+            assert!(
+                analysis
+                    .output
+                    .contains(&format!("kind=requirement value={value:?}")),
+                "{value}: {}",
+                analysis.output
+            );
+        }
+        assert_eq!(
+            analysis
+                .output
+                .lines()
+                .filter(|line| line.contains("kind=requirement"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn markdown_requirement_tokens_reject_false_positives() {
+        let analysis = analyze(
+            "README.md",
+            None,
+            Some(
+                "xREQ_2-17 _REQ_2-17 2REQ_2-17 REq_2-17 REQ_2-17x REQ_2-17_tail REQ_2-17-18 req_2-17 REQ_2-\n",
+            ),
+        )
+        .unwrap();
+        assert!(!analysis.output.contains("kind=requirement"));
     }
 
     #[test]

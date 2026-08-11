@@ -455,6 +455,9 @@ fn artifact_text(review: &ArtifactReview) -> String {
         output.push('\n');
     }
     output.push_str(&review.analysis);
+    if !review.analysis.is_empty() && !review.patch.is_empty() && !review.analysis.ends_with('\n') {
+        output.push('\n');
+    }
     output.push_str(&review.patch);
     output
 }
@@ -2470,6 +2473,23 @@ mod tests {
     }
 
     #[test]
+    fn artifact_text_frames_analysis_and_patch_with_one_newline() {
+        for (analysis, patch, expected) in [
+            ("semantic", "diff", "semantic\ndiff"),
+            ("semantic\n", "diff", "semantic\ndiff"),
+            ("", "diff", "diff"),
+            ("semantic", "", "semantic"),
+        ] {
+            let review = ArtifactReview {
+                files: vec![],
+                analysis: analysis.into(),
+                patch: patch.into(),
+            };
+            assert_eq!(artifact_text(&review), expected);
+        }
+    }
+
+    #[test]
     fn omitted_artifact_keeps_review_incomplete() {
         let mut file = complete_artifact("image.bin", AnalyzerKind::Generic);
         file.diff_complete = false;
@@ -2495,6 +2515,42 @@ mod tests {
             },
             skipped_paths: 0,
         };
+        assert!(!change_content_complete(&changes, DependencyMode::Boundary));
+    }
+
+    #[test]
+    fn source_looking_nonregular_path_is_not_source_complete() {
+        let changes = WorktreeChanges {
+            files: vec![],
+            records: vec![],
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: "link.rs".into(),
+                language: None,
+                additions: None,
+                deletions: None,
+            }],
+            source_patch: String::new(),
+            artifacts: ArtifactReview {
+                files: vec![ArtifactFile {
+                    path: "link.rs".into(),
+                    analyzer: AnalyzerKind::Generic,
+                    diff_complete: false,
+                    analysis_complete: false,
+                    omission: Some(ArtifactOmission::NonRegular),
+                }],
+                analysis: String::new(),
+                patch: String::new(),
+            },
+            skipped_paths: 0,
+        };
+
+        assert!(!path_in_source_patch(
+            &changes.paths[0],
+            DependencyMode::Boundary
+        ));
         assert!(!change_content_complete(&changes, DependencyMode::Boundary));
     }
 
