@@ -785,6 +785,7 @@ pub fn validate_image(path: &Path) -> Result<State> {
     if !metadata.is_file() {
         return Err("database image is not a regular file".into());
     }
+    require_no_sidecars(path)?;
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
@@ -798,9 +799,28 @@ pub fn validate_image(path: &Path) -> Result<State> {
     if version != SCHEMA_VERSION {
         return Err("database schema mismatch; run index --rebuild".into());
     }
+    let mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(db_error)?;
+    if mode != "delete" {
+        return Err("database image is not in DELETE journal mode".into());
+    }
     let state = read_state(&connection)?;
     require_integrity(&connection)?;
+    require_no_sidecars(path)?;
     Ok(state)
+}
+
+#[allow(dead_code)]
+fn require_no_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        match fs::symlink_metadata(sqlite_sidecar(path, suffix)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect database sidecar: {error}")),
+            Ok(_) => return Err("database image has a SQLite sidecar".into()),
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -3414,6 +3434,71 @@ mod tests {
         let reader = Store::open_reader(&path).unwrap();
         assert!(reader.connection.execute("DELETE FROM state", []).is_err());
         drop(reader);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_image_rejects_a_wal_mode_database() {
+        let root = std::env::temp_dir().join(format!(
+            "graphr-wal-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store::open(&path, false, &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((single_node_graph("wal"), ()))
+            })
+            .unwrap();
+        drop(store);
+
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            [std::ffi::OsString::from("graph.db")]
+        );
+        assert!(validate_image(&path).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_image_rejects_any_sqlite_sidecar() {
+        let root = std::env::temp_dir().join(format!(
+            "graphr-sidecar-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store::open(&path, false, &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((single_node_graph("sidecar"), ()))
+            })
+            .unwrap();
+        store.seal(&cancelled).unwrap();
+
+        let mut rejected = Vec::new();
+        for name in ["graph.db-wal", "graph.db-shm", "graph.db-journal"] {
+            let sidecar = root.join(name);
+            fs::write(&sidecar, b"").unwrap();
+            rejected.push(validate_image(&path).is_err());
+            fs::remove_file(sidecar).unwrap();
+        }
+
+        assert_eq!(rejected, [true, true, true]);
         fs::remove_dir_all(root).unwrap();
     }
 

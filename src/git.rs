@@ -3187,6 +3187,7 @@ fn git_command(cwd: &Path, isolate_repository: bool, index_file: Option<&Path>) 
         .env("GIT_PAGER", "cat")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_CONFIG_GLOBAL")
@@ -3368,6 +3369,47 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|node| node.name == "main_only" && node.file_key == "src/feature.rs")
+        );
+        fs::remove_dir_all(capture_root).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commit_capture_uses_original_blob_when_git_replace_is_configured() {
+        let root = initialized_repository("commit-replacement");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn original_blob() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "original"]);
+        let original_oid = git_output(&root, &["rev-parse", "HEAD:src/lib.rs"]);
+        fs::write(
+            root.join("replacement-source"),
+            "pub fn replacement_blob() {}\n",
+        )
+        .unwrap();
+        let replacement_oid = git_output(&root, &["hash-object", "-w", "replacement-source"]);
+        fs::remove_file(root.join("replacement-source")).unwrap();
+        test_git(&root, &["replace", &original_oid, &replacement_oid]);
+
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let capture_root = private_dir("commit-replacement-output");
+        let sources = repository
+            .capture_sources(
+                &repository.head_oid,
+                &SnapshotTarget::Commit,
+                &capture_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let graph =
+            build_snapshot_for_test(&repository, &sources, &AtomicBool::new(false)).unwrap();
+
+        assert!(graph.nodes.iter().any(|node| node.name == "original_blob"));
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.name == "replacement_blob")
         );
         fs::remove_dir_all(capture_root).unwrap();
         fs::remove_dir_all(root).unwrap();
