@@ -17,8 +17,6 @@ const STDOUT_LIMIT: usize = 64 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(30);
 const SOURCE_LIMIT: u64 = 2 * 1024 * 1024;
-const UNTRACKED_STATS_FILE_LIMIT: usize = 256;
-const UNTRACKED_STATS_BYTE_LIMIT: u64 = SOURCE_LIMIT;
 
 pub struct Repository {
     pub root: PathBuf,
@@ -229,7 +227,8 @@ struct TrackedArtifactSnapshot {
 
 struct UntrackedSnapshot {
     paths: Vec<ChangedPath>,
-    patch: Vec<u8>,
+    source_patch: Vec<u8>,
+    artifacts: ArtifactReview,
     skipped_paths: usize,
     signature: [u8; 32],
 }
@@ -594,17 +593,19 @@ fn capture_untracked(
     hash.update(&(input.len() as u64).to_le_bytes());
     hash.update(input);
     let mut paths = Vec::new();
-    let mut patch = Vec::new();
+    let mut source_patch = Vec::new();
+    let mut artifacts = ArtifactReview::default();
+    let mut analysis = Vec::new();
+    let mut output_len = 0usize;
     let mut skipped_paths = 0;
-    let mut files_left = UNTRACKED_STATS_FILE_LIMIT;
-    let mut bytes_left = UNTRACKED_STATS_BYTE_LIMIT;
-    // ponytail: one Git process per supported untracked file, all sharing one
+    // ponytail: one Git process per eligible untracked file, all sharing one
     // deadline; batch only if large untracked source sets become routine.
     let patch_deadline = Instant::now() + DEADLINE;
     if input.is_empty() {
         return Ok(UntrackedSnapshot {
             paths,
-            patch,
+            source_patch,
+            artifacts,
             skipped_paths,
             signature: *hash.finalize().as_bytes(),
         });
@@ -624,80 +625,167 @@ fn capture_untracked(
             skipped_paths += 1;
             continue;
         };
-        let before = safe_regular_metadata(root, &path);
+        let candidate = root.join(&path);
+        let before = fs::symlink_metadata(&candidate).ok();
+        let before_regular = before.as_ref().is_some_and(|metadata| {
+            metadata.is_file()
+                && fs::canonicalize(&candidate).is_ok_and(|canonical| canonical == candidate)
+        });
         let boundary_dependency =
             dependency_mode == DependencyMode::Boundary && dependency_package(&path).is_some();
-        let content =
-            if !boundary_dependency && before.is_some() && files_left > 0 && bytes_left > 0 {
-                files_left -= 1;
-                // ponytail: sample at most 256 files/2 MiB; raise these caps only if
-                // exact all-untracked statistics justify the filesystem exposure.
-                read_regular_file(root, &path, bytes_left, cancelled)?
-            } else {
-                None
-            };
-        let after = safe_regular_metadata(root, &path);
-        let regular = match (&before, &after) {
-            (Some(before), Some(after)) if same_file_version(before, after) => true,
-            (None, None) => false,
-            _ => return Err(format!("file changed while reading: {path}")),
-        };
-        hash.update(&[u8::from(regular)]);
-        if let Some(metadata) = &after {
-            hash_file_version(&mut hash, metadata);
-        }
-        let (mut additions, mut deletions) = if let Some(content) = content {
-            bytes_left -= content.len() as u64;
-            hash.update(&(content.len() as u64).to_le_bytes());
-            hash.update(&content);
-            if content.contains(&0) || std::str::from_utf8(&content).is_err() {
-                (None, None)
-            } else {
-                let lines = content.iter().filter(|byte| **byte == b'\n').count()
-                    + usize::from(!content.is_empty() && !content.ends_with(b"\n"));
-                let lines = u64::try_from(lines)
-                    .map_err(|_| "untracked line count exceeds range".to_owned())?;
-                (Some(lines), Some(0))
-            }
-        } else {
-            hash.update(&u64::MAX.to_le_bytes());
-            (None, None)
-        };
-        if regular
-            && !boundary_dependency
-            && include_patch
-            && language_for_path(&path).is_some()
-            && after
+        let content = if !boundary_dependency
+            && before_regular
+            && before
                 .as_ref()
                 .is_some_and(|metadata| metadata.len() <= SOURCE_LIMIT)
         {
-            let file_patch = untracked_patch(root, &path, patch_deadline, cancelled)?;
-            let current = safe_regular_metadata(root, &path)
-                .ok_or_else(|| format!("file changed while reading: {path}"))?;
-            if !same_file_version(after.as_ref().expect("regular file has metadata"), &current) {
-                return Err(format!("file changed while reading: {path}"));
+            read_regular_file(root, &path, SOURCE_LIMIT, cancelled)?
+        } else {
+            None
+        };
+        let after = fs::symlink_metadata(&candidate).ok();
+        let after_regular = after.as_ref().is_some_and(|metadata| {
+            metadata.is_file()
+                && fs::canonicalize(&candidate).is_ok_and(|canonical| canonical == candidate)
+        });
+        match (&before, &after) {
+            (Some(before), Some(after))
+                if same_file_version(before, after) && before_regular == after_regular => {}
+            (None, None) => {}
+            _ => return Err(format!("file changed while reading: {path}")),
+        }
+        let regular = before_regular && after_regular;
+        if let Some(metadata) = &after {
+            hash_file_version(&mut hash, metadata);
+        }
+        let language = language_for_path(&path);
+        let mut reported_language = regular.then_some(language).flatten();
+        let (mut additions, mut deletions) = (None, None);
+        let mut artifact = None;
+        if boundary_dependency {
+            hash.update(b"boundary");
+        } else if !regular
+            || content.is_none() && after.as_ref().is_some_and(|m| m.len() <= SOURCE_LIMIT)
+        {
+            hash.update(ArtifactOmission::NonRegular.as_str().as_bytes());
+            artifact = Some(ArtifactFile {
+                path: path.clone(),
+                analyzer: analyzer_kind(&path),
+                diff_complete: false,
+                analysis_complete: false,
+                omission: Some(ArtifactOmission::NonRegular),
+            });
+        } else if after
+            .as_ref()
+            .is_some_and(|metadata| metadata.len() > SOURCE_LIMIT)
+        {
+            hash.update(ArtifactOmission::Oversized.as_str().as_bytes());
+            if language.is_none() {
+                artifact = Some(ArtifactFile {
+                    path: path.clone(),
+                    analyzer: analyzer_kind(&path),
+                    diff_complete: false,
+                    analysis_complete: false,
+                    omission: Some(ArtifactOmission::Oversized),
+                });
             }
-            let parsed = parse_patch_hunks(&file_patch, 1, cancelled)?;
-            additions = Some(parsed[0].additions);
-            deletions = Some(parsed[0].deletions);
-            if patch.len().saturating_add(file_patch.len()) > STDOUT_LIMIT {
-                return Err("Git output exceeded its limit".into());
+        } else if let Some(content) = content {
+            hash.update(&(content.len() as u64).to_le_bytes());
+            hash.update(&content);
+            match semantic_text(content) {
+                Err(reason) => {
+                    reported_language = None;
+                    hash.update(reason.as_str().as_bytes());
+                    artifact = Some(ArtifactFile {
+                        path: path.clone(),
+                        analyzer: analyzer_kind(&path),
+                        diff_complete: false,
+                        analysis_complete: false,
+                        omission: Some(reason),
+                    });
+                }
+                Ok(text) => {
+                    let file_patch = untracked_patch(root, &path, patch_deadline, cancelled)?;
+                    let current = safe_regular_metadata(root, &path)
+                        .ok_or_else(|| format!("file changed while reading: {path}"))?;
+                    if !same_file_version(
+                        after.as_ref().expect("regular file has metadata"),
+                        &current,
+                    ) {
+                        return Err(format!("file changed while reading: {path}"));
+                    }
+                    let parsed = parse_patch_hunks(&file_patch, 1, cancelled)?;
+                    additions = Some(parsed[0].additions);
+                    deletions = Some(parsed[0].deletions);
+                    output_len = output_len.saturating_add(file_patch.len());
+                    hash.update(&(file_patch.len() as u64).to_le_bytes());
+                    hash.update(&file_patch);
+                    if let Some(language) = language {
+                        hash.update(language.as_str().as_bytes());
+                        if include_patch {
+                            source_patch.extend_from_slice(&file_patch);
+                        }
+                    } else {
+                        let output_count = analysis.len();
+                        record_artifact_analysis(
+                            &path,
+                            None,
+                            Some(&text),
+                            &mut hash,
+                            &mut analysis,
+                        )?;
+                        if analysis.len() > output_count {
+                            output_len = output_len
+                                .saturating_add(analysis.last().expect("analysis added").len())
+                                .saturating_add(usize::from(output_count > 0));
+                        }
+                        if include_patch {
+                            artifacts.patch.push_str(
+                                std::str::from_utf8(&file_patch)
+                                    .expect("UTF-8 content produces a UTF-8 patch"),
+                            );
+                        }
+                        artifact = Some(ArtifactFile {
+                            path: path.clone(),
+                            analyzer: analyzer_kind(&path),
+                            diff_complete: true,
+                            analysis_complete: true,
+                            omission: None,
+                        });
+                    }
+                }
             }
-            patch.extend_from_slice(&file_patch);
+        } else {
+            hash.update(&u64::MAX.to_le_bytes());
+        }
+        if output_len > STDOUT_LIMIT {
+            return Err("Git output exceeded its limit".into());
+        }
+        if let Some(artifact) = artifact {
+            hash.update(artifact.analyzer.as_str().as_bytes());
+            artifacts.files.push(artifact);
         }
         paths.push(ChangedPath {
             status: ChangeStatus::Untracked,
             old_path: None,
             old_language: None,
             path: path.clone(),
-            language: regular.then(|| language_for_path(&path)).flatten(),
+            language: reported_language,
             additions,
             deletions,
         });
     }
+    artifacts
+        .files
+        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    analysis.sort_unstable();
+    if include_patch {
+        artifacts.analysis = analysis.join("\n");
+    }
     Ok(UntrackedSnapshot {
         paths,
-        patch,
+        source_patch,
+        artifacts,
         skipped_paths,
         signature: *hash.finalize().as_bytes(),
     })
@@ -757,6 +845,7 @@ fn safe_regular_metadata(root: &Path, path: &str) -> Option<fs::Metadata> {
 }
 
 fn hash_file_version(hash: &mut blake3::Hasher, metadata: &fs::Metadata) {
+    hash.update(&metadata.mode().to_le_bytes());
     hash.update(&metadata.dev().to_le_bytes());
     hash.update(&metadata.ino().to_le_bytes());
     hash.update(&metadata.len().to_le_bytes());
@@ -1861,7 +1950,8 @@ fn merge_changes(
     )?;
     let UntrackedSnapshot {
         paths: untracked_paths,
-        patch: untracked_patch,
+        source_patch: untracked_source_patch,
+        artifacts: mut untracked_artifacts,
         skipped_paths: untracked_skipped_paths,
         signature: _,
     } = untracked;
@@ -1881,17 +1971,47 @@ fn merge_changes(
         }
         paths.push(path);
     }
-    let untracked_patch = String::from_utf8_lossy(&untracked_patch);
+    let untracked_source_patch = String::from_utf8_lossy(&untracked_source_patch);
     if patch
         .len()
-        .saturating_add(untracked_patch.len())
+        .saturating_add(untracked_source_patch.len())
         .saturating_add(artifact_review.patch.len())
+        .saturating_add(untracked_artifacts.patch.len())
         .saturating_add(artifact_review.analysis.len())
+        .saturating_add(untracked_artifacts.analysis.len())
+        .saturating_add(usize::from(
+            !artifact_review.analysis.is_empty() && !untracked_artifacts.analysis.is_empty(),
+        ))
         > STDOUT_LIMIT
     {
         return Err("Git output exceeded its limit".into());
     }
-    patch.push_str(&untracked_patch);
+    patch.push_str(&untracked_source_patch);
+    artifact_review.patch.push_str(&untracked_artifacts.patch);
+    let mut analysis = artifact_review
+        .analysis
+        .lines()
+        .chain(untracked_artifacts.analysis.lines())
+        .collect::<Vec<_>>();
+    analysis.sort_unstable();
+    artifact_review.analysis = analysis.join("\n");
+    artifact_review.files.append(&mut untracked_artifacts.files);
+    artifact_review
+        .files
+        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    let mut merged_artifacts: Vec<ArtifactFile> = Vec::with_capacity(artifact_review.files.len());
+    for file in artifact_review.files {
+        if let Some(previous) = merged_artifacts.last()
+            && previous.path == file.path
+        {
+            if previous != &file {
+                return Err("Git working tree changed while reading; retry".into());
+            }
+        } else {
+            merged_artifacts.push(file);
+        }
+    }
+    artifact_review.files = merged_artifacts;
     check_cancelled(cancelled)?;
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     let mut merged = Vec::<ChangedFile>::with_capacity(files.len());
@@ -2107,7 +2227,8 @@ fn check_progress(index: usize, cancelled: &AtomicBool) -> Result<(), String> {
 }
 
 fn same_file_version(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.dev() == right.dev()
+    left.mode() == right.mode()
+        && left.dev() == right.dev()
         && left.ino() == right.ino()
         && left.len() == right.len()
         && left.mtime() == right.mtime()
@@ -2548,6 +2669,43 @@ mod tests {
     }
 
     #[test]
+    fn rejects_merged_payload_over_the_aggregate_limit() {
+        let half = STDOUT_LIMIT / 2;
+        let error = merge_changes(
+            TrackedChanges {
+                files: Vec::new(),
+                records: Vec::new(),
+                patch: String::new(),
+                stats: Vec::new(),
+                omitted_stats: HashSet::new(),
+            },
+            TrackedArtifactSnapshot {
+                review: ArtifactReview {
+                    analysis: "a".repeat(half),
+                    ..ArtifactReview::default()
+                },
+                ..TrackedArtifactSnapshot::default()
+            },
+            (Vec::new(), 0),
+            UntrackedSnapshot {
+                paths: Vec::new(),
+                source_patch: Vec::new(),
+                artifacts: ArtifactReview {
+                    analysis: "b".repeat(STDOUT_LIMIT - half),
+                    ..ArtifactReview::default()
+                },
+                skipped_paths: 0,
+                signature: [0; 32],
+            },
+            DependencyMode::Boundary,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "Git output exceeded its limit");
+    }
+
+    #[test]
     fn oversized_old_semantic_blob_is_classified_without_capture_failure() {
         let root = temp_root("oversized-old-blob");
         fs::create_dir_all(&root).unwrap();
@@ -2633,7 +2791,8 @@ mod tests {
             parse_change_inventory(&inventory, &AtomicBool::new(false)).unwrap(),
             UntrackedSnapshot {
                 paths: Vec::new(),
-                patch: Vec::new(),
+                source_patch: Vec::new(),
+                artifacts: ArtifactReview::default(),
                 skipped_paths: 0,
                 signature: [0; 32],
             },
@@ -2684,7 +2843,7 @@ mod tests {
     }
 
     #[test]
-    fn untracked_patch_outlives_the_stats_sample() {
+    fn untracked_capture_has_no_fallback_file_cap() {
         let root = temp_root("untracked-patch-sample");
         fs::create_dir_all(&root).unwrap();
         assert!(
@@ -2707,7 +2866,7 @@ mod tests {
         let mut input = Vec::new();
         fs::write(root.join("empty.rs"), "").unwrap();
         input.extend_from_slice(b"empty.rs\0");
-        for index in 0..=UNTRACKED_STATS_FILE_LIMIT {
+        for index in 0..=256 {
             let path = format!("file-{index:03}.rs");
             fs::write(root.join(&path), format!("fn value_{index}() {{}}\n")).unwrap();
             input.extend_from_slice(path.as_bytes());
@@ -2723,10 +2882,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(snapshot.paths.len(), UNTRACKED_STATS_FILE_LIMIT + 2);
+        assert_eq!(snapshot.paths.len(), 258);
         assert_eq!(snapshot.paths[0].additions, Some(0));
         assert_eq!(snapshot.paths.last().unwrap().additions, Some(1));
-        let patch = String::from_utf8_lossy(&snapshot.patch);
+        let patch = String::from_utf8_lossy(&snapshot.source_patch);
         assert!(!patch.contains("FILTERED"));
         assert!(!patch.lines().any(|line| line.starts_with("index ")));
         assert!(patch.contains("diff --git a/empty.rs b/empty.rs"));
@@ -2764,7 +2923,8 @@ mod tests {
             inventory,
             untracked: UntrackedSnapshot {
                 paths: Vec::new(),
-                patch: Vec::new(),
+                source_patch: Vec::new(),
+                artifacts: ArtifactReview::default(),
                 skipped_paths: 0,
                 signature: [0; 32],
             },
@@ -2824,7 +2984,7 @@ mod tests {
         let expected_patch = format!(
             "{}{}",
             tracked.split_once("\0\0").unwrap().1,
-            String::from_utf8_lossy(&untracked.patch)
+            String::from_utf8_lossy(&untracked.source_patch)
         );
         let changes = merge_changes(
             parse_tracked_changes(tracked.as_bytes(), &cancelled).unwrap(),
@@ -3108,7 +3268,7 @@ mod tests {
     }
 
     #[test]
-    fn change_inventory_reports_unsupported_untracked_files_and_ignores_ignored_files() {
+    fn change_inventory_captures_untracked_artifacts_and_ignores_ignored_files() {
         let root = temp_root("changes");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests/fixtures")).unwrap();
@@ -3148,6 +3308,7 @@ mod tests {
             vec![b'x'; SOURCE_LIMIT as usize + 1],
         )
         .unwrap();
+        fs::write(root.join("tests/fixtures/invalid.txt"), [0xff]).unwrap();
         std::os::unix::fs::symlink("alias-registry.v1.tsv", root.join("tests/fixtures/link.rs"))
             .unwrap();
         fs::write(root.join("ignored.txt"), "ignored\n").unwrap();
@@ -3200,6 +3361,13 @@ mod tests {
                     None,
                 ),
                 (
+                    "tests/fixtures/invalid.txt",
+                    ChangeStatus::Untracked,
+                    None,
+                    None,
+                    None,
+                ),
+                (
                     "tests/fixtures/large.data",
                     ChangeStatus::Untracked,
                     None,
@@ -3226,6 +3394,46 @@ mod tests {
         assert_eq!(changes.files[0].path, "src/domain.rs");
         assert!(changes.source_patch.contains("+pub fn added() {}"));
         assert!(!changes.source_patch.contains("tracked.tsv"));
+        assert!(changes.artifacts.patch.contains("alias-registry.v1.tsv"));
+        assert!(changes.artifacts.patch.contains("tracked.tsv"));
+        assert!(
+            changes
+                .artifacts
+                .analysis
+                .contains("key_basis=first-column")
+        );
+        assert_eq!(
+            changes
+                .artifacts
+                .file("tests/fixtures/blob.bin")
+                .unwrap()
+                .omission,
+            Some(ArtifactOmission::Binary)
+        );
+        assert_eq!(
+            changes
+                .artifacts
+                .file("tests/fixtures/large.data")
+                .unwrap()
+                .omission,
+            Some(ArtifactOmission::Oversized)
+        );
+        assert_eq!(
+            changes
+                .artifacts
+                .file("tests/fixtures/link.rs")
+                .unwrap()
+                .omission,
+            Some(ArtifactOmission::NonRegular)
+        );
+        assert_eq!(
+            changes
+                .artifacts
+                .file("tests/fixtures/invalid.txt")
+                .unwrap()
+                .omission,
+            Some(ArtifactOmission::InvalidUtf8)
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
