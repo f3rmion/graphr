@@ -733,6 +733,7 @@ fn untracked_patch(
         true,
         true,
         deadline,
+        STDOUT_LIMIT,
         cancelled,
     )?;
     // A no-index diff outside the repository always hashes with SHA-1. The
@@ -1048,6 +1049,15 @@ fn capture_tracked_artifacts(
         if let Some(new_oid) = &change.new_oid {
             hash.update(new_oid.as_bytes());
         }
+        let old_path = change.old.as_deref();
+        let new_path = change.new.as_deref();
+        let old_analyzer = if change.kind == RawKind::Modified {
+            new_path
+        } else {
+            old_path
+        }
+        .map_or(AnalyzerKind::Generic, analyzer_kind);
+        let new_analyzer = new_path.map_or(AnalyzerKind::Generic, analyzer_kind);
         let path = match change.kind {
             RawKind::Added | RawKind::Modified | RawKind::TypeChanged | RawKind::Unmerged => {
                 change.new.as_deref()
@@ -1093,7 +1103,11 @@ fn capture_tracked_artifacts(
         } else {
             (false, Some(ArtifactOmission::InvalidUtf8))
         };
-        let analyzer = analyzer_kind(path);
+        let analyzer = if change.kind == RawKind::Deleted {
+            old_analyzer
+        } else {
+            new_analyzer
+        };
         let mut analysis_complete = false;
         if omission.is_none() {
             omission = match change.kind {
@@ -1116,41 +1130,66 @@ fn capture_tracked_artifacts(
         if omission.is_none() {
             let mut old_text = None;
             let mut new_text = None;
-            if analyzer != AnalyzerKind::Generic {
-                if matches!(
+            let old_required = old_analyzer != AnalyzerKind::Generic
+                && matches!(
                     change.kind,
                     RawKind::Modified | RawKind::Deleted | RawKind::Renamed
-                ) {
-                    let old = old_semantic_text(root, change.old_oid.as_deref(), cancelled)?;
-                    hash_semantic_input(&mut hash, b"old", &old);
-                    match old {
-                        Ok(text) => old_text = Some(text),
-                        Err(reason) => omission = Some(reason),
-                    }
-                }
-                if matches!(
+                );
+            let new_required = new_analyzer != AnalyzerKind::Generic
+                && matches!(
                     change.kind,
                     RawKind::Added | RawKind::Modified | RawKind::Renamed
-                ) {
-                    let new = current_semantic_text(root, path, cancelled)?;
-                    hash_semantic_input(&mut hash, b"new", &new);
-                    match new {
-                        Ok(text) => new_text = Some(text),
-                        Err(reason) if omission.is_none() => omission = Some(reason),
-                        Err(_) => {}
-                    }
+                );
+            let mut old_omission = None;
+            let mut new_omission = None;
+            if old_required {
+                let old = old_semantic_text(root, change.old_oid.as_deref(), cancelled)?;
+                hash_semantic_input(&mut hash, b"old", &old);
+                match old {
+                    Ok(text) => old_text = Some(text),
+                    Err(reason) => old_omission = Some(reason),
                 }
             }
-            if omission.is_none() {
-                let result = analyze(path, old_text.as_deref(), new_text.as_deref())?;
-                hash.update(result.kind.as_str().as_bytes());
-                hash.update(&(result.output.len() as u64).to_le_bytes());
-                hash.update(result.output.as_bytes());
-                if !result.output.is_empty() {
-                    analysis.push(result.output);
+            if new_required {
+                let new = current_semantic_text(root, path, cancelled)?;
+                hash_semantic_input(&mut hash, b"new", &new);
+                match new {
+                    Ok(text) => new_text = Some(text),
+                    Err(reason) => new_omission = Some(reason),
                 }
-                analysis_complete = true;
             }
+            let old_ready = !old_required || old_text.is_some();
+            let new_ready = !new_required || new_text.is_some();
+            if change.kind == RawKind::Renamed && old_analyzer != new_analyzer {
+                if old_ready {
+                    record_artifact_analysis(
+                        old_path.expect("rename has old endpoint"),
+                        old_text.as_deref(),
+                        None,
+                        &mut hash,
+                        &mut analysis,
+                    )?;
+                }
+                if new_ready {
+                    record_artifact_analysis(
+                        new_path.expect("rename has new endpoint"),
+                        None,
+                        new_text.as_deref(),
+                        &mut hash,
+                        &mut analysis,
+                    )?;
+                }
+            } else if old_ready && new_ready {
+                record_artifact_analysis(
+                    path,
+                    old_text.as_deref(),
+                    new_text.as_deref(),
+                    &mut hash,
+                    &mut analysis,
+                )?;
+            }
+            analysis_complete = old_ready && new_ready;
+            omission = old_omission.or(new_omission);
         }
         if let Some(reason) = omission {
             hash.update(reason.as_str().as_bytes());
@@ -1181,6 +1220,23 @@ fn capture_tracked_artifacts(
     })
 }
 
+fn record_artifact_analysis(
+    path: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+    hash: &mut blake3::Hasher,
+    output: &mut Vec<String>,
+) -> Result<(), String> {
+    let result = analyze(path, old, new)?;
+    hash.update(result.kind.as_str().as_bytes());
+    hash.update(&(result.output.len() as u64).to_le_bytes());
+    hash.update(result.output.as_bytes());
+    if !result.output.is_empty() {
+        output.push(result.output);
+    }
+    Ok(())
+}
+
 fn binary_patch_metadata(section: &[u8]) -> Option<&str> {
     let marker = [b"Binary files ".as_slice(), b"GIT binary patch".as_slice()]
         .into_iter()
@@ -1205,11 +1261,18 @@ fn old_semantic_text(
     let Some(oid) = oid else {
         return Ok(Err(ArtifactOmission::NonRegular));
     };
-    Ok(semantic_text(run(
+    match run_with_limit(
         root,
         &["cat-file", "blob", oid],
+        SOURCE_LIMIT as usize + 1,
         cancelled,
-    )?))
+    ) {
+        Ok(content) => Ok(semantic_text(content)),
+        Err(error) if error == "cannot read Git output: output limit exceeded" => {
+            Ok(Err(ArtifactOmission::Oversized))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn current_semantic_text(
@@ -1767,7 +1830,7 @@ fn merge_changes(
         omitted_stats,
     } = tracked;
     let TrackedArtifactSnapshot {
-        review: artifact_review,
+        review: mut artifact_review,
         stats: artifact_stats,
         renames: artifact_renames,
         signature: _,
@@ -1865,6 +1928,7 @@ fn merge_changes(
             .then_with(|| left.old_path.cmp(&right.old_path))
     });
     paths.dedup();
+    finalize_artifact_omissions(&paths, &mut artifact_review, dependency_mode);
     Ok(WorktreeChanges {
         files: merged,
         records,
@@ -1873,6 +1937,38 @@ fn merge_changes(
         artifacts: artifact_review,
         skipped_paths,
     })
+}
+
+fn finalize_artifact_omissions(
+    paths: &[ChangedPath],
+    review: &mut ArtifactReview,
+    dependency_mode: DependencyMode,
+) {
+    for path in paths {
+        let omission = match path.status {
+            ChangeStatus::TypeChanged => ArtifactOmission::TypeChanged,
+            ChangeStatus::Unmerged => ArtifactOmission::Unmerged,
+            _ => continue,
+        };
+        if language_for_path(&path.path).is_some()
+            || !matches!(parse_change_path(path.path.as_bytes()), Ok(Some(_)))
+            || dependency_mode == DependencyMode::Boundary
+                && dependency_package(&path.path).is_some()
+            || review.files.iter().any(|file| file.path == path.path)
+        {
+            continue;
+        }
+        review.files.push(ArtifactFile {
+            path: path.path.clone(),
+            analyzer: analyzer_kind(&path.path),
+            diff_complete: false,
+            analysis_complete: false,
+            omission: Some(omission),
+        });
+    }
+    review
+        .files
+        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
 }
 
 fn parse_change_path(input: &[u8]) -> Result<Option<String>, String> {
@@ -2072,6 +2168,24 @@ fn run(cwd: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Vec<u8>, Str
         false,
         false,
         Instant::now() + DEADLINE,
+        STDOUT_LIMIT,
+        cancelled,
+    )
+}
+
+fn run_with_limit(
+    cwd: &Path,
+    args: &[&str],
+    stdout_limit: usize,
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    run_git(
+        cwd,
+        args,
+        false,
+        false,
+        Instant::now() + DEADLINE,
+        stdout_limit,
         cancelled,
     )
 }
@@ -2082,6 +2196,7 @@ fn run_git(
     allow_diff_exit: bool,
     isolate_repository: bool,
     deadline: Instant,
+    stdout_limit: usize,
     cancelled: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     if cancelled.load(Ordering::Relaxed) {
@@ -2136,7 +2251,7 @@ fn run_git(
     let (overflow_tx, overflow_rx) = mpsc::channel();
     let stdout_thread = thread::spawn({
         let overflow_tx = overflow_tx.clone();
-        move || read_capped(stdout, STDOUT_LIMIT, overflow_tx)
+        move || read_capped(stdout, stdout_limit, overflow_tx)
     });
     let stderr_thread = thread::spawn(move || read_capped(stderr, STDERR_LIMIT, overflow_tx));
 
@@ -2396,6 +2511,64 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!((paths[0].additions, paths[0].deletions), (Some(3), Some(2)));
+    }
+
+    #[test]
+    fn finalizes_non_content_artifact_omissions() {
+        let paths = vec![
+            ChangedPath {
+                status: ChangeStatus::TypeChanged,
+                old_path: None,
+                old_language: None,
+                path: "typed.txt".into(),
+                language: None,
+                additions: None,
+                deletions: None,
+            },
+            ChangedPath {
+                status: ChangeStatus::Unmerged,
+                old_path: None,
+                old_language: None,
+                path: "conflict.txt".into(),
+                language: None,
+                additions: None,
+                deletions: None,
+            },
+        ];
+        let mut review = ArtifactReview::default();
+        finalize_artifact_omissions(&paths, &mut review, DependencyMode::Boundary);
+        assert_eq!(
+            review.file("typed.txt").unwrap().omission,
+            Some(ArtifactOmission::TypeChanged)
+        );
+        assert_eq!(
+            review.file("conflict.txt").unwrap().omission,
+            Some(ArtifactOmission::Unmerged)
+        );
+    }
+
+    #[test]
+    fn oversized_old_semantic_blob_is_classified_without_capture_failure() {
+        let root = temp_root("oversized-old-blob");
+        fs::create_dir_all(&root).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        fs::write(root.join("large.md"), vec![b'a'; STDOUT_LIMIT + 1]).unwrap();
+        let oid = String::from_utf8(
+            run(
+                &root,
+                &["hash-object", "-w", "--", "large.md"],
+                &AtomicBool::new(false),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            old_semantic_text(&root, Some(oid.trim()), &AtomicBool::new(false)).unwrap(),
+            Err(ArtifactOmission::Oversized)
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3127,6 +3300,91 @@ mod tests {
                 && path.path == "docs/new.txt"
         }));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn markdown_to_generic_rename_preserves_removed_semantics() {
+        let root = temp_root("markdown-to-generic");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("old.md"), "See [REQ-1](docs/old.md).\n").unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["add", "--", "."]);
+        test_git(
+            &root,
+            &[
+                "-c",
+                "user.name=Graphr Test",
+                "-c",
+                "user.email=graphr@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+        fs::rename(root.join("old.md"), root.join("new.txt")).unwrap();
+        test_git(&root, &["add", "-A"]);
+
+        let changes = Repository {
+            root: fs::canonicalize(&root).unwrap(),
+            database: root.join(".git/graphr/index.db"),
+        }
+        .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
+        .unwrap();
+
+        assert!(
+            changes.artifacts.analysis.contains(
+                "markdown path=\"old.md\" change=removed kind=requirement value=\"REQ-1\""
+            )
+        );
+        assert_eq!(
+            changes.artifacts.file("new.txt").unwrap().analyzer,
+            AnalyzerKind::Generic
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generic_to_markdown_rename_preserves_added_semantics() {
+        let root = temp_root("generic-to-markdown");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("old.txt"), "See [REQ-2](docs/new.md).\n").unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["add", "--", "."]);
+        test_git(
+            &root,
+            &[
+                "-c",
+                "user.name=Graphr Test",
+                "-c",
+                "user.email=graphr@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+        fs::rename(root.join("old.txt"), root.join("new.md")).unwrap();
+        test_git(&root, &["add", "-A"]);
+
+        let changes = Repository {
+            root: fs::canonicalize(&root).unwrap(),
+            database: root.join(".git/graphr/index.db"),
+        }
+        .worktree_changes("HEAD", DependencyMode::Boundary, &AtomicBool::new(false))
+        .unwrap();
+
+        assert!(
+            changes
+                .artifacts
+                .analysis
+                .contains("markdown path=\"new.md\" change=added kind=requirement value=\"REQ-2\"")
+        );
+        assert_eq!(
+            changes.artifacts.file("new.md").unwrap().analyzer,
+            AnalyzerKind::Markdown
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
