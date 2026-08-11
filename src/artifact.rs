@@ -396,8 +396,7 @@ fn digest_tokens(line: &str) -> Vec<(&'static str, String)> {
             index += 1;
         }
         let length = index - hex_start;
-        if matches!(length, 40 | 64) && (index == bytes.len() || !bytes[index].is_ascii_hexdigit())
-        {
+        if matches!(length, 40 | 64) && (index == bytes.len() || !token_byte(bytes[index])) {
             let value = if let Some(algorithm) = claimed {
                 format!("{algorithm}:{}", &line[hex_start..index])
             } else {
@@ -406,7 +405,7 @@ fn digest_tokens(line: &str) -> Vec<(&'static str, String)> {
             values.push((if claimed.is_some() { "claimed" } else { "bare" }, value));
         }
         if index == start {
-            index += 1;
+            index += line[index..].chars().next().unwrap().len_utf8();
         }
     }
     values
@@ -833,6 +832,32 @@ mod tests {
         assert!(analysis.output.contains("issue=unclosed-fence"));
         assert!(analysis.output.contains("REQ-9"));
         assert!(!analysis.output.contains('\t'));
+    }
+
+    #[test]
+    fn markdown_digest_scanning_handles_unicode_prefixes() {
+        let digest = "a".repeat(64);
+        let analysis =
+            analyze("README.md", None, Some(&format!("café sha256:{digest}\n"))).unwrap();
+        assert!(analysis.output.contains("kind=digest state=claimed"));
+    }
+
+    #[test]
+    fn markdown_digest_scanning_rejects_token_suffixes() {
+        let digest = "a".repeat(64);
+        for suffix in ["z", "0", "_", "-"] {
+            let analysis = analyze(
+                "README.md",
+                None,
+                Some(&format!("sha256:{digest}{suffix}\n")),
+            )
+            .unwrap();
+            assert!(
+                !analysis.output.contains("kind=digest state=claimed"),
+                "accepted suffix {suffix:?}: {}",
+                analysis.output
+            );
+        }
     }
 
     #[test]
