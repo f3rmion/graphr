@@ -24,6 +24,7 @@ pub struct Definition {
     pub line_end: usize,
     pub signature: String,
     pub module: Option<usize>,
+    pub block_scope: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -41,6 +42,7 @@ pub struct Call {
     pub source: usize,
     pub target: String,
     pub line: usize,
+    pub byte: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -214,6 +216,7 @@ impl RustParser {
                         line_end: line_end(node),
                         signature: signature(node, source),
                         module: current_module,
+                        block_scope: containing_function_block(node),
                     });
                     if current_method_container.is_none() {
                         type_parents
@@ -327,6 +330,7 @@ impl RustParser {
                         line_end: line_end(node),
                         signature: signature(node, source),
                         module: current_module,
+                        block_scope: containing_function_block(node),
                     });
                     scopes.push(Scope {
                         end_byte: node.end_byte(),
@@ -385,6 +389,7 @@ impl RustParser {
                     source: source_definition,
                     target: text(node, source).to_owned(),
                     line: line_start(node),
+                    byte: node.start_byte(),
                 });
             }
         }
@@ -400,6 +405,20 @@ impl RustParser {
         }
         Ok(parsed)
     }
+}
+
+fn containing_function_block(mut node: Node<'_>) -> Option<(usize, usize)> {
+    let mut block = None;
+    while let Some(parent) = node.parent() {
+        if block.is_none() && parent.kind() == "block" {
+            block = Some((parent.start_byte(), parent.end_byte()));
+        }
+        if matches!(parent.kind(), "function_item" | "function_signature_item") {
+            return block;
+        }
+        node = parent;
+    }
+    None
 }
 
 fn capture(query: &Query, name: &str) -> Result<u32, String> {

@@ -1381,8 +1381,7 @@ fn add_rust_file(
             continue;
         };
         let keys = call_keys(
-            &call.target,
-            call.source,
+            call,
             &parsed,
             &absolute_paths,
             target,
@@ -1750,21 +1749,21 @@ fn module_import_binding<'a>(
 }
 
 fn call_keys(
-    raw: &str,
-    source: usize,
+    call: &crate::parse::Call,
     parsed: &ParsedFile,
     paths: &[Option<String>],
     target: &TargetPath,
     module_paths: &[String],
     bindings: &Bindings,
 ) -> Vec<String> {
+    let source = call.source;
     let definition = parsed.definitions.get(source);
     let module_index = definition.and_then(|definition| definition.module);
     let module = definition.map_or(target.module.as_str(), |definition| {
         lexical_module(definition.module, &target.module, module_paths)
     });
     let root = target.root.as_str();
-    let Some(raw) = strip_generics(raw.trim()) else {
+    let Some(raw) = strip_generics(call.target.trim()) else {
         return Vec::new();
     };
     let raw = raw.as_ref();
@@ -1863,7 +1862,8 @@ fn call_keys(
         }
         None => {
             if !matches!(first, "crate" | "self" | "super")
-                && let Some(scope) = paths.get(source).and_then(Option::as_deref)
+                && let Some(scope) =
+                    visible_local_type_scope(&owner, source, call.byte, parsed, paths)
             {
                 owners.push(join_path(scope, &owner));
             }
@@ -1885,6 +1885,30 @@ fn call_keys(
         keys.push(item_key(&target));
     }
     dedup_keys(keys)
+}
+
+fn visible_local_type_scope<'a>(
+    owner: &str,
+    source: usize,
+    call_byte: usize,
+    parsed: &ParsedFile,
+    paths: &'a [Option<String>],
+) -> Option<&'a str> {
+    let scope = paths.get(source)?.as_deref()?;
+    let target = join_path(scope, owner);
+    parsed
+        .definitions
+        .iter()
+        .enumerate()
+        .any(|(index, definition)| {
+            definition.kind == DefinitionKind::Type
+                && definition.parent == Some(source)
+                && definition
+                    .block_scope
+                    .is_some_and(|(start, end)| start <= call_byte && call_byte < end)
+                && paths.get(index).and_then(Option::as_deref) == Some(target.as_str())
+        })
+        .then_some(scope)
 }
 
 fn normalize_value_type(
@@ -3236,8 +3260,7 @@ fn register_dispatches() { register(); }
         };
         assert_eq!(
             call_keys(
-                "Item::go",
-                0,
+                &parsed.calls[0],
                 &parsed,
                 &paths,
                 &target,
@@ -3738,6 +3761,56 @@ mod tests {
         assert_ne!(
             call.resolved_target_key.as_deref(),
             Some(outer.key.as_str())
+        );
+    }
+
+    #[test]
+    fn nested_block_types_do_not_shadow_out_of_block_qualified_calls() {
+        let sources = [Source {
+            path: "src/lib.rs".into(),
+            text: r#"
+pub struct AuditRecord;
+impl AuditRecord { pub fn build() {} }
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_outer_type() {
+        if false {
+            struct AuditRecord;
+            impl AuditRecord { fn build() {} }
+        }
+        AuditRecord::build();
+    }
+}
+"#
+            .into(),
+        }];
+        let graph = build_graph(&sources, &AtomicBool::new(false)).unwrap();
+        let node = |key: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.keys.iter().any(|candidate| candidate == key))
+                .unwrap()
+        };
+        let test = node("rust:function:tests::checks_outer_type");
+        let nested = node("rust:method:tests::checks_outer_type::AuditRecord::build");
+        let outer = node("rust:method:AuditRecord::build");
+        let call = graph
+            .refs
+            .iter()
+            .find(|reference| reference.source_key == test.key)
+            .unwrap();
+
+        assert_eq!(
+            call.resolved_target_key.as_deref(),
+            Some(outer.key.as_str())
+        );
+        assert_ne!(
+            call.resolved_target_key.as_deref(),
+            Some(nested.key.as_str())
         );
     }
 

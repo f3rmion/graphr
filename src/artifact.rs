@@ -460,6 +460,8 @@ struct Tsv {
 fn analyze_tsv(path: &str, old: Option<&str>, new: Option<&str>) -> Result<String, String> {
     let old = old.map(parse_tsv).unwrap_or_else(empty_tsv);
     let new = new.map(parse_tsv).unwrap_or_else(empty_tsv);
+    let old_header_names = unique_header_names(&old.header);
+    let new_header_names = unique_header_names(&new.header);
     let mut output = Vec::new();
     output.push(tsv_line(
         "schema",
@@ -510,7 +512,8 @@ fn analyze_tsv(path: &str, old: Option<&str>, new: Option<&str>) -> Result<Strin
                 output.push(tsv_row_line(path, "added", new_row, ambiguous, None))
             }
             (Some(old_row), Some(new_row)) if old_row.fields != new_row.fields => {
-                let columns = changed_columns(old_row, new_row, &old.header, &new.header);
+                let columns =
+                    changed_columns(old_row, new_row, &old_header_names, &new_header_names);
                 output.push(tsv_row_line(
                     path,
                     "modified",
@@ -630,11 +633,24 @@ fn row_map(rows: &[TsvRow]) -> BTreeMap<(String, usize), &TsvRow> {
         .collect()
 }
 
+fn unique_header_names(header: &[String]) -> Vec<Option<&str>> {
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for name in header {
+        *counts.entry(name).or_default() += 1;
+    }
+    header
+        .iter()
+        .map(|name| {
+            (!name.is_empty() && counts.get(name.as_str()) == Some(&1)).then_some(name.as_str())
+        })
+        .collect()
+}
+
 fn changed_columns(
     old: &TsvRow,
     new: &TsvRow,
-    old_header: &[String],
-    new_header: &[String],
+    old_header: &[Option<&str>],
+    new_header: &[Option<&str>],
 ) -> Vec<String> {
     (0..old.fields.len().max(new.fields.len()))
         .filter(|&index| old.fields.get(index) != new.fields.get(index))
@@ -642,13 +658,10 @@ fn changed_columns(
         .collect()
 }
 
-fn column_name(index: usize, old_header: &[String], new_header: &[String]) -> String {
+fn column_name(index: usize, old_header: &[Option<&str>], new_header: &[Option<&str>]) -> String {
     for header in [new_header, old_header] {
-        if let Some(name) = header.get(index)
-            && !name.is_empty()
-            && header.iter().filter(|candidate| *candidate == name).count() == 1
-        {
-            return name.clone();
+        if let Some(Some(name)) = header.get(index) {
+            return (*name).to_owned();
         }
     }
     format!("column_{}", index + 1)
@@ -940,6 +953,16 @@ mod tests {
             analysis
                 .output
                 .contains("kind=duplicate-header side=new name=\"id\" count=2")
+        );
+    }
+
+    #[test]
+    fn tsv_precomputes_unique_header_names() {
+        let headers = ["id", "value", "value", ""].map(str::to_owned);
+
+        assert_eq!(
+            unique_header_names(&headers),
+            [Some("id"), None, None, None]
         );
     }
 
