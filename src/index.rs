@@ -9,8 +9,8 @@ use std::sync::{
 use std::thread;
 
 use crate::git::{
-    ChangeStatus, ChangedPath, DependencyMode, Language, Repository, Source, SourceFile,
-    WorktreeChanges, changed_dependency_package,
+    ArtifactReview, ChangeStatus, ChangedPath, DependencyMode, Language, Repository, Source,
+    SourceFile, WorktreeChanges, changed_dependency_package,
 };
 use crate::parse::{DefinitionKind, ParsedFile, RustParser};
 use crate::python::PythonParser;
@@ -21,9 +21,10 @@ use crate::store::{
 
 const QUALIFIED_PATH_LIMIT: usize = 1024;
 const REVIEW_CONTEXT_BUDGET: usize = 8192;
-const INITIAL_FILES_BUDGET: usize = 2048;
-const INITIAL_DIFF_BUDGET: usize = 3584;
-const INITIAL_GRAPH_BUDGET: usize = 2432;
+const INITIAL_FILES_BUDGET: usize = 1792;
+const INITIAL_DIFF_BUDGET: usize = 2432;
+const INITIAL_ARTIFACTS_BUDGET: usize = 1920;
+const INITIAL_GRAPH_BUDGET: usize = 1920;
 const SECTION_OVERHEAD: usize = 704;
 
 #[derive(Clone)]
@@ -135,7 +136,7 @@ impl Project {
 #[derive(Default)]
 struct DependencyPackageSummary {
     files: usize,
-    supported_sources: usize,
+    source_files: usize,
     checksum_files: usize,
     statuses: [usize; 7],
 }
@@ -150,18 +151,18 @@ fn change_manifest(changes: &WorktreeChanges, dependency_mode: DependencyMode) -
             && let Some(package) = changed_dependency_package(path)
         {
             let mut record = String::new();
-            change_path_line(&mut record, path);
+            change_path_line(&mut record, path, &changes.artifacts);
             dependency_hash.update(&(record.len() as u64).to_le_bytes());
             dependency_hash.update(record.as_bytes());
             dependency_files += 1;
             let summary = dependencies.entry(package).or_default();
             summary.files += 1;
-            summary.supported_sources += usize::from(path.language.is_some());
+            summary.source_files += usize::from(path.language.is_some());
             summary.checksum_files += usize::from(path.path.ends_with("/.cargo-checksum.json"));
             summary.statuses[change_status_index(path.status)] += 1;
             continue;
         }
-        change_path_line(&mut output, path);
+        change_path_line(&mut output, path, &changes.artifacts);
     }
     if !dependencies.is_empty() {
         output.push_str(&format!(
@@ -172,9 +173,9 @@ fn change_manifest(changes: &WorktreeChanges, dependency_mode: DependencyMode) -
         ));
         for (package, summary) in dependencies {
             output.push_str(&format!(
-                "dependency-package name={package} files={} supported_sources={} checksum_files={} added={} modified={} deleted={} renamed={} type_changed={} unmerged={} untracked={}\n",
+                "dependency-package name={package} files={} source_files={} checksum_files={} added={} modified={} deleted={} renamed={} type_changed={} unmerged={} untracked={}\n",
                 summary.files,
-                summary.supported_sources,
+                summary.source_files,
                 summary.checksum_files,
                 summary.statuses[0],
                 summary.statuses[1],
@@ -206,17 +207,7 @@ const fn change_status_index(status: ChangeStatus) -> usize {
     }
 }
 
-fn change_path_line(output: &mut String, path: &ChangedPath) {
-    let support = match (
-        path.status == ChangeStatus::Renamed,
-        path.old_language.is_some(),
-        path.language.is_some(),
-    ) {
-        (true, true, false) => "supported-to-unsupported",
-        (true, false, true) => "unsupported-to-supported",
-        (_, _, true) => "supported",
-        _ => "unsupported",
-    };
+fn change_path_line(output: &mut String, path: &ChangedPath, artifacts: &ArtifactReview) {
     match path.status {
         ChangeStatus::Added => output.push_str("added "),
         ChangeStatus::Modified => output.push_str("changed "),
@@ -226,14 +217,39 @@ fn change_path_line(output: &mut String, path: &ChangedPath) {
         ChangeStatus::Unmerged => output.push_str("unmerged "),
         ChangeStatus::Untracked => output.push_str("untracked "),
     }
-    output.push_str(support);
-    output.push(' ');
+    if let Some(language) = path.language {
+        output.push_str("source ");
+        output.push_str(language.as_str());
+        output.push(' ');
+    } else if let Some(file) = artifacts.file(&path.path) {
+        output.push_str("artifact ");
+        output.push_str(if file.diff_complete {
+            "text "
+        } else {
+            "omitted "
+        });
+    } else {
+        output.push_str("artifact omitted ");
+    }
     if let Some(old) = &path.old_path {
         output.push_str(old);
         output.push_str(" -> ");
     }
     output.push_str(&path.path);
-    if path.status == ChangeStatus::Modified {
+    if path.language.is_none()
+        && let Some(file) = artifacts.file(&path.path)
+    {
+        output.push_str(" analyzer=");
+        output.push_str(file.analyzer.as_str());
+        if !file.analysis_complete && file.diff_complete {
+            output.push_str(" analysis=omitted");
+        }
+        if let Some(reason) = file.omission {
+            output.push_str(" reason=");
+            output.push_str(reason.as_str());
+        }
+    }
+    if path.status == ChangeStatus::Modified && path.language.is_some() {
         output.push_str(" status=modified");
     }
     match (path.additions, path.deletions) {
@@ -249,6 +265,7 @@ fn change_path_line(output: &mut String, path: &ChangedPath) {
 enum ReviewSection {
     Files,
     Diff,
+    Artifacts,
     Graph,
 }
 
@@ -257,6 +274,7 @@ impl ReviewSection {
         match self {
             Self::Files => 'f',
             Self::Diff => 'd',
+            Self::Artifacts => 'a',
             Self::Graph => 'g',
         }
     }
@@ -265,6 +283,7 @@ impl ReviewSection {
         match self {
             Self::Files => "files",
             Self::Diff => "diff",
+            Self::Artifacts => "artifacts",
             Self::Graph => "graph",
         }
     }
@@ -273,6 +292,7 @@ impl ReviewSection {
         match self {
             Self::Files => "files_next_cursor",
             Self::Diff => "diff_next_cursor",
+            Self::Artifacts => "artifacts_next_cursor",
             Self::Graph => "graph_next_cursor",
         }
     }
@@ -290,14 +310,19 @@ struct ReviewSnapshot {
     max_nodes: u32,
     dependency_mode: DependencyMode,
     manifest: String,
+    artifacts: String,
     changes: WorktreeChanges,
     graph: String,
     checksum: String,
     file_ranges: Vec<Range<usize>>,
     hunk_ranges: Vec<Range<usize>>,
+    artifact_file_ranges: Vec<Range<usize>>,
+    artifact_record_ranges: Vec<Range<usize>>,
+    artifact_hunk_ranges: Vec<Range<usize>>,
     graph_record_ranges: Vec<Range<usize>>,
     flow_ranges: Vec<Range<usize>>,
     patch_totals: String,
+    artifact_patch_totals: String,
     all_path_totals: String,
     all_path_hunks: String,
     complete_after_pagination: bool,
@@ -313,26 +338,43 @@ impl ReviewSnapshot {
         graph: String,
     ) -> Self {
         let manifest = change_manifest(&changes, dependency_mode);
+        let artifacts = artifact_text(&changes.artifacts);
         let checksum = review_snapshot(
             base,
             depth,
             max_nodes,
             dependency_mode,
-            &manifest,
-            &changes.source_patch,
-            &graph,
+            [&manifest, &changes.source_patch, &artifacts, &graph],
         );
         let file_ranges = line_ranges(&manifest, None);
+        let artifact_file_ranges = line_ranges(&artifacts, Some("artifact "));
+        let mut artifact_record_ranges = line_ranges(&artifacts, Some("markdown "));
+        artifact_record_ranges.extend(line_ranges(&artifacts, Some("tsv ")));
+        artifact_record_ranges.sort_unstable_by_key(|range| range.start);
+        let artifact_hunk_ranges = hunk_ranges(&artifacts);
         let hunk_ranges = hunk_ranges(&changes.source_patch);
         let graph_record_ranges = line_ranges(&graph, None);
         let flow_ranges = line_ranges(&graph, Some("flow "));
-        let all_path_hunks = change_hunk_totals(&changes, hunk_ranges.len(), dependency_mode);
+        let all_path_hunks = change_hunk_totals(
+            &changes,
+            hunk_ranges.len(),
+            artifact_hunk_ranges.len(),
+            dependency_mode,
+        );
         let patch_totals = change_totals(
             "patch",
             changes
                 .paths
                 .iter()
-                .filter(|path| path_in_patch(path, dependency_mode)),
+                .filter(|path| path_in_source_patch(path, dependency_mode)),
+            0,
+        );
+        let artifact_patch_totals = change_totals(
+            "patch",
+            changes
+                .paths
+                .iter()
+                .filter(|path| path_in_artifact_patch(path, &changes, dependency_mode)),
             0,
         );
         let all_path_totals =
@@ -345,14 +387,19 @@ impl ReviewSnapshot {
             max_nodes,
             dependency_mode,
             manifest,
+            artifacts,
             changes,
             graph,
             checksum,
             file_ranges,
             hunk_ranges,
+            artifact_file_ranges,
+            artifact_record_ranges,
+            artifact_hunk_ranges,
             graph_record_ranges,
             flow_ranges,
             patch_totals,
+            artifact_patch_totals,
             all_path_totals,
             all_path_hunks,
             complete_after_pagination,
@@ -376,6 +423,7 @@ impl ReviewSnapshot {
         match section {
             ReviewSection::Files => &self.manifest,
             ReviewSection::Diff => &self.changes.source_patch,
+            ReviewSection::Artifacts => &self.artifacts,
             ReviewSection::Graph => &self.graph,
         }
     }
@@ -384,9 +432,31 @@ impl ReviewSnapshot {
         match section {
             ReviewSection::Files => &self.file_ranges,
             ReviewSection::Diff => &self.hunk_ranges,
+            ReviewSection::Artifacts => &self.artifact_hunk_ranges,
             ReviewSection::Graph => &self.flow_ranges,
         }
     }
+}
+
+fn artifact_text(review: &ArtifactReview) -> String {
+    let mut output = String::new();
+    for file in &review.files {
+        output.push_str(&format!(
+            "artifact path={:?} analyzer={} diff_complete={} analysis_complete={}",
+            file.path,
+            file.analyzer.as_str(),
+            file.diff_complete,
+            file.analysis_complete,
+        ));
+        if let Some(reason) = file.omission {
+            output.push_str(" reason=");
+            output.push_str(reason.as_str());
+        }
+        output.push('\n');
+    }
+    output.push_str(&review.analysis);
+    output.push_str(&review.patch);
+    output
 }
 
 struct Page<'a> {
@@ -400,11 +470,21 @@ fn review_context(snapshot: &ReviewSnapshot) -> Result<String, String> {
         render_section_page(snapshot, ReviewSection::Files, 0, INITIAL_FILES_BUDGET)?;
     let (diff, diff_more) =
         render_section_page(snapshot, ReviewSection::Diff, 0, INITIAL_DIFF_BUDGET)?;
+    let (artifacts, artifacts_more) = render_section_page(
+        snapshot,
+        ReviewSection::Artifacts,
+        0,
+        INITIAL_ARTIFACTS_BUDGET,
+    )?;
     let (graph_page, graph_more) =
         render_section_page(snapshot, ReviewSection::Graph, 0, INITIAL_GRAPH_BUDGET)?;
     let output = format!(
-        "{files}{diff}{graph_page}review_complete={} review_complete_when_pages_exhausted={}\n",
-        !files_more && !diff_more && !graph_more && snapshot.complete_after_pagination,
+        "{files}{diff}{artifacts}{graph_page}review_complete={} review_complete_when_pages_exhausted={}\n",
+        !files_more
+            && !diff_more
+            && !artifacts_more
+            && !graph_more
+            && snapshot.complete_after_pagination,
         snapshot.complete_after_pagination,
     );
     if output.len() > REVIEW_CONTEXT_BUDGET {
@@ -466,7 +546,7 @@ fn render_section_page(
         ReviewSection::Files => {
             let coverage = record_coverage(snapshot.ranges(section), &page);
             output.push_str(&format!(
-                "files dependency_mode={} rename_detection=supported-only emitted_bytes={} total_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_entries={} partial_entries={} total_entries={} prior_entries={} remaining_entries={} page_complete={}\n",
+                "files dependency_mode={} rename_detection=within-source-and-artifact emitted_bytes={} total_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_entries={} partial_entries={} total_entries={} prior_entries={} remaining_entries={} page_complete={}\n",
                 snapshot.dependency_mode.as_str(),
                 emitted_bytes,
                 value.len(),
@@ -486,7 +566,7 @@ fn render_section_page(
         ReviewSection::Diff => {
             let coverage = record_coverage(snapshot.ranges(section), &page);
             output.push_str(&format!(
-                "diff scope=supported-source dependency_mode={} emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_hunks={} partial_hunks={} total_hunks={} prior_hunks={} remaining_hunks={} {} {} {} page_complete={}\n",
+                "diff scope=source dependency_mode={} emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_hunks={} partial_hunks={} total_hunks={} prior_hunks={} remaining_hunks={} {} {} {} page_complete={}\n",
                 snapshot.dependency_mode.as_str(),
                 emitted_bytes,
                 value.len(),
@@ -506,6 +586,41 @@ fn render_section_page(
                 snapshot.all_path_totals,
                 snapshot.all_path_hunks,
                 !more
+            ));
+        }
+        ReviewSection::Artifacts => {
+            let files = record_coverage(&snapshot.artifact_file_ranges, &page);
+            let records = record_coverage(&snapshot.artifact_record_ranges, &page);
+            let hunks = record_coverage(&snapshot.artifact_hunk_ranges, &page);
+            output.push_str(&format!(
+                "artifacts emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_files={} partial_files={} total_files={} prior_files={} remaining_files={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} emitted_hunks={} partial_hunks={} total_hunks={} prior_hunks={} remaining_hunks={} {} analysis_complete={} page_complete={}\n",
+                emitted_bytes,
+                value.len(),
+                page.start,
+                value.len() - page.end,
+                page.start,
+                page.end,
+                starts_mid_line,
+                ends_mid_line,
+                framing_suffix_bytes,
+                files.emitted,
+                files.partial,
+                files.total,
+                files.prior,
+                files.remaining,
+                records.emitted,
+                records.partial,
+                records.total,
+                records.prior,
+                records.remaining,
+                hunks.emitted,
+                hunks.partial,
+                hunks.total,
+                hunks.prior,
+                hunks.remaining,
+                snapshot.artifact_patch_totals,
+                snapshot.changes.artifacts.analysis_complete(),
+                !more,
             ));
         }
         ReviewSection::Graph => {
@@ -623,9 +738,7 @@ fn review_snapshot(
     depth: u32,
     max_nodes: u32,
     dependency_mode: DependencyMode,
-    manifest: &str,
-    patch: &str,
-    graph: &str,
+    sections: [&str; 4],
 ) -> String {
     let depth = depth.to_string();
     let max_nodes = max_nodes.to_string();
@@ -637,10 +750,10 @@ fn review_snapshot(
         depth.as_bytes(),
         max_nodes.as_bytes(),
         dependency_mode.as_bytes(),
-        manifest.as_bytes(),
-        patch.as_bytes(),
-        graph.as_bytes(),
-    ] {
+    ]
+    .into_iter()
+    .chain(sections.into_iter().map(str::as_bytes))
+    {
         hash.update(&(value.len() as u64).to_le_bytes());
         hash.update(value);
     }
@@ -669,6 +782,7 @@ fn parse_review_cursor(value: &str) -> Result<ReviewCursor, String> {
     let section = match parts.next() {
         Some("f") => ReviewSection::Files,
         Some("d") => ReviewSection::Diff,
+        Some("a") => ReviewSection::Artifacts,
         Some("g") => ReviewSection::Graph,
         _ => return Err("invalid changes cursor".into()),
     };
@@ -721,22 +835,39 @@ fn change_totals<'a>(
     }
 }
 
-fn path_in_patch(path: &ChangedPath, dependency_mode: DependencyMode) -> bool {
+fn path_in_source_patch(path: &ChangedPath, dependency_mode: DependencyMode) -> bool {
     (path.language.is_some() || path.old_language.is_some())
         && (dependency_mode == DependencyMode::Full || changed_dependency_package(path).is_none())
         && path.additions.is_some()
         && path.deletions.is_some()
 }
 
+fn path_in_artifact_patch(
+    path: &ChangedPath,
+    changes: &WorktreeChanges,
+    dependency_mode: DependencyMode,
+) -> bool {
+    path.language.is_none()
+        && (dependency_mode == DependencyMode::Full || changed_dependency_package(path).is_none())
+        && path.additions.is_some()
+        && path.deletions.is_some()
+        && changes
+            .artifacts
+            .file(&path.path)
+            .is_some_and(|file| file.diff_complete)
+}
+
 fn change_hunk_totals(
     changes: &WorktreeChanges,
-    patch_hunks: usize,
+    source_hunks: usize,
+    artifact_hunks: usize,
     dependency_mode: DependencyMode,
 ) -> String {
-    let mut total = patch_hunks;
+    let mut total = source_hunks.saturating_add(artifact_hunks);
     let mut unknown = changes.skipped_paths;
     for path in &changes.paths {
-        let captured = path_in_patch(path, dependency_mode);
+        let captured = path_in_source_patch(path, dependency_mode)
+            || path_in_artifact_patch(path, changes, dependency_mode);
         if captured {
             continue;
         }
@@ -843,14 +974,23 @@ fn graph_review_complete(value: &str) -> bool {
 
 fn change_content_complete(changes: &WorktreeChanges, dependency_mode: DependencyMode) -> bool {
     changes.skipped_paths == 0
+        && changes.artifacts.is_complete()
+        && changes
+            .artifacts
+            .files
+            .iter()
+            .all(|file| file.omission.is_none())
         && changes.paths.iter().all(|path| {
             if dependency_mode == DependencyMode::Boundary
                 && changed_dependency_package(path).is_some()
             {
                 true
+            } else if path.language.is_none() {
+                changes.artifacts.file(&path.path).is_some_and(|file| {
+                    file.diff_complete && file.analysis_complete && file.omission.is_none()
+                })
             } else {
-                path.language.is_some()
-                    && (path.status != ChangeStatus::Renamed || path.old_language.is_some())
+                (path.status != ChangeStatus::Renamed || path.old_language.is_some())
                     && path.additions.is_some()
                     && path.deletions.is_some()
             }
@@ -2235,6 +2375,128 @@ fn check_progress(index: usize, cancelled: &AtomicBool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact::AnalyzerKind;
+    use crate::git::{ArtifactFile, ArtifactOmission, ArtifactReview};
+
+    fn complete_artifact(path: &str, analyzer: AnalyzerKind) -> ArtifactFile {
+        ArtifactFile {
+            path: path.into(),
+            analyzer,
+            diff_complete: true,
+            analysis_complete: true,
+            omission: None,
+        }
+    }
+
+    #[test]
+    fn artifact_pages_are_independent_reconstructable_and_complete() {
+        let artifact_patch = format!(
+            "diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-old\n+{}\n",
+            "é".repeat(5_000)
+        );
+        let changes = WorktreeChanges {
+            files: vec![],
+            records: vec![],
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: "README.md".into(),
+                language: None,
+                additions: Some(1),
+                deletions: Some(1),
+            }],
+            source_patch: String::new(),
+            artifacts: ArtifactReview {
+                files: vec![complete_artifact("README.md", AnalyzerKind::Markdown)],
+                analysis:
+                    "markdown path=\"README.md\" change=added kind=requirement value=\"REQ-2\" line=1\n"
+                        .into(),
+                patch: artifact_patch.clone(),
+            },
+            skipped_paths: 0,
+        };
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n";
+        let snapshot = ReviewSnapshot::new(
+            "HEAD",
+            6,
+            50,
+            DependencyMode::Boundary,
+            changes,
+            graph.into(),
+        );
+
+        let initial = review_context(&snapshot).unwrap();
+        assert!(initial.contains("\nartifacts\n"), "{initial}");
+        assert!(initial.contains("artifacts_next_cursor="), "{initial}");
+        assert!(initial.contains("review_complete_when_pages_exhausted=true"));
+        let mut stale = next_cursor(&initial, "artifacts_next_cursor").unwrap();
+        let replacement = if stale.ends_with('0') { "1" } else { "0" };
+        stale.replace_range(stale.len() - 1.., replacement);
+        assert_eq!(
+            render_section(&snapshot, &parse_review_cursor(&stale).unwrap()).unwrap_err(),
+            "stale changes cursor"
+        );
+
+        let expected = format!(
+            "artifact path=\"README.md\" analyzer=markdown diff_complete=true analysis_complete=true\n{}{}",
+            snapshot.changes.artifacts.analysis, artifact_patch
+        );
+        let mut reconstructed = String::new();
+        let mut offset = 0;
+        loop {
+            let (page, more) = render_section_page(
+                &snapshot,
+                ReviewSection::Artifacts,
+                offset,
+                SECTION_OVERHEAD + 257,
+            )
+            .unwrap();
+            let metadata = page.lines().nth(1).unwrap();
+            let emitted = metadata
+                .split_ascii_whitespace()
+                .find_map(|field| field.strip_prefix("emitted_bytes="))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let content_start = page.match_indices('\n').nth(1).unwrap().0 + 1;
+            reconstructed.push_str(&page[content_start..content_start + emitted]);
+            offset += emitted;
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(reconstructed, expected);
+    }
+
+    #[test]
+    fn omitted_artifact_keeps_review_incomplete() {
+        let mut file = complete_artifact("image.bin", AnalyzerKind::Generic);
+        file.diff_complete = false;
+        file.analysis_complete = false;
+        file.omission = Some(ArtifactOmission::Binary);
+        let changes = WorktreeChanges {
+            files: vec![],
+            records: vec![],
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: "image.bin".into(),
+                language: None,
+                additions: None,
+                deletions: None,
+            }],
+            source_patch: String::new(),
+            artifacts: ArtifactReview {
+                files: vec![file],
+                analysis: String::new(),
+                patch: String::new(),
+            },
+            skipped_paths: 0,
+        };
+        assert!(!change_content_complete(&changes, DependencyMode::Boundary));
+    }
 
     #[test]
     fn review_context_pages_diff_and_graph_without_losing_utf8() {
@@ -2272,7 +2534,7 @@ mod tests {
         let initial = review_context(&snapshot).unwrap();
         assert!(initial.len() <= REVIEW_CONTEXT_BUDGET);
         assert!(initial.contains("emitted_entries=1 partial_entries=0 total_entries=1"));
-        assert!(initial.contains("rename_detection=supported-only"));
+        assert!(initial.contains("rename_detection=within-source-and-artifact"));
         assert!(initial.contains("total_hunks=400"));
         assert!(initial.contains("total_flows=300"));
         assert!(
@@ -2281,7 +2543,11 @@ mod tests {
         assert!(!initial.contains("[truncated]"));
 
         let mut pages = initial.clone();
-        for label in ["diff_next_cursor", "graph_next_cursor"] {
+        for label in [
+            "diff_next_cursor",
+            "artifacts_next_cursor",
+            "graph_next_cursor",
+        ] {
             let mut cursor = next_cursor(&initial, label);
             for _ in 0..100 {
                 let Some(token) = cursor else { break };
@@ -2408,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_language_rename_is_explicit_and_incomplete() {
+    fn cross_class_rename_is_explicit_and_incomplete() {
         let changes = WorktreeChanges {
             files: vec![],
             records: vec![],
@@ -2422,7 +2688,17 @@ mod tests {
                 deletions: Some(0),
             }],
             source_patch: "diff --git a/src/old.rs b/tests/fixture.tsv\n".into(),
-            artifacts: Default::default(),
+            artifacts: ArtifactReview {
+                files: vec![ArtifactFile {
+                    path: "tests/fixture.tsv".into(),
+                    analyzer: AnalyzerKind::Tsv,
+                    diff_complete: false,
+                    analysis_complete: false,
+                    omission: Some(ArtifactOmission::TypeChanged),
+                }],
+                analysis: String::new(),
+                patch: String::new(),
+            },
             skipped_paths: 0,
         };
         let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
@@ -2438,7 +2714,7 @@ mod tests {
         let output = review_context(&snapshot).unwrap();
 
         assert!(
-            output.contains("renamed supported-to-unsupported src/old.rs -> tests/fixture.tsv"),
+            output.contains("renamed artifact omitted src/old.rs -> tests/fixture.tsv analyzer=tsv reason=type-changed"),
             "{output}"
         );
         assert!(output.contains("review_complete=false"), "{output}");
@@ -2481,7 +2757,12 @@ mod tests {
                 },
             ],
             source_patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
-            artifacts: Default::default(),
+            artifacts: ArtifactReview {
+                files: vec![complete_artifact("tests/fixture.tsv", AnalyzerKind::Tsv)],
+                analysis: String::new(),
+                patch: "diff --git a/tests/fixture.tsv b/tests/fixture.tsv\n@@ -0,0 +1,3 @@\n+a\tb\n+1\t2\n+3\t4\n"
+                    .into(),
+            },
             skipped_paths: 0,
         };
         let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
@@ -2496,13 +2777,30 @@ mod tests {
         );
         let output = review_context(&snapshot).unwrap();
 
+        let diff_metadata = output
+            .lines()
+            .find(|line| line.starts_with("diff scope="))
+            .unwrap();
         assert!(
-            output.contains(
-                "patch_additions=436 patch_deletions=7 all_path_additions=439 all_path_deletions=7"
-            ),
-            "{output}"
+            diff_metadata.contains("patch_additions=436 patch_deletions=7"),
+            "{diff_metadata}"
         );
-        assert!(output.contains("all_path_hunks=2"), "{output}");
+        assert!(
+            diff_metadata.contains("all_path_additions=439 all_path_deletions=7"),
+            "{diff_metadata}"
+        );
+        assert!(
+            diff_metadata.contains("all_path_hunks=2"),
+            "{diff_metadata}"
+        );
+        let artifact_metadata = output
+            .lines()
+            .find(|line| line.starts_with("artifacts emitted_bytes="))
+            .unwrap();
+        assert!(
+            artifact_metadata.contains("patch_additions=3 patch_deletions=0"),
+            "{artifact_metadata}"
+        );
 
         let unknown = WorktreeChanges {
             files: vec![],
@@ -2521,13 +2819,13 @@ mod tests {
             skipped_paths: 0,
         };
         assert_eq!(
-            change_hunk_totals(&unknown, 0, DependencyMode::Boundary),
+            change_hunk_totals(&unknown, 0, 0, DependencyMode::Boundary),
             "all_path_hunks_at_least=0 all_path_unknown_hunk_paths=1"
         );
     }
 
     #[test]
-    fn supported_untracked_source_is_complete_diff_content() {
+    fn untracked_source_is_complete_diff_content() {
         let changes = WorktreeChanges {
             files: vec![],
             records: vec![crate::git::PathRecord::Untracked("src/new.rs".into())],
@@ -2556,7 +2854,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert!(output.contains("scope=supported-source"), "{output}");
+        assert!(output.contains("scope=source"), "{output}");
         assert!(
             output.contains("patch_additions=1 patch_deletions=0"),
             "{output}"
@@ -2570,6 +2868,13 @@ mod tests {
 
     #[test]
     fn change_manifest_preserves_every_path_and_status() {
+        let mut large = complete_artifact("LARGE.md", AnalyzerKind::Markdown);
+        large.analysis_complete = false;
+        large.omission = Some(ArtifactOmission::Oversized);
+        let mut binary = complete_artifact("image.bin", AnalyzerKind::Generic);
+        binary.diff_complete = false;
+        binary.analysis_complete = false;
+        binary.omission = Some(ArtifactOmission::Binary);
         let changes = WorktreeChanges {
             files: vec![],
             records: vec![],
@@ -2582,6 +2887,51 @@ mod tests {
                     language: Some(Language::Rust),
                     additions: Some(2),
                     deletions: Some(1),
+                },
+                ChangedPath {
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    old_language: None,
+                    path: "pkg/app.py".into(),
+                    language: Some(Language::Python),
+                    additions: Some(1),
+                    deletions: Some(1),
+                },
+                ChangedPath {
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    old_language: None,
+                    path: "README.md".into(),
+                    language: None,
+                    additions: Some(1),
+                    deletions: Some(1),
+                },
+                ChangedPath {
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    old_language: None,
+                    path: "LARGE.md".into(),
+                    language: None,
+                    additions: Some(1),
+                    deletions: Some(1),
+                },
+                ChangedPath {
+                    status: ChangeStatus::Untracked,
+                    old_path: None,
+                    old_language: None,
+                    path: "tests/fixture.tsv".into(),
+                    language: None,
+                    additions: Some(3),
+                    deletions: Some(0),
+                },
+                ChangedPath {
+                    status: ChangeStatus::Modified,
+                    old_path: None,
+                    old_language: None,
+                    path: "image.bin".into(),
+                    language: None,
+                    additions: None,
+                    deletions: None,
                 },
                 ChangedPath {
                     status: ChangeStatus::Deleted,
@@ -2601,23 +2951,24 @@ mod tests {
                     additions: Some(0),
                     deletions: Some(0),
                 },
-                ChangedPath {
-                    status: ChangeStatus::Untracked,
-                    old_path: None,
-                    old_language: None,
-                    path: "tests/fixture.tsv".into(),
-                    language: None,
-                    additions: Some(3),
-                    deletions: Some(0),
-                },
             ],
             source_patch: String::new(),
-            artifacts: Default::default(),
+            artifacts: ArtifactReview {
+                files: vec![
+                    large,
+                    complete_artifact("README.md", AnalyzerKind::Markdown),
+                    binary,
+                    complete_artifact("tests/fixture.tsv", AnalyzerKind::Tsv),
+                ],
+                analysis: String::new(),
+                patch: "diff --git a/tests/fixture.tsv b/tests/fixture.tsv\n@@ -0,0 +1,3 @@\n+a\tb\n+1\t2\n+3\t4\n"
+                    .into(),
+            },
             skipped_paths: 2,
         };
         assert_eq!(
             change_manifest(&changes, DependencyMode::Boundary),
-            "changed supported src/current.rs status=modified additions=2 deletions=1\ndeleted supported src/deleted.rs additions=0 deletions=3\nrenamed supported src/old.rs -> src/new.rs additions=0 deletions=0\nuntracked unsupported tests/fixture.tsv additions=3 deletions=0\nskipped 2 unsafe paths\n"
+            "changed source rust src/current.rs status=modified additions=2 deletions=1\nchanged source python pkg/app.py status=modified additions=1 deletions=1\nchanged artifact text README.md analyzer=markdown additions=1 deletions=1\nchanged artifact text LARGE.md analyzer=markdown analysis=omitted reason=oversized additions=1 deletions=1\nuntracked artifact text tests/fixture.tsv analyzer=tsv additions=3 deletions=0\nchanged artifact omitted image.bin analyzer=generic reason=binary additions=unknown deletions=unknown\ndeleted source rust src/deleted.rs additions=0 deletions=3\nrenamed source rust src/old.rs -> src/new.rs additions=0 deletions=0\nskipped 2 unsafe paths\n"
         );
     }
 
