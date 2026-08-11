@@ -416,7 +416,7 @@ impl Store {
                 "flows_discovered=0 flows_total=unknown"
             };
             let mut output = format!(
-                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} test_gaps=0 analysis_complete={} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 dependency_analysis={} {}\n",
+                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} static_test_path_gaps=0 analysis_complete={} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 dependency_analysis={} {}\n",
                 deleted_paths_unanalyzed == 0,
                 dependency_analysis(dependency_mode),
                 risk_metadata(None),
@@ -632,7 +632,7 @@ impl Store {
                     "risk {}{}",
                     score_text(risk.score),
                     if risk.test_gap {
-                        " test-gap"
+                        " no-static-test-path"
                     } else if risk.indirect_test_covered {
                         " indirect-test-covered"
                     } else {
@@ -674,7 +674,7 @@ impl Store {
             .iter()
             .min_by_key(|(id, risk)| (std::cmp::Reverse(risk.score), **id))
             .map(|(_, risk)| risk);
-        let test_gaps = analysis.risks.values().filter(|risk| risk.test_gap).count();
+        let static_test_path_gaps = analysis.risks.values().filter(|risk| risk.test_gap).count();
         let flow_incomplete =
             analysis.flow_omitted || analysis_roots_omitted > 0 || deleted_paths_unanalyzed > 0;
         let analysis_incomplete = flow_incomplete || analysis.test_mapping_omitted;
@@ -701,14 +701,14 @@ impl Store {
         lines.insert(
             0,
             format!(
-                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} test_gaps={} analysis_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} dependency_analysis={} {}\n",
+                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} static_test_path_gaps={} analysis_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} dependency_analysis={} {}\n",
                 score_text(overall),
                 changed_symbols_total,
                 analysis.risks.len(),
                 changed_symbols_emitted,
                 changed_symbols_omitted,
                 flow_accounting,
-                test_gaps,
+                static_test_path_gaps,
                 !analysis_incomplete,
                 analysis_roots_omitted,
                 deleted_paths_unanalyzed,
@@ -1647,12 +1647,12 @@ fn score_text(score: u32) -> String {
 
 fn risk_metadata(risk: Option<&NodeRisk>) -> String {
     let Some(risk) = risk else {
-        return "risk_direction=higher-is-riskier risk_components=flow:0.0000,tests:0.0000,security:0.0000,callers:0.0000 risk_rationale=no-symbol-risk".into();
+        return "risk_direction=higher-is-riskier risk_components=flow:0.0000,test_paths:0.0000,security:0.0000,callers:0.0000 risk_rationale=no-symbol-risk test_path_confidence=heuristic test_path_provenance=resolved-static-call-graph".into();
     };
     let mut rationale = if risk.test_node {
         "changed-test".to_owned()
     } else if risk.test_gap {
-        "no-test-coverage".to_owned()
+        "no-static-test-path".to_owned()
     } else if risk.indirect_test_covered {
         "indirect-test-coverage".to_owned()
     } else {
@@ -1669,7 +1669,7 @@ fn risk_metadata(risk: Option<&NodeRisk>) -> String {
         }
     }
     format!(
-        "risk_direction=higher-is-riskier risk_components=flow:{},tests:{},security:{},callers:{} risk_rationale={rationale}",
+        "risk_direction=higher-is-riskier risk_components=flow:{},test_paths:{},security:{},callers:{} risk_rationale={rationale} test_path_confidence=heuristic test_path_provenance=resolved-static-call-graph",
         score_text(risk.flow_component),
         score_text(risk.test_component),
         score_text(risk.security_component),
@@ -3621,7 +3621,7 @@ mod tests {
             .unwrap();
         assert!(
             output.contains(
-                "risk overall=0.4200 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown test_gaps=0 analysis_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
+                "risk overall=0.4200 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown static_test_path_gaps=0 analysis_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
             ),
             "{output}"
         );
@@ -4114,11 +4114,31 @@ mod tests {
 
         assert!(
             output.contains(
-                "changed_symbols_total=51 changed_symbols_analyzed=51 changed_symbols_emitted=51 changed_symbols_omitted=0 flows_total=0 test_gaps=51 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0"
+                "changed_symbols_total=51 changed_symbols_analyzed=51 changed_symbols_emitted=51 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=51 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0"
             ),
             "{output}"
         );
-        assert!(output.contains(" test-gap"), "{output}");
+        assert!(output.contains(" no-static-test-path"), "{output}");
+        assert!(
+            output.contains("test_path_confidence=heuristic"),
+            "{output}"
+        );
+        assert!(
+            output.contains("test_path_provenance=resolved-static-call-graph"),
+            "{output}"
+        );
+        assert!(
+            output.contains("risk_components=flow:0.0000,test_paths:0.3000"),
+            "{output}"
+        );
+        assert!(
+            output.contains("risk_rationale=no-static-test-path"),
+            "{output}"
+        );
+        assert!(!output.contains("test-gap"), "{output}");
+        assert!(!output.contains("test_gaps="), "{output}");
+        assert!(!output.contains("tests:"), "{output}");
+        assert!(!output.contains("no-test-coverage"), "{output}");
         assert!(output.contains(" Function verify_token "), "{output}");
         assert!(output.contains(" Function node_49 "), "{output}");
         assert!(output.contains("neighborhood_omitted=false"), "{output}");

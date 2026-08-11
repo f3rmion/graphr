@@ -633,7 +633,7 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     assert!(
         text.lines().any(|line| {
             line.contains("Function first_untracked src/untracked.rs:1")
-                && !line.contains("test-gap")
+                && !line.contains("no-static-test-path")
         }),
         "{text}"
     );
@@ -641,7 +641,7 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         text.lines().any(|line| {
             line.contains("Function second_untracked src/untracked.rs:2")
                 && line.contains("indirect-test-covered")
-                && !line.contains("test-gap")
+                && !line.contains("no-static-test-path")
         }),
         "{text}"
     );

@@ -2450,7 +2450,7 @@ mod tests {
             },
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n";
         let snapshot = ReviewSnapshot::new(
             "HEAD",
             6,
@@ -2592,7 +2592,7 @@ mod tests {
             "@@ -1 +1 @@\n-é old\n+é changed\n".repeat(400)
         );
         let graph = format!(
-            "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=300 test_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
+            "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=300 static_test_path_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
             (0..300)
                 .map(|index| format!(
                     "flow 0.1000 entry_{index}@src/lib.rs:1 -> changed@src/lib.rs:2\n"
@@ -2670,7 +2670,7 @@ mod tests {
     #[test]
     fn max_nodes_limits_each_graph_page_not_the_snapshot() {
         let graph = format!(
-            "risk overall=0.3000 changed_symbols_total=6 changed_symbols_analyzed=6 changed_symbols_emitted=6 changed_symbols_omitted=0 flows_total=0 test_gaps=6 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
+            "risk overall=0.3000 changed_symbols_total=6 changed_symbols_analyzed=6 changed_symbols_emitted=6 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=6 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
             (0..6)
                 .map(|index| format!("  risk 0.3000 node-{index}\n"))
                 .collect::<String>()
@@ -2741,7 +2741,7 @@ mod tests {
             artifacts: Default::default(),
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             "HEAD",
@@ -2788,7 +2788,7 @@ mod tests {
             },
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             "HEAD",
@@ -2813,7 +2813,7 @@ mod tests {
 
     #[test]
     fn graph_completeness_reads_only_the_summary() {
-        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n  risk 0.0000 node src/analysis_complete=false.rs:1\n";
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n  risk 0.0000 node src/analysis_complete=false.rs:1\n";
         assert!(graph_flow_analysis_complete(graph));
         assert!(graph_review_complete(graph));
     }
@@ -2852,7 +2852,7 @@ mod tests {
             },
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             "HEAD",
@@ -2930,7 +2930,7 @@ mod tests {
             artifacts: Default::default(),
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 test_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
         let output = review_context(&ReviewSnapshot::new(
             "HEAD",
             0,
@@ -3083,7 +3083,7 @@ mod tests {
                 artifacts: Default::default(),
                 skipped_paths: 0,
             },
-            "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 test_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n".into(),
+            "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n".into(),
         );
         let mut offset = 0;
         let mut reconstructed = String::new();
