@@ -1851,7 +1851,7 @@ fn call_keys(
     }
 
     let first = parts[0];
-    let mut owners = Vec::with_capacity(2);
+    let mut owners = Vec::with_capacity(3);
     match import_binding(&bindings.imports, source, module_index, first) {
         Some(Binding::Unique(path)) => owners.push(if parts.len() == 2 {
             path.clone()
@@ -1862,6 +1862,11 @@ fn call_keys(
             return vec![format!("rust:ambiguous-import:{owner}::{method}")];
         }
         None => {
+            if !matches!(first, "crate" | "self" | "super")
+                && let Some(scope) = paths.get(source).and_then(Option::as_deref)
+            {
+                owners.push(join_path(scope, &owner));
+            }
             if let Some(local) = normalize_relative(&owner, module, root) {
                 owners.push(local);
             }
@@ -3686,6 +3691,54 @@ mod tests {
             reference.source_key == test.key
                 && reference.resolved_target_key.as_deref() == Some(outer.key.as_str())
         }));
+    }
+
+    #[test]
+    fn local_types_shadow_glob_imported_qualified_calls() {
+        let sources = [Source {
+            path: "src/lib.rs".into(),
+            text: r#"
+pub struct AuditRecord;
+impl AuditRecord { pub fn build() {} }
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_local_type() {
+        struct AuditRecord;
+        impl AuditRecord { fn build() {} }
+        AuditRecord::build();
+    }
+}
+"#
+            .into(),
+        }];
+        let graph = build_graph(&sources, &AtomicBool::new(false)).unwrap();
+        let node = |key: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.keys.iter().any(|candidate| candidate == key))
+                .unwrap()
+        };
+        let test = node("rust:function:tests::checks_local_type");
+        let local = node("rust:method:tests::checks_local_type::AuditRecord::build");
+        let outer = node("rust:method:AuditRecord::build");
+        let call = graph
+            .refs
+            .iter()
+            .find(|reference| reference.source_key == test.key)
+            .unwrap();
+
+        assert_eq!(
+            call.resolved_target_key.as_deref(),
+            Some(local.key.as_str())
+        );
+        assert_ne!(
+            call.resolved_target_key.as_deref(),
+            Some(outer.key.as_str())
+        );
     }
 
     #[test]
