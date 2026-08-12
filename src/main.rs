@@ -1,6 +1,7 @@
 mod artifact;
 mod git;
 mod index;
+pub mod job;
 mod mcp;
 mod parse;
 mod python;
