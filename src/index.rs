@@ -74,17 +74,31 @@ impl Project {
         let database = self.repository.git_dir.join("graphr/index.db");
         let mut store = Store::open(&database, rebuild, &cancelled)?;
         let capture = LegacyCapture::create(&self.repository.git_dir.join("graphr"))?;
-        let sources = self
-            .repository
-            .capture_sources(
-                &self.repository.head_oid,
-                &SnapshotTarget::Worktree {
-                    include_untracked: true,
-                },
-                &capture.path,
-                &cancelled,
-            )
-            .map_err(|error| error.to_string())?;
+        let target = SnapshotTarget::Worktree {
+            include_untracked: true,
+        };
+        let sources = if self.repository.head_oid.is_empty() {
+            self.repository
+                .capture_sources(
+                    &self.repository.head_oid,
+                    &target,
+                    &capture.path,
+                    &cancelled,
+                )
+                .map_err(|error| error.to_string())?
+        } else {
+            self.repository
+                .capture_snapshot(
+                    &self.repository.head_oid,
+                    &self.repository.head_oid,
+                    &target,
+                    DependencyMode::Boundary,
+                    &capture.path,
+                    &cancelled,
+                )
+                .map_err(|error| error.to_string())?
+                .sources
+        };
         let (state, changed, stats) = store.index_with(&cancelled, |full, existing| {
             build_index(
                 &self.repository,
@@ -324,6 +338,13 @@ fn change_path_line(output: &mut String, path: &ChangedPath, artifacts: &Artifac
         }
         _ => output.push_str(" additions=unknown deletions=unknown"),
     }
+    output.push_str(" layers=");
+    for (index, layer) in path.layers.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str(layer.as_str());
+    }
     output.push('\n');
 }
 
@@ -377,7 +398,7 @@ struct ReviewSnapshot {
     dependency_mode: DependencyMode,
     manifest: String,
     artifacts: String,
-    changes: WorktreeChanges,
+    changes: Arc<WorktreeChanges>,
     graph: String,
     checksum: String,
     file_ranges: Vec<Range<usize>>,
@@ -400,9 +421,10 @@ impl ReviewSnapshot {
         depth: u32,
         max_nodes: u32,
         dependency_mode: DependencyMode,
-        changes: WorktreeChanges,
+        changes: impl Into<Arc<WorktreeChanges>>,
         graph: String,
     ) -> Self {
+        let changes = changes.into();
         let manifest = change_manifest(&changes, dependency_mode);
         let artifacts = artifact_text(&changes.artifacts);
         let checksum = review_snapshot(
@@ -2604,7 +2626,7 @@ fn check_progress(index: usize, cancelled: &AtomicBool) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::artifact::AnalyzerKind;
-    use crate::git::{ArtifactFile, ArtifactOmission, ArtifactReview};
+    use crate::git::{ArtifactFile, ArtifactOmission, ArtifactReview, ChangeLayer};
     use crate::workspace::{AllowedRoots, ErrorCode};
     use std::fs;
     use std::process::Command;
@@ -2875,6 +2897,7 @@ mod tests {
                 language: None,
                 additions: Some(1),
                 deletions: Some(1),
+                layers: Vec::new(),
             }],
             source_patch: String::new(),
             artifacts: ArtifactReview {
@@ -2973,6 +2996,7 @@ mod tests {
                 language: None,
                 additions: None,
                 deletions: None,
+                layers: Vec::new(),
             }],
             source_patch: String::new(),
             artifacts: ArtifactReview {
@@ -2998,6 +3022,7 @@ mod tests {
                 language: None,
                 additions: None,
                 deletions: None,
+                layers: Vec::new(),
             }],
             source_patch: String::new(),
             artifacts: ArtifactReview {
@@ -3046,6 +3071,7 @@ mod tests {
                 language: Some(Language::Rust),
                 additions: Some(400),
                 deletions: Some(400),
+                layers: Vec::new(),
             }],
             source_patch: patch,
             artifacts: Default::default(),
@@ -3127,6 +3153,7 @@ mod tests {
                     language: Some(Language::Rust),
                     additions: Some(1),
                     deletions: Some(1),
+                    layers: Vec::new(),
                 }],
                 source_patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"
                     .into(),
@@ -3172,6 +3199,7 @@ mod tests {
                 language: Some(Language::Rust),
                 additions: Some(1),
                 deletions: Some(1),
+                layers: Vec::new(),
             }],
             source_patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
             artifacts: Default::default(),
@@ -3209,6 +3237,7 @@ mod tests {
                 language: None,
                 additions: Some(0),
                 deletions: Some(0),
+                layers: Vec::new(),
             }],
             source_patch: "diff --git a/src/old.rs b/tests/fixture.tsv\n".into(),
             artifacts: ArtifactReview {
@@ -3268,6 +3297,7 @@ mod tests {
                     language: Some(Language::Rust),
                     additions: Some(436),
                     deletions: Some(7),
+                    layers: Vec::new(),
                 },
                 ChangedPath {
                     status: ChangeStatus::Untracked,
@@ -3277,6 +3307,7 @@ mod tests {
                     language: None,
                     additions: Some(3),
                     deletions: Some(0),
+                    layers: Vec::new(),
                 },
             ],
             source_patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
@@ -3336,6 +3367,7 @@ mod tests {
                 language: Some(Language::Rust),
                 additions: None,
                 deletions: None,
+                layers: Vec::new(),
             }],
             source_patch: String::new(),
             artifacts: Default::default(),
@@ -3360,6 +3392,7 @@ mod tests {
                 language: Some(Language::Rust),
                 additions: Some(1),
                 deletions: Some(0),
+                layers: Vec::new(),
             }],
             source_patch: "diff --git a/src/new.rs b/src/new.rs\n@@ -0,0 +1 @@\n+fn new() {}\n"
                 .into(),
@@ -3410,6 +3443,7 @@ mod tests {
                     language: Some(Language::Rust),
                     additions: Some(2),
                     deletions: Some(1),
+                    layers: vec![ChangeLayer::Committed, ChangeLayer::Staged],
                 },
                 ChangedPath {
                     status: ChangeStatus::Modified,
@@ -3419,6 +3453,7 @@ mod tests {
                     language: Some(Language::Python),
                     additions: Some(1),
                     deletions: Some(1),
+                    layers: vec![ChangeLayer::Committed],
                 },
                 ChangedPath {
                     status: ChangeStatus::Modified,
@@ -3428,6 +3463,7 @@ mod tests {
                     language: None,
                     additions: Some(1),
                     deletions: Some(1),
+                    layers: vec![ChangeLayer::Staged],
                 },
                 ChangedPath {
                     status: ChangeStatus::Modified,
@@ -3437,6 +3473,7 @@ mod tests {
                     language: None,
                     additions: Some(1),
                     deletions: Some(1),
+                    layers: vec![ChangeLayer::Unstaged],
                 },
                 ChangedPath {
                     status: ChangeStatus::Untracked,
@@ -3446,6 +3483,7 @@ mod tests {
                     language: None,
                     additions: Some(3),
                     deletions: Some(0),
+                    layers: vec![ChangeLayer::Untracked],
                 },
                 ChangedPath {
                     status: ChangeStatus::Modified,
@@ -3455,6 +3493,7 @@ mod tests {
                     language: None,
                     additions: None,
                     deletions: None,
+                    layers: vec![ChangeLayer::Unstaged],
                 },
                 ChangedPath {
                     status: ChangeStatus::Deleted,
@@ -3464,6 +3503,7 @@ mod tests {
                     language: Some(Language::Rust),
                     additions: Some(0),
                     deletions: Some(3),
+                    layers: vec![ChangeLayer::Staged],
                 },
                 ChangedPath {
                     status: ChangeStatus::Renamed,
@@ -3473,6 +3513,7 @@ mod tests {
                     language: Some(Language::Rust),
                     additions: Some(0),
                     deletions: Some(0),
+                    layers: vec![ChangeLayer::Committed],
                 },
             ],
             source_patch: String::new(),
@@ -3491,8 +3532,30 @@ mod tests {
         };
         assert_eq!(
             change_manifest(&changes, DependencyMode::Boundary),
-            "changed source rust src/current.rs status=modified additions=2 deletions=1\nchanged source python pkg/app.py status=modified additions=1 deletions=1\nchanged artifact text README.md analyzer=markdown additions=1 deletions=1\nchanged artifact text LARGE.md analyzer=markdown analysis=omitted reason=oversized additions=1 deletions=1\nuntracked artifact text tests/fixture.tsv analyzer=tsv additions=3 deletions=0\nchanged artifact omitted image.bin analyzer=generic reason=binary additions=unknown deletions=unknown\ndeleted source rust src/deleted.rs additions=0 deletions=3\nrenamed source rust src/old.rs -> src/new.rs additions=0 deletions=0\nskipped 2 unsafe paths\n"
+            "changed source rust src/current.rs status=modified additions=2 deletions=1 layers=committed,staged\nchanged source python pkg/app.py status=modified additions=1 deletions=1 layers=committed\nchanged artifact text README.md analyzer=markdown additions=1 deletions=1 layers=staged\nchanged artifact text LARGE.md analyzer=markdown analysis=omitted reason=oversized additions=1 deletions=1 layers=unstaged\nuntracked artifact text tests/fixture.tsv analyzer=tsv additions=3 deletions=0 layers=untracked\nchanged artifact omitted image.bin analyzer=generic reason=binary additions=unknown deletions=unknown layers=unstaged\ndeleted source rust src/deleted.rs additions=0 deletions=3 layers=staged\nrenamed source rust src/old.rs -> src/new.rs additions=0 deletions=0 layers=committed\nskipped 2 unsafe paths\n"
         );
+    }
+
+    #[test]
+    fn review_snapshot_retains_shared_changes() {
+        let changes = Arc::new(WorktreeChanges {
+            files: Vec::new(),
+            records: Vec::new(),
+            paths: Vec::new(),
+            source_patch: String::new(),
+            artifacts: ArtifactReview::default(),
+            skipped_paths: 0,
+        });
+        let snapshot = ReviewSnapshot::new(
+            "HEAD",
+            0,
+            1,
+            DependencyMode::Boundary,
+            Arc::clone(&changes),
+            String::new(),
+        );
+
+        assert!(Arc::ptr_eq(&snapshot.changes, &changes));
     }
 
     #[test]
@@ -3514,6 +3577,7 @@ mod tests {
                     language: Some(Language::Rust),
                     additions: Some(1),
                     deletions: Some(1),
+                layers: Vec::new(),
                 }],
                 source_patch: source.clone(),
                 artifacts: Default::default(),

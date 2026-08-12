@@ -88,6 +88,15 @@ pub enum SnapshotTarget {
     Worktree { include_untracked: bool },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoChangeReason {
+    IdenticalCommitOids,
+    IdenticalTrees,
+    EmptyIndexDelta,
+    EmptyWorktreeDelta,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexRequest {
     pub worktree_root: PathBuf,

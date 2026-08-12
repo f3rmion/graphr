@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -12,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::artifact::{AnalyzerKind, analyze, analyzer_kind};
-use crate::workspace::{ErrorCode, OperationError, SnapshotTarget};
+use crate::workspace::{ErrorCode, NoChangeReason, OperationError, SnapshotTarget};
 
 const STDOUT_LIMIT: usize = 64 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
@@ -35,13 +37,15 @@ pub struct Source {
     pub text: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Language {
     Rust,
     Python,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DependencyMode {
     #[default]
     Boundary,
@@ -102,6 +106,16 @@ pub struct SourceSnapshot {
     pub skipped: usize,
 }
 
+#[allow(dead_code)] // Task 4 consumes the review/provenance fields during publication.
+pub struct SnapshotCapture {
+    pub sources: SourceSnapshot,
+    pub changes: WorktreeChanges,
+    pub dirty_digest: String,
+    pub commits_base_to_head: u64,
+    pub changed_files: usize,
+    pub no_change_reason: Option<NoChangeReason>,
+}
+
 pub(crate) struct BlobReader {
     child: Option<Child>,
     input: Option<BufWriter<ChildStdin>>,
@@ -137,13 +151,13 @@ enum InventoryKind {
     CargoManifest,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct LineSpan {
     pub start: u64,
     pub end: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ChangedFile {
     pub path: String,
     pub whole_file: bool,
@@ -151,14 +165,17 @@ pub struct ChangedFile {
     pub report_unmapped: bool,
 }
 
-#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
 pub enum PathRecord {
     Deleted(String),
     Renamed(String, String),
     Untracked(String),
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum ChangeStatus {
     Added,
     Modified,
@@ -169,7 +186,29 @@ pub enum ChangeStatus {
     Untracked,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeLayer {
+    Committed,
+    Staged,
+    Unstaged,
+    Untracked,
+}
+
+impl ChangeLayer {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Staged => "staged",
+            Self::Unstaged => "unstaged",
+            Self::Untracked => "untracked",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ChangedPath {
     pub status: ChangeStatus,
     pub old_path: Option<String>,
@@ -178,6 +217,7 @@ pub struct ChangedPath {
     pub language: Option<Language>,
     pub additions: Option<u64>,
     pub deletions: Option<u64>,
+    pub layers: Vec<ChangeLayer>,
 }
 
 pub fn changed_dependency_package(path: &ChangedPath) -> Option<&str> {
@@ -190,7 +230,7 @@ pub fn changed_dependency_package(path: &ChangedPath) -> Option<&str> {
     Some(package)
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct WorktreeChanges {
     pub files: Vec<ChangedFile>,
     pub records: Vec<PathRecord>,
@@ -200,7 +240,8 @@ pub struct WorktreeChanges {
     pub skipped_paths: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ArtifactOmission {
     Binary,
     InvalidUtf8,
@@ -223,7 +264,7 @@ impl ArtifactOmission {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ArtifactFile {
     pub path: String,
     pub analyzer: AnalyzerKind,
@@ -232,7 +273,7 @@ pub struct ArtifactFile {
     pub omission: Option<ArtifactOmission>,
 }
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ArtifactReview {
     pub files: Vec<ArtifactFile>,
     pub analysis: String,
@@ -276,6 +317,12 @@ struct TrackedArtifactSnapshot {
     stats: Vec<TrackedStat>,
     renames: Vec<(String, String)>,
     signature: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+enum ArtifactSource {
+    GitBlob,
+    Worktree,
 }
 
 struct UntrackedSnapshot {
@@ -512,6 +559,8 @@ impl Repository {
                 parse_tree_inventory(&output).map_err(capture_error)?
             }
             SnapshotTarget::Index | SnapshotTarget::Worktree { .. } => {
+                // ponytail: repeated index/digest samples reject ordinary races;
+                // use a filesystem snapshot if adversarial ABA mutations matter.
                 let copied_index = capture_index(
                     &self.index_path,
                     capture_root,
@@ -540,42 +589,181 @@ impl Repository {
             }
         };
 
-        let mut files = inventory
-            .sources
-            .into_iter()
-            .map(|(path, (language, content))| {
-                let (git_oid, content_key, content) = match content {
-                    InventoryContent::GitBlob(oid) => {
-                        (Some(oid.clone()), oid.clone(), SourceContent::GitBlob(oid))
-                    }
-                    InventoryContent::Captured {
-                        relative_path,
-                        digest,
-                    } => (
-                        None,
-                        blake3::Hash::from_bytes(digest).to_hex().to_string(),
-                        SourceContent::Captured {
-                            relative_path,
-                            digest,
-                        },
-                    ),
-                };
-                CapturedSource {
-                    path,
-                    language,
-                    git_oid,
-                    content_key,
-                    parse_context: String::new(),
-                    content,
+        Ok(source_snapshot(inventory, capture_root))
+    }
+
+    #[allow(clippy::too_many_arguments)] // One call binds one fully resolved capture request.
+    pub fn capture_snapshot(
+        &self,
+        base_oid: &str,
+        head_oid: &str,
+        target: &SnapshotTarget,
+        dependency_mode: DependencyMode,
+        capture_root: &Path,
+        cancelled: &AtomicBool,
+    ) -> Result<SnapshotCapture, OperationError> {
+        validate_capture_root(capture_root)?;
+        if !valid_lower_oid(base_oid.as_bytes()) || !valid_lower_oid(head_oid.as_bytes()) {
+            return Err(OperationError::new(
+                ErrorCode::InvalidParameters,
+                "base or head object ID is invalid",
+            ));
+        }
+        let mutable = !matches!(target, SnapshotTarget::Commit);
+        if mutable && resolve_commit(&self.root, "HEAD", "HEAD", cancelled)? != head_oid {
+            return Err(OperationError::new(
+                ErrorCode::HeadWorktreeMismatch,
+                "head object ID does not match the worktree HEAD",
+            ));
+        }
+        let commits_base_to_head = parse_count(
+            &run(
+                &self.root,
+                &["rev-list", "--count", &format!("{base_oid}..{head_oid}")],
+                cancelled,
+            )
+            .map_err(capture_error)?,
+        )
+        .map_err(capture_error)?;
+
+        let (sources, mut changes, dirty_digest) = match target {
+            SnapshotTarget::Commit => {
+                let sources = self.capture_sources(head_oid, target, capture_root, cancelled)?;
+                let changes = capture_target_changes(
+                    self,
+                    base_oid,
+                    head_oid,
+                    target,
+                    None,
+                    dependency_mode,
+                    cancelled,
+                )?;
+                (
+                    sources,
+                    changes,
+                    target_dirty_digest(self, target, None, &[], cancelled)?,
+                )
+            }
+            SnapshotTarget::Index | SnapshotTarget::Worktree { .. } => {
+                let copied_index = capture_index(
+                    &self.index_path,
+                    capture_root,
+                    self.head_oid.is_empty(),
+                    cancelled,
+                )?;
+                let index_inventory = run_with_index(
+                    &self.root,
+                    &["ls-files", "--stage", "-z"],
+                    &copied_index,
+                    cancelled,
+                )
+                .map_err(capture_error)?;
+                let first_digest = target_dirty_digest(
+                    self,
+                    target,
+                    Some(&copied_index),
+                    &index_inventory,
+                    cancelled,
+                )?;
+                let mut inventory =
+                    parse_index_inventory(&index_inventory).map_err(capture_error)?;
+                if let SnapshotTarget::Worktree { include_untracked } = target {
+                    overlay_worktree(
+                        self,
+                        &copied_index,
+                        *include_untracked,
+                        capture_root,
+                        &mut inventory,
+                        cancelled,
+                    )?;
                 }
-            })
-            .collect::<Vec<_>>();
-        crate::index::assign_parse_contexts(&mut files, &inventory.cargo_manifests);
-        debug_assert!(files.windows(2).all(|pair| pair[0].path < pair[1].path));
-        Ok(SourceSnapshot {
-            capture_root: capture_root.to_owned(),
-            files,
-            skipped: inventory.skipped,
+                let sources = source_snapshot(inventory, capture_root);
+                let changes = capture_target_changes(
+                    self,
+                    base_oid,
+                    head_oid,
+                    target,
+                    Some(&copied_index),
+                    dependency_mode,
+                    cancelled,
+                )?;
+                let second_digest = target_dirty_digest(
+                    self,
+                    target,
+                    Some(&copied_index),
+                    &index_inventory,
+                    cancelled,
+                )?;
+                let current_index = run(&self.root, &["ls-files", "--stage", "-z"], cancelled)
+                    .map_err(capture_error)?;
+                if first_digest != second_digest
+                    || current_index != index_inventory
+                    || resolve_commit(&self.root, "HEAD", "HEAD", cancelled)? != head_oid
+                {
+                    return Err(OperationError::new(
+                        ErrorCode::CaptureChanged,
+                        "Git state changed during capture",
+                    ));
+                }
+                (sources, changes, first_digest)
+            }
+        };
+        assign_change_layers(
+            self,
+            base_oid,
+            head_oid,
+            target,
+            mutable.then(|| capture_root.join("index")),
+            &mut changes.paths,
+            cancelled,
+        )?;
+        if mutable {
+            let copied_index = capture_root.join("index");
+            let index_inventory = run_with_index(
+                &self.root,
+                &["ls-files", "--stage", "-z"],
+                &copied_index,
+                cancelled,
+            )
+            .map_err(capture_error)?;
+            let final_digest = target_dirty_digest(
+                self,
+                target,
+                Some(&copied_index),
+                &index_inventory,
+                cancelled,
+            )?;
+            if final_digest != dirty_digest
+                || run(&self.root, &["ls-files", "--stage", "-z"], cancelled)
+                    .map_err(capture_error)?
+                    != index_inventory
+                || resolve_commit(&self.root, "HEAD", "HEAD", cancelled)? != head_oid
+            {
+                return Err(OperationError::new(
+                    ErrorCode::CaptureChanged,
+                    "Git state changed during capture",
+                ));
+            }
+        }
+        let changed_files = changes
+            .paths
+            .iter()
+            .map(|path| path.path.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let no_change_reason = changes.is_empty().then(|| match target {
+            SnapshotTarget::Commit if base_oid == head_oid => NoChangeReason::IdenticalCommitOids,
+            SnapshotTarget::Commit => NoChangeReason::IdenticalTrees,
+            SnapshotTarget::Index => NoChangeReason::EmptyIndexDelta,
+            SnapshotTarget::Worktree { .. } => NoChangeReason::EmptyWorktreeDelta,
+        });
+        Ok(SnapshotCapture {
+            sources,
+            changes,
+            dirty_digest,
+            commits_base_to_head,
+            changed_files,
+            no_change_reason,
         })
     }
 
@@ -684,7 +872,12 @@ impl Repository {
                 }
                 let artifacts = scope.spawn(move || {
                     let output = run(&self.root, &artifact_args, cancelled)?;
-                    capture_tracked_artifacts(&self.root, &output, cancelled)
+                    capture_tracked_artifacts(
+                        &self.root,
+                        &output,
+                        ArtifactSource::Worktree,
+                        cancelled,
+                    )
                 });
                 let tracked = run(&self.root, &tracked_args, cancelled);
                 let untracked = untracked
@@ -716,14 +909,56 @@ impl Repository {
         let tracked = parse_tracked_changes(&outputs.tracked, cancelled)?;
         let inventory = parse_change_inventory(&outputs.inventory, cancelled)?;
         check_cancelled(cancelled)?;
-        merge_changes(
+        let mut changes = merge_changes(
             tracked,
             outputs.artifacts,
             inventory,
             outputs.untracked,
             dependency_mode,
             cancelled,
-        )
+        )?;
+        assign_worktree_layers(self, base, &mut changes.paths, cancelled)?;
+        Ok(changes)
+    }
+}
+
+fn source_snapshot(inventory: TargetInventory, capture_root: &Path) -> SourceSnapshot {
+    let mut files = inventory
+        .sources
+        .into_iter()
+        .map(|(path, (language, content))| {
+            let (git_oid, content_key, content) = match content {
+                InventoryContent::GitBlob(oid) => {
+                    (Some(oid.clone()), oid.clone(), SourceContent::GitBlob(oid))
+                }
+                InventoryContent::Captured {
+                    relative_path,
+                    digest,
+                } => (
+                    None,
+                    blake3::Hash::from_bytes(digest).to_hex().to_string(),
+                    SourceContent::Captured {
+                        relative_path,
+                        digest,
+                    },
+                ),
+            };
+            CapturedSource {
+                path,
+                language,
+                git_oid,
+                content_key,
+                parse_context: String::new(),
+                content,
+            }
+        })
+        .collect::<Vec<_>>();
+    crate::index::assign_parse_contexts(&mut files, &inventory.cargo_manifests);
+    debug_assert!(files.windows(2).all(|pair| pair[0].path < pair[1].path));
+    SourceSnapshot {
+        capture_root: capture_root.to_owned(),
+        files,
+        skipped: inventory.skipped,
     }
 }
 
@@ -1072,7 +1307,7 @@ fn write_private_file(path: &Path, content: &[u8]) -> Result<(), String> {
 fn capture_error(error: String) -> OperationError {
     if error.contains("cancelled") {
         OperationError::new(ErrorCode::JobCancelled, "source capture cancelled")
-    } else if error.contains("changed while reading") {
+    } else if error.contains("changed while reading") || error.contains("inventories disagree") {
         OperationError::new(ErrorCode::CaptureChanged, "source changed during capture")
     } else if error.starts_with("cannot create private")
         || error.starts_with("cannot write private")
@@ -1102,6 +1337,559 @@ fn worktree_signature(outputs: &WorktreeCapture) -> [u8; 32] {
     hash.update(&outputs.artifacts.signature);
     hash.update(&outputs.untracked.signature);
     *hash.finalize().as_bytes()
+}
+
+fn parse_count(output: &[u8]) -> Result<u64, String> {
+    parse_value(output)?
+        .parse()
+        .map_err(|_| "Git returned an invalid count".to_owned())
+}
+
+#[allow(clippy::too_many_arguments)] // The shared target selector keeps all diff streams aligned.
+fn capture_target_changes(
+    repository: &Repository,
+    base_oid: &str,
+    head_oid: &str,
+    target: &SnapshotTarget,
+    index_file: Option<&Path>,
+    dependency_mode: DependencyMode,
+    cancelled: &AtomicBool,
+) -> Result<WorktreeChanges, OperationError> {
+    let inventory = run_final_diff(
+        repository,
+        base_oid,
+        head_oid,
+        target,
+        index_file,
+        &[
+            "--raw",
+            "-z",
+            "--abbrev=64",
+            "--no-renames",
+            "--diff-filter=AMDTU",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+        ],
+        &[],
+        cancelled,
+    )?;
+    let mut source_paths = vec!["*.rs", "*.py"];
+    if dependency_mode == DependencyMode::Boundary {
+        source_paths.push(":(glob,exclude).cargo/vendor/*/**");
+    }
+    let tracked = run_final_diff(
+        repository,
+        base_oid,
+        head_oid,
+        target,
+        index_file,
+        &[
+            "--raw",
+            "-z",
+            "--patch",
+            "--unified=0",
+            "--abbrev=64",
+            "--find-renames=50%",
+            "-l0",
+            "--diff-filter=AMDR",
+            "--diff-algorithm=myers",
+            "--no-indent-heuristic",
+            "-O/dev/null",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=all",
+            "--text",
+        ],
+        &source_paths,
+        cancelled,
+    )?;
+    let mut artifact_paths = vec![".", ":(exclude)*.rs", ":(exclude)*.py"];
+    if dependency_mode == DependencyMode::Boundary {
+        artifact_paths.push(":(glob,exclude).cargo/vendor/*/**");
+    }
+    let artifact_output = run_final_diff(
+        repository,
+        base_oid,
+        head_oid,
+        target,
+        index_file,
+        &[
+            "--raw",
+            "-z",
+            "--patch",
+            "--unified=0",
+            "--abbrev=64",
+            "--find-renames=50%",
+            "-l0",
+            "--diff-filter=AMDR",
+            "--diff-algorithm=myers",
+            "--no-indent-heuristic",
+            "-O/dev/null",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=all",
+            "--text",
+        ],
+        &artifact_paths,
+        cancelled,
+    )?;
+    let untracked = if matches!(
+        target,
+        SnapshotTarget::Worktree {
+            include_untracked: true
+        }
+    ) {
+        run_with_index(
+            &repository.root,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            index_file.expect("worktree target has a captured index"),
+            cancelled,
+        )
+        .map_err(capture_error)?
+    } else {
+        Vec::new()
+    };
+    let tracked = parse_tracked_changes(&tracked, cancelled).map_err(capture_error)?;
+    let artifact_source = if matches!(target, SnapshotTarget::Worktree { .. }) {
+        ArtifactSource::Worktree
+    } else {
+        ArtifactSource::GitBlob
+    };
+    let artifacts = capture_tracked_artifacts(
+        &repository.root,
+        &artifact_output,
+        artifact_source,
+        cancelled,
+    )
+    .map_err(capture_error)?;
+    let inventory = parse_change_inventory(&inventory, cancelled).map_err(capture_error)?;
+    let untracked = capture_untracked(
+        &repository.root,
+        &untracked,
+        dependency_mode,
+        true,
+        cancelled,
+    )
+    .map_err(capture_error)?;
+    merge_changes(
+        tracked,
+        artifacts,
+        inventory,
+        untracked,
+        dependency_mode,
+        cancelled,
+    )
+    .map_err(capture_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_final_diff(
+    repository: &Repository,
+    base_oid: &str,
+    head_oid: &str,
+    target: &SnapshotTarget,
+    index_file: Option<&Path>,
+    options: &[&str],
+    paths: &[&str],
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, OperationError> {
+    let mut args = vec!["diff"];
+    args.extend_from_slice(options);
+    match target {
+        SnapshotTarget::Commit => {
+            args.push(base_oid);
+            args.push(head_oid);
+        }
+        SnapshotTarget::Index => {
+            args.push("--cached");
+            args.push(base_oid);
+        }
+        SnapshotTarget::Worktree { .. } => args.push(base_oid),
+    }
+    if !paths.is_empty() {
+        args.push("--");
+        args.extend_from_slice(paths);
+    }
+    run_git(
+        &repository.root,
+        &args,
+        false,
+        false,
+        Instant::now() + DEADLINE,
+        STDOUT_LIMIT,
+        index_file,
+        cancelled,
+    )
+    .map_err(capture_error)
+}
+
+fn assign_change_layers(
+    repository: &Repository,
+    base_oid: &str,
+    head_oid: &str,
+    target: &SnapshotTarget,
+    index_file: Option<PathBuf>,
+    paths: &mut [ChangedPath],
+    cancelled: &AtomicBool,
+) -> Result<(), OperationError> {
+    let options = [
+        "--raw",
+        "-z",
+        "--abbrev=64",
+        "--find-renames=50%",
+        "-l0",
+        "--diff-filter=AMDRTU",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+    ];
+    let mut inventories = vec![(
+        ChangeLayer::Committed,
+        parse_change_inventory(
+            &run_final_diff(
+                repository,
+                base_oid,
+                head_oid,
+                &SnapshotTarget::Commit,
+                None,
+                &options,
+                &[],
+                cancelled,
+            )?,
+            cancelled,
+        )
+        .map_err(capture_error)?
+        .0,
+    )];
+    if !matches!(target, SnapshotTarget::Commit) {
+        let index_file = index_file
+            .as_deref()
+            .expect("mutable target has a captured index");
+        inventories.push((
+            ChangeLayer::Staged,
+            parse_change_inventory(
+                &run_final_diff(
+                    repository,
+                    head_oid,
+                    head_oid,
+                    &SnapshotTarget::Index,
+                    Some(index_file),
+                    &options,
+                    &[],
+                    cancelled,
+                )?,
+                cancelled,
+            )
+            .map_err(capture_error)?
+            .0,
+        ));
+        if matches!(target, SnapshotTarget::Worktree { .. }) {
+            let mut args = vec!["diff"];
+            args.extend_from_slice(&options);
+            let output = run_git(
+                &repository.root,
+                &args,
+                false,
+                false,
+                Instant::now() + DEADLINE,
+                STDOUT_LIMIT,
+                Some(index_file),
+                cancelled,
+            )
+            .map_err(capture_error)?;
+            inventories.push((
+                ChangeLayer::Unstaged,
+                parse_change_inventory(&output, cancelled)
+                    .map_err(capture_error)?
+                    .0,
+            ));
+        }
+    }
+    apply_layers(paths, &inventories);
+    Ok(())
+}
+
+fn same_change_path(final_path: &ChangedPath, layer_path: &ChangedPath) -> bool {
+    [
+        Some(final_path.path.as_str()),
+        final_path.old_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|final_endpoint| {
+        [
+            Some(layer_path.path.as_str()),
+            layer_path.old_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|layer_endpoint| final_endpoint == layer_endpoint)
+    })
+}
+
+fn assign_worktree_layers(
+    repository: &Repository,
+    base: &str,
+    paths: &mut [ChangedPath],
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let inventories = [
+        (
+            ChangeLayer::Committed,
+            layer_inventory(repository, false, &[base, "HEAD"], cancelled)?,
+        ),
+        (
+            ChangeLayer::Staged,
+            layer_inventory(repository, true, &["HEAD"], cancelled)?,
+        ),
+        (
+            ChangeLayer::Unstaged,
+            layer_inventory(repository, false, &[], cancelled)?,
+        ),
+    ];
+    apply_layers(paths, &inventories);
+    Ok(())
+}
+
+fn apply_layers(paths: &mut [ChangedPath], inventories: &[(ChangeLayer, Vec<ChangedPath>)]) {
+    for path in paths {
+        path.layers.clear();
+        for (layer, inventory) in inventories {
+            if inventory
+                .iter()
+                .any(|change| same_change_path(path, change))
+            {
+                path.layers.push(*layer);
+            }
+        }
+        if path.status == ChangeStatus::Untracked {
+            path.layers.push(ChangeLayer::Untracked);
+        }
+        path.layers.sort_unstable();
+        path.layers.dedup();
+    }
+}
+
+fn layer_inventory(
+    repository: &Repository,
+    cached: bool,
+    revisions: &[&str],
+    cancelled: &AtomicBool,
+) -> Result<Vec<ChangedPath>, String> {
+    let mut args = vec![
+        "diff",
+        "--raw",
+        "-z",
+        "--abbrev=64",
+        "--find-renames=50%",
+        "-l0",
+        "--diff-filter=AMDRTU",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+    ];
+    if cached {
+        args.push("--cached");
+    }
+    args.extend_from_slice(revisions);
+    Ok(parse_change_inventory(&run(&repository.root, &args, cancelled)?, cancelled)?.0)
+}
+
+fn target_dirty_digest(
+    repository: &Repository,
+    target: &SnapshotTarget,
+    index_file: Option<&Path>,
+    index_inventory: &[u8],
+    cancelled: &AtomicBool,
+) -> Result<String, OperationError> {
+    let mut hash = blake3::Hasher::new();
+    hash_field(&mut hash, b"domain", b"graphr-dirty-v1");
+    match target {
+        SnapshotTarget::Commit => {
+            hash_field(&mut hash, b"target", b"commit");
+            hash_field(&mut hash, b"include_untracked", b"false");
+            hash_field(&mut hash, b"overlay", b"empty");
+        }
+        SnapshotTarget::Index => {
+            hash_field(&mut hash, b"target", b"index");
+            hash_field(&mut hash, b"include_untracked", b"false");
+            hash_field(&mut hash, b"index", index_inventory);
+        }
+        SnapshotTarget::Worktree { include_untracked } => {
+            hash_field(&mut hash, b"target", b"worktree");
+            hash_field(
+                &mut hash,
+                b"include_untracked",
+                if *include_untracked {
+                    b"true"
+                } else {
+                    b"false"
+                },
+            );
+            hash_field(&mut hash, b"index", index_inventory);
+            let index_file = index_file.expect("worktree target has a captured index");
+            let mut selected = nul_records(
+                &run_with_index(
+                    &repository.root,
+                    &["ls-files", "--modified", "--deleted", "-z"],
+                    index_file,
+                    cancelled,
+                )
+                .map_err(capture_error)?,
+            )
+            .map(<[u8]>::to_vec)
+            .collect::<BTreeSet<_>>();
+            if *include_untracked {
+                selected.extend(
+                    nul_records(
+                        &run_with_index(
+                            &repository.root,
+                            &["ls-files", "--others", "--exclude-standard", "-z"],
+                            index_file,
+                            cancelled,
+                        )
+                        .map_err(capture_error)?,
+                    )
+                    .map(<[u8]>::to_vec),
+                );
+            }
+            for path in selected {
+                hash_dirty_path(&mut hash, &repository.root, &path, cancelled)?;
+            }
+        }
+    }
+    Ok(hash.finalize().to_hex().to_string())
+}
+
+fn hash_dirty_path(
+    hash: &mut blake3::Hasher,
+    root: &Path,
+    raw_path: &[u8],
+    cancelled: &AtomicBool,
+) -> Result<(), OperationError> {
+    let relative = Path::new(OsStr::from_bytes(raw_path));
+    if relative.is_absolute()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(OperationError::new(
+            ErrorCode::GitMetadataInvalid,
+            "Git returned an unsafe dirty path",
+        ));
+    }
+    check_cancelled(cancelled).map_err(capture_error)?;
+    hash_field(hash, b"path", raw_path);
+    let candidate = root.join(relative);
+    let Ok(before) = fs::symlink_metadata(&candidate) else {
+        hash_field(hash, b"type", b"absent");
+        hash_field(hash, b"mode", &0_u32.to_le_bytes());
+        hash_field(hash, b"size", &0_u64.to_le_bytes());
+        hash_field(hash, b"bytes", &[]);
+        return Ok(());
+    };
+    let kind = if before.is_file() {
+        b"regular".as_slice()
+    } else if before.file_type().is_symlink() {
+        b"symlink".as_slice()
+    } else if before.is_dir() {
+        b"directory".as_slice()
+    } else {
+        b"other".as_slice()
+    };
+    hash_field(hash, b"type", kind);
+    hash_field(hash, b"mode", &before.mode().to_le_bytes());
+    hash_field(hash, b"size", &before.len().to_le_bytes());
+    if before.is_file() {
+        if fs::canonicalize(&candidate).ok().as_deref() != Some(candidate.as_path()) {
+            return Err(OperationError::new(
+                ErrorCode::CaptureChanged,
+                "dirty file cannot be read safely",
+            ));
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&candidate)
+            .map_err(|_| {
+                OperationError::new(ErrorCode::CaptureChanged, "dirty file cannot be opened")
+            })?;
+        let opened = file.metadata().map_err(|_| {
+            OperationError::new(ErrorCode::CaptureChanged, "dirty file cannot be inspected")
+        })?;
+        if !same_file_version(&before, &opened) {
+            return Err(OperationError::new(
+                ErrorCode::CaptureChanged,
+                "dirty file changed during capture",
+            ));
+        }
+        hash.update(&(b"bytes".len() as u64).to_le_bytes());
+        hash.update(b"bytes");
+        hash.update(&opened.len().to_le_bytes());
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            check_cancelled(cancelled).map_err(capture_error)?;
+            let read = file.read(&mut buffer).map_err(|_| {
+                OperationError::new(ErrorCode::CaptureChanged, "dirty file cannot be read")
+            })?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&buffer[..read]);
+        }
+        let after = fs::symlink_metadata(&candidate).map_err(|_| {
+            OperationError::new(ErrorCode::CaptureChanged, "dirty file disappeared")
+        })?;
+        if !same_file_version(&opened, &after) {
+            return Err(OperationError::new(
+                ErrorCode::CaptureChanged,
+                "dirty file changed during capture",
+            ));
+        }
+    } else if before.file_type().is_symlink() {
+        let value = fs::read_link(&candidate).map_err(|_| {
+            OperationError::new(ErrorCode::CaptureChanged, "dirty link cannot be read")
+        })?;
+        hash_field(hash, b"bytes", value.as_os_str().as_bytes());
+        let after = fs::symlink_metadata(&candidate).map_err(|_| {
+            OperationError::new(ErrorCode::CaptureChanged, "dirty link disappeared")
+        })?;
+        if !same_file_version(&before, &after) {
+            return Err(OperationError::new(
+                ErrorCode::CaptureChanged,
+                "dirty link changed during capture",
+            ));
+        }
+    } else {
+        hash_field(hash, b"bytes", &[]);
+        let after = fs::symlink_metadata(&candidate).map_err(|_| {
+            OperationError::new(ErrorCode::CaptureChanged, "dirty path disappeared")
+        })?;
+        if !same_file_version(&before, &after) {
+            return Err(OperationError::new(
+                ErrorCode::CaptureChanged,
+                "dirty path changed during capture",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hash_field(hash: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
+    hash.update(&(label.len() as u64).to_le_bytes());
+    hash.update(label);
+    hash.update(&(value.len() as u64).to_le_bytes());
+    hash.update(value);
 }
 
 fn read_regular_file(
@@ -1359,6 +2147,7 @@ fn capture_untracked(
             language: reported_language,
             additions,
             deletions,
+            layers: vec![ChangeLayer::Untracked],
         });
     }
     artifacts
@@ -1694,6 +2483,7 @@ fn parse_tracked_changes(output: &[u8], cancelled: &AtomicBool) -> Result<Tracke
 fn capture_tracked_artifacts(
     root: &Path,
     output: &[u8],
+    source: ArtifactSource,
     cancelled: &AtomicBool,
 ) -> Result<TrackedArtifactSnapshot, String> {
     let mut hash = blake3::Hasher::new();
@@ -1822,7 +2612,12 @@ fn capture_tracked_artifacts(
                 }
             }
             if new_required {
-                let new = current_semantic_text(root, path, cancelled)?;
+                let new = match source {
+                    ArtifactSource::GitBlob => {
+                        old_semantic_text(root, change.new_oid.as_deref(), cancelled)?
+                    }
+                    ArtifactSource::Worktree => current_semantic_text(root, path, cancelled)?,
+                };
                 hash_semantic_input(&mut hash, b"new", &new);
                 match new {
                     Ok(text) => new_text = Some(text),
@@ -2159,6 +2954,7 @@ fn parse_change_inventory(
             path,
             additions: None,
             deletions: None,
+            layers: Vec::new(),
         });
     }
     paths.sort_unstable_by(|left, right| {
@@ -2347,6 +3143,7 @@ fn coalesce_renames(
             language: added.language,
             additions: None,
             deletions: None,
+            layers: Vec::new(),
         });
     }
     if !consumed.is_empty() {
@@ -3263,6 +4060,550 @@ mod tests {
     const OID: &str = "0123456789abcdef0123456789abcdef01234567";
 
     #[test]
+    fn capture_represents_commit_index_and_worktree_layers() {
+        let root = initialized_repository("layered-capture");
+        for (path, content) in [
+            ("mixed.rs", "pub fn mixed_base() {}\n"),
+            ("committed.rs", "pub fn committed_base() {}\n"),
+            ("old.rs", "pub fn renamed() {}\n"),
+            ("deleted.rs", "pub fn deleted() {}\n"),
+            ("unstaged.rs", "pub fn unstaged_base() {}\n"),
+            ("README.md", "# base\n"),
+        ] {
+            fs::write(root.join(path), content).unwrap();
+        }
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git_output(&root, &["rev-parse", "HEAD"]);
+
+        fs::write(root.join("mixed.rs"), "pub fn mixed_commit() {}\n").unwrap();
+        fs::write(root.join("committed.rs"), "pub fn committed_change() {}\n").unwrap();
+        fs::rename(root.join("old.rs"), root.join("renamed.rs")).unwrap();
+        fs::write(root.join("README.md"), "# committed\n").unwrap();
+        test_git(&root, &["add", "-A"]);
+        test_git(&root, &["commit", "--quiet", "-m", "committed"]);
+        let head = git_output(&root, &["rev-parse", "HEAD"]);
+
+        fs::write(root.join("mixed.rs"), "pub fn mixed_staged() {}\n").unwrap();
+        fs::write(root.join("staged.rs"), "pub fn staged() {}\n").unwrap();
+        fs::remove_file(root.join("deleted.rs")).unwrap();
+        fs::write(root.join("README.md"), "# staged\n").unwrap();
+        test_git(
+            &root,
+            &[
+                "add",
+                "-A",
+                "--",
+                "mixed.rs",
+                "staged.rs",
+                "deleted.rs",
+                "README.md",
+            ],
+        );
+
+        fs::write(root.join("mixed.rs"), "pub fn mixed_unstaged() {}\n").unwrap();
+        fs::write(root.join("unstaged.rs"), "pub fn unstaged_change() {}\n").unwrap();
+        fs::write(root.join("README.md"), "# unstaged\n").unwrap();
+        fs::write(root.join("untracked.rs"), "pub fn untracked() {}\n").unwrap();
+        fs::write(root.join("untracked.tsv"), "id\tvalue\na\tone\n").unwrap();
+
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let commit_root = private_dir("layered-commit");
+        let index_root = private_dir("layered-index");
+        let worktree_root = private_dir("layered-worktree");
+        let commit = repository
+            .capture_snapshot(
+                &base,
+                &head,
+                &SnapshotTarget::Commit,
+                DependencyMode::Boundary,
+                &commit_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let index = repository
+            .capture_snapshot(
+                &base,
+                &head,
+                &SnapshotTarget::Index,
+                DependencyMode::Boundary,
+                &index_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let worktree = repository
+            .capture_snapshot(
+                &base,
+                &head,
+                &SnapshotTarget::Worktree {
+                    include_untracked: true,
+                },
+                DependencyMode::Boundary,
+                &worktree_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert_eq!(commit.changed_files, 4);
+        assert_eq!(index.changed_files, 6);
+        assert_eq!(worktree.changed_files, 9);
+        assert_eq!(commit.commits_base_to_head, 1);
+        assert_eq!(index.commits_base_to_head, 1);
+        assert_eq!(worktree.commits_base_to_head, 1);
+        assert_eq!(
+            status_manifest(&commit),
+            [
+                ("README.md", ChangeStatus::Modified, None),
+                ("committed.rs", ChangeStatus::Modified, None),
+                ("mixed.rs", ChangeStatus::Modified, None),
+                ("renamed.rs", ChangeStatus::Renamed, Some("old.rs")),
+            ]
+        );
+        assert_eq!(
+            status_manifest(&index),
+            [
+                ("README.md", ChangeStatus::Modified, None),
+                ("committed.rs", ChangeStatus::Modified, None),
+                ("deleted.rs", ChangeStatus::Deleted, None),
+                ("mixed.rs", ChangeStatus::Modified, None),
+                ("renamed.rs", ChangeStatus::Renamed, Some("old.rs")),
+                ("staged.rs", ChangeStatus::Added, None),
+            ]
+        );
+        assert_eq!(
+            status_manifest(&worktree),
+            [
+                ("README.md", ChangeStatus::Modified, None),
+                ("committed.rs", ChangeStatus::Modified, None),
+                ("deleted.rs", ChangeStatus::Deleted, None),
+                ("mixed.rs", ChangeStatus::Modified, None),
+                ("renamed.rs", ChangeStatus::Renamed, Some("old.rs")),
+                ("staged.rs", ChangeStatus::Added, None),
+                ("unstaged.rs", ChangeStatus::Modified, None),
+                ("untracked.rs", ChangeStatus::Untracked, None),
+                ("untracked.tsv", ChangeStatus::Untracked, None),
+            ]
+        );
+        assert_eq!(change(&commit, "mixed.rs").layers, [ChangeLayer::Committed]);
+        assert_eq!(
+            change(&index, "mixed.rs").layers,
+            [ChangeLayer::Committed, ChangeLayer::Staged]
+        );
+        assert_eq!(
+            change(&worktree, "mixed.rs").layers,
+            [
+                ChangeLayer::Committed,
+                ChangeLayer::Staged,
+                ChangeLayer::Unstaged,
+            ]
+        );
+        assert_eq!(change(&worktree, "staged.rs").layers, [ChangeLayer::Staged]);
+        assert_eq!(
+            change(&worktree, "unstaged.rs").layers,
+            [ChangeLayer::Unstaged]
+        );
+        assert_eq!(
+            change(&worktree, "untracked.rs").layers,
+            [ChangeLayer::Untracked]
+        );
+        assert_eq!(
+            change(&worktree, "deleted.rs").status,
+            ChangeStatus::Deleted
+        );
+        let renamed = change(&worktree, "renamed.rs");
+        assert_eq!(renamed.status, ChangeStatus::Renamed);
+        assert_eq!(renamed.old_path.as_deref(), Some("old.rs"));
+        assert_eq!(renamed.layers, [ChangeLayer::Committed]);
+
+        assert_eq!(
+            source_text(&repository, &commit.sources, "mixed.rs"),
+            "pub fn mixed_commit() {}\n"
+        );
+        assert_eq!(
+            source_text(&repository, &index.sources, "mixed.rs"),
+            "pub fn mixed_staged() {}\n"
+        );
+        assert_eq!(
+            source_text(&repository, &worktree.sources, "mixed.rs"),
+            "pub fn mixed_unstaged() {}\n"
+        );
+        assert!(
+            !commit
+                .sources
+                .files
+                .iter()
+                .any(|file| file.path == "untracked.rs")
+        );
+        assert!(
+            !index
+                .sources
+                .files
+                .iter()
+                .any(|file| file.path == "untracked.rs")
+        );
+        assert_eq!(
+            source_text(&repository, &worktree.sources, "untracked.rs"),
+            "pub fn untracked() {}\n"
+        );
+
+        assert!(
+            commit
+                .changes
+                .source_patch
+                .contains("+pub fn mixed_commit() {}")
+        );
+        assert!(!commit.changes.source_patch.contains("mixed_staged"));
+        assert!(
+            index
+                .changes
+                .source_patch
+                .contains("+pub fn mixed_staged() {}")
+        );
+        assert!(!index.changes.source_patch.contains("mixed_unstaged"));
+        assert!(
+            worktree
+                .changes
+                .source_patch
+                .contains("+pub fn mixed_unstaged() {}")
+        );
+        assert!(
+            worktree
+                .changes
+                .source_patch
+                .contains("+pub fn untracked() {}")
+        );
+        assert!(commit.changes.artifacts.patch.contains("+# committed"));
+        assert!(!commit.changes.artifacts.patch.contains("+# staged"));
+        assert!(index.changes.artifacts.patch.contains("+# staged"));
+        assert!(!index.changes.artifacts.patch.contains("+# unstaged"));
+        assert!(worktree.changes.artifacts.patch.contains("+# unstaged"));
+        assert!(worktree.changes.artifacts.patch.contains("untracked.tsv"));
+        for file in &commit.changes.artifacts.files {
+            assert!(file.diff_complete && file.analysis_complete, "{file:?}");
+        }
+        for file in &index.changes.artifacts.files {
+            assert!(file.diff_complete && file.analysis_complete, "{file:?}");
+        }
+        for file in &worktree.changes.artifacts.files {
+            assert!(file.diff_complete && file.analysis_complete, "{file:?}");
+        }
+        let encoded = rmcp::serde_json::to_vec(&worktree.changes).unwrap();
+        let decoded: WorktreeChanges = rmcp::serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, worktree.changes);
+
+        for path in [commit_root, index_root, worktree_root, root] {
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn capture_rejects_index_or_worktree_drift() {
+        let root = initialized_repository("capture-drift");
+        fs::write(root.join("tracked.rs"), "pub fn base() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git_output(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("staged.rs"), "pub fn first() {}\n").unwrap();
+        test_git(&root, &["add", "--", "staged.rs"]);
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+
+        let index_root = private_dir("index-drift");
+        let watched_index = index_root.join("index");
+        let mutate_root = root.clone();
+        let index_mutation = thread::spawn(move || {
+            while !watched_index.exists() {
+                thread::yield_now();
+            }
+            fs::write(mutate_root.join("staged.rs"), "pub fn second() {}\n").unwrap();
+            test_git(&mutate_root, &["add", "--", "staged.rs"]);
+        });
+        let error = match repository.capture_snapshot(
+            &base,
+            &base,
+            &SnapshotTarget::Index,
+            DependencyMode::Boundary,
+            &index_root,
+            &AtomicBool::new(false),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("index drift was accepted"),
+        };
+        index_mutation.join().unwrap();
+        assert_eq!(error.code, ErrorCode::CaptureChanged);
+
+        fs::write(root.join("tracked.rs"), vec![b'a'; SOURCE_LIMIT as usize]).unwrap();
+        let worktree_root = private_dir("worktree-drift");
+        let watched_source = worktree_root.join("sources/0000000000000000");
+        let mutate_root = root.clone();
+        let worktree_mutation = thread::spawn(move || {
+            while !watched_source.exists() {
+                thread::yield_now();
+            }
+            fs::write(
+                mutate_root.join("tracked.rs"),
+                vec![b'b'; SOURCE_LIMIT as usize],
+            )
+            .unwrap();
+        });
+        let error = match repository.capture_snapshot(
+            &base,
+            &base,
+            &SnapshotTarget::Worktree {
+                include_untracked: false,
+            },
+            DependencyMode::Boundary,
+            &worktree_root,
+            &AtomicBool::new(false),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("worktree drift was accepted"),
+        };
+        worktree_mutation.join().unwrap();
+        assert_eq!(error.code, ErrorCode::CaptureChanged);
+
+        for path in [index_root, worktree_root, root] {
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn dirty_digest_covers_omitted_and_untracked_paths() {
+        let root = initialized_repository("dirty-digest");
+        fs::write(root.join("safe.rs"), "pub fn base() {}\n").unwrap();
+        fs::write(root.join("note.txt"), "base\n").unwrap();
+        fs::write(root.join("large.md"), vec![b'a'; SOURCE_LIMIT as usize + 1]).unwrap();
+        std::os::unix::fs::symlink("one", root.join("link.rs")).unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git_output(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("safe.rs"), "pub fn first() {}\n").unwrap();
+        fs::write(root.join("note.txt"), "first\n").unwrap();
+        fs::write(root.join("large.md"), vec![b'b'; SOURCE_LIMIT as usize + 1]).unwrap();
+        fs::remove_file(root.join("link.rs")).unwrap();
+        std::os::unix::fs::symlink("two", root.join("link.rs")).unwrap();
+        fs::write(root.join("untracked.bin"), [0, 1, 2]).unwrap();
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let capture = |label: &str| {
+            let capture_root = private_dir(label);
+            let capture = repository
+                .capture_snapshot(
+                    &base,
+                    &base,
+                    &SnapshotTarget::Worktree {
+                        include_untracked: true,
+                    },
+                    DependencyMode::Boundary,
+                    &capture_root,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            fs::remove_dir_all(capture_root).unwrap();
+            capture
+        };
+
+        let first = capture("digest-first");
+        assert_eq!(
+            first.changes.artifacts.file("large.md").unwrap().omission,
+            Some(ArtifactOmission::Oversized)
+        );
+        assert_eq!(
+            first.changes.artifacts.file("link.rs").unwrap().omission,
+            Some(ArtifactOmission::NonRegular)
+        );
+        assert_eq!(
+            first
+                .changes
+                .artifacts
+                .file("untracked.bin")
+                .unwrap()
+                .omission,
+            Some(ArtifactOmission::Binary)
+        );
+
+        fs::write(root.join("safe.rs"), "pub fn second() {}\n").unwrap();
+        let second = capture("digest-source");
+        assert_ne!(first.dirty_digest, second.dirty_digest);
+        fs::write(root.join("note.txt"), "second\n").unwrap();
+        let third = capture("digest-artifact");
+        assert_ne!(second.dirty_digest, third.dirty_digest);
+        let mut large = vec![b'b'; SOURCE_LIMIT as usize + 1];
+        *large.last_mut().unwrap() = b'c';
+        fs::write(root.join("large.md"), large).unwrap();
+        let fourth = capture("digest-oversized");
+        assert_ne!(third.dirty_digest, fourth.dirty_digest);
+        fs::remove_file(root.join("link.rs")).unwrap();
+        fs::write(root.join("link.rs"), "regular now\n").unwrap();
+        let fifth = capture("digest-type");
+        assert_ne!(fourth.dirty_digest, fifth.dirty_digest);
+        fs::write(root.join("untracked.bin"), [0, 1, 3]).unwrap();
+        let sixth = capture("digest-untracked");
+        assert_ne!(fifth.dirty_digest, sixth.dirty_digest);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_targets_have_exact_target_specific_reasons() {
+        let root = initialized_repository("empty-targets");
+        fs::write(root.join("lib.rs"), "pub fn unchanged() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git_output(&root, &["rev-parse", "HEAD"]);
+        test_git(
+            &root,
+            &["commit", "--quiet", "--allow-empty", "-m", "empty"],
+        );
+        let head = git_output(&root, &["rev-parse", "HEAD"]);
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+
+        let cases = [
+            (
+                "empty-identical-oids",
+                base.as_str(),
+                base.as_str(),
+                SnapshotTarget::Commit,
+                NoChangeReason::IdenticalCommitOids,
+                0,
+            ),
+            (
+                "empty-identical-trees",
+                base.as_str(),
+                head.as_str(),
+                SnapshotTarget::Commit,
+                NoChangeReason::IdenticalTrees,
+                1,
+            ),
+            (
+                "empty-index",
+                head.as_str(),
+                head.as_str(),
+                SnapshotTarget::Index,
+                NoChangeReason::EmptyIndexDelta,
+                0,
+            ),
+            (
+                "empty-worktree",
+                head.as_str(),
+                head.as_str(),
+                SnapshotTarget::Worktree {
+                    include_untracked: true,
+                },
+                NoChangeReason::EmptyWorktreeDelta,
+                0,
+            ),
+        ];
+        for (label, case_base, case_head, target, reason, commits) in cases {
+            let capture_root = private_dir(label);
+            let capture = repository
+                .capture_snapshot(
+                    case_base,
+                    case_head,
+                    &target,
+                    DependencyMode::Boundary,
+                    &capture_root,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            assert!(capture.changes.is_empty(), "{label}");
+            assert_eq!(capture.changed_files, 0, "{label}");
+            assert_eq!(capture.no_change_reason, Some(reason), "{label}");
+            assert_eq!(capture.commits_base_to_head, commits, "{label}");
+            assert_eq!(capture.dirty_digest.len(), 64, "{label}");
+            fs::remove_dir_all(capture_root).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_changes_reports_current_layer_provenance() {
+        let root = initialized_repository("legacy-layers");
+        fs::write(root.join("mixed.rs"), "pub fn base() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git_output(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("mixed.rs"), "pub fn committed() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "committed"]);
+        fs::write(root.join("mixed.rs"), "pub fn staged() {}\n").unwrap();
+        test_git(&root, &["add", "--", "mixed.rs"]);
+        fs::write(root.join("mixed.rs"), "pub fn unstaged() {}\n").unwrap();
+        fs::write(root.join("untracked.rs"), "pub fn untracked() {}\n").unwrap();
+
+        let changes = Repository::discover_cancelled(&root, &AtomicBool::new(false))
+            .unwrap()
+            .worktree_changes(&base, DependencyMode::Boundary, &AtomicBool::new(false))
+            .unwrap();
+
+        assert_eq!(
+            changes
+                .paths
+                .iter()
+                .find(|path| path.path == "mixed.rs")
+                .unwrap()
+                .layers,
+            [
+                ChangeLayer::Committed,
+                ChangeLayer::Staged,
+                ChangeLayer::Unstaged,
+            ]
+        );
+        assert_eq!(
+            changes
+                .paths
+                .iter()
+                .find(|path| path.path == "untracked.rs")
+                .unwrap()
+                .layers,
+            [ChangeLayer::Untracked]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn change<'a>(capture: &'a SnapshotCapture, path: &str) -> &'a ChangedPath {
+        capture
+            .changes
+            .paths
+            .iter()
+            .find(|change| change.path == path)
+            .unwrap_or_else(|| panic!("missing {path}: {:?}", capture.changes.paths))
+    }
+
+    fn status_manifest(capture: &SnapshotCapture) -> Vec<(&str, ChangeStatus, Option<&str>)> {
+        capture
+            .changes
+            .paths
+            .iter()
+            .map(|path| (path.path.as_str(), path.status, path.old_path.as_deref()))
+            .collect()
+    }
+
+    fn source_text(repository: &Repository, snapshot: &SourceSnapshot, path: &str) -> String {
+        let source = snapshot
+            .files
+            .iter()
+            .find(|source| source.path == path)
+            .unwrap_or_else(|| panic!("missing source {path}"));
+        let bytes = match &source.content {
+            SourceContent::GitBlob(oid) => run(
+                &repository.root,
+                &["cat-file", "blob", oid],
+                &AtomicBool::new(false),
+            )
+            .unwrap(),
+            SourceContent::Captured {
+                relative_path,
+                digest,
+            } => read_captured_source(
+                &snapshot.capture_root,
+                relative_path,
+                digest,
+                &AtomicBool::new(false),
+            )
+            .unwrap(),
+        };
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
     fn unmerged_index_sources_are_omitted_and_counted_once() {
         let output = format!(
             "100644 {OID} 1\tconflict.rs\0\
@@ -3689,6 +5030,7 @@ mod tests {
             language: None,
             additions: None,
             deletions: None,
+            layers: Vec::new(),
         }];
         let result = apply_captured_stats(
             &mut paths,
@@ -3724,6 +5066,7 @@ mod tests {
                 language: None,
                 additions: None,
                 deletions: None,
+                layers: Vec::new(),
             },
             ChangedPath {
                 status: ChangeStatus::Unmerged,
@@ -3733,6 +5076,7 @@ mod tests {
                 language: None,
                 additions: None,
                 deletions: None,
+                layers: Vec::new(),
             },
             ChangedPath {
                 status: ChangeStatus::Modified,
@@ -3742,6 +5086,7 @@ mod tests {
                 language: None,
                 additions: None,
                 deletions: None,
+                layers: Vec::new(),
             },
             ChangedPath {
                 status: ChangeStatus::Modified,
@@ -3751,6 +5096,7 @@ mod tests {
                 language: None,
                 additions: None,
                 deletions: None,
+                layers: Vec::new(),
             },
             ChangedPath {
                 status: ChangeStatus::Modified,
@@ -3760,6 +5106,7 @@ mod tests {
                 language: Some(Language::Rust),
                 additions: Some(1),
                 deletions: Some(1),
+                layers: Vec::new(),
             },
             ChangedPath {
                 status: ChangeStatus::Modified,
@@ -3769,6 +5116,7 @@ mod tests {
                 language: None,
                 additions: None,
                 deletions: None,
+                layers: Vec::new(),
             },
         ];
         let mut review = ArtifactReview {
@@ -4075,6 +5423,7 @@ mod tests {
             language: Some(Language::Rust),
             additions: Some(1),
             deletions: Some(1),
+            layers: Vec::new(),
         };
         assert!(validate_source_projection(&[], &[], &[path], DependencyMode::Boundary).is_err());
 
@@ -4087,6 +5436,10 @@ mod tests {
             skipped_paths: 0,
         };
         assert!(!changes.is_empty());
+        assert_eq!(
+            capture_error("Git change inventories disagree; retry".into()).code,
+            ErrorCode::CaptureChanged
+        );
 
         let snapshot = |inventory| WorktreeCapture {
             tracked: vec![b'a'],
@@ -4213,6 +5566,7 @@ mod tests {
                         language: Some(Language::Rust),
                         additions: Some(2),
                         deletions: Some(0),
+                        layers: Vec::new(),
                     },
                     ChangedPath {
                         status: ChangeStatus::Deleted,
@@ -4222,6 +5576,7 @@ mod tests {
                         language: Some(Language::Rust),
                         additions: Some(0),
                         deletions: Some(1),
+                        layers: Vec::new(),
                     },
                     ChangedPath {
                         status: ChangeStatus::Modified,
@@ -4231,6 +5586,7 @@ mod tests {
                         language: Some(Language::Rust),
                         additions: Some(1),
                         deletions: Some(3),
+                        layers: Vec::new(),
                     },
                     ChangedPath {
                         status: ChangeStatus::Renamed,
@@ -4240,6 +5596,7 @@ mod tests {
                         language: Some(Language::Rust),
                         additions: Some(0),
                         deletions: Some(0),
+                        layers: Vec::new(),
                     },
                     ChangedPath {
                         status: ChangeStatus::Untracked,
@@ -4249,6 +5606,7 @@ mod tests {
                         language: Some(Language::Rust),
                         additions: Some(1),
                         deletions: Some(0),
+                        layers: vec![ChangeLayer::Untracked],
                     },
                 ],
                 source_patch: expected_patch,
