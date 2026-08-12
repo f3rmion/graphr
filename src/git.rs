@@ -32,6 +32,8 @@ pub struct Repository {
     pub root: PathBuf,
     pub git_dir: PathBuf,
     pub common_git_dir: PathBuf,
+    pub common_git_dir_dev: u64,
+    pub common_git_dir_ino: u64,
     pub index_path: PathBuf,
     pub branch: Option<String>,
     pub head_oid: String,
@@ -417,7 +419,7 @@ impl Repository {
                 "cannot resolve Git directory",
             )
         })?;
-        validate_git_directory(&git_dir)?;
+        open_git_directory(&git_dir)?;
         let common_git_dir = parse_path(
             &run(
                 &root,
@@ -433,7 +435,7 @@ impl Repository {
                 "cannot resolve common Git directory",
             )
         })?;
-        validate_git_directory(&common_git_dir)?;
+        let common_git_dir_metadata = open_git_directory(&common_git_dir)?;
         if !git_dir.starts_with(&common_git_dir) {
             return Err(OperationError::new(
                 ErrorCode::GitMetadataInvalid,
@@ -531,6 +533,8 @@ impl Repository {
             root,
             git_dir,
             common_git_dir,
+            common_git_dir_dev: common_git_dir_metadata.dev(),
+            common_git_dir_ino: common_git_dir_metadata.ino(),
             index_path,
             branch,
             head_oid,
@@ -3612,8 +3616,23 @@ fn validate_discovery_path(path: &Path) -> Result<(), OperationError> {
     Ok(())
 }
 
-fn validate_git_directory(path: &Path) -> Result<(), OperationError> {
-    let metadata = fs::metadata(path).map_err(|_| {
+fn open_git_directory(path: &Path) -> Result<fs::Metadata, OperationError> {
+    validate_discovery_path(path).map_err(|_| {
+        OperationError::new(
+            ErrorCode::GitMetadataInvalid,
+            "Git path is not a valid absolute path",
+        )
+        .with_path("git_dir", path)
+    })?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|_| {
+            OperationError::new(ErrorCode::GitMetadataInvalid, "cannot open Git directory")
+                .with_path("git_dir", path)
+        })?;
+    let metadata = file.metadata().map_err(|_| {
         OperationError::new(
             ErrorCode::GitMetadataInvalid,
             "cannot inspect Git directory",
@@ -3627,13 +3646,7 @@ fn validate_git_directory(path: &Path) -> Result<(), OperationError> {
         )
         .with_path("git_dir", path));
     }
-    validate_discovery_path(path).map_err(|_| {
-        OperationError::new(
-            ErrorCode::GitMetadataInvalid,
-            "Git path is not a valid absolute path",
-        )
-        .with_path("git_dir", path)
-    })
+    Ok(metadata)
 }
 
 fn git_metadata_error(error: String) -> OperationError {
@@ -6126,6 +6139,8 @@ mod tests {
         Repository {
             root,
             common_git_dir: git_dir.clone(),
+            common_git_dir_dev: fs::metadata(&git_dir).unwrap().dev(),
+            common_git_dir_ino: fs::metadata(&git_dir).unwrap().ino(),
             index_path: git_dir.join("index"),
             git_dir,
             branch: None,

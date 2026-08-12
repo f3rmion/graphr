@@ -960,6 +960,8 @@ mod tests {
             worktree_root: PathBuf::from("/worktree"),
             git_dir: PathBuf::from("/repository/.git"),
             common_git_dir: PathBuf::from("/repository/.git"),
+            common_git_dir_dev: 1,
+            common_git_dir_ino: 1,
             index_path: PathBuf::from("/repository/.git/index"),
             object_format: "sha1".into(),
             branch: Some("main".into()),

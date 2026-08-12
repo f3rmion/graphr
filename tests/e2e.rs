@@ -1463,12 +1463,24 @@ fn server_started_with_main_indexes_the_selected_linked_worktree() {
     assert_eq!(provenance["git_dir"], feature_git_dir);
     assert_eq!(provenance["branch"], "linked");
     assert_eq!(provenance["head_oid"], feature_oid);
+    assert_eq!(provenance["changed_files"], 1);
+    assert_eq!(
+        provenance["selected_layers"],
+        rmcp::serde_json::json!(["committed"])
+    );
 
     let changes = client.changes(1, 50, None);
+    let changes_text = response_text(&changes);
     assert!(
-        response_text(&changes).contains("src/feature_only.rs"),
+        changes_text.contains("added source rust src/feature_only.rs"),
         "{changes}"
     );
+    assert!(!changes_text.contains("src/main_only.rs"), "{changes}");
+    assert!(
+        changes_text.contains("all_path_additions=1 all_path_deletions=0"),
+        "{changes}"
+    );
+    assert!(changes_text.contains("all_path_hunks=1"), "{changes}");
     let search = client.search("feature_only_symbol", Some("function"));
     assert!(
         response_text(&search).contains("feature_only_symbol"),

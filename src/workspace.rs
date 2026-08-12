@@ -97,6 +97,12 @@ pub struct RootIdentity {
     pub worktree_root: PathBuf,
     pub git_dir: PathBuf,
     pub common_git_dir: PathBuf,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub common_git_dir_dev: u64,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub common_git_dir_ino: u64,
     pub index_path: PathBuf,
     pub object_format: String,
     pub branch: Option<String>,
@@ -366,7 +372,9 @@ impl AllowedRoots {
         self.authorize(&requested)?;
         let repository = Repository::discover_cancelled(&requested, cancelled)?;
         self.authorize(&repository.root)?;
-        identity(repository)
+        #[cfg(test)]
+        after_repository_discovery(&repository);
+        Ok(identity(repository))
     }
 
     pub fn authorize(&self, canonical_root: &Path) -> Result<(), OperationError> {
@@ -1626,6 +1634,8 @@ type PublicationHook = Box<dyn FnOnce(&PublicationPoint) -> Result<(), Operation
 type SeedOpenHook = Box<dyn FnOnce(&Path)>;
 #[cfg(test)]
 type ReviewHook = Box<dyn FnOnce(&Path) -> Result<(), OperationError>>;
+#[cfg(test)]
+type DiscoveryHook = Box<dyn FnOnce(&crate::git::Repository)>;
 
 #[cfg(test)]
 thread_local! {
@@ -1634,6 +1644,23 @@ thread_local! {
     static BEFORE_SEED_OPEN_HOOK: RefCell<Option<SeedOpenHook>> = RefCell::new(None);
     static BEFORE_REVIEW_HOOK: RefCell<Option<ReviewHook>> = RefCell::new(None);
     static BEFORE_GRAPH_LOAD_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static AFTER_REPOSITORY_DISCOVERY_HOOK: RefCell<Option<DiscoveryHook>> = RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_after_repository_discovery_hook_for_test(
+    hook: impl FnOnce(&crate::git::Repository) + 'static,
+) {
+    AFTER_REPOSITORY_DISCOVERY_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn after_repository_discovery(repository: &crate::git::Repository) {
+    AFTER_REPOSITORY_DISCOVERY_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(repository);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1739,21 +1766,14 @@ fn validate_path(path: &Path, label: &str) -> Result<(), OperationError> {
     Ok(())
 }
 
-fn identity(repository: Repository) -> Result<RootIdentity, OperationError> {
-    let metadata = fs::metadata(&repository.common_git_dir).map_err(|_| {
-        OperationError::new(
-            ErrorCode::GitMetadataInvalid,
-            "cannot inspect common Git directory",
-        )
-        .with_path("root", &repository.common_git_dir)
-    })?;
+fn identity(repository: Repository) -> RootIdentity {
     let repository_id = hash_fields(
         b"graphr.repository.v2",
         &[
             &repository.common_git_dir,
             &repository.object_format,
-            &metadata.dev(),
-            &metadata.ino(),
+            &repository.common_git_dir_dev,
+            &repository.common_git_dir_ino,
         ],
     );
     let workspace_id = hash_fields(
@@ -1765,18 +1785,20 @@ fn identity(repository: Repository) -> Result<RootIdentity, OperationError> {
             &repository.index_path,
         ],
     );
-    Ok(RootIdentity {
+    RootIdentity {
         repository_id,
         workspace_id,
         repository_root: repository.root.clone(),
         worktree_root: repository.root,
         git_dir: repository.git_dir,
         common_git_dir: repository.common_git_dir,
+        common_git_dir_dev: repository.common_git_dir_dev,
+        common_git_dir_ino: repository.common_git_dir_ino,
         index_path: repository.index_path,
         object_format: repository.object_format,
         branch: repository.branch,
         head_oid: repository.head_oid,
-    })
+    }
 }
 
 pub(crate) fn graph_image_key(
@@ -1910,7 +1932,8 @@ mod tests {
     use super::{
         AllowedRoots, ErrorCode, IndexRequest, OperationError, PublicationPoint, SnapshotCatalog,
         SnapshotKeyInput, SnapshotTarget, graph_image_key, resolve_request,
-        set_before_manifest_hook_for_test, set_before_review_hook_for_test, snapshot_key,
+        set_after_repository_discovery_hook_for_test, set_before_manifest_hook_for_test,
+        set_before_review_hook_for_test, snapshot_key,
     };
 
     #[test]
@@ -2702,6 +2725,30 @@ mod tests {
             git_required_line(&fixture.linked, &["rev-parse", "--verify", "HEAD^{commit}"])
         );
         assert_ne!(main.head_oid, linked.head_oid);
+    }
+
+    #[test]
+    fn identity_uses_the_common_git_directory_validated_during_discovery() {
+        let root = repository_with_source("identity-boundary", "fn source() {}\n");
+        let roots = AllowedRoots::new(vec![root.clone()]).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let original = roots.inspect(&root, &cancelled).unwrap();
+        let git_dir = root.join(".git");
+        let moved = root.join(".git-original");
+
+        set_after_repository_discovery_hook_for_test(move |_| {
+            fs::rename(&git_dir, &moved).unwrap();
+            fs::create_dir(&git_dir).unwrap();
+        });
+        let raced = roots.inspect(&root, &cancelled).unwrap();
+
+        let raced_repository_id = raced.repository_id;
+        let raced_workspace_id = raced.workspace_id;
+        fs::remove_dir_all(root.join(".git")).unwrap();
+        fs::rename(root.join(".git-original"), root.join(".git")).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(raced_repository_id, original.repository_id);
+        assert_eq!(raced_workspace_id, original.workspace_id);
     }
 
     #[test]

@@ -637,6 +637,8 @@ fn repository_from_identity(root: &crate::workspace::RootIdentity) -> Repository
         root: root.worktree_root.clone(),
         git_dir: root.git_dir.clone(),
         common_git_dir: root.common_git_dir.clone(),
+        common_git_dir_dev: root.common_git_dir_dev,
+        common_git_dir_ino: root.common_git_dir_ino,
         index_path: root.index_path.clone(),
         branch: root.branch.clone(),
         head_oid: root.head_oid.clone(),
