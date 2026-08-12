@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
 use std::ops::Range;
 use std::path::Path;
 #[cfg(test)]
@@ -182,40 +181,33 @@ impl Engine {
             .iter()
             .find(|entry| entry.graph_image_id == graph_image_id)
             .cloned();
-        let exact = match fs::symlink_metadata(&exact_graph) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => {
-                return Err(OperationError::new(
-                    crate::workspace::ErrorCode::CacheCorrupt,
-                    format!("cannot inspect exact graph cache: {error}"),
-                ));
+        let exact = match self.catalog.pin_exact_graph(
+            &job,
+            &graph_image_id,
+            trusted_exact.as_deref(),
+            cancelled,
+        ) {
+            Ok(graph) => graph,
+            Err(error) if error.code == crate::workspace::ErrorCode::JobCancelled => {
+                return Err(error);
             }
-            Ok(_) => match trusted_exact.as_deref().map_or_else(
-                || crate::workspace::validate_published_image(&exact_graph),
-                |entry| validate_entry_graph(entry, cancelled),
-            ) {
-                Ok(_) => true,
-                Err(error) if error.code == crate::workspace::ErrorCode::JobCancelled => {
-                    return Err(error);
-                }
-                Err(_) => {
-                    rejected_cache = Some(exact_graph.display().to_string());
-                    self.catalog
-                        .quarantine_graph(&request.root, &graph_image_id, &snapshot_id)?;
-                    report(
-                        BuildStage::SelectingSeed,
-                        0,
-                        total,
-                        0,
-                        0,
-                        rejected_cache.clone(),
-                    );
-                    false
-                }
-            },
+            Err(_) => {
+                rejected_cache = Some(exact_graph.display().to_string());
+                self.catalog
+                    .quarantine_graph(&request.root, &graph_image_id, &snapshot_id)?;
+                report(
+                    BuildStage::SelectingSeed,
+                    0,
+                    total,
+                    0,
+                    0,
+                    rejected_cache.clone(),
+                );
+                None
+            }
         };
 
-        let (stats, graph_temp) = if exact {
+        let (stats, graph_temp) = if exact.is_some() {
             let stats = IndexStats {
                 files_total: total,
                 files_reused: total,
@@ -327,7 +319,7 @@ impl Engine {
             })?;
             (stats, Some(job.graph_temp()))
         };
-        if exact {
+        if exact.is_some() {
             report(
                 BuildStage::ResolvingGraph,
                 total,
@@ -352,6 +344,7 @@ impl Engine {
             &review_id,
             &review_bytes,
             graph_temp,
+            exact.as_ref(),
             request.dependency_mode,
             capture.no_change_reason,
             provenance,

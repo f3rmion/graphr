@@ -258,8 +258,13 @@ pub struct SnapshotEntry {
     pub no_change_reason: Option<NoChangeReason>,
     pub dependency_mode: DependencyMode,
     pub provenance: Provenance,
-    _graph_file: File,
+    _graph_file: Arc<File>,
     graph_checksum: String,
+}
+
+pub(crate) struct PinnedGraph {
+    file: Arc<File>,
+    checksum: String,
 }
 
 pub struct SnapshotCatalog {
@@ -578,6 +583,39 @@ impl SnapshotCatalog {
         entries
     }
 
+    pub(crate) fn pin_exact_graph(
+        &self,
+        job: &PrivateJob,
+        graph_image_id: &str,
+        trusted: Option<&SnapshotEntry>,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<PinnedGraph>, OperationError> {
+        let name = format!("{graph_image_id}.db");
+        let current = match open_regular_at(&job.cache.graphs, OsStr::new(&name), None) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(cache_corrupt(error)),
+            Ok(file) => Arc::new(file),
+        };
+        let (file, checksum) = match trusted {
+            Some(trusted) => {
+                if !same_file(&current, &trusted._graph_file)? {
+                    return Err(cache_corrupt(
+                        "published graph name changed after exact validation",
+                    ));
+                }
+                validate_entry_graph(trusted, cancelled)?;
+                (trusted._graph_file.clone(), trusted.graph_checksum.clone())
+            }
+            None => {
+                let path = stable_file_path(&current);
+                validate_published_image(&path)?;
+                let checksum = hash_file(&path, cancelled)?;
+                (current, checksum)
+            }
+        };
+        Ok(Some(PinnedGraph { file, checksum }))
+    }
+
     pub(crate) fn begin(&self, root: &RootIdentity) -> Result<PrivateJob, OperationError> {
         self.allowed_roots.authorize(&root.worktree_root)?;
         let cache = cache_paths(root, true)?.expect("created above");
@@ -716,6 +754,7 @@ impl SnapshotCatalog {
         review_id: &str,
         review_bytes: &[u8],
         graph_temp: Option<&Path>,
+        trusted_graph: Option<&PinnedGraph>,
         dependency_mode: DependencyMode,
         no_change_reason: Option<NoChangeReason>,
         mut provenance: Provenance,
@@ -755,7 +794,7 @@ impl SnapshotCatalog {
             ));
         }
 
-        let graph_path = job.graph_path(graph_image_id);
+        let graph_name = format!("{graph_image_id}.db");
         if let Some(graph_temp) = graph_temp {
             fs::set_permissions(graph_temp, fs::Permissions::from_mode(0o444))
                 .map_err(|error| cache_internal("cannot make graph image read-only", error))?;
@@ -767,11 +806,29 @@ impl SnapshotCatalog {
                 &job.directory,
                 OsStr::new("graph.db"),
                 &job.cache.graphs,
-                OsStr::new(&format!("{graph_image_id}.db")),
+                OsStr::new(&graph_name),
             )?;
         }
-        let state = validate_published_image(&graph_path)?;
-        let graph_checksum = hash_file(&graph_path, cancelled)?;
+        let graph_file = open_regular_at(&job.cache.graphs, OsStr::new(&graph_name), None)
+            .map_err(cache_corrupt)?;
+        if let Some(trusted) = trusted_graph
+            && !same_file(&graph_file, &trusted.file)?
+        {
+            return Err(cache_corrupt(
+                "published graph name changed after exact validation",
+            ));
+        }
+        let graph_path = stable_file_path(&graph_file);
+        let (state, graph_checksum) = match trusted_graph {
+            Some(trusted) => (
+                validate_pinned_graph(trusted, cancelled)?,
+                trusted.checksum.clone(),
+            ),
+            None => (
+                validate_published_image(&graph_path)?,
+                hash_file(&graph_path, cancelled)?,
+            ),
+        };
         provenance.index_generation = state.generation;
         let manifest = SnapshotManifest {
             format_version: CACHE_FORMAT_VERSION,
@@ -983,7 +1040,7 @@ impl SnapshotCatalog {
             no_change_reason: manifest.no_change_reason,
             dependency_mode: manifest.dependency_mode,
             provenance: manifest.provenance,
-            _graph_file: graph_file,
+            _graph_file: Arc::new(graph_file),
             graph_checksum: manifest.graph_checksum,
         }))
     }
@@ -1456,6 +1513,23 @@ pub(crate) fn validate_entry_graph(
     validate_published_image(&entry.graph_path)
 }
 
+fn validate_pinned_graph(
+    graph: &PinnedGraph,
+    cancelled: &AtomicBool,
+) -> Result<crate::store::State, OperationError> {
+    let path = stable_file_path(&graph.file);
+    if hash_file(&path, cancelled)? != graph.checksum {
+        return Err(cache_corrupt("snapshot graph checksum is invalid"));
+    }
+    validate_published_image(&path)
+}
+
+fn same_file(left: &File, right: &File) -> Result<bool, OperationError> {
+    let left = left.metadata().map_err(cache_corrupt)?;
+    let right = right.metadata().map_err(cache_corrupt)?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
 fn check_cache_cancelled(cancelled: &AtomicBool) -> Result<(), OperationError> {
     if cancelled.load(Ordering::Relaxed) {
         Err(OperationError::new(
@@ -1824,7 +1898,7 @@ mod tests {
     use super::{
         AllowedRoots, ErrorCode, IndexRequest, OperationError, PublicationPoint, SnapshotCatalog,
         SnapshotKeyInput, SnapshotTarget, graph_image_key, resolve_request,
-        set_before_manifest_hook_for_test, snapshot_key,
+        set_before_manifest_hook_for_test, set_before_review_hook_for_test, snapshot_key,
     };
 
     #[test]
@@ -1993,6 +2067,66 @@ mod tests {
             fresh.get(&completion.snapshot_id).unwrap().graph_image_id,
             completion.graph_image_id
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_reuse_does_not_publish_a_replaced_graph_name() {
+        let root = repository_with_source("exact-reuse-replacement", "fn original() {}\n");
+        let engine = test_engine(&root);
+        let original_request = resolved_commit(&engine, &root, "HEAD", "HEAD");
+        let original = engine
+            .build_snapshot(original_request.clone(), &AtomicBool::new(false), |_| {})
+            .unwrap();
+        let node_ref = engine
+            .search(&original.snapshot_id, "original", Some("function"), 8)
+            .unwrap()
+            .text
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned();
+        fs::write(root.join("src/lib.rs"), "fn replacement() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "replacement"]);
+        let replacement = engine
+            .build_snapshot(
+                resolved_commit(&engine, &root, "HEAD", "HEAD"),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let graph_directory = root.join(".git/graphr/v6/graphs");
+        let original_graph = graph_directory.join(format!("{}.db", original.graph_image_id));
+        let replacement_graph = graph_directory.join(format!("{}.db", replacement.graph_image_id));
+        let manifest = root
+            .join(".git/graphr/v6/snapshots")
+            .join(format!("{}.json", original.snapshot_id));
+        set_before_review_hook_for_test({
+            let manifest = manifest.clone();
+            move |_| {
+                fs::remove_file(&manifest).unwrap();
+                fs::rename(&original_graph, original_graph.with_extension("validated")).unwrap();
+                fs::copy(&replacement_graph, &original_graph).unwrap();
+                Ok(())
+            }
+        });
+
+        let error = engine
+            .build_snapshot(original_request, &AtomicBool::new(false), |_| {})
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::CacheCorrupt);
+        assert!(!manifest.exists());
+        let search = engine
+            .search(&original.snapshot_id, "original", Some("function"), 8)
+            .unwrap();
+        assert!(search.text.contains("original"), "{}", search.text);
+        assert!(!search.text.contains("replacement"), "{}", search.text);
+        let view = engine
+            .view(&original.snapshot_id, &node_ref, 1, 30)
+            .unwrap();
+        assert!(view.text.contains("original"), "{}", view.text);
+        assert!(!view.text.contains("replacement"), "{}", view.text);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2168,6 +2302,7 @@ mod tests {
                 &completion.graph_image_id,
                 &review_id,
                 &oversized,
+                None,
                 None,
                 DependencyMode::Boundary,
                 None,
