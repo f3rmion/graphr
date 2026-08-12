@@ -1720,6 +1720,9 @@ fn change_section_text(changes: &ChangesCapture, section: &str) -> String {
         .map_or(changes.initial.text.len(), |offset| start + offset);
     let mut output = changes.initial.text[start..end].to_owned();
     for (_, page) in &changes.pages[section] {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
         output.push_str(&page.text);
     }
     output
@@ -1763,23 +1766,215 @@ fn assert_semantic_records(changes: &ChangesCapture, expected: &[String]) {
 
 type GraphRecord = (String, String, String, u32);
 
+fn parse_graph_records(output: &str) -> Result<BTreeSet<GraphRecord>, String> {
+    let mut records = BTreeSet::new();
+    for line in output.lines() {
+        if let Some(record) = parse_graph_line(line)? {
+            records.insert(record);
+        }
+    }
+    Ok(records)
+}
+
+fn parse_graph_line(line: &str) -> Result<Option<GraphRecord>, String> {
+    if let Some(risk) = line.strip_prefix("  risk ") {
+        let (score, mut node) = risk.split_once(' ').ok_or_else(|| invalid_graph(line))?;
+        if !valid_score(score) {
+            return Err(invalid_graph(line));
+        }
+        node = ["no-static-test-path ", "indirect-test-covered "]
+            .iter()
+            .find_map(|tag| node.strip_prefix(tag))
+            .unwrap_or(node);
+        return parse_graph_node(node).map(Some);
+    }
+    for relation in [
+        "test <-",
+        "caller <-",
+        "impl <-",
+        "call ->",
+        "implements ->",
+        "import ->",
+    ] {
+        if let Some(node) = line.strip_prefix(&format!("  {relation} ")) {
+            if let Some(package) = node.strip_prefix("dependency-boundary package=") {
+                return (!package.is_empty() && !package.contains(char::is_whitespace))
+                    .then_some(None)
+                    .ok_or_else(|| invalid_graph(line));
+            }
+            return parse_graph_node(node).map(Some);
+        }
+    }
+    if line.starts_with("n1:") {
+        return parse_graph_node(line).map(Some);
+    }
+    if line
+        .split_ascii_whitespace()
+        .any(|field| field.starts_with("n1:"))
+    {
+        return Err(invalid_graph(line));
+    }
+    is_graph_non_node(line)
+        .then_some(None)
+        .ok_or_else(|| invalid_graph(line))
+}
+
+fn parse_graph_node(node: &str) -> Result<GraphRecord, String> {
+    let fields = node.split_ascii_whitespace().collect::<Vec<_>>();
+    let [node_ref, kind, name, path_line] = fields.as_slice() else {
+        return Err(invalid_graph(node));
+    };
+    if !valid_node_ref(node_ref) || !matches!(*kind, "File" | "Type" | "Function" | "Test") {
+        return Err(invalid_graph(node));
+    }
+    let (path, raw_line) = path_line
+        .rsplit_once(':')
+        .filter(|(path, _)| !path.is_empty())
+        .ok_or_else(|| invalid_graph(node))?;
+    let line = raw_line
+        .parse::<u32>()
+        .ok()
+        .filter(|line| *line > 0 && raw_line == line.to_string())
+        .ok_or_else(|| invalid_graph(node))?;
+    Ok((
+        (*kind).to_owned(),
+        (*name).to_owned(),
+        path.to_owned(),
+        line,
+    ))
+}
+
+fn valid_node_ref(node_ref: &str) -> bool {
+    let fields = node_ref.split(':').collect::<Vec<_>>();
+    let ["n1", snapshot, epoch, generation, id] = fields.as_slice() else {
+        return false;
+    };
+    snapshot.len() == 64
+        && snapshot
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        && epoch.len() == 8
+        && epoch.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && canonical_i64(generation, false)
+        && canonical_i64(id, true)
+}
+
+fn canonical_i64(raw: &str, positive: bool) -> bool {
+    raw.parse::<i64>().is_ok_and(|value| {
+        raw == value.to_string() && if positive { value > 0 } else { value >= 0 }
+    })
+}
+
+fn valid_score(score: &str) -> bool {
+    score.split_once('.').is_some_and(|(whole, fraction)| {
+        canonical_i64(whole, false)
+            && fraction.len() == 4
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+            && whole
+                .parse::<u32>()
+                .ok()
+                .and_then(|whole| whole.checked_mul(10_000))
+                .and_then(|whole| whole.checked_add(fraction.parse().unwrap()))
+                .is_some()
+    })
+}
+
+fn is_graph_non_node(line: &str) -> bool {
+    if line.is_empty() || line == "graph" {
+        return true;
+    }
+    if [
+        "graph emitted_bytes=",
+        "risk overall=",
+        "coverage category=",
+        "file-mapped ",
+        "unmapped ",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix) && line.len() > prefix.len())
+        || line == "coverage status=complete remediation=none"
+    {
+        return true;
+    }
+    if let Some(flow) = line.strip_prefix("flow ") {
+        return flow
+            .split_once(' ')
+            .is_some_and(|(score, fields)| valid_score(score) && fields.starts_with("depth="));
+    }
+    line.strip_prefix("graph_next_cursor=")
+        .is_some_and(|cursor| !cursor.is_empty() && !cursor.contains(char::is_whitespace))
+        || matches!(
+            line,
+            "review_complete_when_pages_exhausted=true"
+                | "review_complete_when_pages_exhausted=false"
+        )
+}
+
+fn invalid_graph(line: &str) -> String {
+    format!("invalid graph line: {line}")
+}
+
+#[test]
+fn graph_record_parser_accepts_only_complete_node_records() {
+    const REF: &str =
+        "n1:0000000000000000000000000000000000000000000000000000000000000000:deadbeef:0:1";
+
+    let bare = format!("{REF} Function bare src/lib.rs:1");
+    assert_eq!(
+        parse_graph_records(&bare).unwrap(),
+        BTreeSet::from([(
+            "Function".to_owned(),
+            "bare".to_owned(),
+            "src/lib.rs".to_owned(),
+            1,
+        )])
+    );
+    for prefix in [
+        "  risk 0.1000 ",
+        "  risk 0.1000 no-static-test-path ",
+        "  risk 0.1000 indirect-test-covered ",
+        "  test <- ",
+        "  caller <- ",
+        "  impl <- ",
+        "  call -> ",
+        "  implements -> ",
+        "  import -> ",
+    ] {
+        let line = format!("{prefix}{REF} Function valid src/lib.rs:1");
+        assert!(parse_graph_records(&line).is_ok(), "{line}");
+    }
+    assert!(
+        parse_graph_records("  call -> dependency-boundary package=sha2")
+            .unwrap()
+            .is_empty()
+    );
+
+    for malformed in [
+        format!("bogus {REF} Function name src/lib.rs:1"),
+        "n1:ABCDEF0000000000000000000000000000000000000000000000000000000000:deadbeef:0:1 Function name src/lib.rs:1".to_owned(),
+        "n1:0000000000000000000000000000000000000000000000000000000000000000:deadbeef:00:1 Function name src/lib.rs:1".to_owned(),
+        "n1:0000000000000000000000000000000000000000000000000000000000000000:deadbeef:0:0 Function name src/lib.rs:1".to_owned(),
+        format!("{REF} Function name"),
+        format!("{REF} Function name src/lib.rs:1 trailing"),
+        format!("{REF} Unknown name src/lib.rs:1"),
+        format!("{REF} Function name src/lib.rs:0"),
+        format!("{REF} Function name src/lib.rs:01"),
+        format!("{REF} Function name src/lib.rs:not-a-line"),
+        format!("  risk 1.000 {REF} Function name src/lib.rs:1"),
+        format!("  risk 0.1000 unknown-tag {REF} Function name src/lib.rs:1"),
+        "  call -> dependency-boundary package=".to_owned(),
+        "unknown graph metadata".to_owned(),
+    ] {
+        assert!(
+            parse_graph_records(&malformed).is_err(),
+            "unexpectedly accepted {malformed}"
+        );
+    }
+}
+
 fn assert_graph_records(changes: &ChangesCapture, expected: &[(&str, &str, &str, u32)]) {
-    let actual = change_section_text(changes, "graph")
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_ascii_whitespace();
-            fields.find(|field| field.starts_with("n1:"))?;
-            let kind = fields.next()?;
-            let name = fields.next()?;
-            let (path, line) = fields.next()?.rsplit_once(':')?;
-            Some((
-                kind.to_owned(),
-                name.to_owned(),
-                path.to_owned(),
-                line.parse().unwrap(),
-            ))
-        })
-        .collect::<BTreeSet<GraphRecord>>();
+    let graph = change_section_text(changes, "graph");
+    let actual = parse_graph_records(&graph).unwrap_or_else(|error| panic!("{error}\n{graph}"));
     let expected = expected
         .iter()
         .map(|(kind, name, path, line)| {
