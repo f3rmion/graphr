@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
@@ -827,20 +827,14 @@ fn commit_index_and_worktree_targets_preserve_status_layers_and_artifacts() {
             ),
         ],
     );
-    let commit_graph = change_section_text(&commit_changes, "graph");
-    for symbol in [
-        "committed_layered_symbol",
-        "committed_helper_symbol",
-        "renamed_symbol",
-    ] {
-        assert!(
-            commit_graph.contains(symbol),
-            "missing {symbol}: {commit_graph}"
-        );
-    }
-    for absent in ["staged_layered_symbol", "unstaged_layered_symbol"] {
-        assert!(!commit_graph.contains(absent), "{commit_graph}");
-    }
+    assert_graph_records(
+        &commit_changes,
+        &[
+            ("Function", "committed_layered_symbol", LAYERED_PATH, 1),
+            ("Function", "committed_helper_symbol", LAYERED_PATH, 2),
+            ("Function", "renamed_symbol", AFTER_RENAME_PATH, 1),
+        ],
+    );
     assert_eq!(
         page_metric(&commit_changes.initial.text, "artifacts", "total_records"),
         0
@@ -879,27 +873,16 @@ fn commit_index_and_worktree_targets_preserve_status_layers_and_artifacts() {
             ),
         ],
     );
-    let index_graph = change_section_text(&index_changes, "graph");
-    for symbol in [
-        "committed_layered_symbol",
-        "committed_helper_symbol",
-        "staged_layered_symbol",
-        "renamed_symbol",
-        "staged_added_symbol",
-    ] {
-        assert!(
-            index_graph.contains(symbol),
-            "missing {symbol}: {index_graph}"
-        );
-    }
-    for absent in [
-        "unstaged_layered_symbol",
-        "unstaged_current_symbol",
-        "untracked_symbol_00_with_complete_target_state_evidence",
-        "staged_deleted_symbol",
-    ] {
-        assert!(!index_graph.contains(absent), "{index_graph}");
-    }
+    assert_graph_records(
+        &index_changes,
+        &[
+            ("Function", "committed_layered_symbol", LAYERED_PATH, 1),
+            ("Function", "committed_helper_symbol", LAYERED_PATH, 2),
+            ("Function", "staged_layered_symbol", LAYERED_PATH, 3),
+            ("Function", "renamed_symbol", AFTER_RENAME_PATH, 1),
+            ("Function", "staged_added_symbol", STAGED_ADD_PATH, 1),
+        ],
+    );
     assert_semantic_records(
         &index_changes,
         &[
@@ -957,31 +940,137 @@ fn commit_index_and_worktree_targets_preserve_status_layers_and_artifacts() {
             ),
         ],
     );
-    let worktree_graph = change_section_text(&worktree_changes, "graph");
-    for symbol in [
-        "committed_layered_symbol",
-        "committed_helper_symbol",
-        "staged_layered_symbol",
-        "unstaged_layered_symbol",
-        "renamed_symbol",
-        "staged_added_symbol",
-        "unstaged_current_symbol",
-    ] {
-        assert!(
-            worktree_graph.contains(symbol),
-            "missing {symbol}: {worktree_graph}"
-        );
-    }
-    for index in 0..20 {
-        let symbol = format!("untracked_symbol_{index:02}_with_complete_target_state_evidence");
-        assert!(
-            worktree_graph.contains(&symbol),
-            "missing {symbol}: {worktree_graph}"
-        );
-    }
-    assert!(
-        !worktree_graph.contains("staged_deleted_symbol"),
-        "{worktree_graph}"
+    assert_graph_records(
+        &worktree_changes,
+        &[
+            ("Function", "committed_layered_symbol", LAYERED_PATH, 1),
+            ("Function", "committed_helper_symbol", LAYERED_PATH, 2),
+            ("Function", "staged_layered_symbol", LAYERED_PATH, 3),
+            ("Function", "unstaged_layered_symbol", LAYERED_PATH, 4),
+            ("Function", "renamed_symbol", AFTER_RENAME_PATH, 1),
+            ("Function", "staged_added_symbol", STAGED_ADD_PATH, 1),
+            ("Function", "unstaged_current_symbol", UNSTAGED_PATH, 1),
+            (
+                "Function",
+                "untracked_symbol_00_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                1,
+            ),
+            (
+                "Function",
+                "untracked_symbol_01_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                2,
+            ),
+            (
+                "Function",
+                "untracked_symbol_02_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                3,
+            ),
+            (
+                "Function",
+                "untracked_symbol_03_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                4,
+            ),
+            (
+                "Function",
+                "untracked_symbol_04_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                5,
+            ),
+            (
+                "Function",
+                "untracked_symbol_05_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                6,
+            ),
+            (
+                "Function",
+                "untracked_symbol_06_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                7,
+            ),
+            (
+                "Function",
+                "untracked_symbol_07_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                8,
+            ),
+            (
+                "Function",
+                "untracked_symbol_08_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                9,
+            ),
+            (
+                "Function",
+                "untracked_symbol_09_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                10,
+            ),
+            (
+                "Function",
+                "untracked_symbol_10_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                11,
+            ),
+            (
+                "Function",
+                "untracked_symbol_11_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                12,
+            ),
+            (
+                "Function",
+                "untracked_symbol_12_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                13,
+            ),
+            (
+                "Function",
+                "untracked_symbol_13_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                14,
+            ),
+            (
+                "Function",
+                "untracked_symbol_14_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                15,
+            ),
+            (
+                "Function",
+                "untracked_symbol_15_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                16,
+            ),
+            (
+                "Function",
+                "untracked_symbol_16_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                17,
+            ),
+            (
+                "Function",
+                "untracked_symbol_17_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                18,
+            ),
+            (
+                "Function",
+                "untracked_symbol_18_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                19,
+            ),
+            (
+                "Function",
+                "untracked_symbol_19_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                20,
+            ),
+        ],
     );
     let mut semantic_records = vec![
         format!(
@@ -1077,11 +1166,10 @@ fn editing_after_publication_never_mutates_existing_queries_or_cursors() {
     .unwrap();
     let live_renamed_path =
         "src/complete_target_state/source_renamed_after_snapshot_publication.rs";
-    fs::rename(
-        fixture.path.join(AFTER_RENAME_PATH),
-        fixture.path.join(live_renamed_path),
-    )
-    .unwrap();
+    git(
+        &fixture.path,
+        &["mv", "--", AFTER_RENAME_PATH, live_renamed_path],
+    );
     fs::remove_file(fixture.path.join(STAGED_ADD_PATH)).unwrap();
 
     let repeated_search = capture_query(&client.call(
@@ -1165,20 +1253,174 @@ fn editing_after_publication_never_mutates_existing_queries_or_cursors() {
     let deleted = response_text(&client.search("staged_added_symbol", Some("function")));
     assert!(!deleted.contains("staged_added_symbol"), "{deleted}");
     let new_changes = capture_changes(&mut client, &new_snapshot, 6, 50);
-    let new_changes = ["files", "diff", "artifacts", "graph"]
-        .map(|section| change_section_text(&new_changes, section))
-        .concat();
-    for expected in [
-        "post_publication_symbol",
-        "live_added_after_publication.rs",
-        live_renamed_path,
-    ] {
-        assert!(
-            new_changes.contains(expected),
-            "missing {expected}: {new_changes}"
-        );
-    }
-    assert!(!new_changes.contains(STAGED_ADD_PATH), "{new_changes}");
+    assert_change_manifest(
+        &new_changes,
+        &[
+            format!(
+                "changed source rust {LAYERED_PATH} status=modified additions=5 deletions=1 layers=committed,staged,unstaged"
+            ),
+            format!(
+                "renamed source rust {BEFORE_RENAME_PATH} -> {live_renamed_path} additions=0 deletions=0 layers=committed,staged"
+            ),
+            format!(
+                "deleted source rust {STAGED_DELETE_PATH} additions=0 deletions=1 layers=staged"
+            ),
+            format!(
+                "changed source rust {UNSTAGED_PATH} status=modified additions=1 deletions=1 layers=unstaged"
+            ),
+            format!(
+                "untracked source rust {UNTRACKED_PATH} additions=20 deletions=0 layers=untracked"
+            ),
+            "untracked source rust src/complete_target_state/live_added_after_publication.rs additions=1 deletions=0 layers=untracked".to_owned(),
+            format!(
+                "changed artifact text {STAGED_MARKDOWN_PATH} analyzer=markdown additions=1 deletions=1 layers=staged"
+            ),
+            format!(
+                "changed artifact text {UNSTAGED_MARKDOWN_PATH} analyzer=markdown additions=1 deletions=1 layers=unstaged"
+            ),
+            format!(
+                "untracked artifact text {UNTRACKED_TSV_PATH} analyzer=tsv additions=49 deletions=0 layers=untracked"
+            ),
+        ],
+    );
+    assert_graph_records(
+        &new_changes,
+        &[
+            ("Function", "committed_layered_symbol", LAYERED_PATH, 1),
+            ("Function", "committed_helper_symbol", LAYERED_PATH, 2),
+            ("Function", "staged_layered_symbol", LAYERED_PATH, 3),
+            ("Function", "unstaged_layered_symbol", LAYERED_PATH, 4),
+            ("Function", "post_publication_symbol", LAYERED_PATH, 5),
+            ("Function", "renamed_symbol", live_renamed_path, 1),
+            ("Function", "unstaged_current_symbol", UNSTAGED_PATH, 1),
+            (
+                "Function",
+                "live_added_after_publication_symbol",
+                "src/complete_target_state/live_added_after_publication.rs",
+                1,
+            ),
+            (
+                "Function",
+                "untracked_symbol_00_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                1,
+            ),
+            (
+                "Function",
+                "untracked_symbol_01_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                2,
+            ),
+            (
+                "Function",
+                "untracked_symbol_02_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                3,
+            ),
+            (
+                "Function",
+                "untracked_symbol_03_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                4,
+            ),
+            (
+                "Function",
+                "untracked_symbol_04_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                5,
+            ),
+            (
+                "Function",
+                "untracked_symbol_05_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                6,
+            ),
+            (
+                "Function",
+                "untracked_symbol_06_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                7,
+            ),
+            (
+                "Function",
+                "untracked_symbol_07_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                8,
+            ),
+            (
+                "Function",
+                "untracked_symbol_08_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                9,
+            ),
+            (
+                "Function",
+                "untracked_symbol_09_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                10,
+            ),
+            (
+                "Function",
+                "untracked_symbol_10_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                11,
+            ),
+            (
+                "Function",
+                "untracked_symbol_11_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                12,
+            ),
+            (
+                "Function",
+                "untracked_symbol_12_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                13,
+            ),
+            (
+                "Function",
+                "untracked_symbol_13_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                14,
+            ),
+            (
+                "Function",
+                "untracked_symbol_14_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                15,
+            ),
+            (
+                "Function",
+                "untracked_symbol_15_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                16,
+            ),
+            (
+                "Function",
+                "untracked_symbol_16_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                17,
+            ),
+            (
+                "Function",
+                "untracked_symbol_17_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                18,
+            ),
+            (
+                "Function",
+                "untracked_symbol_18_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                19,
+            ),
+            (
+                "Function",
+                "untracked_symbol_19_with_complete_target_state_evidence",
+                UNTRACKED_PATH,
+                20,
+            ),
+        ],
+    );
 
     let node_mismatch = client.view(&old_node, 6, 50);
     assert_tool_error_code(&node_mismatch, "node_snapshot_mismatch");
@@ -1516,6 +1758,39 @@ fn assert_semantic_records(changes: &ChangesCapture, expected: &[String]) {
     let mut expected = expected.to_vec();
     actual.sort();
     expected.sort();
+    assert_eq!(actual, expected);
+}
+
+type GraphRecord = (String, String, String, u32);
+
+fn assert_graph_records(changes: &ChangesCapture, expected: &[(&str, &str, &str, u32)]) {
+    let actual = change_section_text(changes, "graph")
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            fields.find(|field| field.starts_with("n1:"))?;
+            let kind = fields.next()?;
+            let name = fields.next()?;
+            let (path, line) = fields.next()?.rsplit_once(':')?;
+            Some((
+                kind.to_owned(),
+                name.to_owned(),
+                path.to_owned(),
+                line.parse().unwrap(),
+            ))
+        })
+        .collect::<BTreeSet<GraphRecord>>();
+    let expected = expected
+        .iter()
+        .map(|(kind, name, path, line)| {
+            (
+                (*kind).to_owned(),
+                (*name).to_owned(),
+                (*path).to_owned(),
+                *line,
+            )
+        })
+        .collect::<BTreeSet<GraphRecord>>();
     assert_eq!(actual, expected);
 }
 
