@@ -134,7 +134,7 @@ struct ChangesParams {
 #[tool_router]
 impl Graphr {
     #[tool(
-        description = "Authorize and inspect one allowed Git worktree root without indexing",
+        description = "Authorize and inspect the explicitly selected canonical Git worktree without indexing or fallback",
         output_schema = rmcp::handler::server::tool::schema_for_type::<RootInspection>()
     )]
     async fn inspect_root(
@@ -156,7 +156,7 @@ impl Graphr {
     }
 
     #[tool(
-        description = "Queue an immutable snapshot build for an explicit Git worktree and range",
+        description = "Queue an asynchronous immutable snapshot build for an explicit worktree, range, target, and dependency mode",
         output_schema = rmcp::handler::server::tool::schema_for_type::<JobStatus>()
     )]
     async fn index(
@@ -223,7 +223,7 @@ impl Graphr {
         )))
     }
 
-    #[tool(description = "Return an independently paged review from one immutable snapshot")]
+    #[tool(description = "Return an independently paged review for one explicit snapshot_id")]
     async fn changes(
         &self,
         Parameters(params): Parameters<ChangesParams>,
@@ -251,7 +251,7 @@ impl ServerHandler for Graphr {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("graphr", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Inspect an allowed worktree root, queue index with an explicit base, head, and target, poll index_status until completion, then pass the returned snapshot_id to search, view, or changes. Preserve each changes cursor with its original snapshot_id, depth, and max_nodes.",
+                "Use inspect_root with the explicitly selected worktree_root. Use index with that worktree_root plus base, head, typed target (including include_untracked for a worktree target), and dependency_mode; verify the resolved root and OIDs. Poll index_status until completed and retain its snapshot_id; failed or cancelled is terminal. Call changes for that snapshot_id once without a cursor at depth 6 and max_nodes 50, then pass every files, diff, artifacts, and graph cursor verbatim with the same parameters until terminal completeness. Use search or view with the same snapshot_id only for named graph remediation. Stop on any structured root, job, snapshot, cursor, provenance, or completeness failure. Never fall back to another root, the default checkout, a live diff, or an older snapshot.",
             )
     }
 }
@@ -516,6 +516,59 @@ mod tests {
         for name in ["inspect_root", "index", "index_status", "cancel_index"] {
             assert!(by_name(name).output_schema.is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn tool_and_server_guidance_requires_the_explicit_snapshot_workflow() {
+        let root = repository("guidance");
+        let jobs = JobRegistry::new();
+        let server = Graphr {
+            engine: Arc::new(Engine::new(Arc::new(
+                AllowedRoots::new(vec![root.clone()]).unwrap(),
+            ))),
+            jobs: jobs.clone(),
+        };
+        let instructions = server.get_info().instructions.unwrap();
+
+        for required in [
+            "worktree_root",
+            "base",
+            "head",
+            "target",
+            "include_untracked",
+            "dependency_mode",
+            "index_status",
+            "completed",
+            "snapshot_id",
+            "once without a cursor",
+            "files, diff, artifacts, and graph",
+            "verbatim",
+            "search or view",
+            "Stop on any structured root, job, snapshot, cursor, provenance, or completeness failure",
+            "Never fall back",
+        ] {
+            assert!(
+                instructions.contains(required),
+                "missing {required:?}: {instructions}"
+            );
+        }
+
+        let tools = Graphr::tool_router().list_all();
+        let description = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap()
+                .description
+                .as_deref()
+                .unwrap()
+        };
+        assert!(description("inspect_root").contains("explicitly selected"));
+        assert!(description("index").contains("asynchronous"));
+        assert!(description("changes").contains("snapshot_id"));
+
+        jobs.close();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

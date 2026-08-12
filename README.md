@@ -14,24 +14,131 @@ cargo install graphr --locked
 Register the installed binary with either client:
 
 ```text
-codex mcp add graphr -- graphr serve /absolute/repository
-claude mcp add --scope project graphr -- graphr serve /absolute/repository
+codex mcp add graphr -- graphr serve --allow-root /absolute/repository
+claude mcp add --scope project graphr -- graphr serve --allow-root /absolute/repository
 ```
 
-Graphr detects Rust and Python sources automatically and exposes four MCP tools:
+Repeat `--allow-root PATH` to authorize additional ordinary or linked
+worktrees. Authorization is only a boundary: every operation still names the
+exact canonical worktree it intends to use. Graphr never selects the server's
+current checkout or falls back to another allowed root.
 
-- `index` reparses only dirty, untracked, or Git-OID-changed Rust and Python files.
-- `search` finds symbols and returns compact `node_ref` values.
-- `view` traverses callers, callees, and related tests up to six graph hops.
-- `changes` returns bounded 8 KiB review pages with every safe changed path, an aggregate count of unsafe paths, Rust and Python source diffs, bounded non-source text diffs, Markdown/TSV semantics, explicit artifact omissions, risk-ranked changed symbols, affected static execution paths, and graph impact. `.cargo/vendor` changes collapse to deterministic package boundaries by default; pass `dependency_mode="full"` to inspect dependency internals.
+Graphr exposes seven MCP tools:
+
+- `inspect_root` cheaply authorizes an explicit worktree and returns its Git
+  identity and status without indexing.
+- `index` queues an asynchronous immutable snapshot build for an explicit
+  worktree, range, target, and dependency mode.
+- `index_status` reports progress and returns the completed `snapshot_id`.
+- `cancel_index` requests cooperative cancellation of a job.
+- `search`, `view`, and `changes` query one required `snapshot_id`; there is no
+  default snapshot.
+
+## Snapshot workflow
+
+Inspect the selected root first:
+
+```text
+inspect_root({"worktree_root": "/tmp/project-feature"})
+```
+
+Then queue the exact review selection. This example captures committed,
+staged, unstaged, and untracked changes:
+
+```text
+index({
+  "worktree_root": "/tmp/project-feature",
+  "base": "main",
+  "head": "HEAD",
+  "target": {"kind": "worktree", "include_untracked": true},
+  "dependency_mode": "boundary"
+})
+```
+
+The queued result includes the canonical root and the exact resolved
+`base_oid` and `head_oid`. Poll until completion and retain the returned
+snapshot ID; use cancellation only when the build is no longer wanted:
+
+```text
+index_status({"job_id": "job-1"})
+cancel_index({"job_id": "job-1"})
+```
+
+Query only the completed snapshot:
+
+```text
+changes({"snapshot_id": "<digest>", "depth": 6, "max_nodes": 50})
+search({"snapshot_id": "<digest>", "query": "AuditRecord", "limit": 10})
+view({"snapshot_id": "<digest>", "node_ref": "<opaque>", "depth": 6, "max_nodes": 50})
+```
+
+Call `changes` once without a cursor. Every continuation is a standalone
+`name=value` line: split on the first `=`, pass the complete remaining value
+verbatim with the same snapshot, depth, and max-nodes, and continue until all
+`files_next_cursor`, `diff_next_cursor`, `artifacts_next_cursor`, and
+`graph_next_cursor` values are exhausted. `max_nodes` changes graph page size,
+not snapshot coverage. `analysis_complete` is analyzer-local;
+`review_complete_when_pages_exhausted=true` is the terminal completeness
+predicate after every cursor and named graph remediation is exhausted.
+
+`inspect_root` may also receive a `snapshot_id`. If it reports
+`snapshot_matches_worktree=false`, the old snapshot and its cursors remain
+immutable, but a review of the new live state requires an explicit new index
+job. Graphr never silently refreshes a snapshot or substitutes a live Git diff.
+
+Targets have exact meanings:
+
+| Target | Captured state |
+| --- | --- |
+| `{"kind":"commit"}` | `base_oid..head_oid` from immutable Git objects; `head` may be an unchecked-out branch or commit. |
+| `{"kind":"index"}` | Committed changes through `head_oid`, then the worktree-specific staged state. |
+| `{"kind":"worktree","include_untracked":false}` | Index target plus unstaged tracked files. |
+| `{"kind":"worktree","include_untracked":true}` | Index target plus unstaged and untracked files. |
+
+Index and worktree targets require `head_oid` to equal that worktree's current
+HEAD. The standalone blocking wrapper uses the same selection model:
+
+```text
+graphr index --worktree-root /tmp/project-feature --base main --head HEAD \
+  --target worktree --include-untracked --dependency-mode boundary
+```
+
+Every snapshot-backed response carries repository/workspace identity, common
+and per-worktree Git directories, canonical root, branch, exact refs and OIDs,
+target state, selected layers, dirty digest, commit and changed-file counts,
+index generation, and snapshot ID. A genuine empty review includes a structured
+reason such as `identical_commit_oids`; an unqualified “no changes” is invalid.
+
+Graphr reads Git and worktree state without modifying HEAD, refs, objects,
+indexes, tracked files, or untracked files. Cache writes are confined to the
+validated common Git directory's `graphr/v6` namespace and isolated by
+repository, worktree, resolved revisions, target state, dependency mode, dirty
+digest, and format versions. Linked worktrees may reuse immutable Git-object
+analysis but keep distinct workspace and snapshot identities. Published
+snapshots are immutable. Graphr 0.6.0 performs no automatic cache garbage
+collection.
+
+## Review output
+
+Graphr detects Rust and Python sources automatically. `changes` returns bounded
+8 KiB review pages with every safe changed path, an aggregate count of unsafe
+paths, Rust and Python source diffs, bounded non-source text diffs, Markdown/TSV
+semantics, explicit artifact omissions, risk-ranked changed symbols, affected
+static execution paths, and graph impact. `.cargo/vendor` changes collapse to
+deterministic package boundaries by default; select `dependency_mode="full"`
+while indexing to inspect dependency internals.
 
 Affected-flow discovery follows `CALLS` edges up to 15 hops. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale. `test_path_confidence=heuristic` and `test_path_provenance=resolved-static-call-graph` describe bounded static evidence, not runtime test proof; community and churn factors are not used.
 
-The server indexes when it starts. Run `index` only after Rust or Python source edits made in the current session. For reviews, call `changes` once without a cursor. Each continuation token is a standalone `name=value` line: split on the first `=`, return the complete value verbatim with the original arguments, and continue until all four cursor names are absent. `analysis_complete` is analyzer-local; `review_complete=false` means do not conclude: follow every cursor present, then report incomplete coverage unless all cursors are absent and `review_complete_when_pages_exhausted=true`. Artifact text and semantics belong to that immutable snapshot. `max_nodes` changes graph page size, never snapshot coverage. Non-symbol source ranges map to their indexed file node and are reported as `file-mapped`; targeted `search` or `view` remediation is named for unresolved graph coverage. Binary, oversized, unsafe, non-regular, type-changed, unmerged, and other explicit artifact omissions keep `review_complete_when_pages_exhausted=false`. This is complete artifact coverage; Rust and Python remain the only indexed source languages.
+Artifact text and semantics belong to the immutable snapshot. Non-symbol source
+ranges map to their indexed file node and are reported as `file-mapped`;
+targeted `search` or `view` remediation is named for unresolved graph coverage.
+Binary, oversized, unsafe, non-regular, type-changed, unmerged, and other
+explicit artifact omissions keep `review_complete_when_pages_exhausted=false`.
+This is complete artifact coverage; Rust and Python remain the only indexed
+source languages.
 
 Rename detection runs independently within regular Rust/Python source diffs and within non-source artifact diffs. Renames crossing those streams are conservatively represented as a deletion plus an addition.
-
-Each `graphr serve PATH` process is bound to that repository and working tree for its lifetime. `changes(base=...)` compares `base` with the bound working tree; it has no separate head. To review an unchecked-out `A..B` range, create a temporary clone or worktree at `B`, run a separate Graphr server there, and use `A` as the base.
 
 ## Codex review skill
 
