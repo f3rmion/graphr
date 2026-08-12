@@ -2,8 +2,9 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::ops::Range;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -22,10 +23,10 @@ use crate::store::{
     TraitImplementationInput,
 };
 use crate::workspace::{
-    BuildProgress, BuildStage, CACHE_FORMAT_VERSION, GRAPH_ANALYZER_VERSION, IndexCompletion,
-    OperationError, Provenance, REVIEW_FORMAT_VERSION, ResolvedIndexRequest, SnapshotCatalog,
-    SnapshotEntry, SnapshotKeyInput, SnapshotTarget, graph_image_key, selected_layers,
-    snapshot_key, validate_entry_graph,
+    BuildProgress, BuildStage, CACHE_FORMAT_VERSION, ErrorCode, GRAPH_ANALYZER_VERSION,
+    IndexCompletion, OperationError, Provenance, QueryOutput, REVIEW_FORMAT_VERSION,
+    ResolvedIndexRequest, RootInspection, SnapshotCatalog, SnapshotEntry, SnapshotKeyInput,
+    SnapshotTarget, graph_image_key, selected_layers, snapshot_key, validate_entry_graph,
 };
 
 const QUALIFIED_PATH_LIMIT: usize = 1024;
@@ -35,9 +36,11 @@ const INITIAL_DIFF_BUDGET: usize = 2432;
 const INITIAL_ARTIFACTS_BUDGET: usize = 1920;
 const INITIAL_GRAPH_BUDGET: usize = 1920;
 const SECTION_OVERHEAD: usize = 704;
-static LEGACY_CAPTURE_ID: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema,
+)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct IndexStats {
     pub files_total: usize,
     pub files_reused: usize,
@@ -48,7 +51,6 @@ pub struct IndexStats {
 pub struct Engine {
     roots: Arc<crate::workspace::AllowedRoots>,
     catalog: Arc<SnapshotCatalog>,
-    #[allow(dead_code)] // Task 6 caches bounded rendered review pages here.
     rendered: Mutex<HashMap<(String, u32, u32), Arc<ReviewSnapshot>>>,
 }
 
@@ -277,7 +279,7 @@ impl Engine {
                 }
             }
             report(BuildStage::Indexing, 0, total, 0, 0, rejected_cache.clone());
-            let mut store = Store::open_private_image(job.graph_temp(), false, cancelled)
+            let mut store = Store::open_private_image(job.graph_temp(), cancelled)
                 .map_err(index_operation_error)?;
             let (_, _, stats) = store
                 .index_with(cancelled, |full, existing| {
@@ -362,6 +364,251 @@ impl Engine {
             stats,
         })
     }
+
+    pub fn inspect_root(
+        &self,
+        root: &Path,
+        snapshot_id: Option<&str>,
+        cancelled: &AtomicBool,
+    ) -> Result<RootInspection, OperationError> {
+        let identity = self.roots.inspect(root, cancelled)?;
+        self.catalog.attach(&identity, cancelled)?;
+        let repository = repository_from_identity(&identity);
+        let (staged_paths, unstaged_paths, untracked_paths) =
+            repository.status_counts(cancelled)?;
+        let Some(snapshot_id) = snapshot_id else {
+            return Ok(RootInspection {
+                identity,
+                staged_paths,
+                unstaged_paths,
+                untracked_paths,
+                snapshot_id: None,
+                snapshot_matches_worktree: None,
+                changed_identity_fields: Vec::new(),
+            });
+        };
+        let snapshot = self.catalog.get(snapshot_id)?;
+        let mut changed = changed_identity_fields(&identity, &snapshot.provenance);
+        let inspected_head = match snapshot.provenance.target_state {
+            SnapshotTarget::Commit => &snapshot.provenance.head_oid,
+            SnapshotTarget::Index | SnapshotTarget::Worktree { .. } => &identity.head_oid,
+        };
+        let job = self.catalog.begin(&identity)?;
+        let capture = repository.capture_snapshot(
+            &snapshot.provenance.base_oid,
+            inspected_head,
+            &snapshot.provenance.target_state,
+            snapshot.dependency_mode,
+            job.capture_root(),
+            cancelled,
+        )?;
+        if selected_layers(&capture.changes) != snapshot.provenance.selected_layers {
+            changed.push("selected_layers".into());
+        }
+        if capture.dirty_digest != snapshot.provenance.dirty_digest {
+            changed.push("dirty_digest".into());
+        }
+        changed.sort();
+        changed.dedup();
+        Ok(RootInspection {
+            identity,
+            staged_paths,
+            unstaged_paths,
+            untracked_paths,
+            snapshot_id: Some(snapshot_id.into()),
+            snapshot_matches_worktree: Some(changed.is_empty()),
+            changed_identity_fields: changed,
+        })
+    }
+
+    pub fn search(
+        &self,
+        snapshot_id: &str,
+        query: &str,
+        kind: Option<&str>,
+        limit: u32,
+    ) -> Result<QueryOutput, OperationError> {
+        let snapshot = self.catalog.get(snapshot_id)?;
+        let kind = match kind {
+            None => None,
+            Some("file") => Some(NodeKind::File),
+            Some("type") => Some(NodeKind::Type),
+            Some("function") => Some(NodeKind::Function),
+            Some("test") => Some(NodeKind::Test),
+            Some(_) => {
+                return Err(OperationError::new(
+                    ErrorCode::InvalidParameters,
+                    "kind must be file, type, function, or test",
+                ));
+            }
+        };
+        let text = Store::open_reader(&snapshot.graph_path)
+            .and_then(|mut store| store.search(snapshot_id, query, kind, limit))
+            .map_err(query_operation_error)?;
+        Ok(query_output(&snapshot, text))
+    }
+
+    pub fn view(
+        &self,
+        snapshot_id: &str,
+        node_ref: &str,
+        depth: u32,
+        max_nodes: u32,
+    ) -> Result<QueryOutput, OperationError> {
+        let snapshot = self.catalog.get(snapshot_id)?;
+        let text = Store::open_reader(&snapshot.graph_path)
+            .and_then(|mut store| store.view(snapshot_id, node_ref, depth, max_nodes))
+            .map_err(query_operation_error)?;
+        Ok(query_output(&snapshot, text))
+    }
+
+    pub fn changes(
+        &self,
+        snapshot_id: &str,
+        depth: u32,
+        max_nodes: u32,
+        cursor: Option<&str>,
+        cancelled: &AtomicBool,
+    ) -> Result<QueryOutput, OperationError> {
+        let snapshot = self.catalog.get(snapshot_id)?;
+        if depth > 6 || !(1..=50).contains(&max_nodes) {
+            return Err(OperationError::new(
+                ErrorCode::InvalidParameters,
+                "invalid changes parameters",
+            ));
+        }
+        if let Some(reason) = snapshot.no_change_reason {
+            if cursor.is_some() {
+                return Err(OperationError::new(
+                    ErrorCode::InvalidParameters,
+                    "invalid changes cursor",
+                ));
+            }
+            return Ok(QueryOutput {
+                text: format!("no changes reason={}\n", reason.as_str()),
+                provenance: snapshot.provenance.clone(),
+                no_change_reason: Some(reason),
+            });
+        }
+        let key = (snapshot_id.to_owned(), depth, max_nodes);
+        let review = self
+            .rendered
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .cloned();
+        let review = match review {
+            Some(review) => review,
+            None => {
+                let graph = Store::open_reader(&snapshot.graph_path)
+                    .and_then(|mut store| {
+                        store.changes(
+                            snapshot_id,
+                            &snapshot.changes,
+                            depth,
+                            max_nodes,
+                            snapshot.dependency_mode,
+                            cancelled,
+                        )
+                    })
+                    .map_err(query_operation_error)?;
+                let review = Arc::new(ReviewSnapshot::new(
+                    snapshot_id,
+                    depth,
+                    max_nodes,
+                    snapshot.dependency_mode,
+                    snapshot.changes.clone(),
+                    graph,
+                ));
+                self.rendered
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .entry(key)
+                    .or_insert(review)
+                    .clone()
+            }
+        };
+        let text = match cursor {
+            Some(cursor) => render_section(
+                &review,
+                &parse_review_cursor(cursor, snapshot_id, depth, max_nodes)
+                    .map_err(query_operation_error)?,
+            )
+            .map_err(query_operation_error)?,
+            None => review_context(&review).map_err(query_operation_error)?,
+        };
+        Ok(query_output(&snapshot, text))
+    }
+}
+
+fn query_output(snapshot: &SnapshotEntry, text: String) -> QueryOutput {
+    QueryOutput {
+        text,
+        provenance: snapshot.provenance.clone(),
+        no_change_reason: snapshot.no_change_reason,
+    }
+}
+
+fn changed_identity_fields(
+    current: &crate::workspace::RootIdentity,
+    snapshot: &Provenance,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (name, differs) in [
+        (
+            "repository_id",
+            current.repository_id != snapshot.repository_id,
+        ),
+        (
+            "workspace_id",
+            current.workspace_id != snapshot.workspace_id,
+        ),
+        (
+            "repository_root",
+            current.repository_root != snapshot.repository_root,
+        ),
+        (
+            "worktree_root",
+            current.worktree_root != snapshot.worktree_root,
+        ),
+        ("git_dir", current.git_dir != snapshot.git_dir),
+        (
+            "common_git_dir",
+            current.common_git_dir != snapshot.common_git_dir,
+        ),
+        ("branch", current.branch != snapshot.branch),
+        ("head_oid", current.head_oid != snapshot.head_oid),
+    ] {
+        if differs {
+            changed.push(name.into());
+        }
+    }
+    changed
+}
+
+fn query_operation_error(error: String) -> OperationError {
+    match error.as_str() {
+        "node_snapshot_mismatch" => OperationError::new(
+            ErrorCode::NodeSnapshotMismatch,
+            "node reference belongs to a different snapshot",
+        ),
+        "cursor_snapshot_mismatch" => OperationError::new(
+            ErrorCode::CursorSnapshotMismatch,
+            "cursor belongs to a different snapshot",
+        ),
+        "cursor_parameters_mismatch" => OperationError::new(
+            ErrorCode::CursorParametersMismatch,
+            "cursor parameters differ from the request",
+        ),
+        _ if error.starts_with("invalid ")
+            || error.starts_with("query must ")
+            || error == "stale node_ref"
+            || error == "node not found" =>
+        {
+            OperationError::new(ErrorCode::InvalidParameters, error)
+        }
+        _ => OperationError::new(ErrorCode::Internal, error),
+    }
 }
 
 fn same_workspace(
@@ -397,179 +644,6 @@ fn index_operation_error(error: String) -> OperationError {
         crate::workspace::ErrorCode::Internal
     };
     OperationError::new(code, error)
-}
-
-#[derive(Clone)]
-pub struct Project {
-    repository: Arc<Repository>,
-    review_snapshot: Arc<Mutex<Option<ReviewSnapshot>>>,
-}
-
-impl Project {
-    pub fn open(path: &Path) -> Result<Self, String> {
-        Self::open_cancelled(path, &AtomicBool::new(false))
-    }
-
-    pub fn open_cancelled(path: &Path, cancelled: &AtomicBool) -> Result<Self, String> {
-        Ok(Self {
-            repository: Arc::new(
-                Repository::discover_for_project_cancelled(path, cancelled)
-                    .map_err(|error| error.to_string())?,
-            ),
-            review_snapshot: Arc::new(Mutex::new(None)),
-        })
-    }
-
-    pub fn index(&self, rebuild: bool) -> Result<String, String> {
-        self.index_cancelled(rebuild, Arc::new(AtomicBool::new(false)))
-    }
-
-    pub fn index_cancelled(
-        &self,
-        rebuild: bool,
-        cancelled: Arc<AtomicBool>,
-    ) -> Result<String, String> {
-        check_cancelled(&cancelled)?;
-        let database = self.repository.git_dir.join("graphr/index.db");
-        let mut store = Store::open(&database, rebuild, &cancelled)?;
-        let capture = LegacyCapture::create(&self.repository.git_dir.join("graphr"))?;
-        let target = SnapshotTarget::Worktree {
-            include_untracked: true,
-        };
-        let sources = if self.repository.head_oid.is_empty() {
-            self.repository
-                .capture_sources(
-                    &self.repository.head_oid,
-                    &target,
-                    &capture.path,
-                    &cancelled,
-                )
-                .map_err(|error| error.to_string())?
-        } else {
-            self.repository
-                .capture_snapshot(
-                    &self.repository.head_oid,
-                    &self.repository.head_oid,
-                    &target,
-                    DependencyMode::Boundary,
-                    &capture.path,
-                    &cancelled,
-                )
-                .map_err(|error| error.to_string())?
-                .sources
-        };
-        let (state, changed, stats) = store.index_with(&cancelled, |full, existing| {
-            build_index(
-                &self.repository,
-                &sources,
-                &cancelled,
-                full,
-                existing,
-                |_, _, _| {},
-            )
-        })?;
-        Ok(format!(
-            "indexed generation={} changed={} skipped={}",
-            state.generation, changed, stats.files_skipped
-        ))
-    }
-
-    pub fn search(&self, query: &str, kind: Option<&str>, limit: u32) -> Result<String, String> {
-        let kind = match kind {
-            None => None,
-            Some("file") => Some(NodeKind::File),
-            Some("type") => Some(NodeKind::Type),
-            Some("function") => Some(NodeKind::Function),
-            Some("test") => Some(NodeKind::Test),
-            Some(_) => return Err("kind must be file, type, function, or test".into()),
-        };
-        Store::open_reader(&self.repository.git_dir.join("graphr/index.db"))?
-            .search(query, kind, limit)
-    }
-
-    pub fn view(&self, node_ref: &str, depth: u32, max_nodes: u32) -> Result<String, String> {
-        Store::open_reader(&self.repository.git_dir.join("graphr/index.db"))?
-            .view(node_ref, depth, max_nodes)
-    }
-
-    pub fn changes_cancelled(
-        &self,
-        base: &str,
-        depth: u32,
-        max_nodes: u32,
-        dependency_mode: DependencyMode,
-        cursor: Option<&str>,
-        cancelled: Arc<AtomicBool>,
-    ) -> Result<String, String> {
-        check_cancelled(&cancelled)?;
-        if let Some(cursor) = cursor {
-            let cursor = parse_review_cursor(cursor)?;
-            let snapshot = self
-                .review_snapshot
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let snapshot = snapshot
-                .as_ref()
-                .filter(|snapshot| snapshot.matches(base, depth, max_nodes, dependency_mode))
-                .ok_or_else(|| "stale changes cursor".to_owned())?;
-            return render_section(snapshot, &cursor);
-        }
-
-        let changes = self
-            .repository
-            .worktree_changes(base, dependency_mode, &cancelled)?;
-        if changes.is_empty() {
-            *self
-                .review_snapshot
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = None;
-            return Ok("no changes\n".into());
-        }
-        let graph = Store::open_reader(&self.repository.git_dir.join("graphr/index.db"))?.changes(
-            &changes,
-            depth,
-            max_nodes,
-            dependency_mode,
-            &cancelled,
-        )?;
-        let snapshot = ReviewSnapshot::new(base, depth, max_nodes, dependency_mode, changes, graph);
-        let output = review_context(&snapshot)?;
-        // ponytail: retain one bounded review snapshot; use a keyed LRU only if
-        // concurrent independent review paginations become a real requirement.
-        *self
-            .review_snapshot
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
-        Ok(output)
-    }
-}
-
-struct LegacyCapture {
-    path: PathBuf,
-}
-
-impl LegacyCapture {
-    fn create(parent: &Path) -> Result<Self, String> {
-        let path = parent.join(format!(
-            ".capture-{}-{}",
-            std::process::id(),
-            LEGACY_CAPTURE_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(|error| format!("cannot create source capture: {error}"))?;
-        Ok(Self {
-            path: fs::canonicalize(path)
-                .map_err(|error| format!("cannot resolve source capture: {error}"))?,
-        })
-    }
-}
-
-impl Drop for LegacyCapture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
 }
 
 #[derive(Default)]
@@ -747,11 +821,14 @@ impl ReviewSection {
 struct ReviewCursor {
     section: ReviewSection,
     offset: usize,
+    depth: u32,
+    max_nodes: u32,
+    snapshot_id: String,
     checksum: String,
 }
 
 struct ReviewSnapshot {
-    base: String,
+    snapshot_id: String,
     depth: u32,
     max_nodes: u32,
     dependency_mode: DependencyMode,
@@ -776,7 +853,7 @@ struct ReviewSnapshot {
 
 impl ReviewSnapshot {
     fn new(
-        base: &str,
+        snapshot_id: &str,
         depth: u32,
         max_nodes: u32,
         dependency_mode: DependencyMode,
@@ -787,7 +864,7 @@ impl ReviewSnapshot {
         let manifest = change_manifest(&changes, dependency_mode);
         let artifacts = artifact_text(&changes.artifacts);
         let checksum = review_snapshot(
-            base,
+            snapshot_id,
             depth,
             max_nodes,
             dependency_mode,
@@ -829,7 +906,7 @@ impl ReviewSnapshot {
         let complete_after_pagination =
             graph_review_complete(&graph) && change_content_complete(&changes, dependency_mode);
         Self {
-            base: base.into(),
+            snapshot_id: snapshot_id.into(),
             depth,
             max_nodes,
             dependency_mode,
@@ -851,19 +928,6 @@ impl ReviewSnapshot {
             all_path_hunks,
             complete_after_pagination,
         }
-    }
-
-    fn matches(
-        &self,
-        base: &str,
-        depth: u32,
-        max_nodes: u32,
-        dependency_mode: DependencyMode,
-    ) -> bool {
-        self.base == base
-            && self.depth == depth
-            && self.max_nodes == max_nodes
-            && self.dependency_mode == dependency_mode
     }
 
     fn value(&self, section: ReviewSection) -> &str {
@@ -944,9 +1008,16 @@ fn review_context(snapshot: &ReviewSnapshot) -> Result<String, String> {
 }
 
 fn render_section(snapshot: &ReviewSnapshot, cursor: &ReviewCursor) -> Result<String, String> {
-    let expected = cursor_checksum(&snapshot.checksum, cursor.section, cursor.offset);
+    let expected = cursor_checksum(
+        &snapshot.checksum,
+        cursor.section,
+        cursor.offset,
+        cursor.depth,
+        cursor.max_nodes,
+        &cursor.snapshot_id,
+    );
     if cursor.checksum != expected {
-        return Err("stale changes cursor".into());
+        return Err("invalid changes cursor".into());
     }
     let completion = format!(
         "review_complete_when_pages_exhausted={}\n",
@@ -1123,7 +1194,7 @@ fn render_section_page(
     if more {
         output.push_str(section.cursor_label());
         output.push('=');
-        output.push_str(&cursor_token(&snapshot.checksum, section, page.end));
+        output.push_str(&cursor_token(snapshot, section, page.end));
         output.push('\n');
     }
     if output.len() > budget {
@@ -1184,7 +1255,7 @@ fn limit_page_records<'a>(
 }
 
 fn review_snapshot(
-    base: &str,
+    snapshot_id: &str,
     depth: u32,
     max_nodes: u32,
     dependency_mode: DependencyMode,
@@ -1195,8 +1266,8 @@ fn review_snapshot(
     let dependency_mode = dependency_mode.as_str();
     let mut hash = blake3::Hasher::new();
     for value in [
-        b"graphr changes v1".as_slice(),
-        base.as_bytes(),
+        b"graphr changes v2".as_slice(),
+        snapshot_id.as_bytes(),
         depth.as_bytes(),
         max_nodes.as_bytes(),
         dependency_mode.as_bytes(),
@@ -1210,23 +1281,56 @@ fn review_snapshot(
     hash.finalize().to_hex().to_string()
 }
 
-fn cursor_checksum(snapshot: &str, section: ReviewSection, offset: usize) -> String {
+fn cursor_checksum(
+    review_checksum: &str,
+    section: ReviewSection,
+    offset: usize,
+    depth: u32,
+    max_nodes: u32,
+    snapshot_id: &str,
+) -> String {
     let mut hash = blake3::Hasher::new();
-    hash.update(snapshot.as_bytes());
-    hash.update(&[section.code() as u8]);
-    hash.update(&offset.to_le_bytes());
+    for value in [
+        review_checksum.as_bytes(),
+        &[section.code() as u8],
+        &offset.to_le_bytes(),
+        &depth.to_le_bytes(),
+        &max_nodes.to_le_bytes(),
+        snapshot_id.as_bytes(),
+    ] {
+        hash.update(&(value.len() as u64).to_le_bytes());
+        hash.update(value);
+    }
     hash.finalize().to_hex().to_string()
 }
 
-fn cursor_token(snapshot: &str, section: ReviewSection, offset: usize) -> String {
+fn cursor_token(snapshot: &ReviewSnapshot, section: ReviewSection, offset: usize) -> String {
     format!(
-        "v1:{}:{offset}:{}",
+        "v2:{}:{offset}:{}:{}:{}:{}",
         section.code(),
-        cursor_checksum(snapshot, section, offset)
+        snapshot.depth,
+        snapshot.max_nodes,
+        snapshot.snapshot_id,
+        cursor_checksum(
+            &snapshot.checksum,
+            section,
+            offset,
+            snapshot.depth,
+            snapshot.max_nodes,
+            &snapshot.snapshot_id,
+        )
     )
 }
 
-fn parse_review_cursor(value: &str) -> Result<ReviewCursor, String> {
+fn parse_review_cursor(
+    value: &str,
+    snapshot_id: &str,
+    depth: u32,
+    max_nodes: u32,
+) -> Result<ReviewCursor, String> {
+    if value.len() > 160 {
+        return Err("invalid changes cursor".into());
+    }
     let mut parts = value.split(':');
     let version = parts.next();
     let section = match parts.next() {
@@ -1236,10 +1340,41 @@ fn parse_review_cursor(value: &str) -> Result<ReviewCursor, String> {
         Some("g") => ReviewSection::Graph,
         _ => return Err("invalid changes cursor".into()),
     };
-    let offset = parts
+    let raw_offset = parts
         .next()
         .filter(|offset| !offset.is_empty() && offset.bytes().all(|byte| byte.is_ascii_digit()))
-        .and_then(|offset| offset.parse().ok())
+        .ok_or_else(|| "invalid changes cursor".to_owned())?;
+    let offset = raw_offset
+        .parse::<usize>()
+        .ok()
+        .filter(|offset| raw_offset == offset.to_string())
+        .ok_or_else(|| "invalid changes cursor".to_owned())?;
+    let raw_depth = parts
+        .next()
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| "invalid changes cursor".to_owned())?;
+    let embedded_depth = raw_depth
+        .parse::<u32>()
+        .ok()
+        .filter(|value| raw_depth == value.to_string())
+        .ok_or_else(|| "invalid changes cursor".to_owned())?;
+    let raw_max_nodes = parts
+        .next()
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| "invalid changes cursor".to_owned())?;
+    let embedded_max_nodes = raw_max_nodes
+        .parse::<u32>()
+        .ok()
+        .filter(|value| raw_max_nodes == value.to_string())
+        .ok_or_else(|| "invalid changes cursor".to_owned())?;
+    let embedded_snapshot = parts
+        .next()
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
         .ok_or_else(|| "invalid changes cursor".to_owned())?;
     let checksum = parts
         .next()
@@ -1250,12 +1385,21 @@ fn parse_review_cursor(value: &str) -> Result<ReviewCursor, String> {
                     .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
         })
         .ok_or_else(|| "invalid changes cursor".to_owned())?;
-    if version != Some("v1") || parts.next().is_some() {
+    if version != Some("v2") || parts.next().is_some() {
         return Err("invalid changes cursor".into());
+    }
+    if embedded_snapshot != snapshot_id {
+        return Err("cursor_snapshot_mismatch".into());
+    }
+    if embedded_depth != depth || embedded_max_nodes != max_nodes {
+        return Err("cursor_parameters_mismatch".into());
     }
     Ok(ReviewCursor {
         section,
         offset,
+        depth: embedded_depth,
+        max_nodes: embedded_max_nodes,
+        snapshot_id: embedded_snapshot.into(),
         checksum: checksum.into(),
     })
 }
@@ -2984,6 +3128,9 @@ fn check_progress(index: usize, cancelled: &AtomicBool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REVIEW_SNAPSHOT_ID: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     use crate::artifact::AnalyzerKind;
     use crate::git::{ArtifactFile, ArtifactOmission, ArtifactReview, ChangeLayer};
     use crate::workspace::{
@@ -3303,91 +3450,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_project_accepts_subdirectory_while_workspace_rejects_it() {
-        let root = std::env::temp_dir().join(format!(
-            "graphr-index-subdirectory-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let nested = root.join("nested");
-        fs::create_dir_all(&nested).unwrap();
-        test_git(&root, &["init", "--quiet"]);
-        test_git(&root, &["config", "user.name", "Graphr Test"]);
-        test_git(&root, &["config", "user.email", "graphr@example.invalid"]);
-        fs::write(root.join("baseline.txt"), "baseline\n").unwrap();
-        test_git(&root, &["add", "--", "baseline.txt"]);
-        test_git(&root, &["commit", "--quiet", "-m", "baseline"]);
-
-        assert!(Project::open(&nested).is_ok());
-        assert_eq!(
-            AllowedRoots::new(vec![root.clone()])
-                .unwrap()
-                .inspect(&nested, &AtomicBool::new(false))
-                .unwrap_err()
-                .code,
-            ErrorCode::RootNotWorktree
-        );
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn legacy_project_indexes_an_unborn_worktree() {
-        let root = std::env::temp_dir().join(format!(
-            "graphr-index-unborn-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(root.join("src")).unwrap();
-        test_git(&root, &["init", "--quiet"]);
-        fs::write(root.join("src/lib.rs"), "pub fn unborn() {}\n").unwrap();
-
-        let output = Project::open(&root).unwrap().index(false).unwrap();
-
-        assert!(output.contains("changed=1"), "{output}");
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn legacy_project_skips_an_oversized_clean_git_blob() {
-        let root = std::env::temp_dir().join(format!(
-            "graphr-index-oversized-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        test_git(&root, &["init", "--quiet"]);
-        test_git(&root, &["config", "user.name", "Graphr Test"]);
-        test_git(&root, &["config", "user.email", "graphr@example.invalid"]);
-        fs::write(root.join("a-large.rs"), vec![b'x'; 2 * 1024 * 1024 + 1]).unwrap();
-        fs::write(root.join("z-small.rs"), "pub fn retained() {}\n").unwrap();
-        test_git(&root, &["add", "--", "."]);
-        test_git(&root, &["commit", "--quiet", "-m", "baseline"]);
-
-        let project = Project::open(&root).unwrap();
-        let output = project.index(false).unwrap();
-
-        assert!(output.contains("changed=1"), "{output}");
-        assert!(output.contains("skipped=1"), "{output}");
-        assert!(
-            project
-                .search("retained", None, 20)
-                .unwrap()
-                .contains("retained")
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn index_progress_counts_reuse_before_pending_parse_completion() {
         use std::os::unix::fs::DirBuilderExt;
 
@@ -3422,7 +3484,8 @@ mod tests {
             )
             .unwrap();
         let mut store =
-            Store::open(&root.join("graph/index.db"), false, &AtomicBool::new(false)).unwrap();
+            Store::open_private_image(&root.join("graph/index.db"), &AtomicBool::new(false))
+                .unwrap();
         store
             .index_with(&AtomicBool::new(false), |full, existing| {
                 build_index(
@@ -3572,7 +3635,7 @@ mod tests {
         };
         let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n";
         let snapshot = ReviewSnapshot::new(
-            "HEAD",
+            REVIEW_SNAPSHOT_ID,
             6,
             50,
             DependencyMode::Boundary,
@@ -3588,8 +3651,18 @@ mod tests {
         let replacement = if stale.ends_with('0') { "1" } else { "0" };
         stale.replace_range(stale.len() - 1.., replacement);
         assert_eq!(
-            render_section(&snapshot, &parse_review_cursor(&stale).unwrap()).unwrap_err(),
-            "stale changes cursor"
+            render_section(
+                &snapshot,
+                &parse_review_cursor(
+                    &stale,
+                    REVIEW_SNAPSHOT_ID,
+                    snapshot.depth,
+                    snapshot.max_nodes,
+                )
+                .unwrap(),
+            )
+            .unwrap_err(),
+            "invalid changes cursor"
         );
 
         let expected = format!(
@@ -3738,9 +3811,14 @@ mod tests {
             artifacts: Default::default(),
             skipped_paths: 0,
         };
-        let snapshot = ReviewSnapshot::new("HEAD", 6, 50, DependencyMode::Boundary, changes, graph);
-        assert!(snapshot.matches("HEAD", 6, 50, DependencyMode::Boundary));
-        assert!(!snapshot.matches("HEAD", 6, 50, DependencyMode::Full));
+        let snapshot = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            50,
+            DependencyMode::Boundary,
+            changes,
+            graph,
+        );
         let initial = review_context(&snapshot).unwrap();
         assert!(initial.len() <= REVIEW_CONTEXT_BUDGET);
         assert!(initial.contains("emitted_entries=1 partial_entries=0 total_entries=1"));
@@ -3761,8 +3839,17 @@ mod tests {
             let mut cursor = next_cursor(&initial, label);
             for _ in 0..100 {
                 let Some(token) = cursor else { break };
-                let output =
-                    render_section(&snapshot, &parse_review_cursor(&token).unwrap()).unwrap();
+                let output = render_section(
+                    &snapshot,
+                    &parse_review_cursor(
+                        &token,
+                        REVIEW_SNAPSHOT_ID,
+                        snapshot.depth,
+                        snapshot.max_nodes,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
                 assert!(output.len() <= REVIEW_CONTEXT_BUDGET);
                 assert!(output.is_char_boundary(output.len()));
                 assert!(!output.contains("[truncated]"));
@@ -3785,8 +3872,18 @@ mod tests {
         let replacement = if stale.ends_with('0') { "1" } else { "0" };
         stale.replace_range(stale.len() - 1.., replacement);
         assert_eq!(
-            render_section(&snapshot, &parse_review_cursor(&stale).unwrap()).unwrap_err(),
-            "stale changes cursor"
+            render_section(
+                &snapshot,
+                &parse_review_cursor(
+                    &stale,
+                    REVIEW_SNAPSHOT_ID,
+                    snapshot.depth,
+                    snapshot.max_nodes,
+                )
+                .unwrap(),
+            )
+            .unwrap_err(),
+            "invalid changes cursor"
         );
     }
 
@@ -3799,7 +3896,7 @@ mod tests {
                 .collect::<String>()
         );
         let snapshot = ReviewSnapshot::new(
-            "HEAD",
+            REVIEW_SNAPSHOT_ID,
             6,
             2,
             DependencyMode::Boundary,
@@ -3834,7 +3931,17 @@ mod tests {
         let mut pages = initial.clone();
         let mut cursor = next_cursor(&initial, "graph_next_cursor");
         while let Some(token) = cursor {
-            let output = render_section(&snapshot, &parse_review_cursor(&token).unwrap()).unwrap();
+            let output = render_section(
+                &snapshot,
+                &parse_review_cursor(
+                    &token,
+                    REVIEW_SNAPSHOT_ID,
+                    snapshot.depth,
+                    snapshot.max_nodes,
+                )
+                .unwrap(),
+            )
+            .unwrap();
             assert!(
                 output.lines().filter(|line| line.contains("node-")).count() <= 2,
                 "{output}"
@@ -3845,6 +3952,63 @@ mod tests {
         for index in 0..6 {
             assert!(pages.contains(&format!("node-{index}")), "{pages}");
         }
+    }
+
+    #[test]
+    fn cursors_bind_snapshot_and_page_parameters_without_v1_fallback() {
+        let snapshot = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            50,
+            DependencyMode::Boundary,
+            WorktreeChanges {
+                files: Vec::new(),
+                records: Vec::new(),
+                paths: Vec::new(),
+                source_patch: String::new(),
+                artifacts: Default::default(),
+                skipped_paths: 0,
+            },
+            String::new(),
+        );
+        let cursor = cursor_token(&snapshot, ReviewSection::Files, 0);
+
+        assert_eq!(
+            parse_review_cursor(&cursor, &"b".repeat(64), 6, 50)
+                .err()
+                .unwrap(),
+            "cursor_snapshot_mismatch"
+        );
+        assert_eq!(
+            parse_review_cursor(&cursor, REVIEW_SNAPSHOT_ID, 5, 50)
+                .err()
+                .unwrap(),
+            "cursor_parameters_mismatch"
+        );
+        assert_eq!(
+            parse_review_cursor(&cursor, REVIEW_SNAPSHOT_ID, 6, 49)
+                .err()
+                .unwrap(),
+            "cursor_parameters_mismatch"
+        );
+        assert!(
+            parse_review_cursor(
+                "v1:f:0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                REVIEW_SNAPSHOT_ID,
+                6,
+                50,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_review_cursor(
+                &cursor.replacen(":0:", ":00:", 1),
+                REVIEW_SNAPSHOT_ID,
+                6,
+                50,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3869,7 +4033,7 @@ mod tests {
         let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
-            "HEAD",
+            REVIEW_SNAPSHOT_ID,
             6,
             50,
             DependencyMode::Boundary,
@@ -3917,7 +4081,7 @@ mod tests {
         let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
-            "HEAD",
+            REVIEW_SNAPSHOT_ID,
             6,
             50,
             DependencyMode::Boundary,
@@ -3983,7 +4147,7 @@ mod tests {
         let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
-            "HEAD",
+            REVIEW_SNAPSHOT_ID,
             6,
             50,
             DependencyMode::Boundary,
@@ -4062,7 +4226,7 @@ mod tests {
         };
         let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
         let output = review_context(&ReviewSnapshot::new(
-            "HEAD",
+            REVIEW_SNAPSHOT_ID,
             0,
             1,
             DependencyMode::Boundary,
@@ -4208,7 +4372,7 @@ mod tests {
             skipped_paths: 0,
         });
         let snapshot = ReviewSnapshot::new(
-            "HEAD",
+            REVIEW_SNAPSHOT_ID,
             0,
             1,
             DependencyMode::Boundary,
@@ -4223,7 +4387,7 @@ mod tests {
     fn byte_pages_reconstruct_oversized_unicode_lines_exactly() {
         let source = format!("first\n{}\nlast\n", "é".repeat(5_000));
         let snapshot = ReviewSnapshot::new(
-            "HEAD",
+            REVIEW_SNAPSHOT_ID,
             6,
             50,
             DependencyMode::Boundary,

@@ -1,12 +1,12 @@
+use std::collections::HashMap;
 use std::env;
-use std::ffi::CString;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,13 +24,9 @@ fn binary_only_crate_resolves_crate_paths() {
     fs::write(fixture.path.join("src/worker.rs"), "pub fn work() {}\n").unwrap();
     init_git(&fixture.path);
 
-    let indexed = Command::new(env!("CARGO_BIN_EXE_graphr"))
-        .args(["index", fixture.path.to_str().unwrap(), "--rebuild"])
-        .output()
-        .unwrap();
-    assert!(indexed.status.success(), "{:?}", indexed.stderr);
+    index_repository(&fixture.path);
     assert_eq!(
-        Connection::open(fixture.path.join(".git/graphr/index.db"))
+        Connection::open(graph_path(&fixture.path))
             .unwrap()
             .query_row("SELECT count(*) FROM edges WHERE kind='CALLS'", [], |row| {
                 row.get::<_, i64>(0)
@@ -63,19 +59,13 @@ fn rust_attribute_only_changes_map_to_declarations() {
             "baseline",
         ],
     );
-    index_repository(&fixture.path, true);
+    index_repository(&fixture.path);
 
     fs::write(fixture.path.join("src/lib.rs"), EDITED).unwrap();
-    index_repository(&fixture.path, false);
+    index_repository(&fixture.path);
 
     let mut client = Client::start(&fixture.path);
-    let _ = client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
-    );
-    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-    let changes = client.request(
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":20}}}"#,
-    );
+    let changes = client.changes(0, 20, None);
     let text = response_text(&changes);
     for name in ["Item", "free_function", "method", "test_function"] {
         assert!(text.contains(name), "missing {name}: {changes}");
@@ -125,8 +115,8 @@ fn empty_trait_impl_resolves_across_files_and_retargets_incrementally() {
         git(root, &["add", "--", "."]);
     }
 
-    index_repository(&incremental.path, true);
-    index_repository(&oracle.path, true);
+    index_repository(&incremental.path);
+    index_repository(&oracle.path);
     assert_eq!(
         trait_implementation_count(&incremental.path, "Item", "Marker"),
         1
@@ -138,23 +128,14 @@ fn empty_trait_impl_resolves_across_files_and_retargets_incrementally() {
     assert_eq!(named_edge_count(&incremental.path, "call", "helper"), 0);
 
     let mut client = Client::start(&incremental.path);
-    let _ = client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
-    );
-    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-    for (id, query, relation, related) in [
-        (2, "Item", "implements ->", "Marker"),
-        (4, "Marker", "impl <-", "Item"),
+    for (query, relation, related) in [
+        ("Item", "implements ->", "Marker"),
+        ("Marker", "impl <-", "Item"),
     ] {
-        let search = client.request(&format!(
-            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"search","arguments":{{"query":"{query}","kind":"type"}}}}}}"#,
-        ));
+        let search = client.search(query, Some("type"));
         let search_text = response_text(&search);
         let node_ref = search_text.split_whitespace().next().unwrap();
-        let view = client.request(&format!(
-            r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":1}}}}}}"#,
-            id + 1
-        ));
+        let view = client.view(node_ref, 1, 30);
         assert!(view.contains(relation), "{view}");
         assert!(view.contains(related), "{view}");
     }
@@ -167,7 +148,7 @@ fn empty_trait_impl_resolves_across_files_and_retargets_incrementally() {
         )
         .unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_eq!(
         trait_implementation_count(&incremental.path, "Item", "Marker"),
         1
@@ -176,7 +157,7 @@ fn empty_trait_impl_resolves_across_files_and_retargets_incrementally() {
     for root in [&incremental.path, &oracle.path] {
         fs::write(root.join("src/implementations.rs"), OTHER_IMPL).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_eq!(
         trait_implementation_count(&incremental.path, "Item", "Marker"),
         0
@@ -238,9 +219,9 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
         );
     }
 
-    index_repository(&incremental.path, true);
+    index_repository(&incremental.path);
 
-    let database = incremental.path.join(".git/graphr/index.db");
+    let database = graph_path(&incremental.path);
     let connection = Connection::open(&database).unwrap();
     assert_eq!(
         connection
@@ -318,12 +299,12 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
     for root in [&incremental.path, &oracle.path] {
         fs::write(root.join("src/sample/engine.py"), EDITED_ENGINE).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
 
     for root in [&incremental.path, &oracle.path] {
         fs::write(root.join("src/sample/__init__.py"), EDITED_INIT).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
 
     for root in [&incremental.path, &oracle.path] {
         fs::write(
@@ -332,7 +313,7 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
         )
         .unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_eq!(named_edge_count(&incremental.path, "test_run", "later"), 1);
 
     for root in [&incremental.path, &oracle.path] {
@@ -342,7 +323,7 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
         )
         .unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_eq!(named_edge_count(&incremental.path, "test_run", "later"), 0);
 
     for root in [&incremental.path, &oracle.path] {
@@ -352,45 +333,35 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
         )
         .unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_eq!(named_edge_count(&incremental.path, "test_run", "later"), 1);
 
     for root in [&incremental.path, &oracle.path] {
         fs::remove_file(root.join("src/sample/future.py")).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_eq!(named_edge_count(&incremental.path, "test_run", "later"), 0);
 
     for root in [&incremental.path, &oracle.path] {
         fs::write(root.join("src/sample/checks.py"), EDITED_CHECKS).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
 
     let mut client = Client::start(&incremental.path);
-    let _ = client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
-    );
-    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-    let search = client.request(
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"query":"Stage","kind":"type"}}}"#,
-    );
+    let search = client.search("Stage", Some("type"));
     let search_text = response_text(&search);
     let node_ref = search_text.split_whitespace().next().unwrap();
-    let view = client.request(&format!(
-        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":2}}}}}}"#
-    ));
+    let view = client.view(node_ref, 2, 30);
     assert!(view.contains("member ->"), "{view}");
     assert!(view.contains("dispatch"), "{view}");
-    let changes = client.request(
-        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"changes","arguments":{}}}"#,
-    );
+    let changes = client.changes(1, 50, None);
     assert!(changes.contains("dispatch"), "{changes}");
     assert!(changes.contains("decorated"), "{changes}");
     client.close();
 }
 
 #[test]
-fn incremental_index_matches_rebuild_through_mutations() {
+fn immutable_snapshots_match_fresh_graphs_through_mutations() {
     const CALLER: &str = "use crate::target::answer;\npub fn call() { answer(); answer(); }\n";
     const EDITED_CALLER: &str =
         "use crate::target::answer;\npub fn call() { answer(); answer(); answer(); }\n";
@@ -420,18 +391,18 @@ fn incremental_index_matches_rebuild_through_mutations() {
         git(root, &["add", "--", "src", "crates/app/src/worker.rs"]);
     }
 
-    index_repository(&incremental.path, true);
-    index_repository(&oracle.path, true);
+    index_repository(&incremental.path);
+    index_repository(&oracle.path);
     assert_eq!(
         semantic_graph(&incremental.path),
         semantic_graph(&oracle.path)
     );
     assert_resolution(&incremental.path, None, "file");
 
-    let generation = database_generation(&incremental.path.join(".git/graphr/index.db"));
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 0);
+    let generation = database_generation(&graph_path(&incremental.path));
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_eq!(
-        database_generation(&incremental.path.join(".git/graphr/index.db")),
+        database_generation(&graph_path(&incremental.path)),
         generation
     );
 
@@ -443,55 +414,55 @@ fn incremental_index_matches_rebuild_through_mutations() {
         .unwrap();
         fs::write(root.join("crates/app/src/lib.rs"), "mod worker;\n").unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
 
     for root in roots {
         fs::remove_file(root.join("crates/app/Cargo.toml")).unwrap();
         fs::remove_file(root.join("crates/app/src/lib.rs")).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
 
     for root in roots {
         fs::write(root.join("src/target.rs"), TARGET).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_resolution(&incremental.path, Some(2), "type");
 
     for root in roots {
         fs::write(root.join("src/caller.rs"), EDITED_CALLER).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_resolution(&incremental.path, Some(3), "type");
 
     for root in roots {
         fs::create_dir(root.join("src/target")).unwrap();
         fs::write(root.join("src/target/mod.rs"), TARGET).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_resolution(&incremental.path, None, "file");
 
     for root in roots {
         fs::remove_file(root.join("src/target/mod.rs")).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_resolution(&incremental.path, Some(3), "type");
 
     for root in roots {
         fs::rename(root.join("src/target.rs"), root.join("src/moved.rs")).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_resolution(&incremental.path, None, "file");
 
     for root in roots {
         fs::rename(root.join("src/moved.rs"), root.join("src/target.rs")).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 2);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_resolution(&incremental.path, Some(3), "type");
 
     for root in roots {
         fs::write(root.join("src/caller.rs"), CALLER).unwrap();
     }
-    assert_incremental_matches_rebuild(&incremental.path, &oracle.path, 1);
+    assert_immutable_graphs_match(&incremental.path, &oracle.path);
     assert_resolution(&incremental.path, Some(2), "type");
 }
 
@@ -535,17 +506,14 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
             "baseline",
         ],
     );
-    index_repository(&fixture.path, true);
+    index_repository(&fixture.path);
 
     let mut client = Client::start(&fixture.path);
-    let _ = client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
+    let clean = client.changes(1, 50, None);
+    assert!(
+        clean.contains("no changes reason=empty_worktree_delta"),
+        "{clean}"
     );
-    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-    let clean = client.request(
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{}}}"#,
-    );
-    assert!(clean.contains("no changes\\n"), "{clean}");
 
     fs::write(
         fixture.path.join("src/changed.rs"),
@@ -579,21 +547,15 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     )
     .unwrap();
 
-    let indexed = client.request(
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
-    );
-    assert!(indexed.contains("changed=6"), "{indexed}");
-    let generation = database_generation(&fixture.path.join(".git/graphr/index.db"));
-    let changed = client.request(
-        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"changes","arguments":{"depth":6,"max_nodes":50}}}"#,
-    );
+    let indexed = client.index_and_wait("boundary");
+    assert!(indexed["stats"]["files_parsed"].as_u64().is_some());
+    let generation = database_generation(&graph_path(&fixture.path));
+    let changed = client.changes(6, 50, None);
     let text = response_text(&changed);
     let mut complete = text.clone();
     let mut graph_cursor = page_cursor(&text, "graph_next_cursor");
-    let mut continuation_id = 12;
     while let Some(token) = graph_cursor {
-        let page = changes_page(&mut client, continuation_id, &token);
-        continuation_id += 1;
+        let page = changes_page(&mut client, &token);
         assert!(page.len() <= 8192, "{}", page.len());
         graph_cursor = page_cursor(&page, "graph_next_cursor");
         complete.push_str(&page);
@@ -631,23 +593,23 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         "{complete}"
     );
     assert!(
-        text.lines().any(|line| {
+        complete.lines().any(|line| {
             line.contains("Function first_untracked src/untracked.rs:1")
                 && !line.contains("no-static-test-path")
         }),
-        "{text}"
+        "{complete}"
     );
     assert!(
-        text.lines().any(|line| {
+        complete.lines().any(|line| {
             line.contains("Function second_untracked src/untracked.rs:2")
                 && line.contains("indirect-test-covered")
                 && !line.contains("no-static-test-path")
         }),
-        "{text}"
+        "{complete}"
     );
     assert!(
-        text.contains("Test checks_untracked src/untracked.rs:3"),
-        "{text}"
+        complete.contains("Test checks_untracked src/untracked.rs:3"),
+        "{complete}"
     );
     assert!(text.contains("-pub fn removed_symbol() {}"), "{changed}");
     assert!(
@@ -669,29 +631,20 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     assert!(!graph.contains("ignored_symbol"), "{changed}");
     assert!(text.len() <= 8192, "{}", text.len());
     assert!(text.contains(&format!(":{generation}:")), "{changed}");
-    assert_eq!(
-        database_generation(&fixture.path.join(".git/graphr/index.db")),
-        generation
-    );
-    let repeated = client.request(
-        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"changes","arguments":{"depth":6,"max_nodes":50}}}"#,
-    );
+    assert_eq!(database_generation(&graph_path(&fixture.path)), generation);
+    let repeated = client.changes(6, 50, None);
     assert_eq!(response_text(&repeated), text);
 
-    for invalid in [
-        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"changes","arguments":{"base":"-HEAD"}}}"#,
-        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"changes","arguments":{"base":"missing"}}}"#,
-        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"changes","arguments":{"depth":7}}}"#,
-        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"changes","arguments":{"max_nodes":0}}}"#,
-        r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"changes","arguments":{"base":"HEAD..HEAD"}}}"#,
+    for arguments in [
+        rmcp::serde_json::json!({ "snapshot_id": client.snapshot_id(), "base": "HEAD" }),
+        rmcp::serde_json::json!({ "snapshot_id": client.snapshot_id(), "depth": 7 }),
+        rmcp::serde_json::json!({ "snapshot_id": client.snapshot_id(), "max_nodes": 0 }),
     ] {
-        let response = client.request(invalid);
+        let response = client.call("changes", arguments);
         assert!(tool_failed(&response), "{response}");
         assert!(response.len() <= 8192, "{response}");
     }
-    let bounded = client.request(
-        r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":1}}}"#,
-    );
+    let bounded = client.changes(0, 1, None);
     assert!(bounded.contains("changed_symbols_omitted=0"), "{bounded}");
     assert!(bounded.contains("neighborhood_omitted=false"), "{bounded}");
     assert!(bounded.contains("graph_next_cursor="), "{bounded}");
@@ -767,14 +720,7 @@ fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
     .unwrap();
 
     let mut client = Client::start(&fixture.path);
-    let _ = client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
-    );
-    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-
-    let boundary = response_text(&client.request(
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{"depth":1,"max_nodes":10}}}"#,
-    ));
+    let boundary = response_text(&client.changes(1, 10, None));
     for expected in [
         "dependency_mode=boundary",
         "dependency-boundary root=.cargo/vendor packages=2 files=5 path_digest=",
@@ -812,9 +758,8 @@ fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
         );
     }
 
-    let full = response_text(&client.request(
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":10,"dependency_mode":"full"}}}"#,
-    ));
+    client.index_and_wait("full");
+    let full = response_text(&client.changes(0, 10, None));
     for expected in [
         "dependency_mode=full",
         "changed source rust .cargo/vendor/sha2/src/lib.rs status=modified",
@@ -872,8 +817,6 @@ fn changes_pages_complete_inventory_diff_and_flows() {
             "baseline",
         ],
     );
-    index_repository(&fixture.path, true);
-
     fs::write(fixture.path.join("src/lib.rs"), review_fixture_source(true)).unwrap();
     fs::write(
         fixture.path.join("README.md"),
@@ -894,20 +837,8 @@ fn changes_pages_complete_inventory_diff_and_flows() {
     .unwrap();
     fs::write(fixture.path.join("image.bin"), b"image\0binary\n").unwrap();
     fs::write(fixture.path.join("tests/fixtures/ignored.txt"), "ignored\n").unwrap();
-    index_repository(&fixture.path, false);
-
     let mut client = Client::start(&fixture.path);
-    let initialized = client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
-    );
-    assert!(
-        initialized.contains("artifacts_next_cursor"),
-        "{initialized}"
-    );
-    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-    let initial = response_text(&client.request(
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{"depth":6,"max_nodes":50}}}"#,
-    ));
+    let initial = response_text(&client.changes(6, 50, None));
     for expected in [
         "changed source rust src/lib.rs",
         "changed artifact text README.md analyzer=markdown",
@@ -966,8 +897,8 @@ fn changes_pages_complete_inventory_diff_and_flows() {
     assert_eq!(page_metric(&initial, "graph", "total_flows"), 3);
 
     let first_diff_cursor = page_cursor(&initial, "diff_next_cursor").unwrap();
-    let repeated_a = changes_page(&mut client, 3, &first_diff_cursor);
-    let repeated_b = changes_page(&mut client, 4, &first_diff_cursor);
+    let repeated_a = changes_page(&mut client, &first_diff_cursor);
+    let repeated_b = changes_page(&mut client, &first_diff_cursor);
     assert_eq!(repeated_a, repeated_b);
     assert!(repeated_a.starts_with("diff\n"), "{repeated_a}");
     assert!(!repeated_a.contains("\ngraph\n"), "{repeated_a}");
@@ -987,12 +918,10 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         diff_totals
     );
 
-    let mut next_id = 5;
     let mut diff_pages = initial.clone();
     let mut cursor = Some(first_diff_cursor.clone());
     while let Some(token) = cursor {
-        let page = changes_page(&mut client, next_id, &token);
-        next_id += 1;
+        let page = changes_page(&mut client, &token);
         assert!(page.len() <= 8192, "{}", page.len());
         assert!(!page.contains("[truncated]"), "{page}");
         assert_eq!(
@@ -1026,8 +955,7 @@ fn changes_pages_complete_inventory_diff_and_flows() {
     let mut artifact_pages = initial.clone();
     let mut cursor = page_cursor(&initial, "artifacts_next_cursor");
     while let Some(token) = cursor {
-        let page = changes_page(&mut client, next_id, &token);
-        next_id += 1;
+        let page = changes_page(&mut client, &token);
         assert!(page.len() <= 8192, "{}", page.len());
         assert!(page.starts_with("artifacts\n"), "{page}");
         assert!(
@@ -1064,8 +992,7 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         "graph unexpectedly fit on one page: {initial}"
     );
     while let Some(token) = cursor {
-        let page = changes_page(&mut client, next_id, &token);
-        next_id += 1;
+        let page = changes_page(&mut client, &token);
         assert!(page.len() <= 8192, "{}", page.len());
         assert!(!page.contains("[truncated]"), "{page}");
         assert!(page.starts_with("graph\n"), "{page}");
@@ -1103,22 +1030,17 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         format!("{}// cursor is now stale\n", review_fixture_source(true)),
     )
     .unwrap();
-    let cached = changes_page(&mut client, next_id, &first_diff_cursor);
-    next_id += 1;
+    let cached = changes_page(&mut client, &first_diff_cursor);
     assert_eq!(cached, repeated_a, "cursor did not retain its snapshot");
-    let refreshed = response_text(&client.request(&format!(
-        r#"{{"jsonrpc":"2.0","id":{next_id},"method":"tools/call","params":{{"name":"changes","arguments":{{"depth":6,"max_nodes":50}}}}}}"#,
-    )));
-    next_id += 1;
+    client.index_and_wait("boundary");
+    let refreshed = response_text(&client.changes(6, 50, None));
     assert!(
         refreshed.contains("diff_next_cursor="),
         "refreshed diff unexpectedly fit one page: {refreshed}"
     );
-    let stale = client.request(&format!(
-        r#"{{"jsonrpc":"2.0","id":{next_id},"method":"tools/call","params":{{"name":"changes","arguments":{{"depth":6,"max_nodes":50,"cursor":"{first_diff_cursor}"}}}}}}"#,
-    ));
+    let stale = client.changes(6, 50, Some(&first_diff_cursor));
     assert!(tool_failed(&stale), "{stale}");
-    assert!(stale.contains("stale changes cursor"), "{stale}");
+    assert!(stale.contains("cursor_snapshot_mismatch"), "{stale}");
     client.close();
 }
 
@@ -1144,18 +1066,12 @@ fn changes_file_maps_non_symbol_ranges_in_a_mixed_rust_hunk() {
             "baseline",
         ],
     );
-    index_repository(&fixture.path, true);
+    index_repository(&fixture.path);
     fs::write(fixture.path.join("src/lib.rs"), EDITED).unwrap();
-    index_repository(&fixture.path, false);
+    index_repository(&fixture.path);
 
     let mut client = Client::start(&fixture.path);
-    let _ = client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
-    );
-    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-    let changes = response_text(&client.request(
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"changes","arguments":{"depth":0,"max_nodes":50}}}"#,
-    ));
+    let changes = response_text(&client.changes(0, 50, None));
 
     for expected in [
         "changed_symbols_total=2",
@@ -1216,10 +1132,8 @@ fn page_cursor(output: &str, label: &str) -> Option<String> {
     })
 }
 
-fn changes_page(client: &mut Client, id: u32, cursor: &str) -> String {
-    response_text(&client.request(&format!(
-        r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"changes","arguments":{{"depth":6,"max_nodes":50,"cursor":"{cursor}"}}}}}}"#,
-    )))
+fn changes_page(client: &mut Client, cursor: &str) -> String {
+    response_text(&client.changes(6, 50, Some(cursor)))
 }
 
 fn assert_page_accounting(
@@ -1288,7 +1202,7 @@ fn page_field<'a>(line: &'a str, key: &str) -> &'a str {
 }
 
 #[test]
-fn concurrent_initial_indexes_serialize() {
+fn concurrent_snapshot_publication_is_idempotent() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
     fs::write(fixture.path.join("src/lib.rs"), "pub fn run() {}\n").unwrap();
@@ -1297,40 +1211,42 @@ fn concurrent_initial_indexes_serialize() {
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_graphr"));
         command
-            .args(["index", fixture.path.to_str().unwrap()])
+            .args([
+                "index",
+                "--worktree-root",
+                fixture.path.to_str().unwrap(),
+                "--base",
+                "HEAD",
+                "--head",
+                "HEAD",
+                "--target",
+                "worktree",
+                "--include-untracked",
+                "--dependency-mode",
+                "boundary",
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.spawn().unwrap()
     };
     let first = command();
     let second = command();
-    let mut outputs = [
+    let outputs = [
         first.wait_with_output().unwrap(),
         second.wait_with_output().unwrap(),
     ];
-    for output in &outputs {
+    let completions = outputs.map(|output| {
         assert!(output.status.success(), "{:?}", output.stderr);
-    }
-    outputs.sort_by(|left, right| left.stdout.cmp(&right.stdout));
+        rmcp::serde_json::from_slice::<rmcp::serde_json::Value>(output.stdout.trim_ascii()).unwrap()
+    });
+    assert_eq!(completions[0]["snapshot_id"], completions[1]["snapshot_id"]);
     assert_eq!(
-        String::from_utf8(outputs[0].stdout.clone()).unwrap(),
-        "indexed generation=1 changed=0 skipped=0\n"
+        completions[0]["graph_image_id"],
+        completions[1]["graph_image_id"]
     );
+    remember_graph(&fixture.path, &completions[0]);
     assert_eq!(
-        String::from_utf8(outputs[1].stdout.clone()).unwrap(),
-        "indexed generation=1 changed=1 skipped=0\n"
-    );
-
-    let database = fixture.path.join(".git/graphr/index.db");
-    let concurrent = normalized_graph(&database);
-    let rebuilt = Command::new(env!("CARGO_BIN_EXE_graphr"))
-        .args(["index", fixture.path.to_str().unwrap(), "--rebuild"])
-        .output()
-        .unwrap();
-    assert!(rebuilt.status.success(), "{:?}", rebuilt.stderr);
-    assert_eq!(normalized_graph(&database), concurrent);
-    assert_eq!(
-        Connection::open(database)
+        Connection::open(graph_path(&fixture.path))
             .unwrap()
             .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
             .unwrap(),
@@ -1339,7 +1255,7 @@ fn concurrent_initial_indexes_serialize() {
 }
 
 #[test]
-fn rust_index_search_view_over_mcp() {
+fn rust_index_search_view_and_inspection_over_explicit_snapshots() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
     fs::write(fixture.path.join("src/mailer.rs"), "pub struct Mailer;\n").unwrap();
@@ -1348,386 +1264,235 @@ fn rust_index_search_view_over_mcp() {
         "mod mailer;\nuse crate::mailer::Mailer;\nimpl Mailer { pub fn dispatch() {} }\npub fn register() { Mailer::dispatch(); }\n#[test]\nfn register_dispatches() { register(); }\n",
     )
     .unwrap();
-    fs::write(fixture.path.join("src/bad.rs"), [0xff]).unwrap();
-    fs::File::create(fixture.path.join("src/too_big.rs"))
-        .unwrap()
-        .set_len(2 * 1024 * 1024 + 1)
-        .unwrap();
-    fs::write(fixture.path.join("src/real.txt"), "fn hidden() {}\n").unwrap();
-    symlink("real.txt", fixture.path.join("src/link.rs")).unwrap();
-    let fifo = fixture.path.join("src/pipe.rs");
-    fs::write(&fifo, "fn replaced_by_fifo() {}\n").unwrap();
     init_git(&fixture.path);
-    git(&fixture.path, &["add", "--", "src/pipe.rs"]);
-    fs::remove_file(&fifo).unwrap();
-    let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
 
-    let indexed = Command::new(env!("CARGO_BIN_EXE_graphr"))
-        .args(["index", fixture.path.to_str().unwrap(), "--rebuild"])
-        .env("GIT_LITERAL_PATHSPECS", "1")
-        .output()
-        .unwrap();
-    assert!(indexed.status.success(), "{:?}", indexed.stderr);
-    assert_eq!(
-        String::from_utf8(indexed.stdout).unwrap(),
-        "indexed generation=1 changed=2 skipped=4\n"
-    );
-
-    let database = fixture.path.join(".git/graphr/index.db");
-    let connection = Connection::open(&database).unwrap();
-    let sqlite: String = connection
-        .query_row("SELECT sqlite_version()", [], |row| row.get(0))
-        .unwrap();
-    assert!(version_at_least(&sqlite, [3, 51, 3]));
-    let node_count: i64 = connection
-        .query_row("SELECT count(*) FROM nodes", [], |row| row.get(0))
-        .unwrap();
-    connection.pragma_update(None, "user_version", 999).unwrap();
-    drop(connection);
-
-    let rejected = Command::new(env!("CARGO_BIN_EXE_graphr"))
-        .args(["index", fixture.path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(!rejected.status.success());
-    let connection = Connection::open(&database).unwrap();
-    assert_eq!(
-        connection
-            .query_row("SELECT count(*) FROM nodes", [], |row| row.get::<_, i64>(0))
-            .unwrap(),
-        node_count
-    );
-    assert_eq!(
-        connection
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        999
-    );
-    drop(connection);
-
-    let rebuilt = Command::new(env!("CARGO_BIN_EXE_graphr"))
-        .args(["index", fixture.path.to_str().unwrap(), "--rebuild"])
-        .output()
-        .unwrap();
-    assert!(rebuilt.status.success(), "{:?}", rebuilt.stderr);
-    assert_eq!(
-        String::from_utf8(rebuilt.stdout).unwrap(),
-        "indexed generation=2 changed=2 skipped=4\n"
-    );
-
-    let connection = Connection::open(&database).unwrap();
-    connection.execute("DROP INDEX nodes_parent", []).unwrap();
-    drop(connection);
-    let healed = Command::new(env!("CARGO_BIN_EXE_graphr"))
-        .args(["index", fixture.path.to_str().unwrap(), "--rebuild"])
-        .output()
-        .unwrap();
-    assert!(healed.status.success(), "{:?}", healed.stderr);
-    assert_eq!(
-        String::from_utf8(healed.stdout).unwrap(),
-        "indexed generation=3 changed=2 skipped=4\n"
-    );
-    let connection = Connection::open(&database).unwrap();
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='nodes_parent'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT on_delete FROM pragma_foreign_key_list('nodes') WHERE \"from\"='parent_id'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-        "SET NULL"
-    );
-    drop(connection);
-
-    let mut invalid_client = Client::start(&fixture.path);
-    invalid_client.notify(r#"{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}"#);
-    match invalid_client.lines.recv_timeout(Duration::from_secs(5)) {
-        Ok(response) => assert!(response.contains("\"error\""), "{response}"),
-        Err(RecvTimeoutError::Disconnected) => {}
-        Err(RecvTimeoutError::Timeout) => panic!("uninitialized MCP request did not terminate"),
-    }
-    invalid_client.close();
-
-    let prefix = r#"{"jsonrpc":"2.0","id":8,"method":""#;
-    let suffix = r#""}"#;
-    let exact_method = "A".repeat(3 * 1024 - prefix.len() - suffix.len());
-    let exact_request = format!("{prefix}{exact_method}{suffix}");
-    assert_eq!(exact_request.len(), 3 * 1024);
-    let mut boundary_client = Client::start(&fixture.path);
-    let _ = boundary_client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
-    );
-    boundary_client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-    let boundary_response = boundary_client.request(&exact_request);
-    assert!(boundary_response.contains("\"error\""));
-    assert!(boundary_response.len() <= 4096);
-    boundary_client.close();
-
-    let oversized = "A".repeat(10_000);
-    for request in [
-        format!(r#"{{"jsonrpc":"2.0","id":8,"method":"{oversized}"}}"#),
-        format!(r#"{{"jsonrpc":"2.0","id":"{oversized}","method":"ping"}}"#),
-    ] {
-        let mut bounded_client = Client::start(&fixture.path);
-        let _ = bounded_client.request(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
-        );
-        bounded_client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-        let _ = bounded_client.try_notify(&request);
-        match bounded_client.lines.recv_timeout(Duration::from_secs(5)) {
-            Ok(response) => assert!(response.len() <= 4096, "oversized response"),
-            Err(RecvTimeoutError::Disconnected) => {}
-            Err(RecvTimeoutError::Timeout) => panic!("oversized MCP request did not terminate"),
-        }
-        bounded_client.close();
-    }
-
-    let real_git = find_executable("git");
-    let wrapper_dir = fixture.path.join("git-wrapper");
-    let wrapper = wrapper_dir.join("git");
-    let block_git = fixture.path.join("block-git");
-    let git_entered = fixture.path.join("git-entered");
-    let git_finished = fixture.path.join("git-finished");
-    fs::create_dir(&wrapper_dir).unwrap();
-    fs::write(
-        &wrapper,
-        "#!/bin/sh\nif [ -e \"$GRAPHR_BLOCK_GIT\" ]; then\n  printf '%s\\n' \"$$\" > \"$GRAPHR_GIT_ENTERED\"\n  exec sleep 600\nfi\n\"$GRAPHR_REAL_GIT\" \"$@\"\nstatus=$?\nprintf 'done\\n' >> \"$GRAPHR_GIT_FINISHED\"\nexit \"$status\"\n",
-    )
-    .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
-    let wrapper_path = env::join_paths(
-        std::iter::once(wrapper_dir.clone())
-            .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .unwrap();
-    let configure_git = |command: &mut Command| {
-        command
-            .env("PATH", &wrapper_path)
-            .env("GRAPHR_REAL_GIT", &real_git)
-            .env("GRAPHR_BLOCK_GIT", &block_git)
-            .env("GRAPHR_GIT_ENTERED", &git_entered)
-            .env("GRAPHR_GIT_FINISHED", &git_finished);
-    };
-
-    let generation_before_startup_eof = database_generation(&database);
-    fs::write(&block_git, []).unwrap();
-    let startup_client = Client::start_with(&fixture.path, configure_git);
-    let startup_git = wait_for_pid(&git_entered);
-    startup_client.close();
-    wait_for_exit(startup_git);
-    assert_eq!(
-        database_generation(&database),
-        generation_before_startup_eof
-    );
-    fs::remove_file(&block_git).unwrap();
-    fs::remove_file(&git_entered).unwrap();
-
-    let lock = Connection::open(&database).unwrap();
-    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let generation_before_locked_startup = database_generation(&database);
-    let _ = fs::remove_file(&git_finished);
-    let mut locked_startup = Client::start_with(&fixture.path, configure_git);
-    wait_for_git_calls(&git_finished, 3);
-    thread::sleep(Duration::from_millis(50));
-    assert!(locked_startup.child.try_wait().unwrap().is_none());
-    let closed = Instant::now();
-    locked_startup.close();
-    assert!(closed.elapsed() < Duration::from_secs(1));
-    lock.execute_batch("ROLLBACK").unwrap();
-    assert_eq!(
-        database_generation(&database),
-        generation_before_locked_startup
-    );
-
-    let mut client = Client::start_with(&fixture.path, configure_git);
-    let initialized = client.request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
-    );
-    assert!(initialized.contains("\"id\":1"));
-    client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-
+    let mut client = Client::start(&fixture.path);
     let tools = client.request(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
-    for name in ["changes", "index", "search", "view"] {
-        assert!(tools.contains(&format!("\"name\":\"{name}\"")));
-    }
-    for invalid in [
-        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search","arguments":{"query":"dispatch","kind":"method"}}}"#,
-        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search","arguments":{"query":" ","limit":0}}}"#,
-        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"view","arguments":{"node_ref":"bad","depth":7}}}"#,
+    for name in [
+        "inspect_root",
+        "index",
+        "index_status",
+        "cancel_index",
+        "search",
+        "view",
+        "changes",
     ] {
-        let response = client.request(invalid);
-        assert!(tool_failed(&response), "{response}");
-    }
-    let huge = "A".repeat(1_000);
-    for request in [
-        format!(
-            r#"{{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{{"name":"search","arguments":{{"query":"dispatch","kind":"{huge}"}}}}}}"#
-        ),
-        format!(
-            r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"bad","depth":"{huge}"}}}}}}"#
-        ),
-    ] {
-        let response = client.request(&request);
-        assert!(tool_failed(&response), "{response}");
-        assert!(
-            response.len() < 512,
-            "oversized MCP error: {}",
-            response.len()
-        );
+        assert!(tools.contains(&format!("\"name\":\"{name}\"")), "{tools}");
     }
 
-    let generation_before_cancel = database_generation(&database);
-    fs::write(&block_git, []).unwrap();
-    client.notify(
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
+    let inspection = response_json(&client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({
+            "worktree_root": fixture.path,
+            "snapshot_id": client.snapshot_id(),
+        }),
+    ));
+    assert_eq!(
+        inspection["result"]["structuredContent"]["snapshot_matches_worktree"],
+        true
     );
-    let blocked_git = wait_for_pid(&git_entered);
-    client.notify(
-        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3,"reason":"test"}}"#,
-    );
-    wait_for_exit(blocked_git);
-    fs::remove_file(&block_git).unwrap();
-    let pong = client.request(r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#);
-    assert!(pong.contains("\"id\":4"), "{pong}");
 
-    let expected_generation = generation_before_cancel;
-    let mut reindexed = String::new();
-    for id in 10..30 {
-        reindexed = client.request(&format!(
-            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"index","arguments":{{}}}}}}"#
-        ));
-        if !reindexed.contains("index busy") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        reindexed.contains(&format!(
-            "indexed generation={expected_generation} changed=0 skipped=4"
-        )),
-        "{reindexed}"
-    );
-    assert_eq!(database_generation(&database), expected_generation);
-
-    let search = client.request(
-        r#"{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"search","arguments":{"query":"dispatch"}}}"#,
-    );
+    let search = client.search("dispatch", Some("function"));
     assert!(search.contains("dispatch"), "{search}");
-    let search_text = response_text(&search);
-    let node_ref = search_text.split_whitespace().next().unwrap().to_owned();
-
-    let view = client.request(&format!(
-        r#"{{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":6,"max_nodes":30}}}}}}"#
-    ));
-    assert!(view.contains("dispatch"), "{view}");
-    assert!(view.contains("register"), "{view}");
-    assert!(view.contains("Mailer"), "{view}");
-    assert!(view.contains("Mailer src/mailer.rs:1"), "{view}");
-
-    for (id, query, kind, member) in [
-        (50, "Mailer", "type", "dispatch"),
-        (52, "lib", "file", "register_dispatches"),
-    ] {
-        let search = client.request(&format!(
-            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"search","arguments":{{"query":"{query}","kind":"{kind}"}}}}}}"#
-        ));
-        let search_text = response_text(&search);
-        let node_ref = search_text.split_whitespace().next().unwrap();
-        let view = client.request(&format!(
-            r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}","depth":1}}}}}}"#,
-            id + 1
-        ));
-        assert!(view.contains(member), "{view}");
-        assert!(view.contains("member ->"), "{view}");
-    }
-
-    let no_op = client.request(
-        r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
+    let search_value = response_json(&search);
+    assert_eq!(
+        search_value["result"]["structuredContent"]["provenance"]["snapshot_id"],
+        client.snapshot_id()
     );
     assert!(
-        no_op.contains(&format!(
-            "indexed generation={expected_generation} changed=0 skipped=4"
-        )),
-        "{no_op}"
+        search_value["result"]["structuredContent"]
+            .get("text")
+            .is_none(),
+        "query text was duplicated in structuredContent: {search}"
     );
-    let still_valid = client.request(&format!(
-        r#"{{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}"}}}}}}"#
-    ));
-    assert!(still_valid.contains("dispatch"), "{still_valid}");
+    let node_ref = response_text(&search)
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let old_snapshot = client.snapshot_id().to_owned();
+    let view = client.view(&node_ref, 6, 30);
+    for expected in ["dispatch", "register", "Mailer", "Mailer src/mailer.rs:1"] {
+        assert!(view.contains(expected), "missing {expected}: {view}");
+    }
 
     fs::write(
         fixture.path.join("src/mailer.rs"),
         "pub struct Mailer;\npub fn added() {}\n",
     )
     .unwrap();
-    let changed = client.request(
-        r#"{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
-    );
-    assert!(
-        changed.contains(&format!(
-            "indexed generation={} changed=1 skipped=4",
-            expected_generation + 1
-        )),
-        "{changed}"
-    );
-    let stale = client.request(&format!(
-        r#"{{"jsonrpc":"2.0","id":45,"method":"tools/call","params":{{"name":"view","arguments":{{"node_ref":"{node_ref}"}}}}}}"#
+    let divergent = response_json(&client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({
+            "worktree_root": fixture.path,
+            "snapshot_id": old_snapshot,
+        }),
     ));
-    assert!(stale.contains("stale node_ref"), "{stale}");
-
-    let lock = Connection::open(&database).unwrap();
-    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let generation_before_eof = database_generation(&database);
-    client.notify(
-        r#"{"jsonrpc":"2.0","id":46,"method":"tools/call","params":{"name":"index","arguments":{}}}"#,
+    assert_eq!(
+        divergent["result"]["structuredContent"]["snapshot_matches_worktree"],
+        false
     );
-    let busy = client.request(
-        r#"{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"changes","arguments":{}}}"#,
-    );
-    assert!(busy.contains("changes busy"), "{busy}");
-    thread::sleep(Duration::from_millis(50));
-    let closed = Instant::now();
-    client.close();
-    assert!(closed.elapsed() < Duration::from_secs(1));
-    lock.execute_batch("ROLLBACK").unwrap();
-    assert_eq!(database_generation(&database), generation_before_eof);
-}
-
-fn index_repository(path: &Path, rebuild: bool) -> String {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_graphr"));
-    command.arg("index").arg(path);
-    if rebuild {
-        command.arg("--rebuild");
-    }
-    let output = command.output().unwrap();
-    assert!(output.status.success(), "{:?}", output.stderr);
-    String::from_utf8(output.stdout).unwrap()
-}
-
-fn assert_incremental_matches_rebuild(incremental: &Path, oracle: &Path, expected_changed: usize) {
-    let indexed = index_repository(incremental, false);
     assert!(
-        indexed.contains(&format!("changed={expected_changed} skipped=0")),
-        "{indexed}"
+        divergent["result"]["structuredContent"]["changed_identity_fields"]
+            .as_array()
+            .unwrap()
+            .contains(&rmcp::serde_json::json!("dirty_digest")),
+        "{divergent}"
     );
-    index_repository(oracle, true);
+
+    client.index_and_wait("boundary");
+    assert_ne!(client.snapshot_id(), old_snapshot);
+    let mismatch = client.view(&node_ref, 1, 10);
+    assert!(tool_failed(&mismatch), "{mismatch}");
+    assert!(mismatch.contains("node_snapshot_mismatch"), "{mismatch}");
+
+    let old_view = client.call(
+        "view",
+        rmcp::serde_json::json!({
+            "snapshot_id": old_snapshot,
+            "node_ref": node_ref,
+            "depth": 1,
+            "max_nodes": 10,
+        }),
+    );
+    assert!(old_view.contains("dispatch"), "{old_view}");
+
+    let unknown = client.call(
+        "search",
+        rmcp::serde_json::json!({
+            "snapshot_id": "0".repeat(64),
+            "query": "dispatch",
+        }),
+    );
+    assert!(tool_failed(&unknown), "{unknown}");
+    assert!(unknown.contains("snapshot_not_found"), "{unknown}");
+    client.close();
+}
+
+#[test]
+fn queued_jobs_ignore_request_cancellation_and_eof_closes_them() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(fixture.path.join("src/lib.rs"), "pub fn run() {}\n").unwrap();
+    init_git(&fixture.path);
+
+    let wrapper_dir = fixture.path.join("git-wrapper");
+    let wrapper = wrapper_dir.join("git");
+    let block = fixture.path.join("block-build");
+    let entered = fixture.path.join("build-entered");
+    fs::create_dir(&wrapper_dir).unwrap();
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = rev-list ] && [ -e \"$GRAPHR_BLOCK_BUILD\" ]; then\n    printf '%s\\n' \"$$\" > \"$GRAPHR_BUILD_ENTERED\"\n    exec sleep 600\n  fi\ndone\nexec \"$GRAPHR_REAL_GIT\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let wrapper_path = env::join_paths(
+        std::iter::once(wrapper_dir)
+            .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .unwrap();
+    let real_git = find_executable("git");
+    let configure = |command: &mut Command| {
+        command
+            .env("PATH", &wrapper_path)
+            .env("GRAPHR_REAL_GIT", &real_git)
+            .env("GRAPHR_BLOCK_BUILD", &block)
+            .env("GRAPHR_BUILD_ENTERED", &entered);
+    };
+
+    fs::write(&block, []).unwrap();
+    let mut client = Client::start_unindexed_with(&fixture.path, configure);
+    let request_id = client.next_id;
+    let job_id = client.queue_index("boundary");
+    wait_for_file(&entered);
+    client.notify(
+        &rmcp::serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": request_id, "reason": "request finished" },
+        })
+        .to_string(),
+    );
+    let status = response_json(&client.call(
+        "index_status",
+        rmcp::serde_json::json!({ "job_id": &job_id }),
+    ));
+    assert_ne!(
+        status["result"]["structuredContent"]["state"]["state"], "cancelled",
+        "request cancellation cancelled the queued job: {status}"
+    );
+    client.call(
+        "cancel_index",
+        rmcp::serde_json::json!({ "job_id": &job_id }),
+    );
+    client.wait_for_job(&job_id, "cancelled");
+
+    fs::remove_file(&entered).unwrap();
+    let second_job = client.queue_index("boundary");
+    wait_for_file(&entered);
+    assert!(!second_job.is_empty());
+    client.close();
+}
+
+fn index_repository(path: &Path) -> rmcp::serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_graphr"))
+        .args([
+            "index",
+            "--worktree-root",
+            path.to_str().unwrap(),
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--target",
+            "worktree",
+            "--include-untracked",
+            "--dependency-mode",
+            "boundary",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let completion: rmcp::serde_json::Value =
+        rmcp::serde_json::from_slice(output.stdout.trim_ascii()).unwrap();
+    remember_graph(path, &completion);
+    completion
+}
+
+fn assert_immutable_graphs_match(incremental: &Path, oracle: &Path) {
+    index_repository(incremental);
+    index_repository(oracle);
     assert_eq!(semantic_graph(incremental), semantic_graph(oracle));
 }
 
+fn graph_path(path: &Path) -> PathBuf {
+    latest_graphs()
+        .lock()
+        .unwrap()
+        .get(&fs::canonicalize(path).unwrap())
+        .cloned()
+        .expect("repository was indexed")
+}
+
+fn remember_graph(path: &Path, completion: &rmcp::serde_json::Value) {
+    let common_git_dir = completion["provenance"]["common_git_dir"].as_str().unwrap();
+    let graph_image_id = completion["graph_image_id"].as_str().unwrap();
+    latest_graphs().lock().unwrap().insert(
+        fs::canonicalize(path).unwrap(),
+        Path::new(common_git_dir)
+            .join("graphr/v6/graphs")
+            .join(format!("{graph_image_id}.db")),
+    );
+}
+
+fn latest_graphs() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
+    static GRAPHS: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    GRAPHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn named_edge_count(path: &Path, source: &str, target: &str) -> i64 {
-    Connection::open(path.join(".git/graphr/index.db"))
+    Connection::open(graph_path(path))
         .unwrap()
         .query_row(
             "SELECT count(*) FROM edges edge
@@ -1741,7 +1506,7 @@ fn named_edge_count(path: &Path, source: &str, target: &str) -> i64 {
 }
 
 fn trait_implementation_count(path: &Path, implementor: &str, trait_: &str) -> i64 {
-    Connection::open(path.join(".git/graphr/index.db"))
+    Connection::open(graph_path(path))
         .unwrap()
         .query_row(
             "SELECT count(*) FROM trait_implementations implementation
@@ -1755,7 +1520,7 @@ fn trait_implementation_count(path: &Path, implementor: &str, trait_: &str) -> i
 }
 
 fn assert_resolution(path: &Path, support: Option<i64>, parent_kind: &str) {
-    let connection = Connection::open(path.join(".git/graphr/index.db")).unwrap();
+    let connection = Connection::open(graph_path(path)).unwrap();
     let actual = connection
         .query_row(
             "SELECT e.support_count FROM edges e
@@ -1783,7 +1548,7 @@ fn assert_resolution(path: &Path, support: Option<i64>, parent_kind: &str) {
 }
 
 fn semantic_graph(path: &Path) -> Vec<String> {
-    let connection = Connection::open(path.join(".git/graphr/index.db")).unwrap();
+    let connection = Connection::open(graph_path(path)).unwrap();
     let mut statement = connection
         .prepare(
             "SELECT value FROM (
@@ -1857,26 +1622,22 @@ fn database_generation(path: &PathBuf) -> i64 {
         .unwrap()
 }
 
-fn normalized_graph(path: &PathBuf) -> Vec<(String, String, String, u32)> {
-    let connection = Connection::open(path).unwrap();
-    let mut statement = connection
-        .prepare(
-            "SELECT f.path, n.kind, n.name, n.line_start
-               FROM nodes n JOIN files f ON f.id=n.file_id
-              ORDER BY f.path, n.qualified_name",
-        )
-        .unwrap();
-    statement
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
-}
-
 fn init_git(path: &Path) {
     git(path, &["init", "--quiet"]);
+    git(
+        path,
+        &[
+            "-c",
+            "user.name=Graphr Test",
+            "-c",
+            "user.email=graphr@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
 }
 
 fn git(path: &Path, args: &[&str]) {
@@ -1892,60 +1653,21 @@ fn git(path: &Path, args: &[&str]) {
 fn find_executable(name: &str) -> PathBuf {
     env::split_paths(&env::var_os("PATH").unwrap_or_default())
         .map(|directory| directory.join(name))
-        .find(|candidate| {
-            fs::metadata(candidate).is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            })
-        })
+        .find(|candidate| candidate.is_file())
         .and_then(|path| fs::canonicalize(path).ok())
         .unwrap_or_else(|| panic!("cannot find {name}"))
 }
 
-fn wait_for_pid(path: &PathBuf) -> i32 {
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(5) {
-        if let Ok(pid) = fs::read_to_string(path)
-            && let Ok(pid) = pid.trim().parse()
-        {
-            return pid;
-        }
-        thread::sleep(Duration::from_millis(5));
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "condition was not reached: {}",
+            path.display()
+        );
+        thread::yield_now();
     }
-    panic!("blocked Git did not start");
-}
-
-fn wait_for_git_calls(path: &PathBuf, expected: usize) {
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(5) {
-        if fs::read_to_string(path).is_ok_and(|calls| calls.lines().count() >= expected) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    panic!("Git did not finish {expected} calls");
-}
-
-fn wait_for_exit(pid: i32) {
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(5) {
-        if unsafe { libc::kill(pid, 0) } == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        {
-            return;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    panic!("cancelled Git process {pid} was not reaped");
-}
-
-fn version_at_least(version: &str, floor: [u32; 3]) -> bool {
-    version
-        .split('.')
-        .take(3)
-        .map(|part| part.parse().unwrap_or(0))
-        .collect::<Vec<u32>>()
-        .as_slice()
-        >= floor.as_slice()
 }
 
 fn response_text(response: &str) -> String {
@@ -1964,17 +1686,27 @@ struct Client {
     child: Child,
     input: Option<ChildStdin>,
     lines: Receiver<String>,
+    repository: PathBuf,
+    snapshot_id: Option<String>,
+    next_id: u64,
 }
 
 impl Client {
     fn start(repository: &PathBuf) -> Self {
-        Self::start_with(repository, |_| {})
+        let mut client = Self::start_unindexed(repository);
+        client.index_and_wait("boundary");
+        client
     }
 
-    fn start_with(repository: &PathBuf, configure: impl FnOnce(&mut Command)) -> Self {
+    fn start_unindexed(repository: &PathBuf) -> Self {
+        Self::start_unindexed_with(repository, |_| {})
+    }
+
+    fn start_unindexed_with(repository: &PathBuf, configure: impl FnOnce(&mut Command)) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_graphr"));
         command
             .arg("serve")
+            .arg("--allow-root")
             .arg(repository)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1990,11 +1722,124 @@ impl Client {
                 }
             }
         });
-        Self {
+        let mut client = Self {
             input: child.stdin.take(),
             child,
             lines,
+            repository: repository.clone(),
+            snapshot_id: None,
+            next_id: 10_000,
+        };
+        let initialized = client.request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"graphr-test","version":"0"}}}"#,
+        );
+        assert!(initialized.contains("\"id\":1"), "{initialized}");
+        client.notify(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        client
+    }
+
+    fn index_and_wait(&mut self, dependency_mode: &str) -> rmcp::serde_json::Value {
+        let job_id = self.queue_index(dependency_mode);
+        let value = self.wait_for_job(&job_id, "completed");
+        let completion = value["result"]["structuredContent"]["state"]["completion"].clone();
+        self.snapshot_id = Some(completion["snapshot_id"].as_str().unwrap().to_owned());
+        remember_graph(&self.repository, &completion);
+        completion
+    }
+
+    fn queue_index(&mut self, dependency_mode: &str) -> String {
+        let queued = self.call(
+            "index",
+            rmcp::serde_json::json!({
+                "worktree_root": self.repository,
+                "base": "HEAD",
+                "head": "HEAD",
+                "target": { "kind": "worktree", "include_untracked": true },
+                "dependency_mode": dependency_mode,
+            }),
+        );
+        let queued = response_json(&queued);
+        assert_eq!(
+            queued["result"]["structuredContent"]["state"]["state"],
+            "queued"
+        );
+        queued["result"]["structuredContent"]["job_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn wait_for_job(&mut self, job_id: &str, expected: &str) -> rmcp::serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "index job did not finish");
+            let response = self.call(
+                "index_status",
+                rmcp::serde_json::json!({ "job_id": job_id }),
+            );
+            let value = response_json(&response);
+            let state = &value["result"]["structuredContent"]["state"];
+            match state["state"].as_str().unwrap() {
+                actual if actual == expected => return value,
+                "failed" | "cancelled" | "completed" => {
+                    panic!("index job reached unexpected terminal state: {response}")
+                }
+                _ => {}
+            }
         }
+    }
+
+    fn search(&mut self, query: &str, kind: Option<&str>) -> String {
+        let mut arguments = rmcp::serde_json::json!({
+            "snapshot_id": self.snapshot_id(),
+            "query": query,
+        });
+        if let Some(kind) = kind {
+            arguments["kind"] = kind.into();
+        }
+        self.call("search", arguments)
+    }
+
+    fn view(&mut self, node_ref: &str, depth: u32, max_nodes: u32) -> String {
+        self.call(
+            "view",
+            rmcp::serde_json::json!({
+                "snapshot_id": self.snapshot_id(),
+                "node_ref": node_ref,
+                "depth": depth,
+                "max_nodes": max_nodes,
+            }),
+        )
+    }
+
+    fn changes(&mut self, depth: u32, max_nodes: u32, cursor: Option<&str>) -> String {
+        let mut arguments = rmcp::serde_json::json!({
+            "snapshot_id": self.snapshot_id(),
+            "depth": depth,
+            "max_nodes": max_nodes,
+        });
+        if let Some(cursor) = cursor {
+            arguments["cursor"] = cursor.into();
+        }
+        self.call("changes", arguments)
+    }
+
+    fn call(&mut self, name: &str, arguments: rmcp::serde_json::Value) -> String {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.request(
+            &rmcp::serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            })
+            .to_string(),
+        )
+    }
+
+    fn snapshot_id(&self) -> &str {
+        self.snapshot_id.as_deref().expect("client was indexed")
     }
 
     fn notify(&mut self, request: &str) {
@@ -2025,6 +1870,10 @@ impl Client {
         }
         panic!("MCP server did not stop after EOF");
     }
+}
+
+fn response_json(response: &str) -> rmcp::serde_json::Value {
+    rmcp::serde_json::from_str(response).unwrap()
 }
 
 impl Drop for Client {

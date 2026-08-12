@@ -26,8 +26,9 @@ const MANIFEST_SIZE_LIMIT: u64 = 64 * 1024;
 const REVIEW_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 static PRIVATE_ID: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
 pub enum ErrorCode {
     InvalidParameters,
     RootUnknown,
@@ -50,7 +51,8 @@ pub enum ErrorCode {
     Internal,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct OperationError {
     pub code: ErrorCode,
     pub message: String,
@@ -86,7 +88,8 @@ impl std::fmt::Display for OperationError {
 
 impl std::error::Error for OperationError {}
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct RootIdentity {
     pub repository_id: String,
     pub workspace_id: String,
@@ -100,21 +103,57 @@ pub struct RootIdentity {
     pub head_oid: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
 pub enum SnapshotTarget {
     Commit,
     Index,
     Worktree { include_untracked: bool },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Deserialize,
+    serde::Serialize,
+    rmcp::schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
 pub enum NoChangeReason {
     IdenticalCommitOids,
     IdenticalTrees,
     EmptyIndexDelta,
     EmptyWorktreeDelta,
+}
+
+impl NoChangeReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IdenticalCommitOids => "identical_commit_oids",
+            Self::IdenticalTrees => "identical_trees",
+            Self::EmptyIndexDelta => "empty_index_delta",
+            Self::EmptyWorktreeDelta => "empty_worktree_delta",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct RootInspection {
+    pub identity: RootIdentity,
+    pub staged_paths: usize,
+    pub unstaged_paths: usize,
+    pub untracked_paths: usize,
+    pub snapshot_id: Option<String>,
+    pub snapshot_matches_worktree: Option<bool>,
+    pub changed_identity_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,7 +176,10 @@ pub struct ResolvedIndexRequest {
     pub dependency_mode: DependencyMode,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema,
+)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct Provenance {
     pub repository_id: String,
     pub workspace_id: String,
@@ -178,12 +220,22 @@ pub struct BuildProgress {
     pub rejected_cache: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema,
+)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct IndexCompletion {
     pub snapshot_id: String,
     pub graph_image_id: String,
     pub provenance: Provenance,
     pub stats: IndexStats,
+}
+
+#[derive(Debug)]
+pub struct QueryOutput {
+    pub text: String,
+    pub provenance: Provenance,
+    pub no_change_reason: Option<NoChangeReason>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -204,6 +256,7 @@ pub struct SnapshotEntry {
     pub graph_path: PathBuf,
     pub changes: Arc<WorktreeChanges>,
     pub no_change_reason: Option<NoChangeReason>,
+    pub dependency_mode: DependencyMode,
     pub provenance: Provenance,
     _graph_directory: CacheDirectory,
     graph_checksum: String,
@@ -929,6 +982,7 @@ impl SnapshotCatalog {
             graph_path,
             changes: Arc::new(changes),
             no_change_reason: manifest.no_change_reason,
+            dependency_mode: manifest.dependency_mode,
             provenance: manifest.provenance,
             _graph_directory: cache.graphs.clone(),
             graph_checksum: manifest.graph_checksum,

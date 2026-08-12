@@ -10,7 +10,8 @@ use crate::workspace::{
     SnapshotTarget,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct JobRequestSummary {
     pub root: RootIdentity,
     pub base_ref: String,
@@ -21,8 +22,9 @@ pub struct JobRequestSummary {
     pub dependency_mode: DependencyMode,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, rmcp::schemars::JsonSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
 #[allow(clippy::large_enum_variant)]
 pub enum JobState {
     Queued,
@@ -45,7 +47,8 @@ pub enum JobState {
     Cancelled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct JobStatus {
     pub job_id: String,
     pub workspace_id: String,

@@ -163,25 +163,15 @@ pub struct State {
 
 pub struct Store {
     connection: Connection,
-    rebuild: bool,
 }
 
 impl Store {
-    pub fn open(path: &Path, rebuild: bool, cancelled: &AtomicBool) -> Result<Self> {
-        Self::open_with_parent(path, rebuild, cancelled, false)
-    }
-
-    pub(crate) fn open_private_image(
-        path: &Path,
-        rebuild: bool,
-        cancelled: &AtomicBool,
-    ) -> Result<Self> {
-        Self::open_with_parent(path, rebuild, cancelled, true)
+    pub(crate) fn open_private_image(path: &Path, cancelled: &AtomicBool) -> Result<Self> {
+        Self::open_with_parent(path, cancelled, true)
     }
 
     fn open_with_parent(
         path: &Path,
-        rebuild: bool,
         cancelled: &AtomicBool,
         descriptor_parent: bool,
     ) -> Result<Self> {
@@ -220,19 +210,15 @@ impl Store {
         let version: i64 = retry_sqlite(cancelled, || {
             connection.pragma_query_value(None, "user_version", |row| row.get(0))
         })?;
-        if !matches!(version, 0 | SCHEMA_VERSION) && !rebuild {
-            return Err("database schema mismatch; run index --rebuild".into());
+        if !matches!(version, 0 | SCHEMA_VERSION) {
+            return Err("database schema mismatch".into());
         }
         configure_journal(&connection, cancelled)?;
 
-        let store = Self {
-            connection,
-            rebuild,
-        };
+        let store = Self { connection };
         match version {
             0 => {}
             SCHEMA_VERSION => read_state_cancelled(&store.connection, cancelled).map(|_| ())?,
-            _ if rebuild => {}
             _ => unreachable!("schema mismatch returned above"),
         }
         Ok(store)
@@ -253,12 +239,9 @@ impl Store {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(db_error)?;
         if version != SCHEMA_VERSION {
-            return Err("database schema mismatch; run index --rebuild".into());
+            return Err("database schema mismatch".into());
         }
-        Ok(Self {
-            connection,
-            rebuild: false,
-        })
+        Ok(Self { connection })
     }
 
     pub fn seal(self, cancelled: &AtomicBool) -> Result<State> {
@@ -324,14 +307,13 @@ impl Store {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(db_error)?;
         let new_schema = version == 0;
-        let rebuild_schema = !new_schema && self.rebuild;
-        if !new_schema && !rebuild_schema && version != SCHEMA_VERSION {
-            return Err("database schema mismatch; run index --rebuild".into());
+        if !new_schema && version != SCHEMA_VERSION {
+            return Err("database schema mismatch".into());
         }
         if !new_schema {
             read_state(&tx)?;
         }
-        let full = new_schema || rebuild_schema;
+        let full = new_schema;
         let existing = if full {
             HashMap::new()
         } else {
@@ -341,12 +323,7 @@ impl Store {
         check_cancelled(cancelled)?;
 
         let changed = if full {
-            if new_schema {
-                create_schema(&tx)?;
-            } else {
-                drop_graph_schema(&tx)?;
-                create_schema(&tx)?;
-            }
+            create_schema(&tx)?;
             let (_, implementations) = insert_graph(&tx, &graph, cancelled, false)?;
             resolve_trait_implementations(&tx, implementations.into_iter().collect(), cancelled)?;
             graph.files.len()
@@ -363,11 +340,16 @@ impl Store {
         let state = read_state(&tx)?;
         check_cancelled(cancelled)?;
         tx.commit().map_err(db_error)?;
-        self.rebuild = false;
         Ok((state, changed, value))
     }
 
-    pub fn search(&mut self, query: &str, kind: Option<NodeKind>, limit: u32) -> Result<String> {
+    pub fn search(
+        &mut self,
+        snapshot_id: &str,
+        query: &str,
+        kind: Option<NodeKind>,
+        limit: u32,
+    ) -> Result<String> {
         if query.trim().is_empty() || query.len() > 256 || !(1..=20).contains(&limit) {
             return Err("invalid search parameters".into());
         }
@@ -395,7 +377,7 @@ impl Store {
         let mut lines = Vec::with_capacity(rows.len().min(limit as usize));
         let mut omitted = omitted;
         for node in rows.iter().take(limit as usize) {
-            let Some(line) = node.line(&state, None, SEARCH_BUDGET)? else {
+            let Some(line) = node.line(snapshot_id, &state, None, SEARCH_BUDGET)? else {
                 omitted = true;
                 break;
             };
@@ -404,18 +386,27 @@ impl Store {
         Ok(bounded(lines, SEARCH_BUDGET, omitted))
     }
 
-    pub fn view(&mut self, node_ref: &str, depth: u32, max_nodes: u32) -> Result<String> {
-        if depth > 6 || !(1..=50).contains(&max_nodes) || node_ref.len() > 128 {
+    pub fn view(
+        &mut self,
+        snapshot_id: &str,
+        node_ref: &str,
+        depth: u32,
+        max_nodes: u32,
+    ) -> Result<String> {
+        if depth > 6 || !(1..=50).contains(&max_nodes) || node_ref.len() > 116 {
             return Err("invalid view parameters".into());
         }
-        let (epoch, generation, root_id) = parse_ref(node_ref)?;
+        let (embedded_snapshot, epoch, generation, root_id) = parse_ref(node_ref)?;
+        if embedded_snapshot != snapshot_id {
+            return Err("node_snapshot_mismatch".into());
+        }
         let tx = self.connection.transaction().map_err(db_error)?;
         let state = read_state(&tx)?;
         if epoch != state.epoch || generation != state.generation {
             return Err("stale node_ref".into());
         }
         let root = load_node(&tx, root_id)?.ok_or_else(|| "node not found".to_owned())?;
-        let Some(root_line) = root.line(&state, None, VIEW_BUDGET)? else {
+        let Some(root_line) = root.line(snapshot_id, &state, None, VIEW_BUDGET)? else {
             return Ok(TRUNCATED.into());
         };
         let root_has_members = matches!(root.kind.as_str(), "file" | "type");
@@ -448,7 +439,8 @@ impl Store {
                 }
                 visited.insert(node.id);
                 let include_traits = node.kind == "type";
-                let Some(line) = node.line(&state, Some(&relation), VIEW_BUDGET)? else {
+                let Some(line) = node.line(snapshot_id, &state, Some(&relation), VIEW_BUDGET)?
+                else {
                     omitted = true;
                     break;
                 };
@@ -465,6 +457,7 @@ impl Store {
 
     pub fn changes(
         &mut self,
+        snapshot_id: &str,
         changes: &WorktreeChanges,
         depth: u32,
         max_nodes: u32,
@@ -719,7 +712,7 @@ impl Store {
                 )
             });
             let line = root
-                .line(&state, relation.as_deref(), usize::MAX)?
+                .line(snapshot_id, &state, relation.as_deref(), usize::MAX)?
                 .ok_or_else(|| "changed root line exceeds address space".to_owned())?;
             lines.push(line);
         }
@@ -730,6 +723,7 @@ impl Store {
         } else {
             traverse_changes(
                 &tx,
+                snapshot_id,
                 &state,
                 &roots,
                 (depth, CHANGE_ANALYSIS_LIMIT),
@@ -820,7 +814,7 @@ pub fn validate_image(path: &Path) -> Result<State> {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(db_error)?;
     if version != SCHEMA_VERSION {
-        return Err("database schema mismatch; run index --rebuild".into());
+        return Err("database schema mismatch".into());
     }
     let mode: String = connection
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -962,15 +956,21 @@ struct ChangeAnalysis {
 }
 
 impl RowNode {
-    fn line(&self, state: &State, relation: Option<&str>, budget: usize) -> Result<Option<String>> {
+    fn line(
+        &self,
+        snapshot_id: &str,
+        state: &State,
+        relation: Option<&str>,
+        budget: usize,
+    ) -> Result<Option<String>> {
         if self.id <= 0 {
             return Err("database node id is invalid".into());
         }
         let kind = title(&self.kind).ok_or_else(|| "database node kind is invalid".to_owned())?;
         let prefix = relation.map_or(String::new(), |value| format!("  {value} "));
         let mut output = format!(
-            "{prefix}{}:{}:{} {kind} ",
-            state.epoch, state.generation, self.id
+            "{prefix}n1:{snapshot_id}:{}:{}:{} {kind} ",
+            state.epoch, state.generation, self.id,
         );
         if !push_escaped(&mut output, &self.name, budget)
             || !push_literal(&mut output, " ", budget)
@@ -1040,8 +1040,11 @@ const CHANGE_NEIGHBORS: [(&str, bool, &str); 6] = [
     ),
 ];
 
+// Snapshot identity and traversal/output state are all required at this boundary.
+#[allow(clippy::too_many_arguments)]
 fn traverse_changes(
     connection: &Connection,
+    snapshot_id: &str,
     state: &State,
     roots: &[RowNode],
     limits: (u32, usize),
@@ -1120,7 +1123,7 @@ fn traverse_changes(
                     }
                     row_budget -= 1;
                     let line = node
-                        .line(state, Some(relation), usize::MAX)?
+                        .line(snapshot_id, state, Some(relation), usize::MAX)?
                         .ok_or_else(|| "changed neighbor line exceeds address space".to_owned())?;
                     lines.push(line);
                     visited.insert(node.id);
@@ -3033,20 +3036,6 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     .map_err(db_error)
 }
 
-fn drop_graph_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
-    tx.execute_batch(
-        "DROP TABLE IF EXISTS nodes_fts;
-         DROP TABLE IF EXISTS trait_implementations;
-         DROP TABLE IF EXISTS edges;
-         DROP TABLE IF EXISTS ref_keys;
-         DROP TABLE IF EXISTS refs;
-         DROP TABLE IF EXISTS node_keys;
-         DROP TABLE IF EXISTS nodes;
-         DROP TABLE IF EXISTS files;",
-    )
-    .map_err(db_error)
-}
-
 fn read_state(connection: &Connection) -> Result<State> {
     validate_state(query_state(connection).map_err(db_error)?)
 }
@@ -3282,18 +3271,29 @@ fn literal_fts(query: &str) -> Result<String> {
     }
 }
 
-fn parse_ref(value: &str) -> Result<(&str, i64, i64)> {
+fn parse_ref(value: &str) -> Result<(&str, &str, i64, i64)> {
     let mut parts = value.split(':');
+    let version = parts.next();
+    let snapshot_id = parts.next().unwrap_or_default();
     let epoch = parts.next().unwrap_or_default();
-    let generation = parts
-        .next()
-        .and_then(|value| value.parse().ok())
+    let raw_generation = parts.next().unwrap_or_default();
+    let generation = raw_generation
+        .parse::<i64>()
+        .ok()
+        .filter(|value| raw_generation == value.to_string())
         .ok_or_else(|| "invalid node_ref".to_owned())?;
-    let id = parts
-        .next()
-        .and_then(|value| value.parse().ok())
+    let raw_id = parts.next().unwrap_or_default();
+    let id = raw_id
+        .parse::<i64>()
+        .ok()
+        .filter(|value| raw_id == value.to_string())
         .ok_or_else(|| "invalid node_ref".to_owned())?;
-    if epoch.len() != 8
+    if version != Some("n1")
+        || snapshot_id.len() != 64
+        || !snapshot_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || epoch.len() != 8
         || !epoch.bytes().all(|byte| byte.is_ascii_hexdigit())
         || generation < 0
         || id <= 0
@@ -3301,7 +3301,7 @@ fn parse_ref(value: &str) -> Result<(&str, i64, i64)> {
     {
         Err("invalid node_ref".into())
     } else {
-        Ok((epoch, generation, id))
+        Ok((snapshot_id, epoch, generation, id))
     }
 }
 
@@ -3439,6 +3439,8 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
 mod tests {
     use super::*;
 
+    const SNAPSHOT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     #[test]
     fn sealed_image_is_single_file_and_read_only() {
         let root = std::env::temp_dir().join(format!(
@@ -3452,7 +3454,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let path = root.join("graph.db");
         let cancelled = AtomicBool::new(false);
-        let mut store = Store::open(&path, false, &cancelled).unwrap();
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
         let (indexed, _, ()) = store
             .index_with(&cancelled, |_full, _existing| {
                 Ok((single_node_graph("sealed"), ()))
@@ -3489,7 +3491,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let path = root.join("graph.db");
         let cancelled = AtomicBool::new(false);
-        let mut store = Store::open(&path, false, &cancelled).unwrap();
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
         store
             .index_with(&cancelled, |_full, _existing| {
                 Ok((single_node_graph("wal"), ()))
@@ -3521,7 +3523,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let path = root.join("graph.db");
         let cancelled = AtomicBool::new(false);
-        let mut store = Store::open(&path, false, &cancelled).unwrap();
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
         store
             .index_with(&cancelled, |_full, _existing| {
                 Ok((single_node_graph("sidecar"), ()))
@@ -3554,7 +3556,6 @@ mod tests {
     fn search_query_uses_the_bounded_fts_plan() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let cancelled = AtomicBool::new(false);
         store
@@ -3605,15 +3606,43 @@ mod tests {
             line: 1,
         };
         assert!(
-            node.line(&state, None, 100)
+            node.line(SNAPSHOT, &state, None, 180)
                 .unwrap()
                 .unwrap()
                 .contains("\\u{1b}")
         );
         node.name = "é".repeat(100);
-        assert!(node.line(&state, None, 20).unwrap().is_none());
+        assert!(node.line(SNAPSHOT, &state, None, 20).unwrap().is_none());
         node.kind = "bogus".into();
-        assert!(node.line(&state, None, 100).is_err());
+        assert!(node.line(SNAPSHOT, &state, None, 180).is_err());
+    }
+
+    #[test]
+    fn node_references_bind_snapshot_before_graph_state() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        let cancelled = AtomicBool::new(false);
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((single_node_graph("bound"), ()))
+            })
+            .unwrap();
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        let output = store.search(&first, "bound", None, 1).unwrap();
+        let node_ref = output.split_whitespace().next().unwrap();
+
+        assert_eq!(
+            store.view(&second, node_ref, 1, 10).unwrap_err(),
+            "node_snapshot_mismatch"
+        );
+        assert_eq!(
+            store
+                .view(&first, &node_ref.replacen(":1:", ":01:", 1), 1, 10)
+                .unwrap_err(),
+            "invalid node_ref"
+        );
     }
 
     #[test]
@@ -3639,7 +3668,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        assert!(Store::open(&path, false, &AtomicBool::new(false)).is_err());
+        assert!(Store::open_private_image(&path, &AtomicBool::new(false)).is_err());
         let connection = Connection::open(&path).unwrap();
         let mode: String = connection
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -3653,7 +3682,6 @@ mod tests {
     fn full_node_queue_is_not_automatically_truncated() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let graph = Graph {
             files: vec![FileInput {
@@ -3707,7 +3735,12 @@ mod tests {
             .unwrap();
 
         let output = store
-            .view(&format!("{}:{}:1", state.epoch, state.generation), 3, 2)
+            .view(
+                SNAPSHOT,
+                &format!("n1:{SNAPSHOT}:{}:{}:1", state.epoch, state.generation),
+                3,
+                2,
+            )
             .unwrap();
         assert!(output.contains("call ->"));
         assert!(!output.contains(TRUNCATED.trim()));
@@ -3717,7 +3750,6 @@ mod tests {
     fn traversal_reaches_six_hops_but_not_seven() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let mut graph = single_node_graph("n0");
         for index in 1_u32..=7 {
@@ -3736,7 +3768,12 @@ mod tests {
             .unwrap();
 
         let output = store
-            .view(&format!("{}:{}:1", state.epoch, state.generation), 6, 50)
+            .view(
+                SNAPSHOT,
+                &format!("n1:{SNAPSHOT}:{}:{}:1", state.epoch, state.generation),
+                6,
+                50,
+            )
             .unwrap();
         assert!(output.contains(" n6 "), "{output}");
         assert!(!output.contains(" n7 "), "{output}");
@@ -3756,7 +3793,14 @@ mod tests {
             skipped_paths: 0,
         };
         let output = store
-            .changes(&changes, 6, 50, DependencyMode::Boundary, &cancelled)
+            .changes(
+                SNAPSHOT,
+                &changes,
+                6,
+                50,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
             .unwrap();
         assert!(output.contains(" n6 "), "{output}");
         assert!(!output.contains(" n7 "), "{output}");
@@ -3766,12 +3810,24 @@ mod tests {
 
         assert!(
             store
-                .view(&format!("{}:{}:1", state.epoch, state.generation), 7, 50)
+                .view(
+                    SNAPSHOT,
+                    &format!("n1:{SNAPSHOT}:{}:{}:1", state.epoch, state.generation),
+                    7,
+                    50
+                )
                 .is_err()
         );
         assert!(
             store
-                .changes(&changes, 7, 50, DependencyMode::Boundary, &cancelled)
+                .changes(
+                    SNAPSHOT,
+                    &changes,
+                    7,
+                    50,
+                    DependencyMode::Boundary,
+                    &cancelled
+                )
                 .is_err()
         );
     }
@@ -3780,7 +3836,6 @@ mod tests {
     fn changes_map_gaps_and_traverse_in_global_priority_order() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let names = ["root", "test", "caller", "callee", "imported"];
         let kinds = [
@@ -3877,7 +3932,14 @@ mod tests {
             skipped_paths: 0,
         };
         let output = store
-            .changes(&changes, 1, 10, DependencyMode::Boundary, &cancelled)
+            .changes(
+                SNAPSHOT,
+                &changes,
+                1,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
             .unwrap();
         assert!(
             output.contains(
@@ -3901,7 +3963,14 @@ mod tests {
         assert!(!output.contains(TRUNCATED.trim()), "{output}");
 
         let depth_zero = store
-            .changes(&changes, 0, 10, DependencyMode::Boundary, &cancelled)
+            .changes(
+                SNAPSHOT,
+                &changes,
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
             .unwrap();
         assert!(
             depth_zero.contains("neighborhood_omitted=false"),
@@ -3923,7 +3992,14 @@ mod tests {
             skipped_paths: 0,
         };
         let output = store
-            .changes(&unmapped, 0, 10, DependencyMode::Boundary, &cancelled)
+            .changes(
+                SNAPSHOT,
+                &unmapped,
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
             .unwrap();
         assert!(output.contains(" File src/lib.rs src/lib.rs:1"), "{output}");
         assert!(
@@ -3955,7 +4031,14 @@ mod tests {
             skipped_paths: 0,
         };
         let output = store
-            .changes(&type_change, 0, 10, DependencyMode::Boundary, &cancelled)
+            .changes(
+                SNAPSHOT,
+                &type_change,
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
             .unwrap();
         assert!(output.contains(" Type imported src/lib.rs:11"), "{output}");
         assert!(output.contains("flow 0.1200"), "{output}");
@@ -3984,7 +4067,14 @@ mod tests {
             flooded.records.push(PathRecord::Untracked(path));
         }
         let output = store
-            .changes(&flooded, 1, 10, DependencyMode::Boundary, &cancelled)
+            .changes(
+                SNAPSHOT,
+                &flooded,
+                1,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
             .unwrap();
         assert!(output.contains(" root "), "{output}");
         assert!(output.contains("test <-"), "{output}");
@@ -4043,7 +4133,6 @@ mod tests {
         }
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let cancelled = AtomicBool::new(false);
         store
@@ -4164,7 +4253,6 @@ mod tests {
         };
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let cancelled = AtomicBool::new(false);
         store
@@ -4172,7 +4260,14 @@ mod tests {
             .unwrap();
 
         let output = store
-            .changes(&changes(), 0, 10, DependencyMode::Boundary, &cancelled)
+            .changes(
+                SNAPSHOT,
+                &changes(),
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
             .unwrap();
         assert!(
             output.contains("file-mapped src/lib.rs:1-4,6-7"),
@@ -4198,7 +4293,14 @@ mod tests {
             skipped_paths: 0,
         };
         let output = store
-            .changes(&renamed, 0, 10, DependencyMode::Boundary, &cancelled)
+            .changes(
+                SNAPSHOT,
+                &renamed,
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
             .unwrap();
         assert!(output.contains("file-mapped src/lib.rs:1\n"), "{output}");
         assert!(
@@ -4210,7 +4312,14 @@ mod tests {
             .index_with(&cancelled, |_full, _existing| Ok((graph(false), ())))
             .unwrap();
         let output = store
-            .changes(&changes(), 0, 10, DependencyMode::Boundary, &cancelled)
+            .changes(
+                SNAPSHOT,
+                &changes(),
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
             .unwrap();
         assert!(output.contains("file-mapped src/lib.rs:1-7"), "{output}");
         assert!(!output.contains("file-mapped src/lib.rs:1\n"), "{output}");
@@ -4220,10 +4329,10 @@ mod tests {
     fn deleted_only_changes_report_incomplete_analysis() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let output = store
             .changes(
+                SNAPSHOT,
                 &WorktreeChanges {
                     files: vec![],
                     records: vec![PathRecord::Deleted("src/removed.rs".into())],
@@ -4287,7 +4396,6 @@ mod tests {
         };
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let cancelled = AtomicBool::new(false);
         store
@@ -4296,6 +4404,7 @@ mod tests {
 
         let output = store
             .changes(
+                SNAPSHOT,
                 &WorktreeChanges {
                     files: vec![ChangedFile {
                         path: "src/lib.rs".into(),
@@ -4343,7 +4452,6 @@ mod tests {
         };
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let cancelled = AtomicBool::new(false);
         store
@@ -4352,6 +4460,7 @@ mod tests {
 
         let output = store
             .changes(
+                SNAPSHOT,
                 &WorktreeChanges {
                     files: vec![ChangedFile {
                         path: "src/lib.rs".into(),
@@ -4426,7 +4535,6 @@ mod tests {
         }
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let cancelled = AtomicBool::new(false);
         store
@@ -4435,6 +4543,7 @@ mod tests {
 
         let output = store
             .changes(
+                SNAPSHOT,
                 &WorktreeChanges {
                     files: vec![ChangedFile {
                         path: "src/lib.rs".into(),
@@ -4484,7 +4593,6 @@ mod tests {
         };
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let cancelled = AtomicBool::new(false);
         store
@@ -4493,6 +4601,7 @@ mod tests {
 
         let output = store
             .changes(
+                SNAPSHOT,
                 &WorktreeChanges {
                     files: vec![ChangedFile {
                         path: "src/lib.rs".into(),
@@ -4532,7 +4641,6 @@ mod tests {
     fn trait_implementations_resolve_incrementally_and_map_headers() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let cancelled = AtomicBool::new(false);
         let file = |path: &str, replace| FileInput {
@@ -4615,7 +4723,11 @@ mod tests {
         assert!(
             store
                 .view(
-                    &format!("{}:{}:{implementor}", state.epoch, state.generation),
+                    SNAPSHOT,
+                    &format!(
+                        "n1:{SNAPSHOT}:{}:{}:{implementor}",
+                        state.epoch, state.generation
+                    ),
                     1,
                     10,
                 )
@@ -4625,7 +4737,11 @@ mod tests {
         assert!(
             store
                 .view(
-                    &format!("{}:{}:{trait_}", state.epoch, state.generation),
+                    SNAPSHOT,
+                    &format!(
+                        "n1:{SNAPSHOT}:{}:{}:{trait_}",
+                        state.epoch, state.generation
+                    ),
                     1,
                     10,
                 )
@@ -4634,6 +4750,7 @@ mod tests {
         );
         let output = store
             .changes(
+                SNAPSHOT,
                 &WorktreeChanges {
                     files: vec![ChangedFile {
                         path: "src/impl.rs".into(),
@@ -4698,7 +4815,6 @@ mod tests {
     fn failed_replacement_preserves_the_committed_graph() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let cancelled = AtomicBool::new(false);
         let (before, _, ()) = store
@@ -4750,7 +4866,6 @@ mod tests {
     fn changes_do_not_truncate_on_visited_rows_with_budget_left() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let mut graph = single_node_graph("a");
         graph.nodes.push(function_node("b", 2));
@@ -4775,6 +4890,7 @@ mod tests {
 
         let output = store
             .changes(
+                SNAPSHOT,
                 &WorktreeChanges {
                     files: vec![ChangedFile {
                         path: "src/lib.rs".into(),
@@ -4802,7 +4918,6 @@ mod tests {
     fn boundary_neighbors_do_not_spend_the_first_party_budget() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let mut graph = single_node_graph("root");
         graph.files.extend([
@@ -4853,6 +4968,7 @@ mod tests {
 
         let output = store
             .changes(
+                SNAPSHOT,
                 &WorktreeChanges {
                     files: vec![ChangedFile {
                         path: "src/lib.rs".into(),
@@ -4886,7 +5002,6 @@ mod tests {
     fn boundary_flows_collapse_vendor_fanout_before_the_scan_budget() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let mut graph = single_node_graph("root");
         graph.files.extend([
@@ -4987,7 +5102,6 @@ mod tests {
     fn neighbor_queries_stop_at_the_shared_budget() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
-            rebuild: false,
         };
         let mut graph = single_node_graph("root");
         for index in 0..100 {
