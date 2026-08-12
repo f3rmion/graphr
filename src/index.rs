@@ -94,7 +94,7 @@ impl Engine {
                 "resolved workspace identity changed before indexing",
             ));
         }
-        self.catalog.attach(&current)?;
+        self.catalog.attach(&current, cancelled)?;
         let job = self.catalog.begin(&request.root)?;
         let repository = repository_from_identity(&request.root);
         let capture = repository.capture_snapshot(
@@ -190,7 +190,7 @@ impl Engine {
             }
             Ok(_) => match trusted_exact.as_deref().map_or_else(
                 || crate::workspace::validate_published_image(&exact_graph),
-                validate_entry_graph,
+                |entry| validate_entry_graph(entry, cancelled),
             ) {
                 Ok(_) => true,
                 Err(_) => {
@@ -246,9 +246,10 @@ impl Engine {
                     })
             });
             for candidate in candidates {
-                match validate_entry_graph(&candidate) {
+                match validate_entry_graph(&candidate, cancelled)
+                    .and_then(|_| job.copy_seed(&candidate, cancelled))
+                {
                     Ok(_) => {
-                        job.copy_seed(&candidate.graph_path)?;
                         break;
                     }
                     Err(_) => {
@@ -270,8 +271,8 @@ impl Engine {
                 }
             }
             report(BuildStage::Indexing, 0, total, 0, 0, rejected_cache.clone());
-            let mut store =
-                Store::open(job.graph_temp(), false, cancelled).map_err(index_operation_error)?;
+            let mut store = Store::open_private_image(job.graph_temp(), false, cancelled)
+                .map_err(index_operation_error)?;
             let (_, _, stats) = store
                 .index_with(cancelled, |full, existing| {
                     build_index(
@@ -346,6 +347,7 @@ impl Engine {
             request.dependency_mode,
             capture.no_change_reason,
             provenance,
+            cancelled,
         )?;
         Ok(IndexCompletion {
             snapshot_id,
@@ -2980,6 +2982,7 @@ mod tests {
     use crate::git::{ArtifactFile, ArtifactOmission, ArtifactReview, ChangeLayer};
     use crate::workspace::{
         AllowedRoots, ErrorCode, IndexRequest, SnapshotTarget, resolve_request,
+        set_before_seed_open_hook_for_test,
     };
     use std::fs;
     use std::process::Command;
@@ -3087,6 +3090,44 @@ mod tests {
                 .next()
                 .is_some()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seed_copy_revalidates_bytes_after_candidate_replacement() {
+        let root = snapshot_repository("seed-replacement");
+        let base = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &base),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        fs::write(root.join("src/a.rs"), "fn changed() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "change one file"]);
+        let head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        set_before_seed_open_hook_for_test(|path| {
+            fs::rename(path, path.with_extension("validated")).unwrap();
+            fs::write(path, b"replacement after validation").unwrap();
+        });
+        let rejected = Mutex::new(Vec::new());
+
+        let completion = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &head),
+                &AtomicBool::new(false),
+                |progress| {
+                    if let Some(path) = progress.rejected_cache {
+                        rejected.lock().unwrap().push(path);
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(completion.stats.files_parsed, 2);
+        assert!(!rejected.into_inner().unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

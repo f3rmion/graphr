@@ -1,9 +1,12 @@
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -202,13 +205,22 @@ pub struct SnapshotEntry {
     pub changes: Arc<WorktreeChanges>,
     pub no_change_reason: Option<NoChangeReason>,
     pub provenance: Provenance,
+    _graph_directory: CacheDirectory,
     graph_checksum: String,
 }
 
 pub struct SnapshotCatalog {
     allowed_roots: Arc<AllowedRoots>,
     loaded: RwLock<HashMap<String, Arc<SnapshotEntry>>>,
-    rejected: RwLock<HashMap<String, OperationError>>,
+    rejected: RwLock<HashMap<String, RejectedSnapshot>>,
+}
+
+#[derive(Clone)]
+struct RejectedSnapshot {
+    repository_id: String,
+    cache: CachePaths,
+    manifest_name: String,
+    error: OperationError,
 }
 
 #[derive(Clone)]
@@ -325,17 +337,25 @@ impl AllowedRoots {
 
 #[derive(Clone)]
 struct CachePaths {
-    graphs: PathBuf,
-    reviews: PathBuf,
-    snapshots: PathBuf,
-    quarantine: PathBuf,
-    tmp: PathBuf,
+    graphs: CacheDirectory,
+    reviews: CacheDirectory,
+    snapshots: CacheDirectory,
+    quarantine: CacheDirectory,
+    tmp: CacheDirectory,
+}
+
+#[derive(Clone, Debug)]
+struct CacheDirectory {
+    path: PathBuf,
+    handle: Option<Arc<File>>,
 }
 
 pub(crate) struct PrivateJob {
     root: RootIdentity,
     cache: CachePaths,
-    path: PathBuf,
+    directory: CacheDirectory,
+    _capture_directory: CacheDirectory,
+    name: String,
     capture_root: PathBuf,
     graph_temp: PathBuf,
 }
@@ -350,29 +370,57 @@ impl PrivateJob {
     }
 
     pub(crate) fn graph_path(&self, graph_image_id: &str) -> PathBuf {
-        self.cache.graphs.join(format!("{graph_image_id}.db"))
+        self.cache
+            .graphs
+            .stable_path(OsStr::new(&format!("{graph_image_id}.db")))
     }
 
-    pub(crate) fn copy_seed(&self, source: &Path) -> Result<(), OperationError> {
-        let mut source = open_regular(source, None).map_err(cache_corrupt)?;
-        let mut target = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&self.graph_temp)
-            .map_err(|error| cache_internal("cannot create private graph image", error))?;
-        std::io::copy(&mut source, &mut target)
-            .map_err(|error| cache_internal("cannot copy graph seed", error))?;
-        target
-            .sync_all()
-            .map_err(|error| cache_internal("cannot sync graph seed", error))
+    pub(crate) fn copy_seed(
+        &self,
+        seed: &SnapshotEntry,
+        cancelled: &AtomicBool,
+    ) -> Result<(), OperationError> {
+        #[cfg(test)]
+        BEFORE_SEED_OPEN_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook(&seed.graph_path);
+            }
+        });
+        let result = (|| {
+            let mut source = open_regular(&seed.graph_path, None).map_err(cache_corrupt)?;
+            let mut target = create_file_at(&self.directory, OsStr::new("graph.db"), 0o600)
+                .map_err(|error| cache_internal("cannot create private graph image", error))?;
+            std::io::copy(&mut source, &mut target)
+                .map_err(|error| cache_internal("cannot copy graph seed", error))?;
+            target
+                .sync_all()
+                .map_err(|error| cache_internal("cannot sync graph seed", error))?;
+            if hash_file(&self.graph_temp, cancelled)? != seed.graph_checksum {
+                return Err(cache_corrupt("copied graph seed checksum is invalid"));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&self.graph_temp);
+        }
+        result
     }
 }
 
 impl Drop for PrivateJob {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if let Ok(entries) = fs::read_dir(self.directory.stable_path(OsStr::new("."))) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = fs::remove_dir_all(path);
+                } else {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+        let _ = unlink_at(&self.cache.tmp, OsStr::new(&self.name), libc::AT_REMOVEDIR);
+        let _ = self.cache.tmp.sync();
     }
 }
 
@@ -385,41 +433,69 @@ impl SnapshotCatalog {
         }
     }
 
-    pub fn attach(&self, root: &RootIdentity) -> Result<(), OperationError> {
+    pub fn attach(
+        &self,
+        root: &RootIdentity,
+        cancelled: &AtomicBool,
+    ) -> Result<(), OperationError> {
+        check_cache_cancelled(cancelled)?;
         self.allowed_roots.authorize(&root.worktree_root)?;
         let Some(cache) = cache_paths(root, false)? else {
+            self.reconcile(root, &BTreeSet::new());
             return Ok(());
         };
-        let Some(directory) = existing_directory(&cache.snapshots)? else {
+        let Some(directory) = cache.snapshots.handle.as_ref() else {
+            self.reconcile(root, &BTreeSet::new());
             return Ok(());
         };
-        let mut manifests = fs::read_dir(directory)
+        let mut manifests = fs::read_dir(stable_directory_path(directory))
             .map_err(|error| cache_internal("cannot read snapshot catalog", error))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| cache_internal("cannot read snapshot catalog", error))?;
         manifests.sort_by_key(fs::DirEntry::file_name);
+        let mut seen = BTreeSet::new();
         for manifest in manifests {
-            let path = manifest.path();
-            let Some(snapshot_id) = path
-                .file_name()
-                .and_then(|name| name.to_str())
+            check_cache_cancelled(cancelled)?;
+            let file_name = manifest.file_name();
+            let Some(snapshot_id) = file_name
+                .to_str()
                 .and_then(|name| name.strip_suffix(".json"))
                 .filter(|id| valid_id(id))
             else {
                 continue;
             };
-            match self.load_entry(root, &cache, snapshot_id, &path) {
+            seen.insert(snapshot_id.to_owned());
+            match self.load_entry(root, &cache, snapshot_id, &file_name, cancelled) {
                 Ok(entry) => {
                     write_lock(&self.loaded).insert(snapshot_id.into(), entry);
                     write_lock(&self.rejected).remove(snapshot_id);
                 }
+                Err(error) if error.code == ErrorCode::JobCancelled => return Err(error),
                 Err(error) => {
                     write_lock(&self.loaded).remove(snapshot_id);
-                    write_lock(&self.rejected).insert(snapshot_id.into(), error);
+                    write_lock(&self.rejected).insert(
+                        snapshot_id.into(),
+                        RejectedSnapshot {
+                            repository_id: root.repository_id.clone(),
+                            cache: cache.clone(),
+                            manifest_name: file_name.to_string_lossy().into_owned(),
+                            error,
+                        },
+                    );
                 }
             }
         }
+        self.reconcile(root, &seen);
         Ok(())
+    }
+
+    fn reconcile(&self, root: &RootIdentity, seen: &BTreeSet<String>) {
+        write_lock(&self.loaded).retain(|snapshot_id, entry| {
+            entry.provenance.repository_id != root.repository_id || seen.contains(snapshot_id)
+        });
+        write_lock(&self.rejected).retain(|snapshot_id, rejected| {
+            rejected.repository_id != root.repository_id || seen.contains(snapshot_id)
+        });
     }
 
     pub fn get(&self, snapshot_id: &str) -> Result<Arc<SnapshotEntry>, OperationError> {
@@ -429,8 +505,8 @@ impl SnapshotCatalog {
         if let Some(entry) = read_lock(&self.loaded).get(snapshot_id) {
             return Ok(entry.clone());
         }
-        if let Some(error) = read_lock(&self.rejected).get(snapshot_id) {
-            return Err(error.clone());
+        if let Some(rejected) = read_lock(&self.rejected).get(snapshot_id) {
+            return Err(rejected.error.clone());
         }
         Err(snapshot_not_found(snapshot_id))
     }
@@ -453,22 +529,27 @@ impl SnapshotCatalog {
         self.allowed_roots.authorize(&root.worktree_root)?;
         let cache = cache_paths(root, true)?.expect("created above");
         let path = loop {
-            let path = cache.tmp.join(private_name("job"));
-            match fs::DirBuilder::new().mode(0o700).create(&path) {
-                Ok(()) => break path,
+            let name = private_name("job");
+            match create_child_directory(&cache.tmp, OsStr::new(&name), true) {
+                Ok(directory) => break (name, directory),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
                     return Err(cache_internal("cannot create private job directory", error));
                 }
             }
         };
-        sync_directory(&cache.tmp)?;
-        let capture_root = create_directory(&path, "capture")?;
+        cache.tmp.sync()?;
+        let (name, directory) = path;
+        let capture = create_child_directory(&directory, OsStr::new("capture"), false)
+            .map_err(|error| cache_internal("cannot create private capture directory", error))?;
+        let capture_root = capture.path.clone();
         Ok(PrivateJob {
             root: root.clone(),
             cache,
-            graph_temp: path.join("graph.db"),
-            path,
+            graph_temp: directory.stable_path(OsStr::new("graph.db")),
+            directory,
+            _capture_directory: capture,
+            name,
             capture_root,
         })
     }
@@ -482,29 +563,51 @@ impl SnapshotCatalog {
     ) -> Result<Option<String>, OperationError> {
         let mut rejected_path = None;
         let rejected = { read_lock(&self.rejected).get(snapshot_id).cloned() };
-        if let Some(error) = rejected {
+        if let Some(rejected) = rejected {
             if !matches!(
-                error.code,
+                rejected.error.code,
                 ErrorCode::CacheCorrupt | ErrorCode::SnapshotIncomplete
             ) {
-                return Err(error);
+                return Err(rejected.error);
             }
-            let manifest = job.cache.snapshots.join(format!("{snapshot_id}.json"));
-            quarantine_file(&job.cache, &manifest)?;
-            rejected_path = Some(manifest.display().to_string());
+            quarantine_name(
+                &job.cache,
+                &rejected.cache.snapshots,
+                OsStr::new(&rejected.manifest_name),
+            )?;
+            rejected_path = Some(
+                rejected
+                    .cache
+                    .snapshots
+                    .path
+                    .join(&rejected.manifest_name)
+                    .display()
+                    .to_string(),
+            );
             write_lock(&self.loaded).remove(snapshot_id);
             write_lock(&self.rejected).remove(snapshot_id);
         }
 
-        let review = job.cache.reviews.join(format!("{review_id}.json"));
-        match read_bounded(&review, REVIEW_SIZE_LIMIT) {
+        let review_name = format!("{review_id}.json");
+        match read_bounded_at(
+            &job.cache.reviews,
+            OsStr::new(&review_name),
+            REVIEW_SIZE_LIMIT,
+        ) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(bytes)
                 if bytes == expected_review
                     && blake3::hash(&bytes).to_hex().as_str() == review_id => {}
             Ok(_) | Err(_) => {
-                quarantine_file(&job.cache, &review)?;
-                rejected_path = Some(review.display().to_string());
+                quarantine_name(&job.cache, &job.cache.reviews, OsStr::new(&review_name))?;
+                rejected_path = Some(
+                    job.cache
+                        .reviews
+                        .path
+                        .join(review_name)
+                        .display()
+                        .to_string(),
+                );
             }
         }
         Ok(rejected_path)
@@ -519,21 +622,33 @@ impl SnapshotCatalog {
         let rejected = {
             read_lock(&self.rejected)
                 .iter()
-                .filter(|(snapshot_id, error)| {
+                .filter(|(snapshot_id, rejected)| {
                     snapshot_id.as_str() != requested_snapshot_id
+                        && rejected.repository_id == root.repository_id
                         && matches!(
-                            error.code,
+                            rejected.error.code,
                             ErrorCode::CacheCorrupt | ErrorCode::SnapshotIncomplete
                         )
                 })
-                .map(|(snapshot_id, _)| snapshot_id.clone())
+                .map(|(snapshot_id, rejected)| (snapshot_id.clone(), rejected.clone()))
                 .collect::<Vec<_>>()
         };
         let mut rejected_path = None;
-        for snapshot_id in rejected {
-            let manifest = cache.snapshots.join(format!("{snapshot_id}.json"));
-            quarantine_file(&cache, &manifest)?;
-            rejected_path = Some(manifest.display().to_string());
+        for (snapshot_id, rejected) in rejected {
+            quarantine_name(
+                &cache,
+                &rejected.cache.snapshots,
+                OsStr::new(&rejected.manifest_name),
+            )?;
+            rejected_path = Some(
+                rejected
+                    .cache
+                    .snapshots
+                    .path
+                    .join(&rejected.manifest_name)
+                    .display()
+                    .to_string(),
+            );
             write_lock(&self.loaded).remove(&snapshot_id);
             write_lock(&self.rejected).remove(&snapshot_id);
         }
@@ -551,6 +666,7 @@ impl SnapshotCatalog {
         dependency_mode: DependencyMode,
         no_change_reason: Option<NoChangeReason>,
         mut provenance: Provenance,
+        cancelled: &AtomicBool,
     ) -> Result<Arc<SnapshotEntry>, OperationError> {
         if !valid_id(graph_image_id) || !valid_id(review_id) || !valid_id(&provenance.snapshot_id) {
             return Err(OperationError::new(
@@ -558,11 +674,28 @@ impl SnapshotCatalog {
                 "generated cache identifier is invalid",
             ));
         }
-        let review_temp = job.path.join("review.json");
-        write_private(&review_temp, review_bytes)?;
-        let review_path = job.cache.reviews.join(format!("{review_id}.json"));
-        publish_no_replace(&review_temp, &review_path)?;
-        let winner = read_bounded(&review_path, REVIEW_SIZE_LIMIT).map_err(cache_corrupt)?;
+        if review_bytes.len() as u64 > REVIEW_SIZE_LIMIT {
+            return Err(OperationError::new(
+                ErrorCode::Internal,
+                "generated review exceeds the cache size limit",
+            ));
+        }
+        write_private(&job.directory, OsStr::new("review.json"), review_bytes)?;
+        let review_name = format!("{review_id}.json");
+        #[cfg(test)]
+        before_review_publication(&job.cache.reviews.path.join(&review_name))?;
+        publish_no_replace(
+            &job.directory,
+            OsStr::new("review.json"),
+            &job.cache.reviews,
+            OsStr::new(&review_name),
+        )?;
+        let winner = read_bounded_at(
+            &job.cache.reviews,
+            OsStr::new(&review_name),
+            REVIEW_SIZE_LIMIT,
+        )
+        .map_err(cache_corrupt)?;
         if blake3::hash(&winner).to_hex().as_str() != review_id {
             return Err(cache_corrupt(
                 "published review checksum does not match its ID",
@@ -576,10 +709,16 @@ impl SnapshotCatalog {
             open_regular(graph_temp, None)
                 .and_then(|file| file.sync_all())
                 .map_err(|error| cache_internal("cannot sync read-only graph image", error))?;
-            publish_no_replace(graph_temp, &graph_path)?;
+            let _ = graph_temp;
+            publish_no_replace(
+                &job.directory,
+                OsStr::new("graph.db"),
+                &job.cache.graphs,
+                OsStr::new(&format!("{graph_image_id}.db")),
+            )?;
         }
         let state = validate_published_image(&graph_path)?;
-        let graph_checksum = hash_file(&graph_path).map_err(cache_corrupt)?;
+        let graph_checksum = hash_file(&graph_path, cancelled)?;
         provenance.index_generation = state.generation;
         let manifest = SnapshotManifest {
             format_version: CACHE_FORMAT_VERSION,
@@ -597,25 +736,33 @@ impl SnapshotCatalog {
                 format!("cannot serialize snapshot: {error}"),
             )
         })?;
-        let manifest_temp = job.path.join("snapshot.json");
-        write_private(&manifest_temp, &manifest_bytes)?;
-        let manifest_path = job
-            .cache
-            .snapshots
-            .join(format!("{}.json", manifest.provenance.snapshot_id));
+        if manifest_bytes.len() as u64 > MANIFEST_SIZE_LIMIT {
+            return Err(OperationError::new(
+                ErrorCode::Internal,
+                "generated manifest exceeds the cache size limit",
+            ));
+        }
+        write_private(&job.directory, OsStr::new("snapshot.json"), &manifest_bytes)?;
+        let manifest_name = format!("{}.json", manifest.provenance.snapshot_id);
         #[cfg(test)]
         before_manifest_publication(&PublicationPoint {
             snapshot_id: manifest.provenance.snapshot_id.clone(),
             graph_path: graph_path.clone(),
-            review_path: review_path.clone(),
-            manifest_path: manifest_path.clone(),
+            review_path: job.cache.reviews.stable_path(OsStr::new(&review_name)),
+            manifest_path: job.cache.snapshots.stable_path(OsStr::new(&manifest_name)),
         })?;
-        publish_no_replace(&manifest_temp, &manifest_path)?;
+        publish_no_replace(
+            &job.directory,
+            OsStr::new("snapshot.json"),
+            &job.cache.snapshots,
+            OsStr::new(&manifest_name),
+        )?;
         let entry = self.load_entry(
             &job.root,
             &job.cache,
             &manifest.provenance.snapshot_id,
-            &manifest_path,
+            OsStr::new(&manifest_name),
+            cancelled,
         )?;
         write_lock(&self.loaded).insert(manifest.provenance.snapshot_id.clone(), entry.clone());
         write_lock(&self.rejected).remove(&manifest.provenance.snapshot_id);
@@ -629,8 +776,8 @@ impl SnapshotCatalog {
         requested_snapshot_id: &str,
     ) -> Result<(), OperationError> {
         let cache = cache_paths(root, true)?.expect("created above");
-        let graph = cache.graphs.join(format!("{graph_image_id}.db"));
-        quarantine_file(&cache, &graph)?;
+        let graph_name = format!("{graph_image_id}.db");
+        quarantine_name(&cache, &cache.graphs, OsStr::new(&graph_name))?;
         let mut snapshot_ids = BTreeSet::from([requested_snapshot_id.to_owned()]);
         for entry in read_lock(&self.loaded).values() {
             if entry.graph_image_id == graph_image_id {
@@ -638,7 +785,11 @@ impl SnapshotCatalog {
             }
         }
         for snapshot_id in &snapshot_ids {
-            quarantine_file(&cache, &cache.snapshots.join(format!("{snapshot_id}.json")))?;
+            quarantine_name(
+                &cache,
+                &cache.snapshots,
+                OsStr::new(&format!("{snapshot_id}.json")),
+            )?;
         }
         write_lock(&self.loaded).retain(|_, entry| entry.graph_image_id != graph_image_id);
         let mut rejected = write_lock(&self.rejected);
@@ -653,9 +804,11 @@ impl SnapshotCatalog {
         attached_root: &RootIdentity,
         cache: &CachePaths,
         snapshot_id: &str,
-        manifest_path: &Path,
+        manifest_name: &OsStr,
+        cancelled: &AtomicBool,
     ) -> Result<Arc<SnapshotEntry>, OperationError> {
-        let bytes = match read_bounded(manifest_path, MANIFEST_SIZE_LIMIT) {
+        check_cache_cancelled(cancelled)?;
+        let bytes = match read_bounded_at(&cache.snapshots, manifest_name, MANIFEST_SIZE_LIMIT) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(snapshot_not_found(snapshot_id));
             }
@@ -686,7 +839,7 @@ impl SnapshotCatalog {
         }
         let authorized = self
             .allowed_roots
-            .inspect(&manifest.provenance.worktree_root, &AtomicBool::new(false))?;
+            .inspect(&manifest.provenance.worktree_root, cancelled)?;
         if authorized.repository_id != manifest.provenance.repository_id
             || authorized.workspace_id != manifest.provenance.workspace_id
             || authorized.common_git_dir != manifest.provenance.common_git_dir
@@ -697,16 +850,18 @@ impl SnapshotCatalog {
             return Err(cache_corrupt("snapshot root identity changed"));
         }
 
-        let review_path = cache.reviews.join(format!("{}.json", manifest.review_id));
-        let review_bytes = match read_bounded(&review_path, REVIEW_SIZE_LIMIT) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(OperationError::new(
-                    ErrorCode::SnapshotIncomplete,
-                    "snapshot review is not published",
-                ));
-            }
-            result => result.map_err(cache_corrupt)?,
-        };
+        let review_name = format!("{}.json", manifest.review_id);
+        let review_bytes =
+            match read_bounded_at(&cache.reviews, OsStr::new(&review_name), REVIEW_SIZE_LIMIT) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(OperationError::new(
+                        ErrorCode::SnapshotIncomplete,
+                        "snapshot review is not published",
+                    ));
+                }
+                result => result.map_err(cache_corrupt)?,
+            };
+        check_cache_cancelled(cancelled)?;
         if blake3::hash(&review_bytes).to_hex().as_str() != manifest.review_id {
             return Err(cache_corrupt("snapshot review checksum is invalid"));
         }
@@ -742,7 +897,17 @@ impl SnapshotCatalog {
             return Err(cache_corrupt("snapshot ID does not match its manifest"));
         }
 
-        let graph_path = cache.graphs.join(format!("{}.db", manifest.graph_image_id));
+        #[cfg(test)]
+        before_graph_load();
+        if cache.graphs.handle.is_none() {
+            return Err(OperationError::new(
+                ErrorCode::SnapshotIncomplete,
+                "snapshot graph is not published",
+            ));
+        }
+        let graph_path = cache
+            .graphs
+            .stable_path(OsStr::new(&format!("{}.db", manifest.graph_image_id)));
         match fs::symlink_metadata(&graph_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(OperationError::new(
@@ -753,7 +918,7 @@ impl SnapshotCatalog {
             Err(error) => return Err(cache_corrupt(error)),
             Ok(_) => {}
         }
-        if hash_file(&graph_path).map_err(cache_corrupt)? != manifest.graph_checksum
+        if hash_file(&graph_path, cancelled)? != manifest.graph_checksum
             || validate_published_image(&graph_path)?.generation
                 != manifest.provenance.index_generation
         {
@@ -765,50 +930,13 @@ impl SnapshotCatalog {
             changes: Arc::new(changes),
             no_change_reason: manifest.no_change_reason,
             provenance: manifest.provenance,
+            _graph_directory: cache.graphs.clone(),
             graph_checksum: manifest.graph_checksum,
         }))
     }
 }
 
 fn cache_paths(root: &RootIdentity, create: bool) -> Result<Option<CachePaths>, OperationError> {
-    validate_cache_root(root)?;
-    let graphr = root.common_git_dir.join("graphr");
-    let v6 = graphr.join("v6");
-    if !create {
-        let Some(_) = existing_directory(&graphr)? else {
-            return Ok(None);
-        };
-        let Some(_) = existing_directory(&v6)? else {
-            return Ok(None);
-        };
-    } else {
-        create_directory(&root.common_git_dir, "graphr")?;
-        create_directory(&graphr, "v6")?;
-    }
-    let paths = CachePaths {
-        graphs: v6.join("graphs"),
-        reviews: v6.join("reviews"),
-        snapshots: v6.join("snapshots"),
-        quarantine: v6.join("quarantine"),
-        tmp: v6.join("tmp"),
-    };
-    for path in [
-        &paths.graphs,
-        &paths.reviews,
-        &paths.snapshots,
-        &paths.quarantine,
-        &paths.tmp,
-    ] {
-        if create {
-            create_directory(&v6, path.file_name().expect("fixed component"))?;
-        } else {
-            existing_directory(path)?;
-        }
-    }
-    Ok(Some(paths))
-}
-
-fn validate_cache_root(root: &RootIdentity) -> Result<(), OperationError> {
     let metadata = fs::symlink_metadata(&root.common_git_dir)
         .map_err(|error| cache_internal("cannot inspect common Git directory", error))?;
     let canonical = fs::canonicalize(&root.common_git_dir)
@@ -822,32 +950,277 @@ fn validate_cache_root(root: &RootIdentity) -> Result<(), OperationError> {
             "common Git directory is not a validated directory",
         ));
     }
-    Ok(())
+    let common = CacheDirectory::open_root(&root.common_git_dir, &metadata)
+        .map_err(|error| cache_internal("cannot open common Git directory", error))?;
+    let graphr = cache_child(&common, OsStr::new("graphr"), create, false)?;
+    if graphr.handle.is_none() {
+        return Ok(None);
+    }
+    let v6 = cache_child(&graphr, OsStr::new("v6"), create, false)?;
+    if v6.handle.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(CachePaths {
+        graphs: cache_child(&v6, OsStr::new("graphs"), create, false)?,
+        reviews: cache_child(&v6, OsStr::new("reviews"), create, false)?,
+        snapshots: cache_child(&v6, OsStr::new("snapshots"), create, false)?,
+        quarantine: cache_child(&v6, OsStr::new("quarantine"), create, false)?,
+        tmp: cache_child(&v6, OsStr::new("tmp"), create, false)?,
+    }))
 }
 
-fn existing_directory(path: &Path) -> Result<Option<PathBuf>, OperationError> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(cache_internal("cannot inspect cache directory", error)),
-        Ok(metadata) if metadata.is_dir() => Ok(Some(path.to_path_buf())),
-        Ok(_) => Err(
+impl CacheDirectory {
+    fn open_root(path: &Path, expected: &fs::Metadata) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)?;
+        let actual = file.metadata()?;
+        if !actual.is_dir() || actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cache root changed while opening",
+            ));
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            handle: Some(Arc::new(file)),
+        })
+    }
+
+    fn stable_path(&self, name: &OsStr) -> PathBuf {
+        self.handle.as_ref().map_or_else(
+            || self.path.join(name),
+            |handle| stable_directory_path(handle).join(name),
+        )
+    }
+
+    fn file(&self) -> std::io::Result<&File> {
+        self.handle.as_deref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "cache directory is absent")
+        })
+    }
+
+    fn sync(&self) -> Result<(), OperationError> {
+        self.file()
+            .and_then(File::sync_all)
+            .map_err(|error| cache_internal("cannot sync cache directory", error))
+    }
+}
+
+fn stable_directory_path(directory: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+}
+
+fn cache_child(
+    parent: &CacheDirectory,
+    name: &OsStr,
+    create: bool,
+    exclusive: bool,
+) -> Result<CacheDirectory, OperationError> {
+    let result = if create {
+        create_child_directory(parent, name, exclusive)
+    } else {
+        open_child_directory(parent, name)
+    };
+    match result {
+        Ok(handle) => Ok(handle),
+        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(CacheDirectory {
+                path: parent.path.join(name),
+                handle: None,
+            })
+        }
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => Err(
             OperationError::new(ErrorCode::CacheCorrupt, "cache path is not a directory")
-                .with_path("path", path),
+                .with_path("path", &parent.path.join(name)),
         ),
+        Err(error) => Err(cache_internal("cannot open cache directory", error)),
     }
 }
 
-fn create_directory(parent: &Path, name: impl AsRef<Path>) -> Result<PathBuf, OperationError> {
-    let path = parent.join(name);
-    match fs::DirBuilder::new().mode(0o700).create(&path) {
-        Ok(()) => sync_directory(parent)?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(cache_internal("cannot create cache directory", error)),
+fn create_child_directory(
+    parent: &CacheDirectory,
+    name: &OsStr,
+    exclusive: bool,
+) -> std::io::Result<CacheDirectory> {
+    let name_c = component_cstring(name)?;
+    // SAFETY: the parent descriptor and NUL-terminated component remain valid for the call.
+    let created = unsafe { libc::mkdirat(parent.file()?.as_raw_fd(), name_c.as_ptr(), 0o700) };
+    if created == 0 {
+        parent.file()?.sync_all()?;
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists || exclusive {
+            return Err(error);
+        }
     }
-    existing_directory(&path)?.ok_or_else(|| {
-        OperationError::new(ErrorCode::Internal, "cache directory disappeared")
-            .with_path("path", &path)
+    open_child_directory(parent, name)
+}
+
+fn open_child_directory(parent: &CacheDirectory, name: &OsStr) -> std::io::Result<CacheDirectory> {
+    let name_c = component_cstring(name)?;
+    // SAFETY: openat receives a live directory descriptor and a valid C string.
+    let fd = unsafe {
+        libc::openat(
+            parent.file()?.as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful openat returns a newly owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    Ok(CacheDirectory {
+        path: parent.path.join(name),
+        handle: Some(Arc::new(file)),
     })
+}
+
+fn component_cstring(name: &OsStr) -> std::io::Result<CString> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.contains(&b'/') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cache name is not one path component",
+        ));
+    }
+    CString::new(bytes).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "cache name contains NUL")
+    })
+}
+
+fn create_file_at(directory: &CacheDirectory, name: &OsStr, mode: u32) -> std::io::Result<File> {
+    let name = component_cstring(name)?;
+    // SAFETY: openat receives a live directory descriptor and a valid C string.
+    let fd = unsafe {
+        libc::openat(
+            directory.file()?.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: a successful openat returns a newly owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn open_regular_at(
+    directory: &CacheDirectory,
+    name: &OsStr,
+    limit: Option<u64>,
+) -> std::io::Result<File> {
+    let name = component_cstring(name)?;
+    // SAFETY: openat receives a live directory descriptor and a valid C string.
+    let fd = unsafe {
+        libc::openat(
+            directory.file()?.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful openat returns a newly owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || limit.is_some_and(|limit| metadata.len() > limit) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cache file is not a bounded regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn link_file_at(
+    source: &File,
+    target_directory: &CacheDirectory,
+    target_name: &OsStr,
+) -> std::io::Result<()> {
+    let source_path = CString::new(format!("/proc/self/fd/{}", source.as_raw_fd())).unwrap();
+    let target_name = component_cstring(target_name)?;
+    // SAFETY: both C strings and descriptors remain valid for the duration of linkat.
+    let result = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            source_path.as_ptr(),
+            target_directory.file()?.as_raw_fd(),
+            target_name.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn unlink_at(directory: &CacheDirectory, name: &OsStr, flags: i32) -> std::io::Result<()> {
+    let name = component_cstring(name)?;
+    // SAFETY: unlinkat receives a live directory descriptor and a valid C string.
+    let result = unsafe { libc::unlinkat(directory.file()?.as_raw_fd(), name.as_ptr(), flags) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn rename_at(
+    source_directory: &CacheDirectory,
+    source_name: &OsStr,
+    target_directory: &CacheDirectory,
+    target_name: &OsStr,
+) -> std::io::Result<()> {
+    let source_name = component_cstring(source_name)?;
+    let target_name = component_cstring(target_name)?;
+    // SAFETY: both directory descriptors and C strings remain valid for renameat.
+    let result = unsafe {
+        libc::renameat(
+            source_directory.file()?.as_raw_fd(),
+            source_name.as_ptr(),
+            target_directory.file()?.as_raw_fd(),
+            target_name.as_ptr(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn entry_exists_at(directory: &CacheDirectory, name: &OsStr) -> std::io::Result<bool> {
+    let name = component_cstring(name)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstatat initializes metadata on success; it is never read here.
+    let result = unsafe {
+        libc::fstatat(
+            directory.file()?.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        Ok(true)
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
 }
 
 fn private_name(label: &str) -> String {
@@ -858,13 +1231,12 @@ fn private_name(label: &str) -> String {
     )
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), OperationError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
+fn write_private(
+    directory: &CacheDirectory,
+    name: &OsStr,
+    bytes: &[u8],
+) -> Result<(), OperationError> {
+    let mut file = create_file_at(directory, name, 0o600)
         .map_err(|error| cache_internal("cannot create private cache file", error))?;
     file.write_all(bytes)
         .map_err(|error| cache_internal("cannot write private cache file", error))?;
@@ -872,8 +1244,16 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), OperationError> {
         .map_err(|error| cache_internal("cannot sync private cache file", error))
 }
 
-fn publish_no_replace(temp: &Path, final_path: &Path) -> Result<bool, OperationError> {
-    let metadata = fs::symlink_metadata(temp)
+fn publish_no_replace(
+    source_directory: &CacheDirectory,
+    source_name: &OsStr,
+    target_directory: &CacheDirectory,
+    target_name: &OsStr,
+) -> Result<bool, OperationError> {
+    let source = open_regular_at(source_directory, source_name, None)
+        .map_err(|error| cache_internal("cannot inspect private cache file", error))?;
+    let metadata = source
+        .metadata()
         .map_err(|error| cache_internal("cannot inspect private cache file", error))?;
     if !metadata.is_file() {
         return Err(OperationError::new(
@@ -881,55 +1261,37 @@ fn publish_no_replace(temp: &Path, final_path: &Path) -> Result<bool, OperationE
             "private cache path is not a regular file",
         ));
     }
-    let published = match fs::hard_link(temp, final_path) {
+    let published = match link_file_at(&source, target_directory, target_name) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) => return Err(cache_internal("cannot publish cache file", error)),
     };
-    fs::remove_file(temp)
+    unlink_at(source_directory, source_name, 0)
         .map_err(|error| cache_internal("cannot remove private cache name", error))?;
-    let temp_parent = temp.parent().expect("private file has parent");
-    let final_parent = final_path.parent().expect("published file has parent");
-    sync_directory(temp_parent)?;
-    if final_parent != temp_parent {
-        sync_directory(final_parent)?;
-    }
+    source_directory.sync()?;
+    target_directory.sync()?;
     Ok(published)
 }
 
-fn quarantine_file(cache: &CachePaths, path: &Path) -> Result<(), OperationError> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(cache_corrupt(error)),
-        Ok(_) => {}
+fn quarantine_name(
+    cache: &CachePaths,
+    source: &CacheDirectory,
+    name: &OsStr,
+) -> Result<(), OperationError> {
+    if !entry_exists_at(source, name).map_err(cache_corrupt)? {
+        return Ok(());
     }
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("cache");
+    let display_name = name.to_string_lossy();
     let target = loop {
-        let target = cache
-            .quarantine
-            .join(format!("{name}.{}", private_name("rejected")));
-        match fs::symlink_metadata(&target) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break target,
-            Err(error) => return Err(cache_corrupt(error)),
-            Ok(_) => continue,
+        let target = format!("{display_name}.{}", private_name("rejected"));
+        if !entry_exists_at(&cache.quarantine, OsStr::new(&target)).map_err(cache_corrupt)? {
+            break target;
         }
     };
-    fs::rename(path, &target)
+    rename_at(source, name, &cache.quarantine, OsStr::new(&target))
         .map_err(|error| cache_corrupt(format!("cannot quarantine cache file: {error}")))?;
-    sync_directory(path.parent().expect("cache file has parent"))?;
-    sync_directory(&cache.quarantine)
-}
-
-fn sync_directory(path: &Path) -> Result<(), OperationError> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
-        .open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| cache_internal("cannot sync cache directory", error))
+    source.sync()?;
+    cache.quarantine.sync()
 }
 
 fn open_regular(path: &Path, limit: Option<u64>) -> std::io::Result<File> {
@@ -947,14 +1309,32 @@ fn open_regular(path: &Path, limit: Option<u64>) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    let mut file = open_regular(path, Some(limit))?;
+fn read_bounded_at(
+    directory: &CacheDirectory,
+    name: &OsStr,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    let mut file = open_regular_at(directory, name, Some(limit))?;
     let size = usize::try_from(file.metadata()?.len()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "cache file is too large")
     })?;
-    let mut bytes = Vec::with_capacity(size);
-    file.read_to_end(&mut bytes)?;
-    if bytes.len() != size {
+    read_exact_bounded(&mut file, size, limit)
+}
+
+fn read_exact_bounded(
+    reader: &mut impl Read,
+    expected_size: usize,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(expected_size);
+    reader.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cache file grew beyond its size limit",
+        ));
+    }
+    if bytes.len() != expected_size {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "cache file changed while reading",
@@ -963,15 +1343,23 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn hash_file(path: &Path) -> std::io::Result<String> {
-    let mut file = open_regular(path, None)?;
+fn hash_file(path: &Path, cancelled: &AtomicBool) -> Result<String, OperationError> {
+    let mut file = open_regular(path, None).map_err(cache_corrupt)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer)?;
+        check_cache_cancelled(cancelled)?;
+        let read = file.read(&mut buffer).map_err(cache_corrupt)?;
         if read == 0 {
             break;
         }
+        #[cfg(test)]
+        HASH_CHUNK_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
+        check_cache_cancelled(cancelled)?;
         hasher.update(&buffer[..read]);
     }
     Ok(hasher.finalize().to_hex().to_string())
@@ -988,11 +1376,23 @@ pub(crate) fn validate_published_image(path: &Path) -> Result<crate::store::Stat
 
 pub(crate) fn validate_entry_graph(
     entry: &SnapshotEntry,
+    cancelled: &AtomicBool,
 ) -> Result<crate::store::State, OperationError> {
-    if hash_file(&entry.graph_path).map_err(cache_corrupt)? != entry.graph_checksum {
+    if hash_file(&entry.graph_path, cancelled)? != entry.graph_checksum {
         return Err(cache_corrupt("snapshot graph checksum is invalid"));
     }
     validate_published_image(&entry.graph_path)
+}
+
+fn check_cache_cancelled(cancelled: &AtomicBool) -> Result<(), OperationError> {
+    if cancelled.load(Ordering::Relaxed) {
+        Err(OperationError::new(
+            ErrorCode::JobCancelled,
+            "snapshot operation was cancelled",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn selected_layers(changes: &WorktreeChanges) -> Vec<ChangeLayer> {
@@ -1076,10 +1476,18 @@ pub(crate) struct PublicationPoint {
 
 #[cfg(test)]
 type PublicationHook = Box<dyn FnOnce(&PublicationPoint) -> Result<(), OperationError>>;
+#[cfg(test)]
+type SeedOpenHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+type ReviewHook = Box<dyn FnOnce(&Path) -> Result<(), OperationError>>;
 
 #[cfg(test)]
 thread_local! {
     static BEFORE_MANIFEST_HOOK: RefCell<Option<PublicationHook>> = RefCell::new(None);
+    static HASH_CHUNK_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static BEFORE_SEED_OPEN_HOOK: RefCell<Option<SeedOpenHook>> = RefCell::new(None);
+    static BEFORE_REVIEW_HOOK: RefCell<Option<ReviewHook>> = RefCell::new(None);
+    static BEFORE_GRAPH_LOAD_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -1095,6 +1503,45 @@ fn before_manifest_publication(point: &PublicationPoint) -> Result<(), Operation
         let hook = slot.borrow_mut().take();
         hook.map_or(Ok(()), |hook| hook(point))
     })
+}
+
+#[cfg(test)]
+fn set_hash_chunk_hook_for_test(hook: impl FnOnce() + 'static) {
+    HASH_CHUNK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_seed_open_hook_for_test(hook: impl FnOnce(&Path) + 'static) {
+    BEFORE_SEED_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn set_before_review_hook_for_test(
+    hook: impl FnOnce(&Path) -> Result<(), OperationError> + 'static,
+) {
+    BEFORE_REVIEW_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn before_review_publication(path: &Path) -> Result<(), OperationError> {
+    BEFORE_REVIEW_HOOK.with(|slot| {
+        let hook = slot.borrow_mut().take();
+        hook.map_or(Ok(()), |hook| hook(path))
+    })
+}
+
+#[cfg(test)]
+fn set_before_graph_load_hook_for_test(hook: impl FnOnce() + 'static) {
+    BEFORE_GRAPH_LOAD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn before_graph_load() {
+    BEFORE_GRAPH_LOAD_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 pub fn resolve_request(
@@ -1469,7 +1916,7 @@ mod tests {
             fresh.get(&completion.snapshot_id).unwrap_err().code,
             ErrorCode::SnapshotNotFound
         );
-        fresh.attach(&identity).unwrap();
+        fresh.attach(&identity, &AtomicBool::new(false)).unwrap();
         assert_eq!(
             fresh.get(&completion.snapshot_id).unwrap().graph_image_id,
             completion.graph_image_id
@@ -1546,6 +1993,185 @@ mod tests {
     }
 
     #[test]
+    fn rejected_cache_is_quarantined_only_by_its_repository() {
+        let first_root = repository_with_source("rejected-first", "fn first() {}\n");
+        let second_root = repository_with_source("rejected-second", "fn second() {}\n");
+        let first_engine = test_engine(&first_root);
+        let completion = first_engine
+            .build_snapshot(
+                resolved_commit(&first_engine, &first_root, "HEAD", "HEAD"),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let manifest_path = first_root
+            .join(".git/graphr/v6/snapshots")
+            .join(format!("{}.json", completion.snapshot_id));
+        let manifest: super::SnapshotManifest =
+            rmcp::serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        fs::write(
+            first_root
+                .join(".git/graphr/v6/reviews")
+                .join(format!("{}.json", manifest.review_id)),
+            b"corrupt",
+        )
+        .unwrap();
+
+        let roots =
+            Arc::new(AllowedRoots::new(vec![first_root.clone(), second_root.clone()]).unwrap());
+        let first = roots.inspect(&first_root, &AtomicBool::new(false)).unwrap();
+        let second = roots
+            .inspect(&second_root, &AtomicBool::new(false))
+            .unwrap();
+        let catalog = SnapshotCatalog::new(roots);
+        catalog.attach(&first, &AtomicBool::new(false)).unwrap();
+
+        catalog
+            .quarantine_rejected(&second, &"b".repeat(64))
+            .unwrap();
+
+        assert!(manifest_path.exists());
+        assert_eq!(
+            catalog.get(&completion.snapshot_id).unwrap_err().code,
+            ErrorCode::CacheCorrupt
+        );
+        fs::remove_dir_all(first_root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn attach_evicts_loaded_snapshot_after_manifest_disappears() {
+        let root = repository_with_source("manifest-removed", "fn source() {}\n");
+        let engine = test_engine(&root);
+        let completion = engine
+            .build_snapshot(
+                resolved_commit(&engine, &root, "HEAD", "HEAD"),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let roots = Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap());
+        let identity = roots.inspect(&root, &AtomicBool::new(false)).unwrap();
+        let catalog = SnapshotCatalog::new(roots);
+        catalog.attach(&identity, &AtomicBool::new(false)).unwrap();
+        catalog.get(&completion.snapshot_id).unwrap();
+        fs::remove_file(
+            root.join(".git/graphr/v6/snapshots")
+                .join(format!("{}.json", completion.snapshot_id)),
+        )
+        .unwrap();
+
+        catalog.attach(&identity, &AtomicBool::new(false)).unwrap();
+
+        assert_eq!(
+            catalog.get(&completion.snapshot_id).unwrap_err().code,
+            ErrorCode::SnapshotNotFound
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_rejects_oversized_review_before_sidecar() {
+        let root = repository_with_source("oversized-review", "fn source() {}\n");
+        let engine = test_engine(&root);
+        let completion = engine
+            .build_snapshot(
+                resolved_commit(&engine, &root, "HEAD", "HEAD"),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let oversized = vec![b'x'; super::REVIEW_SIZE_LIMIT as usize + 1];
+        let review_id = blake3::hash(&oversized).to_hex().to_string();
+        let roots = Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap());
+        let identity = roots.inspect(&root, &AtomicBool::new(false)).unwrap();
+        let catalog = SnapshotCatalog::new(roots);
+        let job = catalog.begin(&identity).unwrap();
+        let mut provenance = completion.provenance;
+        provenance.snapshot_id = "a".repeat(64);
+
+        let error = catalog
+            .publish(
+                &job,
+                &completion.graph_image_id,
+                &review_id,
+                &oversized,
+                None,
+                DependencyMode::Boundary,
+                None,
+                provenance,
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(
+            !root
+                .join(".git/graphr/v6/reviews")
+                .join(format!("{review_id}.json"))
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_rejects_oversized_manifest_before_marker() {
+        let root = repository_with_source("oversized-manifest", "fn source() {}\n");
+        let engine = test_engine(&root);
+        let mut request = resolved_commit(&engine, &root, "HEAD", "HEAD");
+        request.base_ref = "x".repeat(super::MANIFEST_SIZE_LIMIT as usize);
+
+        let error = engine
+            .build_snapshot(request, &AtomicBool::new(false), |_| {})
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(
+            fs::read_dir(root.join(".git/graphr/v6/snapshots"))
+                .unwrap()
+                .count(),
+            0
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_reader_stops_after_limit_plus_one_when_file_grows() {
+        let mut reader = std::io::Cursor::new(vec![b'x'; 32]);
+
+        let error = super::read_exact_bounded(&mut reader, 1, 4).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(reader.position(), 5);
+    }
+
+    #[test]
+    fn attach_honors_cancellation_during_graph_hashing() {
+        let root = repository_with_source("attach-cancel", "fn source() {}\n");
+        let engine = test_engine(&root);
+        engine
+            .build_snapshot(
+                resolved_commit(&engine, &root, "HEAD", "HEAD"),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let roots = Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap());
+        let identity = roots.inspect(&root, &AtomicBool::new(false)).unwrap();
+        let catalog = SnapshotCatalog::new(roots);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        super::set_hash_chunk_hook_for_test({
+            let cancelled = cancelled.clone();
+            move || cancelled.store(true, std::sync::atomic::Ordering::Relaxed)
+        });
+
+        let error = catalog.attach(&identity, &cancelled).unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::JobCancelled);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn failed_publication_preserves_the_previous_snapshot() {
         let root = repository_with_source("publication-rollback", "fn first() {}\n");
         fs::write(root.join("src/lib.rs"), "fn second() {}\n").unwrap();
@@ -1610,6 +2236,72 @@ mod tests {
     }
 
     #[test]
+    fn publication_uses_validated_directory_after_component_swap() {
+        let root = repository_with_source("cache-component-swap", "fn source() {}\n");
+        let outside = temp_root("cache-component-swap-outside");
+        fs::create_dir(&outside).unwrap();
+        let engine = test_engine(&root);
+        let original = root.join(".git/graphr/v6/reviews-original");
+        super::set_before_review_hook_for_test({
+            let outside = outside.clone();
+            let original = original.clone();
+            move |review_path| {
+                let reviews = review_path.parent().unwrap();
+                fs::rename(reviews, &original).unwrap();
+                std::os::unix::fs::symlink(&outside, reviews).unwrap();
+                Ok(())
+            }
+        });
+
+        let completion = engine
+            .build_snapshot(
+                resolved_commit(&engine, &root, "HEAD", "HEAD"),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+
+        store::Store::open_reader(&engine.snapshot(&completion.snapshot_id).unwrap().graph_path)
+            .unwrap();
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&original).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn attachment_does_not_follow_graph_directory_created_after_validation() {
+        let root = repository_with_source("missing-graph-swap", "fn source() {}\n");
+        let engine = test_engine(&root);
+        let completion = engine
+            .build_snapshot(
+                resolved_commit(&engine, &root, "HEAD", "HEAD"),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let graph_directory = root.join(".git/graphr/v6/graphs");
+        let outside = root.join("outside-graphs");
+        fs::rename(&graph_directory, &outside).unwrap();
+        super::set_before_graph_load_hook_for_test({
+            let graph_directory = graph_directory.clone();
+            let outside = outside.clone();
+            move || std::os::unix::fs::symlink(outside, graph_directory).unwrap()
+        });
+        let roots = Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap());
+        let identity = roots.inspect(&root, &AtomicBool::new(false)).unwrap();
+        let catalog = SnapshotCatalog::new(roots);
+
+        catalog.attach(&identity, &AtomicBool::new(false)).unwrap();
+
+        assert_eq!(
+            catalog.get(&completion.snapshot_id).unwrap_err().code,
+            ErrorCode::SnapshotIncomplete
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn attached_manifest_reauthorizes_its_worktree() {
         let fixture = linked_worktrees("manifest-authorization");
         let engine = Engine::new(Arc::new(
@@ -1628,7 +2320,7 @@ mod tests {
             .unwrap();
         let catalog = SnapshotCatalog::new(roots);
 
-        catalog.attach(&identity).unwrap();
+        catalog.attach(&identity, &AtomicBool::new(false)).unwrap();
 
         assert_eq!(
             catalog.get(&completion.snapshot_id).unwrap_err().code,

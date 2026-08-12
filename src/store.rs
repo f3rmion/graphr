@@ -168,6 +168,23 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path, rebuild: bool, cancelled: &AtomicBool) -> Result<Self> {
+        Self::open_with_parent(path, rebuild, cancelled, false)
+    }
+
+    pub(crate) fn open_private_image(
+        path: &Path,
+        rebuild: bool,
+        cancelled: &AtomicBool,
+    ) -> Result<Self> {
+        Self::open_with_parent(path, rebuild, cancelled, true)
+    }
+
+    fn open_with_parent(
+        path: &Path,
+        rebuild: bool,
+        cancelled: &AtomicBool,
+        descriptor_parent: bool,
+    ) -> Result<Self> {
         check_cancelled(cancelled)?;
         let parent = path
             .parent()
@@ -179,14 +196,20 @@ impl Store {
         }
         let metadata = fs::symlink_metadata(parent)
             .map_err(|error| format!("cannot inspect database directory: {error}"))?;
-        if !metadata.is_dir() {
+        if !metadata.is_dir()
+            && !(descriptor_parent
+                && parent.starts_with("/proc/self/fd")
+                && fs::metadata(parent).is_ok_and(|metadata| metadata.is_dir()))
+        {
             return Err("database directory is not a regular directory".into());
         }
 
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        if !descriptor_parent {
+            flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        }
         let connection = Connection::open_with_flags(path, flags)
             .map_err(|error| format!("cannot open database {}: {error}", path.display()))?;
         connection.busy_timeout(Duration::ZERO).map_err(db_error)?;
@@ -216,9 +239,10 @@ impl Store {
     }
 
     pub fn open_reader(path: &Path) -> Result<Self> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let mut flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        if !path.parent().is_some_and(is_process_descriptor_directory) {
+            flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        }
         let connection = Connection::open_with_flags(path, flags)
             .map_err(|error| format!("cannot open database {}: {error}", path.display()))?;
         connection
@@ -784,9 +808,10 @@ pub fn validate_image(path: &Path) -> Result<State> {
         return Err("database image is not a regular file".into());
     }
     require_no_sidecars(path)?;
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let mut flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    if !path.parent().is_some_and(is_process_descriptor_directory) {
+        flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    }
     let connection = Connection::open_with_flags(path, flags)
         .map_err(|error| format!("cannot open database {}: {error}", path.display()))?;
     connection.busy_timeout(Duration::ZERO).map_err(db_error)?;
@@ -807,6 +832,25 @@ pub fn validate_image(path: &Path) -> Result<State> {
     require_integrity(&connection)?;
     require_no_sidecars(path)?;
     Ok(state)
+}
+
+fn is_process_descriptor_directory(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(std::path::Component::RootDir))
+        && components
+            .next()
+            .is_some_and(|part| part.as_os_str() == "proc")
+        && components
+            .next()
+            .is_some_and(|part| part.as_os_str() == "self")
+        && components
+            .next()
+            .is_some_and(|part| part.as_os_str() == "fd")
+        && components
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit()))
+        && components.next().is_none()
 }
 
 fn require_no_sidecars(path: &Path) -> Result<()> {
