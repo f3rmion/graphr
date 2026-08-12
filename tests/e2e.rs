@@ -1764,7 +1764,11 @@ fn assert_semantic_records(changes: &ChangesCapture, expected: &[String]) {
     assert_eq!(actual, expected);
 }
 
-type GraphRecord = (String, String, String, u32);
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum GraphRecord {
+    Symbol(String, String, String, u32),
+    File(String, u32),
+}
 
 fn parse_graph_records(output: &str) -> Result<BTreeSet<GraphRecord>, String> {
     let mut records = BTreeSet::new();
@@ -1820,25 +1824,34 @@ fn parse_graph_line(line: &str) -> Result<Option<GraphRecord>, String> {
 }
 
 fn parse_graph_node(node: &str) -> Result<GraphRecord, String> {
-    let fields = node.split_ascii_whitespace().collect::<Vec<_>>();
-    let [node_ref, kind, name, path_line] = fields.as_slice() else {
-        return Err(invalid_graph(node));
-    };
-    if !valid_node_ref(node_ref) || !matches!(*kind, "File" | "Type" | "Function" | "Test") {
+    let (node_ref, fields) = node.split_once(' ').ok_or_else(|| invalid_graph(node))?;
+    let (kind, payload_line) = fields.split_once(' ').ok_or_else(|| invalid_graph(node))?;
+    if !valid_node_ref(node_ref)
+        || !matches!(kind, "File" | "Type" | "Function" | "Test")
+        || payload_line.is_empty()
+        || payload_line.starts_with(' ')
+    {
         return Err(invalid_graph(node));
     }
-    let (path, raw_line) = path_line
+    let (payload, raw_line) = payload_line
         .rsplit_once(':')
-        .filter(|(path, _)| !path.is_empty())
+        .filter(|(payload, _)| !payload.is_empty())
         .ok_or_else(|| invalid_graph(node))?;
     let line = raw_line
         .parse::<u32>()
         .ok()
         .filter(|line| *line > 0 && raw_line == line.to_string())
         .ok_or_else(|| invalid_graph(node))?;
-    Ok((
-        (*kind).to_owned(),
-        (*name).to_owned(),
+    if kind == "File" {
+        return Ok(GraphRecord::File(payload.to_owned(), line));
+    }
+    let (name, path) = payload
+        .split_once(' ')
+        .filter(|(name, path)| !name.is_empty() && !path.is_empty() && !path.starts_with(' '))
+        .ok_or_else(|| invalid_graph(node))?;
+    Ok(GraphRecord::Symbol(
+        kind.to_owned(),
+        name.to_owned(),
         path.to_owned(),
         line,
     ))
@@ -1915,6 +1928,60 @@ fn invalid_graph(line: &str) -> String {
 }
 
 #[test]
+fn graph_record_parser_preserves_ascii_spaces_inside_paths() {
+    const REF: &str =
+        "n1:0000000000000000000000000000000000000000000000000000000000000000:deadbeef:0:1";
+
+    assert_eq!(
+        parse_graph_records(&format!("{REF} Function one_space src/one space.rs:2")).unwrap(),
+        BTreeSet::from([GraphRecord::Symbol(
+            "Function".to_owned(),
+            "one_space".to_owned(),
+            "src/one space.rs".to_owned(),
+            2,
+        )])
+    );
+    assert_eq!(
+        parse_graph_records(&format!(
+            "{REF} Function repeated_spaces src/repeated  spaces.rs:3"
+        ))
+        .unwrap(),
+        BTreeSet::from([GraphRecord::Symbol(
+            "Function".to_owned(),
+            "repeated_spaces".to_owned(),
+            "src/repeated  spaces.rs".to_owned(),
+            3,
+        )])
+    );
+    assert_eq!(
+        parse_graph_records(&format!("{REF} File src/file name.rs src/file name.rs:4")).unwrap(),
+        BTreeSet::from([GraphRecord::File(
+            "src/file name.rs src/file name.rs".to_owned(),
+            4,
+        )])
+    );
+}
+
+#[test]
+fn graph_record_parser_rejects_noncanonical_field_whitespace() {
+    const REF: &str =
+        "n1:0000000000000000000000000000000000000000000000000000000000000000:deadbeef:0:1";
+
+    for malformed in [
+        format!("{REF}  Function name src/lib.rs:1"),
+        format!("{REF} Function  name src/lib.rs:1"),
+        format!("{REF} Function name  src/lib.rs:1"),
+        format!(" {REF} Function name src/lib.rs:1"),
+        format!("{REF} Function name src/lib.rs:1 "),
+    ] {
+        assert!(
+            parse_graph_records(&malformed).is_err(),
+            "unexpectedly accepted {malformed:?}"
+        );
+    }
+}
+
+#[test]
 fn graph_record_parser_accepts_only_complete_node_records() {
     const REF: &str =
         "n1:0000000000000000000000000000000000000000000000000000000000000000:deadbeef:0:1";
@@ -1922,7 +1989,7 @@ fn graph_record_parser_accepts_only_complete_node_records() {
     let bare = format!("{REF} Function bare src/lib.rs:1");
     assert_eq!(
         parse_graph_records(&bare).unwrap(),
-        BTreeSet::from([(
+        BTreeSet::from([GraphRecord::Symbol(
             "Function".to_owned(),
             "bare".to_owned(),
             "src/lib.rs".to_owned(),
@@ -1978,7 +2045,7 @@ fn assert_graph_records(changes: &ChangesCapture, expected: &[(&str, &str, &str,
     let expected = expected
         .iter()
         .map(|(kind, name, path, line)| {
-            (
+            GraphRecord::Symbol(
                 (*kind).to_owned(),
                 (*name).to_owned(),
                 (*path).to_owned(),
