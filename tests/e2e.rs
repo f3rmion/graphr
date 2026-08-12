@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -1617,6 +1617,27 @@ fn capture_changes(
     depth: u32,
     max_nodes: u32,
 ) -> ChangesCapture {
+    capture_changes_in_order(
+        client,
+        snapshot_id,
+        depth,
+        max_nodes,
+        [
+            ("files", "files_next_cursor"),
+            ("diff", "diff_next_cursor"),
+            ("artifacts", "artifacts_next_cursor"),
+            ("graph", "graph_next_cursor"),
+        ],
+    )
+}
+
+fn capture_changes_in_order(
+    client: &mut Client,
+    snapshot_id: &str,
+    depth: u32,
+    max_nodes: u32,
+    sections: [(&'static str, &'static str); 4],
+) -> ChangesCapture {
     let initial = capture_query(&client.call(
         "changes",
         rmcp::serde_json::json!({
@@ -1628,12 +1649,7 @@ fn capture_changes(
     assert_eq!(initial.provenance["snapshot_id"], snapshot_id);
     let review_complete = review_complete_when_pages_exhausted(&initial.text);
     let mut pages = BTreeMap::new();
-    for (section, cursor_label) in [
-        ("files", "files_next_cursor"),
-        ("diff", "diff_next_cursor"),
-        ("artifacts", "artifacts_next_cursor"),
-        ("graph", "graph_next_cursor"),
-    ] {
+    for (section, cursor_label) in sections {
         let mut section_pages = Vec::new();
         let mut cursor = page_cursor(&initial.text, cursor_label);
         assert_eq!(
@@ -2975,6 +2991,263 @@ fn linked_worktrees_report_shared_repository_and_distinct_workspace_identity() {
 }
 
 #[test]
+fn two_linked_worktrees_index_concurrently_without_cross_contamination() {
+    let mut worktrees = linked_worktrees("concurrent-isolation");
+    let second = worktrees.add("linked-two");
+    fs::write(second.join("second.txt"), "second\n").unwrap();
+    git(&second, &["add", "--", "second.txt"]);
+    git_commit(&second, "second linked head");
+
+    fs::write(
+        worktrees.linked.join("src/left.rs"),
+        "pub fn left_staged_symbol() {}\n",
+    )
+    .unwrap();
+    git(&worktrees.linked, &["add", "--", "src/left.rs"]);
+    fs::write(
+        second.join("src/right.rs"),
+        "pub fn right_staged_symbol() {}\n",
+    )
+    .unwrap();
+    git(&second, &["add", "--", "src/right.rs"]);
+    let left_before = repository_state(&worktrees.linked);
+    let right_before = repository_state(&second);
+
+    let blocker = GitBlocker::new(&worktrees.root, 2);
+    blocker.block();
+    let mut client = Client::start_unindexed_with(&worktrees.linked, |command| {
+        command.arg("--allow-root").arg(&second);
+        blocker.configure(command);
+    });
+    let left_queued = response_json(&client.call(
+        "index",
+        rmcp::serde_json::json!({
+            "worktree_root": &worktrees.linked,
+            "base": "HEAD",
+            "head": "HEAD",
+            "target": { "kind": "worktree", "include_untracked": true },
+            "dependency_mode": "boundary",
+        }),
+    ));
+    let right_queued = response_json(&client.call(
+        "index",
+        rmcp::serde_json::json!({
+            "worktree_root": &second,
+            "base": "HEAD",
+            "head": "HEAD",
+            "target": { "kind": "worktree", "include_untracked": true },
+            "dependency_mode": "boundary",
+        }),
+    ));
+    let left_job = left_queued["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap();
+    let right_job = right_queued["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap();
+    assert_ne!(left_job, right_job);
+    let entered = blocker.wait_for_entries(2);
+    assert!(
+        entered
+            .iter()
+            .any(|entry| entry.contains(worktrees.linked.to_str().unwrap())),
+        "{entered:?}"
+    );
+    assert!(
+        entered
+            .iter()
+            .any(|entry| entry.contains(second.to_str().unwrap())),
+        "{entered:?}"
+    );
+    for job_id in [left_job, right_job] {
+        let status = response_json(&client.call(
+            "index_status",
+            rmcp::serde_json::json!({ "job_id": job_id }),
+        ));
+        assert_eq!(
+            status["result"]["structuredContent"]["state"]["state"], "capturing",
+            "both jobs must be active before release: {status}"
+        );
+    }
+
+    let left_inspection = response_json(&client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({ "worktree_root": &worktrees.linked }),
+    ));
+    let right_inspection = response_json(&client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({ "worktree_root": &second }),
+    ));
+    let left_identity = &left_inspection["result"]["structuredContent"]["identity"];
+    let right_identity = &right_inspection["result"]["structuredContent"]["identity"];
+    for inspection in [&left_inspection, &right_inspection] {
+        let root = &inspection["result"]["structuredContent"];
+        assert_eq!(root["staged_paths"], 1);
+        assert_eq!(root["unstaged_paths"], 0);
+        assert_eq!(root["untracked_paths"], 0);
+    }
+    assert_eq!(
+        left_identity["repository_id"],
+        right_identity["repository_id"]
+    );
+    assert_eq!(
+        left_identity["common_git_dir"],
+        right_identity["common_git_dir"]
+    );
+    for field in [
+        "workspace_id",
+        "worktree_root",
+        "git_dir",
+        "head_oid",
+        "index_path",
+    ] {
+        assert_ne!(left_identity[field], right_identity[field], "{field}");
+    }
+
+    blocker.release();
+    let left_completed = client.wait_for_job(left_job, "completed");
+    let right_completed = client.wait_for_job(right_job, "completed");
+    let left_status = &left_completed["result"]["structuredContent"];
+    let right_status = &right_completed["result"]["structuredContent"];
+    assert_eq!(left_status["request"]["root"], *left_identity);
+    assert_eq!(right_status["request"]["root"], *right_identity);
+    let left = &left_status["state"]["completion"];
+    let right = &right_status["state"]["completion"];
+    let left_provenance = &left["provenance"];
+    let right_provenance = &right["provenance"];
+    assert_eq!(
+        left_provenance["repository_id"],
+        right_provenance["repository_id"]
+    );
+    assert_eq!(
+        left_provenance["common_git_dir"],
+        right_provenance["common_git_dir"]
+    );
+    for field in [
+        "workspace_id",
+        "snapshot_id",
+        "repository_root",
+        "worktree_root",
+        "git_dir",
+        "head_oid",
+        "dirty_digest",
+    ] {
+        assert_ne!(left_provenance[field], right_provenance[field], "{field}");
+    }
+    for provenance in [left_provenance, right_provenance] {
+        assert_eq!(provenance["target_state"]["kind"], "worktree");
+        assert_eq!(
+            provenance["selected_layers"],
+            rmcp::serde_json::json!(["staged"])
+        );
+        assert_eq!(provenance["changed_files"], 1);
+    }
+    assert_ne!(left["graph_image_id"], right["graph_image_id"]);
+
+    let left_cache = cached_snapshot(left);
+    let right_cache = cached_snapshot(right);
+    assert_eq!(left_cache.manifest["provenance"], *left_provenance);
+    assert_eq!(right_cache.manifest["provenance"], *right_provenance);
+    assert_ne!(left_cache.graph_path, right_cache.graph_path);
+    assert_ne!(
+        left_cache.files[&left_cache.graph_path].bytes,
+        right_cache.files[&right_cache.graph_path].bytes
+    );
+    for cache in [&left_cache, &right_cache] {
+        assert_eq!(cache.files[&cache.graph_path].mode & 0o222, 0);
+        assert!(!PathBuf::from(format!("{}-wal", cache.graph_path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", cache.graph_path.display())).exists());
+    }
+
+    let left_snapshot = left["snapshot_id"].as_str().unwrap();
+    let right_snapshot = right["snapshot_id"].as_str().unwrap();
+    let left_search = capture_query(&client.call(
+        "search",
+        rmcp::serde_json::json!({
+            "snapshot_id": left_snapshot,
+            "query": "left_staged_symbol",
+            "kind": "function",
+        }),
+    ));
+    let right_search = capture_query(&client.call(
+        "search",
+        rmcp::serde_json::json!({
+            "snapshot_id": right_snapshot,
+            "query": "right_staged_symbol",
+            "kind": "function",
+        }),
+    ));
+    assert!(left_search.text.contains("left_staged_symbol"));
+    assert!(!left_search.text.contains("right_staged_symbol"));
+    assert!(right_search.text.contains("right_staged_symbol"));
+    assert!(!right_search.text.contains("left_staged_symbol"));
+    let left_view = capture_query(&client.call(
+        "view",
+        rmcp::serde_json::json!({
+            "snapshot_id": left_snapshot,
+            "node_ref": left_search.text.split_whitespace().next().unwrap(),
+            "depth": 1,
+            "max_nodes": 30,
+        }),
+    ));
+    let right_view = capture_query(&client.call(
+        "view",
+        rmcp::serde_json::json!({
+            "snapshot_id": right_snapshot,
+            "node_ref": right_search.text.split_whitespace().next().unwrap(),
+            "depth": 1,
+            "max_nodes": 30,
+        }),
+    ));
+    assert!(left_view.text.contains("left_staged_symbol"));
+    assert!(!left_view.text.contains("right_staged_symbol"));
+    assert!(right_view.text.contains("right_staged_symbol"));
+    assert!(!right_view.text.contains("left_staged_symbol"));
+    let left_changes = capture_changes(&mut client, left_snapshot, 6, 50);
+    let right_changes = capture_changes_in_order(
+        &mut client,
+        right_snapshot,
+        6,
+        50,
+        [
+            ("graph", "graph_next_cursor"),
+            ("artifacts", "artifacts_next_cursor"),
+            ("diff", "diff_next_cursor"),
+            ("files", "files_next_cursor"),
+        ],
+    );
+    assert_change_manifest(
+        &left_changes,
+        &["added source rust src/left.rs additions=1 deletions=0 layers=staged".into()],
+    );
+    assert_change_manifest(
+        &right_changes,
+        &["added source rust src/right.rs additions=1 deletions=0 layers=staged".into()],
+    );
+    assert_graph_records(
+        &left_changes,
+        &[("Function", "left_staged_symbol", "src/left.rs", 1)],
+    );
+    assert_graph_records(
+        &right_changes,
+        &[("Function", "right_staged_symbol", "src/right.rs", 1)],
+    );
+    for capture in [&left_search, &left_view, &left_changes.initial] {
+        assert_eq!(capture.provenance, *left_provenance);
+        assert!(!capture.text.contains("src/right.rs"), "{}", capture.text);
+    }
+    for capture in [&right_search, &right_view, &right_changes.initial] {
+        assert_eq!(capture.provenance, *right_provenance);
+        assert!(!capture.text.contains("src/left.rs"), "{}", capture.text);
+    }
+    assert_eq!(cached_snapshot(left), left_cache);
+    assert_eq!(cached_snapshot(right), right_cache);
+    assert_eq!(repository_state(&worktrees.linked), left_before);
+    assert_eq!(repository_state(&second), right_before);
+    client.close();
+}
+
+#[test]
 fn commit_target_reviews_a_branch_without_checking_it_out() {
     let fixture = Fixture::new();
     let repository = fixture.path.join("repository");
@@ -3098,6 +3371,353 @@ fn identical_clean_oids_return_explained_no_changes() {
 }
 
 #[test]
+fn long_indexing_keeps_status_inspect_and_existing_snapshot_queries_responsive() {
+    let repository = Fixture::new();
+    let controls = Fixture::new();
+    fs::create_dir_all(repository.path.join("src")).unwrap();
+    fs::write(
+        repository.path.join("src/lib.rs"),
+        "pub fn baseline_symbol() {}\n",
+    )
+    .unwrap();
+    init_git(&repository.path);
+    git(&repository.path, &["add", "--", "."]);
+    git_commit(&repository.path, "baseline");
+    fs::write(
+        repository.path.join("src/lib.rs"),
+        "pub fn baseline_symbol() {}\npub fn stable_snapshot_symbol() {}\n",
+    )
+    .unwrap();
+
+    let blocker = GitBlocker::new(&controls.path, 1);
+    let mut client = Client::start_unindexed_with(&repository.path, |command| {
+        blocker.configure(command);
+    });
+    let completion = client.index_and_wait("boundary");
+    let snapshot_id = completion["snapshot_id"].as_str().unwrap().to_owned();
+    let provenance = completion["provenance"].clone();
+    let old_search = capture_query(&client.search("stable_snapshot_symbol", Some("function")));
+    let node_ref = old_search
+        .text
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let old_view = capture_query(&client.view(&node_ref, 1, 30));
+    let old_changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    for capture in [&old_search, &old_view, &old_changes.initial] {
+        assert_eq!(capture.provenance, provenance);
+    }
+    let old_cache = cached_snapshot(&completion);
+    let cache_root =
+        Path::new(completion["provenance"]["common_git_dir"].as_str().unwrap()).join("graphr/v6");
+    let old_cache_tree = worktree_bytes(&cache_root, &cache_root);
+
+    fs::write(
+        repository.path.join("src/lib.rs"),
+        "pub fn baseline_symbol() {}\npub fn stable_snapshot_symbol() {}\npub fn pending_cancelled_symbol() {}\n",
+    )
+    .unwrap();
+    let intended_state = repository_state(&repository.path);
+    blocker.block();
+    let job_id = client.queue_index("boundary");
+    blocker.wait_for_entries(1);
+
+    let status = response_json(&client.call(
+        "index_status",
+        rmcp::serde_json::json!({ "job_id": &job_id }),
+    ));
+    assert_eq!(
+        status["result"]["structuredContent"]["state"]["state"], "capturing",
+        "{status}"
+    );
+    let inspection = response_json(&client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({
+            "worktree_root": &repository.path,
+            "snapshot_id": &snapshot_id,
+        }),
+    ));
+    assert_eq!(
+        inspection["result"]["structuredContent"]["snapshot_matches_worktree"], false,
+        "{inspection}"
+    );
+    let blocked_search = capture_query(&client.search("stable_snapshot_symbol", Some("function")));
+    let blocked_view = capture_query(&client.view(&node_ref, 1, 30));
+    let blocked_changes = capture_changes_in_order(
+        &mut client,
+        &snapshot_id,
+        6,
+        50,
+        [
+            ("artifacts", "artifacts_next_cursor"),
+            ("graph", "graph_next_cursor"),
+            ("files", "files_next_cursor"),
+            ("diff", "diff_next_cursor"),
+        ],
+    );
+    assert_eq!(blocked_search, old_search);
+    assert_eq!(blocked_view, old_view);
+    assert_eq!(blocked_changes, old_changes);
+
+    let cancel = response_json(&client.call(
+        "cancel_index",
+        rmcp::serde_json::json!({ "job_id": &job_id }),
+    ));
+    assert_ne!(
+        cancel["result"]["structuredContent"]["state"]["state"], "completed",
+        "{cancel}"
+    );
+    blocker.release();
+    client.wait_for_job(&job_id, "cancelled");
+
+    assert_eq!(
+        capture_query(&client.search("stable_snapshot_symbol", Some("function"))),
+        old_search
+    );
+    assert_eq!(capture_query(&client.view(&node_ref, 1, 30)), old_view);
+    assert_eq!(
+        capture_changes(&mut client, &snapshot_id, 6, 50),
+        old_changes
+    );
+    assert_eq!(cached_snapshot(&completion), old_cache);
+    assert_eq!(worktree_bytes(&cache_root, &cache_root), old_cache_tree);
+    assert_eq!(repository_state(&repository.path), intended_state);
+    client.close();
+}
+
+#[test]
+fn linked_feature_with_ten_commits_and_twelve_files_returns_replay_symbols() {
+    let worktrees = linked_worktrees("ten-commit-divergence");
+    let base_oid = git_output(&worktrees.main, &["rev-parse", "HEAD"]);
+    let source = |prefix: &str| {
+        (0..12)
+            .map(|index| {
+                format!(
+                    "pub fn {prefix}_{index:02}() {{ let _ = \"{}\"; }}\n",
+                    "generic_divergence_content_".repeat(8)
+                )
+            })
+            .collect::<String>()
+    };
+    for commit in 0..9 {
+        match commit {
+            0 => {
+                fs::write(
+                    worktrees.linked.join("src/replay.rs"),
+                    format!(
+                        "pub fn replay_entry() {{ replay_step_00(); }}\n{}",
+                        source("replay_step")
+                    ),
+                )
+                .unwrap();
+                fs::write(
+                    worktrees.linked.join("linked.txt"),
+                    (0..48)
+                        .map(|index| {
+                            format!(
+                                "generic record {index:02} {}\n",
+                                "divergence_value_".repeat(10)
+                            )
+                        })
+                        .collect::<String>(),
+                )
+                .unwrap();
+            }
+            1..=7 => {
+                let path = format!("src/change_{commit:02}_with_generic_divergence_evidence.rs");
+                fs::write(
+                    worktrees.linked.join(path),
+                    source(&format!("change_{commit:02}")),
+                )
+                .unwrap();
+            }
+            8 => {
+                for suffix in 8..=10 {
+                    let path =
+                        format!("src/change_{suffix:02}_with_generic_divergence_evidence.rs");
+                    fs::write(
+                        worktrees.linked.join(path),
+                        source(&format!("change_{suffix:02}")),
+                    )
+                    .unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+        git(&worktrees.linked, &["add", "--", "."]);
+        git_commit(&worktrees.linked, &format!("generic change {commit}"));
+    }
+    assert_eq!(
+        git_output(
+            &worktrees.linked,
+            &["rev-list", "--count", &format!("{base_oid}..HEAD")],
+        ),
+        "10"
+    );
+    let expected_paths = [
+        "linked.txt",
+        "src/change_01_with_generic_divergence_evidence.rs",
+        "src/change_02_with_generic_divergence_evidence.rs",
+        "src/change_03_with_generic_divergence_evidence.rs",
+        "src/change_04_with_generic_divergence_evidence.rs",
+        "src/change_05_with_generic_divergence_evidence.rs",
+        "src/change_06_with_generic_divergence_evidence.rs",
+        "src/change_07_with_generic_divergence_evidence.rs",
+        "src/change_08_with_generic_divergence_evidence.rs",
+        "src/change_09_with_generic_divergence_evidence.rs",
+        "src/change_10_with_generic_divergence_evidence.rs",
+        "src/replay.rs",
+    ];
+    assert_eq!(
+        git_output(
+            &worktrees.linked,
+            &["diff", "--name-only", &base_oid, "HEAD"],
+        )
+        .lines()
+        .collect::<Vec<_>>(),
+        expected_paths
+    );
+    let main_before = repository_state(&worktrees.main);
+    let feature_before = repository_state(&worktrees.linked);
+
+    let mut client = Client::start_unindexed_with(&worktrees.main, |command| {
+        command.arg("--allow-root").arg(&worktrees.linked);
+    });
+    let main = client.index_target_and_wait(
+        "HEAD",
+        "HEAD",
+        rmcp::serde_json::json!({ "kind": "commit" }),
+    );
+    let main_cache = cached_snapshot(&main);
+    let queued = response_json(&client.call(
+        "index",
+        rmcp::serde_json::json!({
+            "worktree_root": &worktrees.linked,
+            "base": &base_oid,
+            "head": "HEAD",
+            "target": { "kind": "commit" },
+            "dependency_mode": "boundary",
+        }),
+    ));
+    let job_id = queued["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap();
+    let completed = client.wait_for_job(job_id, "completed");
+    let completion = &completed["result"]["structuredContent"]["state"]["completion"];
+    let snapshot_id = completion["snapshot_id"].as_str().unwrap().to_owned();
+    client.snapshot_id = Some(snapshot_id.clone());
+    remember_graph(&worktrees.linked, completion);
+    let provenance = &completion["provenance"];
+    assert_eq!(provenance["commits_base_to_head"], 10);
+    assert_eq!(provenance["changed_files"], 12);
+    assert_eq!(provenance["target_state"]["kind"], "commit");
+    assert_eq!(
+        provenance["selected_layers"],
+        rmcp::serde_json::json!(["committed"])
+    );
+    assert!(
+        completion["stats"]["files_reused"].as_u64().unwrap() > 0,
+        "unchanged Rust/Python sources were not reused: {completion}"
+    );
+
+    let first_changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    assert!(!first_changes.initial.text.starts_with("no changes"));
+    for label in [
+        "files_next_cursor",
+        "diff_next_cursor",
+        "artifacts_next_cursor",
+        "graph_next_cursor",
+    ] {
+        assert!(
+            page_cursor(&first_changes.initial.text, label).is_some(),
+            "{label} missing: {}",
+            first_changes.initial.text
+        );
+    }
+    assert_eq!(
+        change_section_text(&first_changes, "files")
+            .lines()
+            .filter(|line| {
+                line.starts_with("added ")
+                    || line.starts_with("changed ")
+                    || line.starts_with("deleted ")
+                    || line.starts_with("renamed ")
+            })
+            .count(),
+        12
+    );
+    let graph = parse_graph_records(&change_section_text(&first_changes, "graph")).unwrap();
+    assert!(graph.contains(&GraphRecord::Symbol(
+        "Function".into(),
+        "replay_entry".into(),
+        "src/replay.rs".into(),
+        1,
+    )));
+    let search = capture_query(&client.search("replay_entry", Some("function")));
+    assert_eq!(
+        search.text.lines().collect::<Vec<_>>(),
+        [format!(
+            "{} Function replay_entry src/replay.rs:1",
+            search.text.split_whitespace().next().unwrap()
+        )]
+    );
+    let view = capture_query(&client.view(search.text.split_whitespace().next().unwrap(), 1, 30));
+    assert!(view.text.contains("Function replay_entry src/replay.rs:1"));
+    assert!(
+        view.text
+            .contains("Function replay_step_00 src/replay.rs:2")
+    );
+    for capture in [&search, &view, &first_changes.initial] {
+        assert_eq!(capture.provenance, *provenance);
+    }
+    let first_cache = cached_snapshot(completion);
+    assert_eq!(first_cache.manifest["provenance"], *provenance);
+    assert_eq!(first_cache.files[&first_cache.graph_path].mode & 0o222, 0);
+
+    let repeated = response_json(&client.call(
+        "index",
+        rmcp::serde_json::json!({
+            "worktree_root": &worktrees.linked,
+            "base": &base_oid,
+            "head": "HEAD",
+            "target": { "kind": "commit" },
+            "dependency_mode": "boundary",
+        }),
+    ));
+    let repeated_job = repeated["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap();
+    let repeated = client.wait_for_job(repeated_job, "completed");
+    let repeated = &repeated["result"]["structuredContent"]["state"]["completion"];
+    assert_eq!(repeated["snapshot_id"], completion["snapshot_id"]);
+    assert_eq!(repeated["graph_image_id"], completion["graph_image_id"]);
+    assert_eq!(repeated["provenance"], *provenance);
+    assert_eq!(
+        repeated["stats"]["files_reused"], repeated["stats"]["files_total"],
+        "exact graph was not fully reused: {repeated}"
+    );
+    let reused_changes = capture_changes_in_order(
+        &mut client,
+        &snapshot_id,
+        6,
+        50,
+        [
+            ("diff", "diff_next_cursor"),
+            ("files", "files_next_cursor"),
+            ("graph", "graph_next_cursor"),
+            ("artifacts", "artifacts_next_cursor"),
+        ],
+    );
+    assert_eq!(reused_changes, first_changes);
+    assert_eq!(cached_snapshot(repeated), first_cache);
+    assert_eq!(cached_snapshot(&main), main_cache);
+    assert_eq!(repository_state(&worktrees.main), main_before);
+    assert_eq!(repository_state(&worktrees.linked), feature_before);
+    client.close();
+}
+
+#[test]
 fn queued_jobs_ignore_request_cancellation_and_eof_closes_them() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
@@ -3201,6 +3821,57 @@ fn graph_path(path: &Path) -> PathBuf {
         .get(&fs::canonicalize(path).unwrap())
         .cloned()
         .expect("repository was indexed")
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CachedFile {
+    bytes: Vec<u8>,
+    mode: u32,
+    len: u64,
+    inode: u64,
+    modified: (i64, i64),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CachedSnapshot {
+    graph_path: PathBuf,
+    files: BTreeMap<PathBuf, CachedFile>,
+    manifest: rmcp::serde_json::Value,
+}
+
+fn cached_snapshot(completion: &rmcp::serde_json::Value) -> CachedSnapshot {
+    let cache =
+        Path::new(completion["provenance"]["common_git_dir"].as_str().unwrap()).join("graphr/v6");
+    let snapshot_id = completion["snapshot_id"].as_str().unwrap();
+    let graph_image_id = completion["graph_image_id"].as_str().unwrap();
+    let manifest_path = cache.join("snapshots").join(format!("{snapshot_id}.json"));
+    let manifest: rmcp::serde_json::Value =
+        rmcp::serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let review_path = cache
+        .join("reviews")
+        .join(format!("{}.json", manifest["review_id"].as_str().unwrap()));
+    let graph_path = cache.join("graphs").join(format!("{graph_image_id}.db"));
+    let files = [&graph_path, &review_path, &manifest_path]
+        .into_iter()
+        .map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                path.clone(),
+                CachedFile {
+                    bytes: fs::read(path).unwrap(),
+                    mode: metadata.mode(),
+                    len: metadata.len(),
+                    inode: metadata.ino(),
+                    modified: (metadata.mtime(), metadata.mtime_nsec()),
+                },
+            )
+        })
+        .collect();
+    CachedSnapshot {
+        graph_path,
+        files,
+        manifest,
+    }
 }
 
 fn remember_graph(path: &Path, completion: &rmcp::serde_json::Value) {
@@ -3443,10 +4114,37 @@ struct LinkedWorktrees {
     root: PathBuf,
     main: PathBuf,
     linked: PathBuf,
+    extra: Vec<PathBuf>,
+}
+
+impl LinkedWorktrees {
+    fn add(&mut self, branch: &str) -> PathBuf {
+        let path = self.root.join(branch);
+        git(
+            &self.main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+            ],
+        );
+        self.extra.push(path.clone());
+        path
+    }
 }
 
 impl Drop for LinkedWorktrees {
     fn drop(&mut self) {
+        for linked in self.extra.iter().rev() {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(linked)
+                .current_dir(&self.main)
+                .status();
+        }
         let _ = Command::new("git")
             .args(["worktree", "remove", "--force"])
             .arg(&self.linked)
@@ -3468,8 +4166,19 @@ fn linked_worktrees(label: &str) -> LinkedWorktrees {
     let main = root.join("main");
     let linked = root.join("linked");
     init_git_main(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
     fs::write(main.join("baseline.txt"), "baseline\n").unwrap();
-    git(&main, &["add", "--", "baseline.txt"]);
+    fs::write(
+        main.join("src/shared.rs"),
+        "pub fn unchanged_rust_symbol() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        main.join("src/shared.py"),
+        "def unchanged_python_symbol():\n    pass\n",
+    )
+    .unwrap();
+    git(&main, &["add", "--", "."]);
     git_commit(&main, "baseline");
     git(
         &main,
@@ -3485,7 +4194,12 @@ fn linked_worktrees(label: &str) -> LinkedWorktrees {
     fs::write(linked.join("linked.txt"), "linked\n").unwrap();
     git(&linked, &["add", "--", "linked.txt"]);
     git_commit(&linked, "linked");
-    LinkedWorktrees { root, main, linked }
+    LinkedWorktrees {
+        root,
+        main,
+        linked,
+        extra: Vec::new(),
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -3563,6 +4277,85 @@ fn find_executable(name: &str) -> PathBuf {
         .find(|candidate| candidate.is_file())
         .and_then(|path| fs::canonicalize(path).ok())
         .unwrap_or_else(|| panic!("cannot find {name}"))
+}
+
+struct GitBlocker {
+    block: PathBuf,
+    entered: PathBuf,
+    claims: PathBuf,
+    permits: usize,
+    wrapper_path: std::ffi::OsString,
+    real_git: PathBuf,
+}
+
+impl GitBlocker {
+    fn new(root: &Path, permits: usize) -> Self {
+        let wrapper_dir = root.join("git-wrapper");
+        let wrapper = wrapper_dir.join("git");
+        let block = root.join("block-build");
+        let entered = root.join("build-entered");
+        let claims = root.join("build-claims");
+        fs::create_dir(&wrapper_dir).unwrap();
+        fs::create_dir(&entered).unwrap();
+        fs::create_dir(&claims).unwrap();
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = rev-list ] && [ -e \"$GRAPHR_BLOCK_BUILD\" ]; then\n    slot=1\n    while [ \"$slot\" -le \"$GRAPHR_BLOCK_PERMITS\" ]; do\n      if mkdir \"$GRAPHR_BLOCK_CLAIMS/$slot\" 2>/dev/null; then\n        marker=\"$GRAPHR_BUILD_ENTERED.$$.tmp\"\n        printf '%s\\n' \"$@\" > \"$marker\"\n        mv \"$marker\" \"$GRAPHR_BUILD_ENTERED/$$\"\n        while [ -e \"$GRAPHR_BLOCK_BUILD\" ]; do :; done\n        break\n      fi\n      slot=$((slot + 1))\n    done\n  fi\ndone\nexec \"$GRAPHR_REAL_GIT\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let wrapper_path = env::join_paths(
+            std::iter::once(wrapper_dir)
+                .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+        )
+        .unwrap();
+        Self {
+            block,
+            entered,
+            claims,
+            permits,
+            wrapper_path,
+            real_git: find_executable("git"),
+        }
+    }
+
+    fn configure(&self, command: &mut Command) {
+        command
+            .env("PATH", &self.wrapper_path)
+            .env("GRAPHR_REAL_GIT", &self.real_git)
+            .env("GRAPHR_BLOCK_BUILD", &self.block)
+            .env("GRAPHR_BUILD_ENTERED", &self.entered)
+            .env("GRAPHR_BLOCK_CLAIMS", &self.claims)
+            .env("GRAPHR_BLOCK_PERMITS", self.permits.to_string());
+    }
+
+    fn block(&self) {
+        fs::write(&self.block, []).unwrap();
+    }
+
+    fn release(&self) {
+        fs::remove_file(&self.block).unwrap();
+    }
+
+    fn wait_for_entries(&self, expected: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut entries = fs::read_dir(&self.entered)
+                .unwrap()
+                .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+                .collect::<Vec<_>>();
+            if entries.len() == expected && entries.iter().all(|entry| !entry.is_empty()) {
+                entries.sort();
+                return entries;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {expected} blocked Git commands, found {}",
+                entries.len()
+            );
+            thread::yield_now();
+        }
+    }
 }
 
 fn wait_for_file(path: &Path) {
