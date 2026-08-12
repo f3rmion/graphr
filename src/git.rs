@@ -22,6 +22,12 @@ const DEADLINE: Duration = Duration::from_secs(30);
 const SOURCE_LIMIT: u64 = 2 * 1024 * 1024;
 const OVERSIZED_BLOB: &str = "Git blob exceeds the source size limit";
 
+#[cfg(test)]
+type GitTestHook = Box<dyn FnMut(&Path, &[&str], Option<&Path>) + Send>;
+
+#[cfg(test)]
+static GIT_TEST_HOOK: std::sync::Mutex<Option<GitTestHook>> = std::sync::Mutex::new(None);
+
 pub struct Repository {
     pub root: PathBuf,
     pub git_dir: PathBuf,
@@ -309,6 +315,8 @@ struct WorktreeCapture {
     artifacts: TrackedArtifactSnapshot,
     inventory: Vec<u8>,
     untracked: UntrackedSnapshot,
+    head: Vec<u8>,
+    index: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -603,6 +611,7 @@ impl Repository {
         cancelled: &AtomicBool,
     ) -> Result<SnapshotCapture, OperationError> {
         validate_capture_root(capture_root)?;
+        let mut capture_guard = CaptureDirectoryGuard::new(capture_root);
         if !valid_lower_oid(base_oid.as_bytes()) || !valid_lower_oid(head_oid.as_bytes()) {
             return Err(OperationError::new(
                 ErrorCode::InvalidParameters,
@@ -658,11 +667,18 @@ impl Repository {
                     cancelled,
                 )
                 .map_err(capture_error)?;
+                let index_signature = run_with_index(
+                    &self.root,
+                    &["ls-files", "--stage", "-v", "-z"],
+                    &copied_index,
+                    cancelled,
+                )
+                .map_err(capture_error)?;
                 let first_digest = target_dirty_digest(
                     self,
                     target,
                     Some(&copied_index),
-                    &index_inventory,
+                    &index_signature,
                     cancelled,
                 )?;
                 let mut inventory =
@@ -691,13 +707,14 @@ impl Repository {
                     self,
                     target,
                     Some(&copied_index),
-                    &index_inventory,
+                    &index_signature,
                     cancelled,
                 )?;
-                let current_index = run(&self.root, &["ls-files", "--stage", "-z"], cancelled)
-                    .map_err(capture_error)?;
+                let current_index =
+                    run(&self.root, &["ls-files", "--stage", "-v", "-z"], cancelled)
+                        .map_err(capture_error)?;
                 if first_digest != second_digest
-                    || current_index != index_inventory
+                    || current_index != index_signature
                     || resolve_commit(&self.root, "HEAD", "HEAD", cancelled)? != head_oid
                 {
                     return Err(OperationError::new(
@@ -719,9 +736,9 @@ impl Repository {
         )?;
         if mutable {
             let copied_index = capture_root.join("index");
-            let index_inventory = run_with_index(
+            let index_signature = run_with_index(
                 &self.root,
-                &["ls-files", "--stage", "-z"],
+                &["ls-files", "--stage", "-v", "-z"],
                 &copied_index,
                 cancelled,
             )
@@ -730,13 +747,13 @@ impl Repository {
                 self,
                 target,
                 Some(&copied_index),
-                &index_inventory,
+                &index_signature,
                 cancelled,
             )?;
             if final_digest != dirty_digest
-                || run(&self.root, &["ls-files", "--stage", "-z"], cancelled)
+                || run(&self.root, &["ls-files", "--stage", "-v", "-z"], cancelled)
                     .map_err(capture_error)?
-                    != index_inventory
+                    != index_signature
                 || resolve_commit(&self.root, "HEAD", "HEAD", cancelled)? != head_oid
             {
                 return Err(OperationError::new(
@@ -757,14 +774,16 @@ impl Repository {
             SnapshotTarget::Index => NoChangeReason::EmptyIndexDelta,
             SnapshotTarget::Worktree { .. } => NoChangeReason::EmptyWorktreeDelta,
         });
-        Ok(SnapshotCapture {
+        let capture = SnapshotCapture {
             sources,
             changes,
             dirty_digest,
             commits_base_to_head,
             changed_files,
             no_change_reason,
-        })
+        };
+        capture_guard.retain();
+        Ok(capture)
     }
 
     pub(crate) fn blob_reader(&self) -> Result<BlobReader, String> {
@@ -814,6 +833,15 @@ impl Repository {
                         cancelled,
                     )
                 });
+                let head = scope.spawn(|| {
+                    run(
+                        &self.root,
+                        &["rev-parse", "--verify", "HEAD^{commit}"],
+                        cancelled,
+                    )
+                });
+                let index = scope
+                    .spawn(|| run(&self.root, &["ls-files", "--stage", "-v", "-z"], cancelled));
                 let mut tracked_args = vec![
                     "diff-index",
                     "--raw",
@@ -889,11 +917,19 @@ impl Repository {
                 let artifacts = artifacts
                     .join()
                     .map_err(|_| "Git artifact worker panicked".to_owned())?;
+                let head = head
+                    .join()
+                    .map_err(|_| "Git HEAD worker panicked".to_owned())?;
+                let index = index
+                    .join()
+                    .map_err(|_| "Git index worker panicked".to_owned())?;
                 Ok::<_, String>(WorktreeCapture {
                     tracked: tracked?,
                     artifacts: artifacts?,
                     inventory: inventory?,
                     untracked: untracked?,
+                    head: head?,
+                    index: index?,
                 })
             })
         };
@@ -918,6 +954,9 @@ impl Repository {
             cancelled,
         )?;
         assign_worktree_layers(self, base, &mut changes.paths, cancelled)?;
+        if signature != worktree_signature(&capture(false)?) {
+            return Err("Git working tree changed while reading; retry".into());
+        }
         Ok(changes)
     }
 }
@@ -1159,6 +1198,32 @@ fn validate_capture_root(path: &Path) -> Result<(), OperationError> {
     Ok(())
 }
 
+struct CaptureDirectoryGuard<'a> {
+    path: &'a Path,
+    retain: bool,
+}
+
+impl<'a> CaptureDirectoryGuard<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            retain: false,
+        }
+    }
+
+    fn retain(&mut self) {
+        self.retain = true;
+    }
+}
+
+impl Drop for CaptureDirectoryGuard<'_> {
+    fn drop(&mut self) {
+        if !self.retain {
+            let _ = fs::remove_dir_all(self.path);
+        }
+    }
+}
+
 fn capture_index(
     index_path: &Path,
     capture_root: &Path,
@@ -1322,7 +1387,12 @@ fn capture_error(error: String) -> OperationError {
 
 fn worktree_signature(outputs: &WorktreeCapture) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
-    for output in [&outputs.tracked, &outputs.inventory] {
+    for output in [
+        &outputs.tracked,
+        &outputs.inventory,
+        &outputs.head,
+        &outputs.index,
+    ] {
         hash.update(&(output.len() as u64).to_le_bytes());
         hash.update(output);
     }
@@ -1709,7 +1779,7 @@ fn target_dirty_digest(
     repository: &Repository,
     target: &SnapshotTarget,
     index_file: Option<&Path>,
-    index_inventory: &[u8],
+    index_signature: &[u8],
     cancelled: &AtomicBool,
 ) -> Result<String, OperationError> {
     let mut hash = blake3::Hasher::new();
@@ -1723,7 +1793,7 @@ fn target_dirty_digest(
         SnapshotTarget::Index => {
             hash_field(&mut hash, b"target", b"index");
             hash_field(&mut hash, b"include_untracked", b"false");
-            hash_field(&mut hash, b"index", index_inventory);
+            hash_field(&mut hash, b"index", index_signature);
         }
         SnapshotTarget::Worktree { include_untracked } => {
             hash_field(&mut hash, b"target", b"worktree");
@@ -1736,7 +1806,7 @@ fn target_dirty_digest(
                     b"false"
                 },
             );
-            hash_field(&mut hash, b"index", index_inventory);
+            hash_field(&mut hash, b"index", index_signature);
             let index_file = index_file.expect("worktree target has a captured index");
             let mut selected = nul_records(
                 &run_with_index(
@@ -3910,6 +3980,14 @@ fn run_git(
     if Instant::now() >= deadline {
         return Err("Git timed out".into());
     }
+    #[cfg(test)]
+    if let Some(hook) = GIT_TEST_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        hook(cwd, args, index_file);
+    }
     let mut command = git_command(cwd, isolate_repository, index_file);
     command
         .args(args)
@@ -4056,8 +4134,38 @@ mod tests {
     use super::*;
     use crate::index::build_snapshot_for_test;
     use crate::workspace::SnapshotTarget;
+    use std::sync::{Mutex, MutexGuard};
 
     const OID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    static GIT_TEST_HOOK_SERIAL: Mutex<()> = Mutex::new(());
+
+    struct GitTestHookGuard {
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for GitTestHookGuard {
+        fn drop(&mut self) {
+            *GIT_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
+    fn git_test_hook(
+        hook: impl FnMut(&Path, &[&str], Option<&Path>) + Send + 'static,
+    ) -> GitTestHookGuard {
+        let serial = GIT_TEST_HOOK_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slot = GIT_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(slot.is_none());
+        *slot = Some(Box::new(hook));
+        drop(slot);
+        GitTestHookGuard { _serial: serial }
+    }
 
     #[test]
     fn capture_represents_commit_index_and_worktree_layers() {
@@ -4308,14 +4416,18 @@ mod tests {
         let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
 
         let index_root = private_dir("index-drift");
-        let watched_index = index_root.join("index");
-        let mutate_root = root.clone();
-        let index_mutation = thread::spawn(move || {
-            while !watched_index.exists() {
-                thread::yield_now();
+        let hook_root = root.clone();
+        let mut mutated = false;
+        let hook = git_test_hook(move |cwd, args, index_file| {
+            if !mutated
+                && cwd == hook_root
+                && index_file.is_some()
+                && args == ["ls-files", "--stage", "-z"]
+            {
+                fs::write(hook_root.join("staged.rs"), "pub fn second() {}\n").unwrap();
+                test_git(&hook_root, &["add", "--", "staged.rs"]);
+                mutated = true;
             }
-            fs::write(mutate_root.join("staged.rs"), "pub fn second() {}\n").unwrap();
-            test_git(&mutate_root, &["add", "--", "staged.rs"]);
         });
         let error = match repository.capture_snapshot(
             &base,
@@ -4328,22 +4440,24 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("index drift was accepted"),
         };
-        index_mutation.join().unwrap();
+        drop(hook);
         assert_eq!(error.code, ErrorCode::CaptureChanged);
+        assert!(!index_root.exists());
 
         fs::write(root.join("tracked.rs"), vec![b'a'; SOURCE_LIMIT as usize]).unwrap();
         let worktree_root = private_dir("worktree-drift");
-        let watched_source = worktree_root.join("sources/0000000000000000");
-        let mutate_root = root.clone();
-        let worktree_mutation = thread::spawn(move || {
-            while !watched_source.exists() {
-                thread::yield_now();
+        let hook_root = root.clone();
+        let mut mutated = false;
+        let hook = git_test_hook(move |cwd, args, index_file| {
+            if !mutated && cwd == hook_root && index_file.is_some() && args.first() == Some(&"diff")
+            {
+                fs::write(
+                    hook_root.join("tracked.rs"),
+                    vec![b'b'; SOURCE_LIMIT as usize],
+                )
+                .unwrap();
+                mutated = true;
             }
-            fs::write(
-                mutate_root.join("tracked.rs"),
-                vec![b'b'; SOURCE_LIMIT as usize],
-            )
-            .unwrap();
         });
         let error = match repository.capture_snapshot(
             &base,
@@ -4358,12 +4472,111 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("worktree drift was accepted"),
         };
-        worktree_mutation.join().unwrap();
+        drop(hook);
         assert_eq!(error.code, ErrorCode::CaptureChanged);
+        assert!(!worktree_root.exists());
 
-        for path in [index_root, worktree_root, root] {
-            fs::remove_dir_all(path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn capture_rejects_index_flag_only_drift() {
+        let root = initialized_repository("capture-flag-drift");
+        fs::write(root.join("tracked.rs"), "pub fn base() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git_output(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("tracked.rs"), "pub fn dirty() {}\n").unwrap();
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let capture_root = private_dir("capture-flag-drift-output");
+
+        let hook_root = root.clone();
+        let mut mutated = false;
+        let hook = git_test_hook(move |cwd, args, index_file| {
+            if !mutated
+                && cwd == hook_root
+                && index_file.is_some()
+                && args == ["ls-files", "--stage", "-z"]
+            {
+                test_git(
+                    &hook_root,
+                    &["update-index", "--skip-worktree", "tracked.rs"],
+                );
+                mutated = true;
+            }
+        });
+        let result = repository.capture_snapshot(
+            &base,
+            &base,
+            &SnapshotTarget::Worktree {
+                include_untracked: false,
+            },
+            DependencyMode::Boundary,
+            &capture_root,
+            &AtomicBool::new(false),
+        );
+        drop(hook);
+
+        assert!(
+            git_output(&root, &["ls-files", "--stage", "-v"]).starts_with("S 100644 "),
+            "Git did not retain the flag-only mutation"
+        );
+        match result {
+            Err(error) => assert_eq!(error.code, ErrorCode::CaptureChanged),
+            Ok(_) => panic!("index flag-only drift was accepted"),
         }
+        assert!(!capture_root.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_capture_removes_private_directory() {
+        let root = initialized_repository("capture-cleanup");
+        fs::write(root.join("tracked.rs"), "pub fn base() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git_output(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("staged.rs"), "pub fn first() {}\n").unwrap();
+        test_git(&root, &["add", "--", "staged.rs"]);
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let capture_root = private_dir("capture-cleanup-output");
+
+        let hook_root = root.clone();
+        let mut mutated = false;
+        let hook = git_test_hook(move |cwd, args, index_file| {
+            if !mutated
+                && cwd == hook_root
+                && index_file.is_some()
+                && args == ["ls-files", "--stage", "-z"]
+            {
+                fs::write(hook_root.join("staged.rs"), "pub fn second() {}\n").unwrap();
+                test_git(&hook_root, &["add", "--", "staged.rs"]);
+                mutated = true;
+            }
+        });
+        let result = repository.capture_snapshot(
+            &base,
+            &base,
+            &SnapshotTarget::Index,
+            DependencyMode::Boundary,
+            &capture_root,
+            &AtomicBool::new(false),
+        );
+        drop(hook);
+
+        match result {
+            Err(error) => assert_eq!(error.code, ErrorCode::CaptureChanged),
+            Ok(_) => panic!("index drift was accepted"),
+        }
+        assert_eq!(
+            git_output(&root, &["show", ":staged.rs"]),
+            "pub fn second() {}"
+        );
+        assert!(
+            !capture_root.exists(),
+            "failed capture retained its private directory"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4554,6 +4767,49 @@ mod tests {
                 .unwrap()
                 .layers,
             [ChangeLayer::Untracked]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_changes_rejects_post_validation_layer_drift() {
+        let root = initialized_repository("legacy-layer-drift");
+        fs::write(root.join("mixed.rs"), "pub fn base() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git_output(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("mixed.rs"), "pub fn committed() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "committed"]);
+
+        let hook_root = root.clone();
+        let hook_base = base.clone();
+        let hook = git_test_hook(move |cwd, args, index_file| {
+            if cwd == hook_root
+                && index_file.is_none()
+                && args.first() == Some(&"diff")
+                && args.ends_with(&[hook_base.as_str(), "HEAD"])
+            {
+                test_git(&hook_root, &["reset", "--quiet", "--soft", &hook_base]);
+            }
+        });
+        let result = Repository::discover_cancelled(&root, &AtomicBool::new(false))
+            .unwrap()
+            .worktree_changes(&base, DependencyMode::Boundary, &AtomicBool::new(false));
+        drop(hook);
+
+        match result {
+            Err(error) => assert_eq!(error, "Git working tree changed while reading; retry"),
+            Ok(_) => panic!("post-validation layer drift was accepted"),
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("mixed.rs")).unwrap(),
+            "pub fn committed() {}\n"
+        );
+        assert_eq!(git_output(&root, &["rev-parse", "HEAD"]), base);
+        assert_eq!(git_output(&root, &["diff", "--name-only"]), "");
+        assert_eq!(
+            git_output(&root, &["diff", "--cached", "--name-only", "HEAD"]),
+            "mixed.rs"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -5452,6 +5708,8 @@ mod tests {
                 skipped_paths: 0,
                 signature: [0; 32],
             },
+            head: Vec::new(),
+            index: Vec::new(),
         };
         let first = snapshot(vec![b'b']);
         let second = snapshot(vec![b'B']);
