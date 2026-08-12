@@ -15,7 +15,7 @@ use crate::git::{
     dependency_package,
 };
 
-const SCHEMA_VERSION: i64 = 4;
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
@@ -237,7 +237,6 @@ impl Store {
         })
     }
 
-    #[allow(dead_code)] // Task 4 switches publication to sealed images.
     pub fn seal(self, cancelled: &AtomicBool) -> Result<State> {
         check_cancelled(cancelled)?;
         if !self.connection.is_autocommit() {
@@ -778,7 +777,6 @@ impl Store {
     }
 }
 
-#[allow(dead_code)] // Task 4 validates images while loading the snapshot catalog.
 pub fn validate_image(path: &Path) -> Result<State> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect database {}: {error}", path.display()))?;
@@ -811,7 +809,6 @@ pub fn validate_image(path: &Path) -> Result<State> {
     Ok(state)
 }
 
-#[allow(dead_code)]
 fn require_no_sidecars(path: &Path) -> Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
         match fs::symlink_metadata(sqlite_sidecar(path, suffix)) {
@@ -823,7 +820,6 @@ fn require_no_sidecars(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 fn require_integrity(connection: &Connection) -> Result<()> {
     let integrity: String = connection
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -835,7 +831,6 @@ fn require_integrity(connection: &Connection) -> Result<()> {
     }
 }
 
-#[allow(dead_code)]
 fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);

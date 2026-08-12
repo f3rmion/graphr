@@ -21,7 +21,12 @@ use crate::store::{
     EdgeInput, EdgeKind, FileInput, Graph, NodeInput, NodeKind, RefInput, RefKind, Store,
     TraitImplementationInput,
 };
-use crate::workspace::SnapshotTarget;
+use crate::workspace::{
+    BuildProgress, BuildStage, CACHE_FORMAT_VERSION, GRAPH_ANALYZER_VERSION, IndexCompletion,
+    OperationError, Provenance, REVIEW_FORMAT_VERSION, ResolvedIndexRequest, SnapshotCatalog,
+    SnapshotEntry, SnapshotKeyInput, SnapshotTarget, graph_image_key, selected_layers,
+    snapshot_key, validate_entry_graph,
+};
 
 const QUALIFIED_PATH_LIMIT: usize = 1024;
 const REVIEW_CONTEXT_BUDGET: usize = 8192;
@@ -38,6 +43,352 @@ pub struct IndexStats {
     pub files_reused: usize,
     pub files_parsed: usize,
     pub files_skipped: usize,
+}
+
+pub struct Engine {
+    roots: Arc<crate::workspace::AllowedRoots>,
+    catalog: Arc<SnapshotCatalog>,
+    #[allow(dead_code)] // Task 6 caches bounded rendered review pages here.
+    rendered: Mutex<HashMap<(String, u32, u32), Arc<ReviewSnapshot>>>,
+}
+
+impl Engine {
+    pub fn new(roots: Arc<crate::workspace::AllowedRoots>) -> Self {
+        Self {
+            catalog: Arc::new(SnapshotCatalog::new(roots.clone())),
+            roots,
+            rendered: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn roots(&self) -> &crate::workspace::AllowedRoots {
+        &self.roots
+    }
+
+    pub fn snapshot(&self, snapshot_id: &str) -> Result<Arc<SnapshotEntry>, OperationError> {
+        self.catalog.get(snapshot_id)
+    }
+
+    pub fn build_snapshot(
+        &self,
+        request: ResolvedIndexRequest,
+        cancelled: &AtomicBool,
+        progress: impl Fn(BuildProgress) + Sync,
+    ) -> Result<IndexCompletion, OperationError> {
+        let report =
+            |stage, files_done, files_total, files_reused, files_parsed, rejected_cache| {
+                progress(BuildProgress {
+                    stage,
+                    files_done,
+                    files_total,
+                    files_reused,
+                    files_parsed,
+                    rejected_cache,
+                });
+            };
+        report(BuildStage::Capturing, 0, 0, 0, 0, None);
+        let current = self.roots.inspect(&request.root.worktree_root, cancelled)?;
+        if !same_workspace(&current, &request.root) {
+            return Err(OperationError::new(
+                crate::workspace::ErrorCode::RootStale,
+                "resolved workspace identity changed before indexing",
+            ));
+        }
+        self.catalog.attach(&current)?;
+        let job = self.catalog.begin(&request.root)?;
+        let repository = repository_from_identity(&request.root);
+        let capture = repository.capture_snapshot(
+            &request.base_oid,
+            &request.head_oid,
+            &request.target,
+            request.dependency_mode,
+            job.capture_root(),
+            cancelled,
+        )?;
+        let total = capture.sources.files.len();
+        report(BuildStage::Capturing, total, total, 0, 0, None);
+
+        let graph_image_id = graph_image_key(
+            &request.root.repository_id,
+            &capture.sources.files,
+            CACHE_FORMAT_VERSION,
+            GRAPH_ANALYZER_VERSION,
+            crate::store::SCHEMA_VERSION,
+        );
+        let review_bytes = rmcp::serde_json::to_vec(&capture.changes).map_err(|error| {
+            OperationError::new(
+                crate::workspace::ErrorCode::Internal,
+                format!("cannot serialize captured review: {error}"),
+            )
+        })?;
+        let review_id = blake3::hash(&review_bytes).to_hex().to_string();
+        let snapshot_id = snapshot_key(
+            &SnapshotKeyInput {
+                graph_image_id: &graph_image_id,
+                workspace_id: &request.root.workspace_id,
+                base_oid: &request.base_oid,
+                head_oid: &request.head_oid,
+                target: &request.target,
+                dependency_mode: request.dependency_mode,
+                dirty_digest: &capture.dirty_digest,
+                review_id: &review_id,
+            },
+            CACHE_FORMAT_VERSION,
+            REVIEW_FORMAT_VERSION,
+        );
+        let provenance = Provenance {
+            repository_id: request.root.repository_id.clone(),
+            workspace_id: request.root.workspace_id.clone(),
+            snapshot_id: snapshot_id.clone(),
+            common_git_dir: request.root.common_git_dir.clone(),
+            git_dir: request.root.git_dir.clone(),
+            repository_root: request.root.repository_root.clone(),
+            worktree_root: request.root.worktree_root.clone(),
+            branch: request.root.branch.clone(),
+            base_ref: request.base_ref.clone(),
+            base_oid: request.base_oid.clone(),
+            head_ref: request.head_ref.clone(),
+            head_oid: request.head_oid.clone(),
+            target_state: request.target.clone(),
+            selected_layers: selected_layers(&capture.changes),
+            dirty_digest: capture.dirty_digest.clone(),
+            commits_base_to_head: capture.commits_base_to_head,
+            changed_files: capture.changed_files,
+            index_generation: 0,
+        };
+
+        let mut rejected_cache =
+            self.catalog
+                .prepare_publication(&job, &snapshot_id, &review_id, &review_bytes)?;
+        if let Some(path) = self
+            .catalog
+            .quarantine_rejected(&request.root, &snapshot_id)?
+        {
+            rejected_cache = Some(path);
+        }
+        report(
+            BuildStage::SelectingSeed,
+            0,
+            total,
+            0,
+            0,
+            rejected_cache.clone(),
+        );
+        let exact_graph = job.graph_path(&graph_image_id);
+        let mut candidates = self.catalog.entries(&request.root.repository_id);
+        let trusted_exact = candidates
+            .iter()
+            .find(|entry| entry.graph_image_id == graph_image_id)
+            .cloned();
+        let exact = match fs::symlink_metadata(&exact_graph) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(OperationError::new(
+                    crate::workspace::ErrorCode::CacheCorrupt,
+                    format!("cannot inspect exact graph cache: {error}"),
+                ));
+            }
+            Ok(_) => match trusted_exact.as_deref().map_or_else(
+                || crate::workspace::validate_published_image(&exact_graph),
+                validate_entry_graph,
+            ) {
+                Ok(_) => true,
+                Err(_) => {
+                    rejected_cache = Some(exact_graph.display().to_string());
+                    self.catalog
+                        .quarantine_graph(&request.root, &graph_image_id, &snapshot_id)?;
+                    report(
+                        BuildStage::SelectingSeed,
+                        0,
+                        total,
+                        0,
+                        0,
+                        rejected_cache.clone(),
+                    );
+                    false
+                }
+            },
+        };
+
+        let (stats, graph_temp) = if exact {
+            let stats = IndexStats {
+                files_total: total,
+                files_reused: total,
+                files_parsed: 0,
+                files_skipped: capture.sources.skipped,
+            };
+            report(
+                BuildStage::Indexing,
+                total,
+                total,
+                total,
+                0,
+                rejected_cache.clone(),
+            );
+            (stats, None)
+        } else {
+            candidates.retain(|entry| entry.graph_image_id != graph_image_id);
+            candidates.sort_by(|left, right| {
+                let left_base = left.provenance.head_oid == request.base_oid;
+                let right_base = right.provenance.head_oid == request.base_oid;
+                right_base
+                    .cmp(&left_base)
+                    .then_with(|| {
+                        right
+                            .provenance
+                            .index_generation
+                            .cmp(&left.provenance.index_generation)
+                    })
+                    .then_with(|| {
+                        left.provenance
+                            .snapshot_id
+                            .cmp(&right.provenance.snapshot_id)
+                    })
+            });
+            for candidate in candidates {
+                match validate_entry_graph(&candidate) {
+                    Ok(_) => {
+                        job.copy_seed(&candidate.graph_path)?;
+                        break;
+                    }
+                    Err(_) => {
+                        rejected_cache = Some(candidate.graph_path.display().to_string());
+                        self.catalog.quarantine_graph(
+                            &request.root,
+                            &candidate.graph_image_id,
+                            &candidate.provenance.snapshot_id,
+                        )?;
+                        report(
+                            BuildStage::SelectingSeed,
+                            0,
+                            total,
+                            0,
+                            0,
+                            rejected_cache.clone(),
+                        );
+                    }
+                }
+            }
+            report(BuildStage::Indexing, 0, total, 0, 0, rejected_cache.clone());
+            let mut store =
+                Store::open(job.graph_temp(), false, cancelled).map_err(index_operation_error)?;
+            let (_, _, stats) = store
+                .index_with(cancelled, |full, existing| {
+                    build_index(
+                        &repository,
+                        &capture.sources,
+                        cancelled,
+                        full,
+                        existing,
+                        |done, total, reused| {
+                            report(
+                                BuildStage::Indexing,
+                                done,
+                                total,
+                                reused,
+                                done.saturating_sub(reused),
+                                rejected_cache.clone(),
+                            );
+                        },
+                    )
+                })
+                .map_err(index_operation_error)?;
+            report(
+                BuildStage::Indexing,
+                total,
+                total,
+                stats.files_reused,
+                stats.files_parsed,
+                rejected_cache.clone(),
+            );
+            report(
+                BuildStage::ResolvingGraph,
+                total,
+                total,
+                stats.files_reused,
+                stats.files_parsed,
+                rejected_cache.clone(),
+            );
+            store.seal(cancelled).map_err(index_operation_error)?;
+            crate::store::validate_image(job.graph_temp()).map_err(|error| {
+                OperationError::new(
+                    crate::workspace::ErrorCode::CacheCorrupt,
+                    format!("private graph image is invalid: {error}"),
+                )
+            })?;
+            (stats, Some(job.graph_temp()))
+        };
+        if exact {
+            report(
+                BuildStage::ResolvingGraph,
+                total,
+                total,
+                stats.files_reused,
+                stats.files_parsed,
+                rejected_cache.clone(),
+            );
+        }
+        check_cancelled(cancelled).map_err(index_operation_error)?;
+        report(
+            BuildStage::Publishing,
+            total,
+            total,
+            stats.files_reused,
+            stats.files_parsed,
+            rejected_cache,
+        );
+        let entry = self.catalog.publish(
+            &job,
+            &graph_image_id,
+            &review_id,
+            &review_bytes,
+            graph_temp,
+            request.dependency_mode,
+            capture.no_change_reason,
+            provenance,
+        )?;
+        Ok(IndexCompletion {
+            snapshot_id,
+            graph_image_id,
+            provenance: entry.provenance.clone(),
+            stats,
+        })
+    }
+}
+
+fn same_workspace(
+    current: &crate::workspace::RootIdentity,
+    resolved: &crate::workspace::RootIdentity,
+) -> bool {
+    current.repository_id == resolved.repository_id
+        && current.workspace_id == resolved.workspace_id
+        && current.repository_root == resolved.repository_root
+        && current.worktree_root == resolved.worktree_root
+        && current.git_dir == resolved.git_dir
+        && current.common_git_dir == resolved.common_git_dir
+        && current.index_path == resolved.index_path
+        && current.object_format == resolved.object_format
+}
+
+fn repository_from_identity(root: &crate::workspace::RootIdentity) -> Repository {
+    Repository {
+        root: root.worktree_root.clone(),
+        git_dir: root.git_dir.clone(),
+        common_git_dir: root.common_git_dir.clone(),
+        index_path: root.index_path.clone(),
+        branch: root.branch.clone(),
+        head_oid: root.head_oid.clone(),
+        object_format: root.object_format.clone(),
+    }
+}
+
+fn index_operation_error(error: String) -> OperationError {
+    let code = if error.contains("cancelled") {
+        crate::workspace::ErrorCode::JobCancelled
+    } else {
+        crate::workspace::ErrorCode::Internal
+    };
+    OperationError::new(code, error)
 }
 
 #[derive(Clone)]
@@ -2627,7 +2978,9 @@ mod tests {
     use super::*;
     use crate::artifact::AnalyzerKind;
     use crate::git::{ArtifactFile, ArtifactOmission, ArtifactReview, ChangeLayer};
-    use crate::workspace::{AllowedRoots, ErrorCode};
+    use crate::workspace::{
+        AllowedRoots, ErrorCode, IndexRequest, SnapshotTarget, resolve_request,
+    };
     use std::fs;
     use std::process::Command;
 
@@ -2639,6 +2992,152 @@ mod tests {
             analysis_complete: true,
             omission: None,
         }
+    }
+
+    #[test]
+    fn exact_graph_hit_reuses_every_file() {
+        let root = snapshot_repository("exact-graph-hit");
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        let request = snapshot_request(&engine, &root, "HEAD", "HEAD");
+
+        let first = engine
+            .build_snapshot(request.clone(), &AtomicBool::new(false), |_| {})
+            .unwrap();
+        let second = engine
+            .build_snapshot(request, &AtomicBool::new(false), |_| {})
+            .unwrap();
+
+        assert_eq!(first.graph_image_id, second.graph_image_id);
+        assert_eq!(second.stats.files_total, 2);
+        assert_eq!(second.stats.files_reused, 2);
+        assert_eq!(second.stats.files_parsed, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn base_oid_seed_reparses_only_changed_files() {
+        let root = snapshot_repository("base-oid-seed");
+        let base = test_git_line(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("src/a.rs"), "fn changed() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "change one file"]);
+        let head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &base),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+
+        let completion = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &head),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(completion.stats.files_total, 2);
+        assert_eq!(completion.stats.files_reused, 1);
+        assert_eq!(completion.stats.files_parsed, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_non_exact_seed_is_quarantined_and_reported() {
+        let root = snapshot_repository("corrupt-seed");
+        let base = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        let first = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &base),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let graph = engine
+            .snapshot(&first.snapshot_id)
+            .unwrap()
+            .graph_path
+            .clone();
+        fs::set_permissions(&graph, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        fs::write(root.join("src/a.rs"), "fn changed() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "change one file"]);
+        let head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let rejected = Mutex::new(Vec::new());
+
+        let completion = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &head),
+                &AtomicBool::new(false),
+                |progress| {
+                    if let Some(path) = progress.rejected_cache {
+                        rejected.lock().unwrap().push(path);
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(completion.stats.files_parsed, 2);
+        assert!(!rejected.into_inner().unwrap().is_empty());
+        assert!(
+            fs::read_dir(root.join(".git/graphr/v6/quarantine"))
+                .unwrap()
+                .next()
+                .is_some()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn snapshot_repository(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "graphr-index-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        test_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        test_git(&root, &["config", "user.name", "Graphr Test"]);
+        test_git(&root, &["config", "user.email", "graphr@example.invalid"]);
+        fs::write(root.join("src/a.rs"), "fn first() {}\n").unwrap();
+        fs::write(root.join("src/b.rs"), "fn second() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "base"]);
+        root
+    }
+
+    fn snapshot_request(
+        engine: &Engine,
+        root: &Path,
+        base: &str,
+        head: &str,
+    ) -> crate::workspace::ResolvedIndexRequest {
+        resolve_request(
+            engine.roots(),
+            IndexRequest {
+                worktree_root: root.to_path_buf(),
+                base_ref: base.into(),
+                head_ref: head.into(),
+                target: SnapshotTarget::Commit,
+                dependency_mode: DependencyMode::Boundary,
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+    }
+
+    fn test_git_line(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        String::from_utf8(output.stdout).unwrap().trim().into()
     }
 
     #[test]
