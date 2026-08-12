@@ -781,6 +781,770 @@ fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
     client.close();
 }
 
+const LAYERED_PATH: &str =
+    "src/complete_target_state/layered_source_with_committed_staged_and_unstaged_changes.rs";
+const BEFORE_RENAME_PATH: &str = "src/complete_target_state/source_before_the_committed_rename.rs";
+const AFTER_RENAME_PATH: &str = "src/complete_target_state/source_after_the_committed_rename.rs";
+const STAGED_ADD_PATH: &str = "src/complete_target_state/source_added_in_the_staged_layer.rs";
+const STAGED_DELETE_PATH: &str = "src/complete_target_state/source_deleted_in_the_staged_layer.rs";
+const UNSTAGED_PATH: &str = "src/complete_target_state/source_modified_in_the_unstaged_layer.rs";
+const UNTRACKED_PATH: &str = "src/complete_target_state/source_only_in_the_untracked_layer.rs";
+const STAGED_MARKDOWN_PATH: &str =
+    "docs/complete_target_state/requirements_changed_in_the_staged_layer.md";
+const UNSTAGED_MARKDOWN_PATH: &str =
+    "docs/complete_target_state/requirements_changed_in_the_unstaged_layer.md";
+const UNTRACKED_TSV_PATH: &str =
+    "tests/fixtures/complete_target_state/registry_only_in_the_untracked_layer.tsv";
+
+#[test]
+fn commit_index_and_worktree_targets_preserve_status_layers_and_artifacts() {
+    let fixture = complete_target_state_fixture();
+    let mut client = Client::start_unindexed(&fixture.path);
+
+    let commit = client.index_target_and_wait(
+        "HEAD~1",
+        "HEAD",
+        rmcp::serde_json::json!({ "kind": "commit" }),
+    );
+    let commit_snapshot = client.snapshot_id().to_owned();
+    let commit_changes = capture_changes(&mut client, &commit_snapshot, 6, 50);
+    assert_snapshot_provenance(
+        &commit,
+        &commit_changes,
+        rmcp::serde_json::json!({ "kind": "commit" }),
+        2,
+        &["committed"],
+    );
+    assert_review_completion(&commit_changes, true);
+    assert_change_manifest(
+        &commit_changes,
+        &[
+            format!(
+                "changed source rust {LAYERED_PATH} status=modified additions=2 deletions=1 layers=committed"
+            ),
+            format!(
+                "renamed source rust {BEFORE_RENAME_PATH} -> {AFTER_RENAME_PATH} additions=0 deletions=0 layers=committed"
+            ),
+        ],
+    );
+    let commit_graph = change_section_text(&commit_changes, "graph");
+    for symbol in [
+        "committed_layered_symbol",
+        "committed_helper_symbol",
+        "renamed_symbol",
+    ] {
+        assert!(
+            commit_graph.contains(symbol),
+            "missing {symbol}: {commit_graph}"
+        );
+    }
+    for absent in ["staged_layered_symbol", "unstaged_layered_symbol"] {
+        assert!(!commit_graph.contains(absent), "{commit_graph}");
+    }
+    assert_eq!(
+        page_metric(&commit_changes.initial.text, "artifacts", "total_records"),
+        0
+    );
+
+    let index = client.index_target_and_wait(
+        "HEAD~1",
+        "HEAD",
+        rmcp::serde_json::json!({ "kind": "index" }),
+    );
+    let index_snapshot = client.snapshot_id().to_owned();
+    let index_changes = capture_changes(&mut client, &index_snapshot, 6, 50);
+    assert_snapshot_provenance(
+        &index,
+        &index_changes,
+        rmcp::serde_json::json!({ "kind": "index" }),
+        5,
+        &["committed", "staged"],
+    );
+    assert_review_completion(&index_changes, false);
+    assert_change_manifest(
+        &index_changes,
+        &[
+            format!(
+                "changed source rust {LAYERED_PATH} status=modified additions=3 deletions=1 layers=committed,staged"
+            ),
+            format!(
+                "renamed source rust {BEFORE_RENAME_PATH} -> {AFTER_RENAME_PATH} additions=0 deletions=0 layers=committed"
+            ),
+            format!("added source rust {STAGED_ADD_PATH} additions=1 deletions=0 layers=staged"),
+            format!(
+                "deleted source rust {STAGED_DELETE_PATH} additions=0 deletions=1 layers=staged"
+            ),
+            format!(
+                "changed artifact text {STAGED_MARKDOWN_PATH} analyzer=markdown additions=1 deletions=1 layers=staged"
+            ),
+        ],
+    );
+    let index_graph = change_section_text(&index_changes, "graph");
+    for symbol in [
+        "committed_layered_symbol",
+        "committed_helper_symbol",
+        "staged_layered_symbol",
+        "renamed_symbol",
+        "staged_added_symbol",
+    ] {
+        assert!(
+            index_graph.contains(symbol),
+            "missing {symbol}: {index_graph}"
+        );
+    }
+    for absent in [
+        "unstaged_layered_symbol",
+        "unstaged_current_symbol",
+        "untracked_symbol_00_with_complete_target_state_evidence",
+        "staged_deleted_symbol",
+    ] {
+        assert!(!index_graph.contains(absent), "{index_graph}");
+    }
+    assert_semantic_records(
+        &index_changes,
+        &[
+            format!(
+                "markdown path={STAGED_MARKDOWN_PATH:?} change=added kind=requirement value=\"REQ-2\" line=3"
+            ),
+            format!(
+                "markdown path={STAGED_MARKDOWN_PATH:?} change=removed kind=requirement value=\"REQ-1\" line=3"
+            ),
+        ],
+    );
+
+    let worktree = client.index_target_and_wait(
+        "HEAD~1",
+        "HEAD",
+        rmcp::serde_json::json!({ "kind": "worktree", "include_untracked": true }),
+    );
+    let worktree_snapshot = client.snapshot_id().to_owned();
+    let worktree_changes = capture_changes(&mut client, &worktree_snapshot, 6, 50);
+    assert_snapshot_provenance(
+        &worktree,
+        &worktree_changes,
+        rmcp::serde_json::json!({ "kind": "worktree", "include_untracked": true }),
+        9,
+        &["committed", "staged", "unstaged", "untracked"],
+    );
+    assert_review_completion(&worktree_changes, false);
+    assert_change_manifest(
+        &worktree_changes,
+        &[
+            format!(
+                "changed source rust {LAYERED_PATH} status=modified additions=4 deletions=1 layers=committed,staged,unstaged"
+            ),
+            format!(
+                "renamed source rust {BEFORE_RENAME_PATH} -> {AFTER_RENAME_PATH} additions=0 deletions=0 layers=committed"
+            ),
+            format!("added source rust {STAGED_ADD_PATH} additions=1 deletions=0 layers=staged"),
+            format!(
+                "deleted source rust {STAGED_DELETE_PATH} additions=0 deletions=1 layers=staged"
+            ),
+            format!(
+                "changed source rust {UNSTAGED_PATH} status=modified additions=1 deletions=1 layers=unstaged"
+            ),
+            format!(
+                "untracked source rust {UNTRACKED_PATH} additions=20 deletions=0 layers=untracked"
+            ),
+            format!(
+                "changed artifact text {STAGED_MARKDOWN_PATH} analyzer=markdown additions=1 deletions=1 layers=staged"
+            ),
+            format!(
+                "changed artifact text {UNSTAGED_MARKDOWN_PATH} analyzer=markdown additions=1 deletions=1 layers=unstaged"
+            ),
+            format!(
+                "untracked artifact text {UNTRACKED_TSV_PATH} analyzer=tsv additions=49 deletions=0 layers=untracked"
+            ),
+        ],
+    );
+    let worktree_graph = change_section_text(&worktree_changes, "graph");
+    for symbol in [
+        "committed_layered_symbol",
+        "committed_helper_symbol",
+        "staged_layered_symbol",
+        "unstaged_layered_symbol",
+        "renamed_symbol",
+        "staged_added_symbol",
+        "unstaged_current_symbol",
+    ] {
+        assert!(
+            worktree_graph.contains(symbol),
+            "missing {symbol}: {worktree_graph}"
+        );
+    }
+    for index in 0..20 {
+        let symbol = format!("untracked_symbol_{index:02}_with_complete_target_state_evidence");
+        assert!(
+            worktree_graph.contains(&symbol),
+            "missing {symbol}: {worktree_graph}"
+        );
+    }
+    assert!(
+        !worktree_graph.contains("staged_deleted_symbol"),
+        "{worktree_graph}"
+    );
+    let mut semantic_records = vec![
+        format!(
+            "markdown path={STAGED_MARKDOWN_PATH:?} change=added kind=requirement value=\"REQ-2\" line=3"
+        ),
+        format!(
+            "markdown path={STAGED_MARKDOWN_PATH:?} change=removed kind=requirement value=\"REQ-1\" line=3"
+        ),
+        format!(
+            "markdown path={UNSTAGED_MARKDOWN_PATH:?} change=added kind=requirement value=\"DOC-2\" line=3"
+        ),
+        format!(
+            "markdown path={UNSTAGED_MARKDOWN_PATH:?} change=removed kind=requirement value=\"DOC-1\" line=3"
+        ),
+        format!(
+            "tsv path={UNTRACKED_TSV_PATH:?} kind=key key_basis=first-column old=null new=\"id\""
+        ),
+        format!("tsv path={UNTRACKED_TSV_PATH:?} kind=schema old=[] new=[\"id\", \"value\"]"),
+    ];
+    semantic_records.extend((0..48).map(|index| {
+        format!(
+            "tsv path={UNTRACKED_TSV_PATH:?} change=added kind=row key=\"row-{index:02}\" occurrence=1 line={}",
+            index + 2
+        )
+    }));
+    assert_semantic_records(&worktree_changes, &semantic_records);
+    for label in [
+        "files_next_cursor",
+        "diff_next_cursor",
+        "artifacts_next_cursor",
+        "graph_next_cursor",
+    ] {
+        assert!(
+            page_cursor(&worktree_changes.initial.text, label).is_some(),
+            "{label} unexpectedly terminal: {}",
+            worktree_changes.initial.text
+        );
+    }
+    assert_ne!(commit_snapshot, index_snapshot);
+    assert_ne!(index_snapshot, worktree_snapshot);
+    client.close();
+}
+
+#[test]
+fn editing_after_publication_never_mutates_existing_queries_or_cursors() {
+    let fixture = complete_target_state_fixture();
+    let mut client = Client::start_unindexed(&fixture.path);
+    client.index_target_and_wait(
+        "HEAD~1",
+        "HEAD",
+        rmcp::serde_json::json!({ "kind": "worktree", "include_untracked": true }),
+    );
+    let old_snapshot = client.snapshot_id().to_owned();
+    let old_search = capture_query(&client.search(
+        "untracked_symbol_00_with_complete_target_state_evidence",
+        Some("function"),
+    ));
+    let old_node = old_search
+        .text
+        .split_ascii_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let old_view = capture_query(&client.view(&old_node, 6, 50));
+    let old_changes = capture_changes(&mut client, &old_snapshot, 6, 50);
+    for label in [
+        "files_next_cursor",
+        "diff_next_cursor",
+        "artifacts_next_cursor",
+        "graph_next_cursor",
+    ] {
+        assert!(
+            page_cursor(&old_changes.initial.text, label).is_some(),
+            "{label} unexpectedly terminal: {}",
+            old_changes.initial.text
+        );
+    }
+
+    fs::write(
+        fixture.path.join(LAYERED_PATH),
+        format!(
+            "{}pub fn post_publication_symbol() {{}}\n",
+            layered_source(3)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        fixture
+            .path
+            .join("src/complete_target_state/live_added_after_publication.rs"),
+        "pub fn live_added_after_publication_symbol() {}\n",
+    )
+    .unwrap();
+    let live_renamed_path =
+        "src/complete_target_state/source_renamed_after_snapshot_publication.rs";
+    fs::rename(
+        fixture.path.join(AFTER_RENAME_PATH),
+        fixture.path.join(live_renamed_path),
+    )
+    .unwrap();
+    fs::remove_file(fixture.path.join(STAGED_ADD_PATH)).unwrap();
+
+    let repeated_search = capture_query(&client.call(
+        "search",
+        rmcp::serde_json::json!({
+            "snapshot_id": &old_snapshot,
+            "query": "untracked_symbol_00_with_complete_target_state_evidence",
+            "kind": "function",
+        }),
+    ));
+    assert_eq!(repeated_search, old_search);
+    let repeated_view = capture_query(&client.call(
+        "view",
+        rmcp::serde_json::json!({
+            "snapshot_id": &old_snapshot,
+            "node_ref": &old_node,
+            "depth": 6,
+            "max_nodes": 50,
+        }),
+    ));
+    assert_eq!(repeated_view, old_view);
+    let repeated_initial = capture_query(&client.call(
+        "changes",
+        rmcp::serde_json::json!({
+            "snapshot_id": &old_snapshot,
+            "depth": 6,
+            "max_nodes": 50,
+        }),
+    ));
+    assert_eq!(repeated_initial, old_changes.initial);
+    for (cursor, expected) in old_changes.cursor_queries() {
+        let repeated = capture_query(&client.call(
+            "changes",
+            rmcp::serde_json::json!({
+                "snapshot_id": &old_snapshot,
+                "depth": 6,
+                "max_nodes": 50,
+                "cursor": cursor,
+            }),
+        ));
+        assert_eq!(&repeated, expected, "old cursor changed: {cursor}");
+    }
+
+    let divergent = response_json(&client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({
+            "worktree_root": &fixture.path,
+            "snapshot_id": &old_snapshot,
+        }),
+    ));
+    assert_eq!(
+        divergent["result"]["structuredContent"]["snapshot_matches_worktree"],
+        false
+    );
+    assert!(
+        divergent["result"]["structuredContent"]["changed_identity_fields"]
+            .as_array()
+            .unwrap()
+            .contains(&rmcp::serde_json::json!("dirty_digest")),
+        "{divergent}"
+    );
+
+    client.index_target_and_wait(
+        "HEAD~1",
+        "HEAD",
+        rmcp::serde_json::json!({ "kind": "worktree", "include_untracked": true }),
+    );
+    let new_snapshot = client.snapshot_id().to_owned();
+    assert_ne!(new_snapshot, old_snapshot);
+    for (query, expected) in [
+        ("post_publication_symbol", "post_publication_symbol"),
+        (
+            "live_added_after_publication_symbol",
+            "live_added_after_publication_symbol",
+        ),
+        ("renamed_symbol", live_renamed_path),
+    ] {
+        let result = response_text(&client.search(query, Some("function")));
+        assert!(result.contains(expected), "missing {expected}: {result}");
+    }
+    let deleted = response_text(&client.search("staged_added_symbol", Some("function")));
+    assert!(!deleted.contains("staged_added_symbol"), "{deleted}");
+    let new_changes = capture_changes(&mut client, &new_snapshot, 6, 50);
+    let new_changes = ["files", "diff", "artifacts", "graph"]
+        .map(|section| change_section_text(&new_changes, section))
+        .concat();
+    for expected in [
+        "post_publication_symbol",
+        "live_added_after_publication.rs",
+        live_renamed_path,
+    ] {
+        assert!(
+            new_changes.contains(expected),
+            "missing {expected}: {new_changes}"
+        );
+    }
+    assert!(!new_changes.contains(STAGED_ADD_PATH), "{new_changes}");
+
+    let node_mismatch = client.view(&old_node, 6, 50);
+    assert_tool_error_code(&node_mismatch, "node_snapshot_mismatch");
+    for (cursor, _) in old_changes.cursor_queries() {
+        let snapshot_mismatch = client.call(
+            "changes",
+            rmcp::serde_json::json!({
+                "snapshot_id": &new_snapshot,
+                "depth": 6,
+                "max_nodes": 50,
+                "cursor": cursor,
+            }),
+        );
+        assert_tool_error_code(&snapshot_mismatch, "cursor_snapshot_mismatch");
+        let depth_mismatch = client.call(
+            "changes",
+            rmcp::serde_json::json!({
+                "snapshot_id": &old_snapshot,
+                "depth": 5,
+                "max_nodes": 50,
+                "cursor": cursor,
+            }),
+        );
+        assert_tool_error_code(&depth_mismatch, "cursor_parameters_mismatch");
+        let nodes_mismatch = client.call(
+            "changes",
+            rmcp::serde_json::json!({
+                "snapshot_id": &old_snapshot,
+                "depth": 6,
+                "max_nodes": 49,
+                "cursor": cursor,
+            }),
+        );
+        assert_tool_error_code(&nodes_mismatch, "cursor_parameters_mismatch");
+    }
+    client.close();
+}
+
+fn complete_target_state_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    for directory in [
+        "src/complete_target_state",
+        "docs/complete_target_state",
+        "tests/fixtures/complete_target_state",
+    ] {
+        fs::create_dir_all(fixture.path.join(directory)).unwrap();
+    }
+    fs::write(fixture.path.join(LAYERED_PATH), layered_source(0)).unwrap();
+    fs::write(
+        fixture.path.join(BEFORE_RENAME_PATH),
+        "pub fn renamed_symbol() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join(STAGED_DELETE_PATH),
+        "pub fn staged_deleted_symbol() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join(UNSTAGED_PATH),
+        "pub fn unstaged_base_symbol() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join(STAGED_MARKDOWN_PATH),
+        "# Stable heading\n\nREQ-1\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join(UNSTAGED_MARKDOWN_PATH),
+        "# Stable heading\n\nDOC-1\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git_commit(&fixture.path, "baseline");
+
+    fs::write(fixture.path.join(LAYERED_PATH), layered_source(1)).unwrap();
+    git(
+        &fixture.path,
+        &["mv", "--", BEFORE_RENAME_PATH, AFTER_RENAME_PATH],
+    );
+    git(&fixture.path, &["add", "--", LAYERED_PATH]);
+    git_commit(&fixture.path, "committed layer");
+
+    fs::write(fixture.path.join(LAYERED_PATH), layered_source(2)).unwrap();
+    fs::write(
+        fixture.path.join(STAGED_ADD_PATH),
+        "pub fn staged_added_symbol() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join(STAGED_MARKDOWN_PATH),
+        "# Stable heading\n\nREQ-2\n",
+    )
+    .unwrap();
+    git(
+        &fixture.path,
+        &[
+            "add",
+            "--",
+            LAYERED_PATH,
+            STAGED_ADD_PATH,
+            STAGED_MARKDOWN_PATH,
+        ],
+    );
+    git(&fixture.path, &["rm", "--quiet", "--", STAGED_DELETE_PATH]);
+
+    fs::write(fixture.path.join(LAYERED_PATH), layered_source(3)).unwrap();
+    fs::write(
+        fixture.path.join(UNSTAGED_PATH),
+        "pub fn unstaged_current_symbol() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join(UNSTAGED_MARKDOWN_PATH),
+        "# Stable heading\n\nDOC-2\n",
+    )
+    .unwrap();
+    fs::write(fixture.path.join(UNTRACKED_PATH), untracked_source()).unwrap();
+    fs::write(fixture.path.join(UNTRACKED_TSV_PATH), untracked_tsv()).unwrap();
+    fixture
+}
+
+fn layered_source(layer: usize) -> String {
+    let mut lines = vec![if layer == 0 {
+        "pub fn layered_base_symbol() {}\n"
+    } else {
+        "pub fn committed_layered_symbol() { committed_helper_symbol(); }\n"
+    }];
+    if layer > 0 {
+        lines.push("pub fn committed_helper_symbol() {}\n");
+    }
+    if layer > 1 {
+        lines.push("pub fn staged_layered_symbol() { committed_helper_symbol(); }\n");
+    }
+    if layer > 2 {
+        lines.push("pub fn unstaged_layered_symbol() { staged_layered_symbol(); }\n");
+    }
+    lines.concat()
+}
+
+fn untracked_source() -> String {
+    (0..20)
+        .map(|index| {
+            format!(
+                "pub fn untracked_symbol_{index:02}_with_complete_target_state_evidence() {{}}\n"
+            )
+        })
+        .collect()
+}
+
+fn untracked_tsv() -> String {
+    let mut output = String::from("id\tvalue\n");
+    for index in 0..48 {
+        output.push_str(&format!("row-{index:02}\tvalue-{index:02}\n"));
+    }
+    output
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QueryCapture {
+    text: String,
+    provenance: rmcp::serde_json::Value,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ChangesCapture {
+    initial: QueryCapture,
+    pages: BTreeMap<&'static str, Vec<(String, QueryCapture)>>,
+}
+
+impl ChangesCapture {
+    fn cursor_queries(&self) -> impl Iterator<Item = (&str, &QueryCapture)> {
+        self.pages
+            .values()
+            .flatten()
+            .map(|(cursor, capture)| (cursor.as_str(), capture))
+    }
+}
+
+fn capture_query(response: &str) -> QueryCapture {
+    let value = response_json(response);
+    assert_ne!(value["result"]["isError"], true, "{response}");
+    QueryCapture {
+        text: response_text(response),
+        provenance: value["result"]["structuredContent"]["provenance"].clone(),
+    }
+}
+
+fn capture_changes(
+    client: &mut Client,
+    snapshot_id: &str,
+    depth: u32,
+    max_nodes: u32,
+) -> ChangesCapture {
+    let initial = capture_query(&client.call(
+        "changes",
+        rmcp::serde_json::json!({
+            "snapshot_id": snapshot_id,
+            "depth": depth,
+            "max_nodes": max_nodes,
+        }),
+    ));
+    assert_eq!(initial.provenance["snapshot_id"], snapshot_id);
+    let review_complete = review_complete_when_pages_exhausted(&initial.text);
+    let mut pages = BTreeMap::new();
+    for (section, cursor_label) in [
+        ("files", "files_next_cursor"),
+        ("diff", "diff_next_cursor"),
+        ("artifacts", "artifacts_next_cursor"),
+        ("graph", "graph_next_cursor"),
+    ] {
+        let mut section_pages = Vec::new();
+        let mut cursor = page_cursor(&initial.text, cursor_label);
+        assert_eq!(
+            page_field(page_metadata_line(&initial.text, section), "page_complete") == "true",
+            cursor.is_none(),
+            "{}",
+            initial.text
+        );
+        while let Some(token) = cursor {
+            let page = capture_query(&client.call(
+                "changes",
+                rmcp::serde_json::json!({
+                    "snapshot_id": snapshot_id,
+                    "depth": depth,
+                    "max_nodes": max_nodes,
+                    "cursor": &token,
+                }),
+            ));
+            assert_eq!(page.provenance, initial.provenance);
+            assert!(
+                page.text.starts_with(&format!("{section}\n")),
+                "{}",
+                page.text
+            );
+            assert!(
+                review_complete_when_pages_exhausted(&page.text) == review_complete,
+                "completion changed between pages: {}",
+                page.text,
+            );
+            let next = page_cursor(&page.text, cursor_label);
+            assert_eq!(
+                page_field(page_metadata_line(&page.text, section), "page_complete") == "true",
+                next.is_none(),
+                "{}",
+                page.text
+            );
+            section_pages.push((token, page));
+            cursor = next;
+        }
+        pages.insert(section, section_pages);
+    }
+    ChangesCapture { initial, pages }
+}
+
+fn review_complete_when_pages_exhausted(output: &str) -> bool {
+    output
+        .lines()
+        .flat_map(str::split_ascii_whitespace)
+        .find_map(|field| field.strip_prefix("review_complete_when_pages_exhausted="))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+fn assert_review_completion(changes: &ChangesCapture, expected: bool) {
+    assert_eq!(
+        review_complete_when_pages_exhausted(&changes.initial.text),
+        expected,
+        "{}",
+        changes.initial.text
+    );
+    for (_, page) in changes.cursor_queries() {
+        assert_eq!(
+            review_complete_when_pages_exhausted(&page.text),
+            expected,
+            "{}",
+            page.text
+        );
+    }
+}
+
+fn change_section_text(changes: &ChangesCapture, section: &str) -> String {
+    let next = match section {
+        "files" => "diff",
+        "diff" => "artifacts",
+        "artifacts" => "graph",
+        "graph" => "review_complete=",
+        _ => unreachable!(),
+    };
+    let header = format!("{section}\n");
+    let start = changes.initial.text.find(&header).unwrap() + header.len();
+    let end = changes.initial.text[start..]
+        .find(&format!("\n{next}"))
+        .map_or(changes.initial.text.len(), |offset| start + offset);
+    let mut output = changes.initial.text[start..end].to_owned();
+    for (_, page) in &changes.pages[section] {
+        output.push_str(&page.text);
+    }
+    output
+}
+
+fn assert_change_manifest(changes: &ChangesCapture, expected: &[String]) {
+    let mut actual = change_section_text(changes, "files")
+        .lines()
+        .filter(|line| {
+            [
+                "added ",
+                "changed ",
+                "deleted ",
+                "renamed ",
+                "type-changed ",
+                "unmerged ",
+                "untracked ",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+fn assert_semantic_records(changes: &ChangesCapture, expected: &[String]) {
+    let mut actual = change_section_text(changes, "artifacts")
+        .lines()
+        .filter(|line| line.starts_with("markdown ") || line.starts_with("tsv "))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+fn assert_snapshot_provenance(
+    completion: &rmcp::serde_json::Value,
+    changes: &ChangesCapture,
+    target: rmcp::serde_json::Value,
+    changed_files: usize,
+    selected_layers: &[&str],
+) {
+    let provenance = &completion["provenance"];
+    assert_eq!(provenance["target_state"], target);
+    assert_eq!(provenance["changed_files"], changed_files);
+    assert_eq!(
+        provenance["selected_layers"],
+        rmcp::serde_json::json!(selected_layers)
+    );
+    assert_eq!(changes.initial.provenance, *provenance);
+}
+
+fn assert_tool_error_code(response: &str, expected: &str) {
+    let value = response_json(response);
+    assert_eq!(value["result"]["isError"], true, "{response}");
+    assert_eq!(
+        value["result"]["structuredContent"]["code"], expected,
+        "{response}"
+    );
+}
+
 #[test]
 fn changes_pages_complete_inventory_diff_and_flows() {
     let fixture = Fixture::new();
@@ -2347,6 +3111,36 @@ impl Client {
     fn index_and_wait(&mut self, dependency_mode: &str) -> rmcp::serde_json::Value {
         let job_id = self.queue_index(dependency_mode);
         let value = self.wait_for_job(&job_id, "completed");
+        let completion = value["result"]["structuredContent"]["state"]["completion"].clone();
+        self.snapshot_id = Some(completion["snapshot_id"].as_str().unwrap().to_owned());
+        remember_graph(&self.repository, &completion);
+        completion
+    }
+
+    fn index_target_and_wait(
+        &mut self,
+        base: &str,
+        head: &str,
+        target: rmcp::serde_json::Value,
+    ) -> rmcp::serde_json::Value {
+        let queued = response_json(&self.call(
+            "index",
+            rmcp::serde_json::json!({
+                "worktree_root": self.repository,
+                "base": base,
+                "head": head,
+                "target": target,
+                "dependency_mode": "boundary",
+            }),
+        ));
+        assert_eq!(
+            queued["result"]["structuredContent"]["state"]["state"],
+            "queued"
+        );
+        let job_id = queued["result"]["structuredContent"]["job_id"]
+            .as_str()
+            .unwrap();
+        let value = self.wait_for_job(job_id, "completed");
         let completion = value["result"]["structuredContent"]["state"]["completion"].clone();
         self.snapshot_id = Some(completion["snapshot_id"].as_str().unwrap().to_owned());
         remember_graph(&self.repository, &completion);
