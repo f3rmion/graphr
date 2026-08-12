@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use crate::git::DependencyMode;
@@ -109,6 +110,19 @@ impl JobRegistry {
         + Send
         + 'static,
     ) -> Result<JobStatus, OperationError> {
+        self.start_with_hook(workspace_id, request_key, request, work, || {})
+    }
+
+    fn start_with_hook(
+        self: &Arc<Self>,
+        workspace_id: String,
+        request_key: String,
+        request: JobRequestSummary,
+        work: impl FnOnce(JobReporter, Arc<AtomicBool>) -> Result<IndexCompletion, OperationError>
+        + Send
+        + 'static,
+        after_spawn: impl FnOnce(),
+    ) -> Result<JobStatus, OperationError> {
         let mut registry = self.state.lock().expect("job registry poisoned");
         if let Some(active) = registry.active_workspaces.get(&workspace_id) {
             if active.request_key == request_key {
@@ -140,17 +154,36 @@ impl JobRegistry {
                 request_key,
             },
         );
+        let (start_tx, start_rx) = mpsc::sync_channel(0);
         let handle = thread::Builder::new().name(job_id).spawn({
             let job = job.clone();
             let cancelled = job.cancelled.clone();
             let registry = self.clone();
             move || {
-                let result = work(JobReporter { job: job.clone() }, cancelled);
+                if start_rx.recv().is_err() {
+                    return;
+                }
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    work(JobReporter { job: job.clone() }, cancelled)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(OperationError::new(
+                        ErrorCode::Internal,
+                        "indexing worker panicked",
+                    ))
+                });
                 registry.finish(&job, result);
             }
         });
         match handle {
-            Ok(handle) => registry.handles.push(handle),
+            Ok(handle) => {
+                registry.handles.push(handle);
+                let status = job.status();
+                drop(registry);
+                start_tx.send(()).expect("registered worker disappeared");
+                after_spawn();
+                Ok(status)
+            }
             Err(error) => {
                 job.state.lock().expect("job state poisoned").state = JobState::Failed {
                     error: OperationError::new(
@@ -165,9 +198,9 @@ impl JobRegistry {
                 {
                     registry.active_workspaces.remove(&job.workspace_id);
                 }
+                Ok(job.status())
             }
         }
-        Ok(job.status())
     }
 
     pub fn status(&self, job_id: &str) -> Result<JobStatus, OperationError> {
@@ -258,7 +291,7 @@ impl JobReporter {
             }
         };
         let valid_counters = state.progress.as_ref().is_none_or(|previous| {
-            previous.stage != progress.stage
+            (previous.stage == BuildStage::Capturing && progress.stage == BuildStage::SelectingSeed)
                 || (progress.files_done >= previous.files_done
                     && progress.files_total >= previous.files_total
                     && progress.files_reused >= previous.files_reused
@@ -377,6 +410,34 @@ mod tests {
             registry.status("job-1").unwrap().state,
             JobState::Completed { .. }
         ));
+    }
+
+    #[test]
+    fn work_starts_after_handle_registration_and_registry_unlock() {
+        let registry = JobRegistry::new();
+        let registry_from_work = registry.clone();
+        let lock_was_free = Arc::new(AtomicBool::new(false));
+        let observed = lock_was_free.clone();
+        let (lock_tx, lock_rx) = mpsc::sync_channel(0);
+
+        let status = registry
+            .start_with_hook(
+                "workspace-1".into(),
+                "request-1".into(),
+                request("workspace-1"),
+                move |_, _| {
+                    lock_tx
+                        .send(registry_from_work.state.try_lock().is_ok())
+                        .unwrap();
+                    Ok(completion("workspace-1", "snapshot-1"))
+                },
+                move || observed.store(lock_rx.recv().unwrap(), Ordering::Relaxed),
+            )
+            .unwrap();
+
+        assert_eq!(status.state, JobState::Queued);
+        registry.close();
+        assert!(lock_was_free.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -587,6 +648,46 @@ mod tests {
     }
 
     #[test]
+    fn panicking_worker_fails_and_releases_workspace() {
+        let registry = JobRegistry::new();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        registry
+            .start(
+                "workspace-1".into(),
+                "request-1".into(),
+                request("workspace-1"),
+                move |_, _| {
+                    started_tx.send(()).unwrap();
+                    panic!("intentional worker panic");
+                },
+            )
+            .unwrap();
+        started_rx.recv().unwrap();
+        registry.close();
+
+        assert!(matches!(
+            registry.status("job-1").unwrap().state,
+            JobState::Failed {
+                error: OperationError {
+                    code: ErrorCode::Internal,
+                    ref message,
+                    ..
+                }
+            } if message == "indexing worker panicked"
+        ));
+        let replacement = registry
+            .start(
+                "workspace-1".into(),
+                "request-2".into(),
+                request("workspace-1"),
+                |_, _| Ok(completion("workspace-1", "snapshot-2")),
+            )
+            .unwrap();
+        assert_eq!(replacement.job_id, "job-2");
+        registry.close();
+    }
+
+    #[test]
     fn reporter_accepts_only_forward_progress() {
         let registry = JobRegistry::new();
         let (progress_tx, progress_rx) = mpsc::channel();
@@ -673,6 +774,84 @@ mod tests {
         assert_eq!(
             registry.status("job-1").unwrap().state,
             JobState::Publishing
+        );
+        progress_tx.send(None).unwrap();
+        registry.close();
+    }
+
+    #[test]
+    fn reporter_rejects_cross_stage_counter_regression() {
+        let registry = JobRegistry::new();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let (reported_tx, reported_rx) = mpsc::sync_channel(0);
+        registry
+            .start(
+                "workspace-1".into(),
+                "request-1".into(),
+                request("workspace-1"),
+                move |reporter, _| {
+                    while let Some(progress) = progress_rx.recv().unwrap() {
+                        reporter.report(progress);
+                        reported_tx.send(()).unwrap();
+                    }
+                    Ok(completion("workspace-1", "snapshot-1"))
+                },
+            )
+            .unwrap();
+
+        report_and_wait(
+            &progress_tx,
+            &reported_rx,
+            progress(BuildStage::Capturing, 0, 0),
+        );
+        report_and_wait(
+            &progress_tx,
+            &reported_rx,
+            BuildProgress {
+                stage: BuildStage::Capturing,
+                files_done: 3,
+                files_total: 3,
+                files_reused: 0,
+                files_parsed: 0,
+                rejected_cache: None,
+            },
+        );
+        report_and_wait(
+            &progress_tx,
+            &reported_rx,
+            progress(BuildStage::SelectingSeed, 0, 3),
+        );
+        assert_eq!(
+            registry.status("job-1").unwrap().state,
+            JobState::SelectingSeed
+        );
+        report_and_wait(
+            &progress_tx,
+            &reported_rx,
+            progress(BuildStage::Indexing, 2, 3),
+        );
+        report_and_wait(
+            &progress_tx,
+            &reported_rx,
+            progress(BuildStage::ResolvingGraph, 1, 3),
+        );
+        assert_eq!(
+            registry.status("job-1").unwrap().state,
+            JobState::Indexing {
+                files_done: 2,
+                files_total: 3,
+                files_reused: 0,
+                files_parsed: 2,
+            }
+        );
+        report_and_wait(
+            &progress_tx,
+            &reported_rx,
+            progress(BuildStage::ResolvingGraph, 2, 3),
+        );
+        assert_eq!(
+            registry.status("job-1").unwrap().state,
+            JobState::ResolvingGraph
         );
         progress_tx.send(None).unwrap();
         registry.close();
