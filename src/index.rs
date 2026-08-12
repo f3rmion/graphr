@@ -193,6 +193,9 @@ impl Engine {
                 |entry| validate_entry_graph(entry, cancelled),
             ) {
                 Ok(_) => true,
+                Err(error) if error.code == crate::workspace::ErrorCode::JobCancelled => {
+                    return Err(error);
+                }
                 Err(_) => {
                     rejected_cache = Some(exact_graph.display().to_string());
                     self.catalog
@@ -251,6 +254,9 @@ impl Engine {
                 {
                     Ok(_) => {
                         break;
+                    }
+                    Err(error) if error.code == crate::workspace::ErrorCode::JobCancelled => {
+                        return Err(error);
                     }
                     Err(_) => {
                         rejected_cache = Some(candidate.graph_path.display().to_string());
@@ -3018,6 +3024,58 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_during_exact_validation_preserves_published_snapshot() {
+        let root = snapshot_repository("cancel-exact-validation");
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        let request = snapshot_request(&engine, &root, "HEAD", "HEAD");
+        let first = engine
+            .build_snapshot(request.clone(), &AtomicBool::new(false), |_| {})
+            .unwrap();
+        let graph = root
+            .join(".git/graphr/v6/graphs")
+            .join(format!("{}.db", first.graph_image_id));
+        let manifest = root
+            .join(".git/graphr/v6/snapshots")
+            .join(format!("{}.json", first.snapshot_id));
+        let review = fs::read_dir(root.join(".git/graphr/v6/reviews"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let cancelled = AtomicBool::new(false);
+        let rejected = Mutex::new(Vec::new());
+
+        let error = engine
+            .build_snapshot(request, &cancelled, |progress| {
+                if progress.stage == BuildStage::SelectingSeed {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                if let Some(path) = progress.rejected_cache {
+                    rejected.lock().unwrap().push(path);
+                }
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::JobCancelled);
+        assert_eq!(*rejected.lock().unwrap(), Vec::<String>::new());
+        assert!(graph.exists());
+        assert!(manifest.exists());
+        assert!(review.exists());
+        assert_eq!(
+            fs::read_dir(root.join(".git/graphr/v6/quarantine"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let loaded = engine.snapshot(&first.snapshot_id).unwrap();
+        crate::store::validate_image(&loaded.graph_path).unwrap();
+        rmcp::serde_json::from_slice::<crate::git::WorktreeChanges>(&fs::read(&review).unwrap())
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn base_oid_seed_reparses_only_changed_files() {
         let root = snapshot_repository("base-oid-seed");
         let base = test_git_line(&root, &["rev-parse", "HEAD"]);
@@ -3044,6 +3102,69 @@ mod tests {
         assert_eq!(completion.stats.files_total, 2);
         assert_eq!(completion.stats.files_reused, 1);
         assert_eq!(completion.stats.files_parsed, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_during_seed_validation_preserves_published_snapshot() {
+        let root = snapshot_repository("cancel-seed-validation");
+        let base = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        let first = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &base),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let graph = root
+            .join(".git/graphr/v6/graphs")
+            .join(format!("{}.db", first.graph_image_id));
+        let manifest = root
+            .join(".git/graphr/v6/snapshots")
+            .join(format!("{}.json", first.snapshot_id));
+        let review = fs::read_dir(root.join(".git/graphr/v6/reviews"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::write(root.join("src/a.rs"), "fn changed() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "change one file"]);
+        let head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let cancelled = AtomicBool::new(false);
+        let rejected = Mutex::new(Vec::new());
+
+        let error = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &head),
+                &cancelled,
+                |progress| {
+                    if progress.stage == BuildStage::SelectingSeed {
+                        cancelled.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(path) = progress.rejected_cache {
+                        rejected.lock().unwrap().push(path);
+                    }
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::JobCancelled);
+        assert_eq!(*rejected.lock().unwrap(), Vec::<String>::new());
+        assert!(graph.exists());
+        assert!(manifest.exists());
+        assert!(review.exists());
+        assert_eq!(
+            fs::read_dir(root.join(".git/graphr/v6/quarantine"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let loaded = engine.snapshot(&first.snapshot_id).unwrap();
+        crate::store::validate_image(&loaded.graph_path).unwrap();
+        rmcp::serde_json::from_slice::<crate::git::WorktreeChanges>(&fs::read(&review).unwrap())
+            .unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
