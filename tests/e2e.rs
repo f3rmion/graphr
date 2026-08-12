@@ -1594,6 +1594,10 @@ struct ChangesCapture {
 }
 
 impl ChangesCapture {
+    fn queries(&self) -> impl Iterator<Item = &QueryCapture> {
+        std::iter::once(&self.initial).chain(self.pages.values().flatten().map(|(_, page)| page))
+    }
+
     fn cursor_queries(&self) -> impl Iterator<Item = (&str, &QueryCapture)> {
         self.pages
             .values()
@@ -1796,6 +1800,37 @@ fn parse_graph_records(output: &str) -> Result<BTreeSet<GraphRecord>, String> {
     Ok(records)
 }
 
+#[test]
+fn compact_query_records_reject_unexpected_nodes() {
+    let snapshot = "a".repeat(64);
+    let output = format!(
+        "n1:{snapshot}:00000001:1:1 Function left_staged_symbol src/left.rs:1\nn1:{snapshot}:00000001:1:2 Function unexpected_symbol src/unexpected.rs:7\n"
+    );
+    let expected = BTreeSet::from([GraphRecord::Symbol(
+        "Function".into(),
+        "left_staged_symbol".into(),
+        "src/left.rs".into(),
+        1,
+    )]);
+
+    assert!(output.contains("left_staged_symbol"));
+    assert!(!output.contains("right_staged_symbol"));
+    assert!(
+        assert_exact_query_records(&output, &expected).is_err(),
+        "unexpected compact node was accepted"
+    );
+}
+
+fn assert_exact_query_records(
+    output: &str,
+    expected: &BTreeSet<GraphRecord>,
+) -> Result<(), String> {
+    let actual = parse_graph_records(output)?;
+    (actual == *expected)
+        .then_some(())
+        .ok_or_else(|| format!("compact node records differ: {actual:?}"))
+}
+
 fn parse_graph_line(line: &str) -> Result<Option<GraphRecord>, String> {
     if let Some(risk) = line.strip_prefix("  risk ") {
         let (score, mut node) = risk.split_once(' ').ok_or_else(|| invalid_graph(line))?;
@@ -1811,6 +1846,7 @@ fn parse_graph_line(line: &str) -> Result<Option<GraphRecord>, String> {
     for relation in [
         "test <-",
         "caller <-",
+        "in <-",
         "impl <-",
         "call ->",
         "implements ->",
@@ -3047,18 +3083,12 @@ fn two_linked_worktrees_index_concurrently_without_cross_contamination() {
         .unwrap();
     assert_ne!(left_job, right_job);
     let entered = blocker.wait_for_entries(2);
-    assert!(
-        entered
-            .iter()
-            .any(|entry| entry.contains(worktrees.linked.to_str().unwrap())),
-        "{entered:?}"
-    );
-    assert!(
-        entered
-            .iter()
-            .any(|entry| entry.contains(second.to_str().unwrap())),
-        "{entered:?}"
-    );
+    let expected_roots = BTreeSet::from([
+        fs::canonicalize(&worktrees.linked).unwrap(),
+        fs::canonicalize(&second).unwrap(),
+    ]);
+    assert_blocked_git_markers(&entered, &expected_roots)
+        .unwrap_or_else(|error| panic!("{error}: {entered:?}"));
     for job_id in [left_job, right_job] {
         let status = response_json(&client.call(
             "index_status",
@@ -3177,10 +3207,22 @@ fn two_linked_worktrees_index_concurrently_without_cross_contamination() {
             "kind": "function",
         }),
     ));
-    assert!(left_search.text.contains("left_staged_symbol"));
-    assert!(!left_search.text.contains("right_staged_symbol"));
-    assert!(right_search.text.contains("right_staged_symbol"));
-    assert!(!right_search.text.contains("left_staged_symbol"));
+    let left_records = BTreeSet::from([GraphRecord::Symbol(
+        "Function".into(),
+        "left_staged_symbol".into(),
+        "src/left.rs".into(),
+        1,
+    )]);
+    let right_records = BTreeSet::from([GraphRecord::Symbol(
+        "Function".into(),
+        "right_staged_symbol".into(),
+        "src/right.rs".into(),
+        1,
+    )]);
+    assert_exact_query_records(&left_search.text, &left_records)
+        .unwrap_or_else(|error| panic!("{error}: {}", left_search.text));
+    assert_exact_query_records(&right_search.text, &right_records)
+        .unwrap_or_else(|error| panic!("{error}: {}", right_search.text));
     let left_view = capture_query(&client.call(
         "view",
         rmcp::serde_json::json!({
@@ -3199,10 +3241,28 @@ fn two_linked_worktrees_index_concurrently_without_cross_contamination() {
             "max_nodes": 30,
         }),
     ));
-    assert!(left_view.text.contains("left_staged_symbol"));
-    assert!(!left_view.text.contains("right_staged_symbol"));
-    assert!(right_view.text.contains("right_staged_symbol"));
-    assert!(!right_view.text.contains("left_staged_symbol"));
+    let left_view_records = BTreeSet::from([
+        GraphRecord::File("src/left.rs src/left.rs".into(), 1),
+        GraphRecord::Symbol(
+            "Function".into(),
+            "left_staged_symbol".into(),
+            "src/left.rs".into(),
+            1,
+        ),
+    ]);
+    let right_view_records = BTreeSet::from([
+        GraphRecord::File("src/right.rs src/right.rs".into(), 1),
+        GraphRecord::Symbol(
+            "Function".into(),
+            "right_staged_symbol".into(),
+            "src/right.rs".into(),
+            1,
+        ),
+    ]);
+    assert_exact_query_records(&left_view.text, &left_view_records)
+        .unwrap_or_else(|error| panic!("{error}: {}", left_view.text));
+    assert_exact_query_records(&right_view.text, &right_view_records)
+        .unwrap_or_else(|error| panic!("{error}: {}", right_view.text));
     let left_changes = capture_changes(&mut client, left_snapshot, 6, 50);
     let right_changes = capture_changes_in_order(
         &mut client,
@@ -3232,13 +3292,17 @@ fn two_linked_worktrees_index_concurrently_without_cross_contamination() {
         &right_changes,
         &[("Function", "right_staged_symbol", "src/right.rs", 1)],
     );
-    for capture in [&left_search, &left_view, &left_changes.initial] {
+    for capture in std::iter::once(&left_search)
+        .chain(std::iter::once(&left_view))
+        .chain(left_changes.queries())
+    {
         assert_eq!(capture.provenance, *left_provenance);
-        assert!(!capture.text.contains("src/right.rs"), "{}", capture.text);
     }
-    for capture in [&right_search, &right_view, &right_changes.initial] {
+    for capture in std::iter::once(&right_search)
+        .chain(std::iter::once(&right_view))
+        .chain(right_changes.queries())
+    {
         assert_eq!(capture.provenance, *right_provenance);
-        assert!(!capture.text.contains("src/left.rs"), "{}", capture.text);
     }
     assert_eq!(cached_snapshot(left), left_cache);
     assert_eq!(cached_snapshot(right), right_cache);
@@ -3655,20 +3719,36 @@ fn linked_feature_with_ten_commits_and_twelve_files_returns_replay_symbols() {
         1,
     )));
     let search = capture_query(&client.search("replay_entry", Some("function")));
-    assert_eq!(
-        search.text.lines().collect::<Vec<_>>(),
-        [format!(
-            "{} Function replay_entry src/replay.rs:1",
-            search.text.split_whitespace().next().unwrap()
-        )]
-    );
+    let search_records = BTreeSet::from([GraphRecord::Symbol(
+        "Function".into(),
+        "replay_entry".into(),
+        "src/replay.rs".into(),
+        1,
+    )]);
+    assert_exact_query_records(&search.text, &search_records)
+        .unwrap_or_else(|error| panic!("{error}: {}", search.text));
     let view = capture_query(&client.view(search.text.split_whitespace().next().unwrap(), 1, 30));
-    assert!(view.text.contains("Function replay_entry src/replay.rs:1"));
-    assert!(
-        view.text
-            .contains("Function replay_step_00 src/replay.rs:2")
-    );
-    for capture in [&search, &view, &first_changes.initial] {
+    let view_records = BTreeSet::from([
+        GraphRecord::File("src/replay.rs src/replay.rs".into(), 1),
+        GraphRecord::Symbol(
+            "Function".into(),
+            "replay_entry".into(),
+            "src/replay.rs".into(),
+            1,
+        ),
+        GraphRecord::Symbol(
+            "Function".into(),
+            "replay_step_00".into(),
+            "src/replay.rs".into(),
+            2,
+        ),
+    ]);
+    assert_exact_query_records(&view.text, &view_records)
+        .unwrap_or_else(|error| panic!("{error}: {}", view.text));
+    for capture in std::iter::once(&search)
+        .chain(std::iter::once(&view))
+        .chain(first_changes.queries())
+    {
         assert_eq!(capture.provenance, *provenance);
     }
     let first_cache = cached_snapshot(completion);
@@ -4286,6 +4366,74 @@ struct GitBlocker {
     permits: usize,
     wrapper_path: std::ffi::OsString,
     real_git: PathBuf,
+}
+
+#[test]
+fn blocked_git_markers_require_exact_distinct_roots() {
+    let linked = PathBuf::from("/tmp/repository/linked");
+    let linked_two = PathBuf::from("/tmp/repository/linked-two");
+    let longer_marker = "--no-pager\n-c\ncore.fsmonitor=false\n-C\n/tmp/repository/linked-two\nrev-list\n--count\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+    let markers = [longer_marker.to_owned(), longer_marker.to_owned()];
+    let expected = BTreeSet::from([linked.clone(), linked_two.clone()]);
+
+    assert!(
+        expected.iter().all(|root| markers
+            .iter()
+            .any(|marker| marker.contains(root.to_str().unwrap()))),
+        "fixture no longer demonstrates the substring false positive"
+    );
+    assert!(
+        assert_blocked_git_markers(&markers, &expected).is_err(),
+        "duplicate longer-root markers were accepted"
+    );
+}
+
+fn assert_blocked_git_markers(
+    markers: &[String],
+    expected: &BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    if markers.len() != expected.len() {
+        return Err("blocked Git marker count differs".into());
+    }
+    let actual = markers
+        .iter()
+        .map(|marker| parse_blocked_git_root(marker))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    (actual == *expected)
+        .then_some(())
+        .ok_or_else(|| format!("blocked Git roots differ: {actual:?}"))
+}
+
+fn parse_blocked_git_root(marker: &str) -> Result<PathBuf, String> {
+    let args = marker.lines().collect::<Vec<_>>();
+    let [
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-C",
+        root,
+        "rev-list",
+        "--count",
+        range,
+    ] = args.as_slice()
+    else {
+        return Err(format!("unexpected blocked Git argv: {args:?}"));
+    };
+    let (base, head) = range
+        .split_once("..")
+        .ok_or_else(|| format!("unexpected blocked rev-list range: {range}"))?;
+    if ![base, head].iter().all(|oid| {
+        matches!(oid.len(), 40 | 64)
+            && oid
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(format!("unexpected blocked rev-list range: {range}"));
+    }
+    let root = PathBuf::from(root);
+    root.is_absolute()
+        .then_some(root)
+        .ok_or_else(|| "blocked Git root is not absolute".into())
 }
 
 impl GitBlocker {
