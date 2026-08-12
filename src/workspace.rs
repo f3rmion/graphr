@@ -366,7 +366,7 @@ impl AllowedRoots {
         self.authorize(&requested)?;
         let repository = Repository::discover_cancelled(&requested, cancelled)?;
         self.authorize(&repository.root)?;
-        Ok(identity(repository))
+        identity(repository)
     }
 
     pub fn authorize(&self, canonical_root: &Path) -> Result<(), OperationError> {
@@ -1739,10 +1739,22 @@ fn validate_path(path: &Path, label: &str) -> Result<(), OperationError> {
     Ok(())
 }
 
-fn identity(repository: Repository) -> RootIdentity {
+fn identity(repository: Repository) -> Result<RootIdentity, OperationError> {
+    let metadata = fs::metadata(&repository.common_git_dir).map_err(|_| {
+        OperationError::new(
+            ErrorCode::GitMetadataInvalid,
+            "cannot inspect common Git directory",
+        )
+        .with_path("root", &repository.common_git_dir)
+    })?;
     let repository_id = hash_fields(
-        b"graphr.repository.v1",
-        &[&repository.common_git_dir, &repository.object_format],
+        b"graphr.repository.v2",
+        &[
+            &repository.common_git_dir,
+            &repository.object_format,
+            &metadata.dev(),
+            &metadata.ino(),
+        ],
     );
     let workspace_id = hash_fields(
         b"graphr.workspace.v1",
@@ -1753,7 +1765,7 @@ fn identity(repository: Repository) -> RootIdentity {
             &repository.index_path,
         ],
     );
-    RootIdentity {
+    Ok(RootIdentity {
         repository_id,
         workspace_id,
         repository_root: repository.root.clone(),
@@ -1764,7 +1776,7 @@ fn identity(repository: Repository) -> RootIdentity {
         object_format: repository.object_format,
         branch: repository.branch,
         head_oid: repository.head_oid,
-    }
+    })
 }
 
 pub(crate) fn graph_image_key(

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
@@ -1370,6 +1370,421 @@ fn rust_index_search_view_and_inspection_over_explicit_snapshots() {
 }
 
 #[test]
+fn server_started_with_main_indexes_the_selected_linked_worktree() {
+    let worktrees = linked_worktrees("explicit-selection");
+    fs::create_dir_all(worktrees.main.join("src")).unwrap();
+    fs::write(
+        worktrees.main.join("src/main_only.rs"),
+        "pub fn main_only_symbol() {}\n",
+    )
+    .unwrap();
+    git(&worktrees.main, &["add", "--", "src/main_only.rs"]);
+    git(
+        &worktrees.main,
+        &[
+            "-c",
+            "user.name=Graphr Test",
+            "-c",
+            "user.email=graphr@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "main only",
+        ],
+    );
+    fs::create_dir_all(worktrees.linked.join("src")).unwrap();
+    fs::write(
+        worktrees.linked.join("src/feature_only.rs"),
+        "pub fn feature_only_symbol() {}\n",
+    )
+    .unwrap();
+    git(&worktrees.linked, &["add", "--", "src/feature_only.rs"]);
+    git(
+        &worktrees.linked,
+        &[
+            "-c",
+            "user.name=Graphr Test",
+            "-c",
+            "user.email=graphr@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "feature only",
+        ],
+    );
+    let feature_oid = git_output(&worktrees.linked, &["rev-parse", "HEAD"]);
+    let feature_git_dir = git_output(
+        &worktrees.linked,
+        &["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
+    );
+    let mut client = Client::start_unindexed_with(&worktrees.linked, |command| {
+        command
+            .current_dir(&worktrees.main)
+            .arg("--allow-root")
+            .arg(&worktrees.main);
+    });
+    let main_workspace = response_json(&client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({ "worktree_root": &worktrees.main }),
+    ));
+    let main_workspace_id =
+        main_workspace["result"]["structuredContent"]["identity"]["workspace_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+    let queued = response_json(&client.call(
+        "index",
+        rmcp::serde_json::json!({
+            "worktree_root": &worktrees.linked,
+            "base": "HEAD~1",
+            "head": "HEAD",
+            "target": { "kind": "commit" },
+            "dependency_mode": "boundary",
+        }),
+    ));
+    let job_id = queued["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let completed = client.wait_for_job(&job_id, "completed");
+    let completion = &completed["result"]["structuredContent"]["state"]["completion"];
+    let snapshot_id = completion["snapshot_id"].as_str().unwrap().to_owned();
+    client.snapshot_id = Some(snapshot_id.clone());
+
+    let provenance = &completion["provenance"];
+    assert_eq!(
+        provenance["worktree_root"],
+        fs::canonicalize(&worktrees.linked)
+            .unwrap()
+            .display()
+            .to_string()
+    );
+    assert_eq!(provenance["git_dir"], feature_git_dir);
+    assert_eq!(provenance["branch"], "linked");
+    assert_eq!(provenance["head_oid"], feature_oid);
+
+    let changes = client.changes(1, 50, None);
+    assert!(
+        response_text(&changes).contains("src/feature_only.rs"),
+        "{changes}"
+    );
+    let search = client.search("feature_only_symbol", Some("function"));
+    assert!(
+        response_text(&search).contains("feature_only_symbol"),
+        "{search}"
+    );
+    let absent = client.search("main_only_symbol", Some("function"));
+    assert!(
+        !response_text(&absent).contains("main_only_symbol"),
+        "{absent}"
+    );
+    for response in [
+        &queued.to_string(),
+        &completed.to_string(),
+        &changes,
+        &search,
+        &absent,
+    ] {
+        assert!(
+            !response.contains(&main_workspace_id),
+            "main workspace leaked into selected feature response: {response}"
+        );
+    }
+    assert_eq!(snapshot_id, client.snapshot_id());
+    client.close();
+}
+
+#[test]
+fn unknown_disallowed_replaced_subdirectory_bare_and_symlink_roots_fail_explicitly() {
+    let fixture = Fixture::new();
+    let repository = fixture.path.join("repository");
+    init_git_main(&repository);
+    fs::create_dir(repository.join("src")).unwrap();
+    let outside = fixture.path.join("outside");
+    init_git_main(&outside);
+    let bare = fixture.path.join("bare.git");
+    git_init_bare(&bare);
+
+    let mut client = Client::start(&repository);
+    assert_root_error(
+        &client.call(
+            "inspect_root",
+            rmcp::serde_json::json!({ "worktree_root": fixture.path.join("unknown") }),
+        ),
+        "root_unknown",
+        &[("root", fixture.path.join("unknown").display().to_string())],
+    );
+    assert_root_error(
+        &client.call(
+            "inspect_root",
+            rmcp::serde_json::json!({ "worktree_root": &outside }),
+        ),
+        "root_disallowed",
+        &[(
+            "root",
+            fs::canonicalize(&outside).unwrap().display().to_string(),
+        )],
+    );
+    assert_root_error(
+        &client.call(
+            "inspect_root",
+            rmcp::serde_json::json!({ "worktree_root": repository.join("src") }),
+        ),
+        "root_not_worktree",
+        &[("root", repository.join("src").display().to_string())],
+    );
+
+    let old_snapshot = client.snapshot_id().to_owned();
+    let old_workspace = response_json(&client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({ "worktree_root": &repository }),
+    ))["result"]["structuredContent"]["identity"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let moved = fixture.path.join("moved");
+    fs::rename(&repository, &moved).unwrap();
+    init_git_main(&repository);
+    assert_root_error(
+        &client.call(
+            "inspect_root",
+            rmcp::serde_json::json!({
+                "worktree_root": &repository,
+                "snapshot_id": old_snapshot,
+            }),
+        ),
+        "root_stale",
+        &[("root", repository.display().to_string())],
+    );
+    client.close();
+
+    let mut replacement = Client::start(&repository);
+    let replacement_workspace = response_json(&replacement.call(
+        "inspect_root",
+        rmcp::serde_json::json!({ "worktree_root": &repository }),
+    ))["result"]["structuredContent"]["identity"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(replacement_workspace, old_workspace);
+    replacement.close();
+
+    let mut bare_client = Client::start_unindexed(&bare);
+    assert_root_error(
+        &bare_client.call(
+            "inspect_root",
+            rmcp::serde_json::json!({ "worktree_root": &bare }),
+        ),
+        "git_metadata_invalid",
+        &[],
+    );
+    bare_client.close();
+
+    let worktrees = linked_worktrees("symlink-root");
+    let git_dir = PathBuf::from(git_output(
+        &worktrees.linked,
+        &["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
+    ));
+    let escaped = fixture.path.join("escaped-git-dir");
+    fs::rename(&git_dir, &escaped).unwrap();
+    std::os::unix::fs::symlink(&escaped, &git_dir).unwrap();
+    let mut symlink_client = Client::start_unindexed(&worktrees.linked);
+    assert_root_error(
+        &symlink_client.call(
+            "inspect_root",
+            rmcp::serde_json::json!({ "worktree_root": &worktrees.linked }),
+        ),
+        "git_metadata_invalid",
+        &[],
+    );
+    symlink_client.close();
+    fs::remove_file(&git_dir).unwrap();
+    fs::rename(&escaped, &git_dir).unwrap();
+}
+
+#[test]
+fn linked_worktrees_report_shared_repository_and_distinct_workspace_identity() {
+    let worktrees = linked_worktrees("identity");
+    let mut client = Client::start_unindexed_with(&worktrees.main, |command| {
+        command.arg("--allow-root").arg(&worktrees.linked);
+    });
+    let main = response_json(&client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({ "worktree_root": &worktrees.main }),
+    ));
+    let linked = response_json(&client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({ "worktree_root": &worktrees.linked }),
+    ));
+    let main_identity = &main["result"]["structuredContent"]["identity"];
+    let linked_identity = &linked["result"]["structuredContent"]["identity"];
+
+    assert_eq!(
+        main_identity["common_git_dir"],
+        linked_identity["common_git_dir"]
+    );
+    assert_eq!(
+        main_identity["repository_id"],
+        linked_identity["repository_id"]
+    );
+    assert_ne!(
+        main_identity["workspace_id"],
+        linked_identity["workspace_id"]
+    );
+    assert_ne!(main_identity["git_dir"], linked_identity["git_dir"]);
+    assert_ne!(main_identity["index_path"], linked_identity["index_path"]);
+    assert_eq!(
+        main_identity["worktree_root"],
+        fs::canonicalize(&worktrees.main)
+            .unwrap()
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        linked_identity["worktree_root"],
+        fs::canonicalize(&worktrees.linked)
+            .unwrap()
+            .display()
+            .to_string()
+    );
+    assert_eq!(main_identity["branch"], "main");
+    assert_eq!(linked_identity["branch"], "linked");
+    assert_eq!(
+        main_identity["head_oid"],
+        git_output(&worktrees.main, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        linked_identity["head_oid"],
+        git_output(&worktrees.linked, &["rev-parse", "HEAD"])
+    );
+    client.close();
+}
+
+#[test]
+fn commit_target_reviews_a_branch_without_checking_it_out() {
+    let fixture = Fixture::new();
+    let repository = fixture.path.join("repository");
+    init_git_main(&repository);
+    fs::create_dir_all(repository.join("src")).unwrap();
+    fs::write(repository.join("src/main.rs"), "pub fn base_symbol() {}\n").unwrap();
+    git(&repository, &["add", "--", "."]);
+    git_commit(&repository, "base");
+    let base_oid = git_output(&repository, &["rev-parse", "HEAD"]);
+    git(&repository, &["switch", "--quiet", "-c", "feature"]);
+    fs::write(
+        repository.join("src/feature.rs"),
+        "pub fn unchecked_feature_symbol() {}\n",
+    )
+    .unwrap();
+    git(&repository, &["add", "--", "."]);
+    git_commit(&repository, "feature");
+    let feature_oid = git_output(&repository, &["rev-parse", "HEAD"]);
+    git(&repository, &["switch", "--quiet", "main"]);
+    let before = repository_state(&repository);
+
+    let mut client = Client::start_unindexed(&repository);
+    let queued = response_json(&client.call(
+        "index",
+        rmcp::serde_json::json!({
+            "worktree_root": &repository,
+            "base": "main",
+            "head": "feature",
+            "target": { "kind": "commit" },
+            "dependency_mode": "boundary",
+        }),
+    ));
+    let job_id = queued["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let completed = client.wait_for_job(&job_id, "completed");
+    let completion = &completed["result"]["structuredContent"]["state"]["completion"];
+    client.snapshot_id = Some(completion["snapshot_id"].as_str().unwrap().to_owned());
+    assert_eq!(completion["provenance"]["base_oid"], base_oid);
+    assert_eq!(completion["provenance"]["head_oid"], feature_oid);
+    assert_eq!(completion["provenance"]["target_state"]["kind"], "commit");
+    let search = client.search("unchecked_feature_symbol", Some("function"));
+    assert!(
+        response_text(&search).contains("unchecked_feature_symbol"),
+        "{search}"
+    );
+    let changes = client.changes(1, 50, None);
+    assert!(
+        response_text(&changes).contains("src/feature.rs"),
+        "{changes}"
+    );
+    assert_eq!(repository_state(&repository), before);
+    client.close();
+}
+
+#[test]
+fn identical_clean_oids_return_explained_no_changes() {
+    let fixture = Fixture::new();
+    let repository = fixture.path.join("repository");
+    init_git_main(&repository);
+    fs::create_dir_all(repository.join("src")).unwrap();
+    fs::write(repository.join("src/lib.rs"), "pub fn clean_symbol() {}\n").unwrap();
+    git(&repository, &["add", "--", "."]);
+    git_commit(&repository, "clean");
+    let oid = git_output(&repository, &["rev-parse", "HEAD"]);
+
+    let mut client = Client::start_unindexed(&repository);
+    let queued = response_json(&client.call(
+        "index",
+        rmcp::serde_json::json!({
+            "worktree_root": &repository,
+            "base": "HEAD",
+            "head": "HEAD",
+            "target": { "kind": "commit" },
+            "dependency_mode": "boundary",
+        }),
+    ));
+    let job_id = queued["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let completed = client.wait_for_job(&job_id, "completed");
+    let completion = &completed["result"]["structuredContent"]["state"]["completion"];
+    let snapshot_id = completion["snapshot_id"].as_str().unwrap().to_owned();
+    client.snapshot_id = Some(snapshot_id.clone());
+    let changes = client.changes(1, 50, None);
+    let structured = response_json(&changes);
+    let provenance = &structured["result"]["structuredContent"]["provenance"];
+
+    assert_eq!(
+        response_text(&changes),
+        "no changes reason=identical_commit_oids\n"
+    );
+    assert_eq!(
+        structured["result"]["structuredContent"]["no_change_reason"],
+        "identical_commit_oids"
+    );
+    assert_eq!(
+        provenance["worktree_root"],
+        fs::canonicalize(&repository).unwrap().display().to_string()
+    );
+    assert_eq!(provenance["base_oid"], oid);
+    assert_eq!(provenance["head_oid"], oid);
+    assert_eq!(provenance["commits_base_to_head"], 0);
+    assert_eq!(provenance["changed_files"], 0);
+    assert_eq!(provenance["snapshot_id"], snapshot_id);
+    assert_eq!(
+        provenance["repository_root"],
+        fs::canonicalize(&repository).unwrap().display().to_string()
+    );
+    assert_eq!(provenance["branch"], "main");
+    assert_eq!(provenance["target_state"]["kind"], "commit");
+    assert_eq!(provenance["selected_layers"], rmcp::serde_json::json!([]));
+    assert_eq!(provenance["dirty_digest"].as_str().unwrap().len(), 64);
+    assert_ne!(provenance["repository_id"], rmcp::serde_json::Value::Null);
+    assert_ne!(provenance["workspace_id"], rmcp::serde_json::Value::Null);
+    assert_ne!(provenance["common_git_dir"], rmcp::serde_json::Value::Null);
+    assert_ne!(provenance["git_dir"], rmcp::serde_json::Value::Null);
+    client.close();
+}
+
+#[test]
 fn queued_jobs_ignore_request_cancellation_and_eof_closes_them() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
@@ -1638,6 +2053,185 @@ fn init_git(path: &Path) {
             "initial",
         ],
     );
+}
+
+fn init_git_main(path: &Path) {
+    fs::create_dir_all(path).unwrap();
+    git(path, &["init", "--quiet", "--initial-branch=main"]);
+    git(
+        path,
+        &[
+            "-c",
+            "user.name=Graphr Test",
+            "-c",
+            "user.email=graphr@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+}
+
+fn git_init_bare(path: &Path) {
+    let output = Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+}
+
+fn git_commit(path: &Path, message: &str) {
+    git(
+        path,
+        &[
+            "-c",
+            "user.name=Graphr Test",
+            "-c",
+            "user.email=graphr@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ],
+    );
+}
+
+fn git_output(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn assert_root_error(response: &str, code: &str, details: &[(&str, String)]) {
+    let value = response_json(response);
+    assert_eq!(value["result"]["isError"], true, "{response}");
+    let structured = &value["result"]["structuredContent"];
+    assert_eq!(structured["code"], code, "{response}");
+    let actual = structured["details"].as_object();
+    assert_eq!(
+        actual.map_or(0, |actual| actual.len()),
+        details.len(),
+        "{response}"
+    );
+    for (key, expected) in details {
+        assert_eq!(actual.unwrap().get(*key).unwrap(), expected, "{response}");
+    }
+}
+
+struct LinkedWorktrees {
+    root: PathBuf,
+    main: PathBuf,
+    linked: PathBuf,
+}
+
+impl Drop for LinkedWorktrees {
+    fn drop(&mut self) {
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.linked)
+            .current_dir(&self.main)
+            .status();
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn linked_worktrees(label: &str) -> LinkedWorktrees {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "graphr-e2e-linked-{label}-{}-{unique}",
+        std::process::id()
+    ));
+    let main = root.join("main");
+    let linked = root.join("linked");
+    init_git_main(&main);
+    fs::write(main.join("baseline.txt"), "baseline\n").unwrap();
+    git(&main, &["add", "--", "baseline.txt"]);
+    git_commit(&main, "baseline");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    fs::write(linked.join("linked.txt"), "linked\n").unwrap();
+    git(&linked, &["add", "--", "linked.txt"]);
+    git_commit(&linked, "linked");
+    LinkedWorktrees { root, main, linked }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RepositoryState {
+    head: String,
+    branch: String,
+    refs: Vec<u8>,
+    object_ids: Vec<u8>,
+    index: Vec<u8>,
+    worktree: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+fn repository_state(root: &Path) -> RepositoryState {
+    let git_path = |args: &[&str]| PathBuf::from(git_output(root, args));
+    RepositoryState {
+        head: git_output(root, &["rev-parse", "HEAD"]),
+        branch: git_output(root, &["symbolic-ref", "--short", "HEAD"]),
+        refs: git_bytes(root, &["for-each-ref", "--format=%(refname) %(objectname)"]),
+        object_ids: git_bytes(root, &["rev-list", "--objects", "--all"]),
+        index: fs::read(git_path(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ]))
+        .unwrap(),
+        worktree: worktree_bytes(root, root),
+    }
+}
+
+fn git_bytes(path: &Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    output.stdout
+}
+
+fn worktree_bytes(root: &Path, directory: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(directory).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(worktree_bytes(root, &path));
+        } else {
+            files.insert(
+                path.strip_prefix(root).unwrap().to_owned(),
+                fs::read(path).unwrap(),
+            );
+        }
+    }
+    files
 }
 
 fn git(path: &Path, args: &[&str]) {
