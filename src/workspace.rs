@@ -875,12 +875,13 @@ impl SnapshotCatalog {
             &job.cache.snapshots,
             OsStr::new(&manifest_name),
         )?;
+        // The manifest is the publication point, so cancellation has lost the race.
         let entry = self.load_entry(
             &job.root,
             &job.cache,
             &manifest.provenance.snapshot_id,
             OsStr::new(&manifest_name),
-            cancelled,
+            &AtomicBool::new(false),
         )?;
         write_lock(&self.loaded).insert(manifest.provenance.snapshot_id.clone(), entry.clone());
         write_lock(&self.rejected).remove(&manifest.provenance.snapshot_id);
@@ -2101,6 +2102,39 @@ mod tests {
         assert_eq!(
             fresh.get(&completion.snapshot_id).unwrap().graph_image_id,
             completion.graph_image_id
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_wins_cancellation_after_manifest_marker() {
+        let root = repository_with_source("published-before-cancel", "fn source() {}\n");
+        let engine = test_engine(&root);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicBool::new(false));
+        super::set_before_graph_load_hook_for_test({
+            let cancelled = cancelled.clone();
+            let observed = observed.clone();
+            let snapshots = root.join(".git/graphr/v6/snapshots");
+            move || {
+                assert_eq!(fs::read_dir(snapshots).unwrap().count(), 1);
+                observed.store(true, std::sync::atomic::Ordering::Release);
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+
+        let completion = engine
+            .build_snapshot(
+                resolved_commit(&engine, &root, "HEAD", "HEAD"),
+                &cancelled,
+                |_| {},
+            )
+            .unwrap();
+
+        assert!(observed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            engine.snapshot(&completion.snapshot_id).unwrap().provenance,
+            completion.provenance
         );
         fs::remove_dir_all(root).unwrap();
     }
