@@ -389,6 +389,20 @@ impl Engine {
         };
         let snapshot = self.catalog.get(snapshot_id)?;
         let mut changed = changed_identity_fields(&identity, &snapshot.provenance);
+        if identity.repository_id != snapshot.provenance.repository_id
+            || identity.workspace_id != snapshot.provenance.workspace_id
+        {
+            changed.sort();
+            return Ok(RootInspection {
+                identity,
+                staged_paths,
+                unstaged_paths,
+                untracked_paths,
+                snapshot_id: Some(snapshot_id.into()),
+                snapshot_matches_worktree: Some(false),
+                changed_identity_fields: changed,
+            });
+        }
         let inspected_head = match snapshot.provenance.target_state {
             SnapshotTarget::Commit => &snapshot.provenance.head_oid,
             SnapshotTarget::Index | SnapshotTarget::Worktree { .. } => &identity.head_oid,
@@ -3134,7 +3148,7 @@ mod tests {
     use crate::artifact::AnalyzerKind;
     use crate::git::{ArtifactFile, ArtifactOmission, ArtifactReview, ChangeLayer};
     use crate::workspace::{
-        AllowedRoots, ErrorCode, IndexRequest, SnapshotTarget, resolve_request,
+        AllowedRoots, ErrorCode, IndexRequest, SnapshotCatalog, SnapshotTarget, resolve_request,
         set_before_seed_open_hook_for_test,
     };
     use std::fs;
@@ -3168,6 +3182,145 @@ mod tests {
         assert_eq!(second.stats.files_reused, 2);
         assert_eq!(second.stats.files_parsed, 0);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_queries_keep_the_validated_graph_after_filename_replacement() {
+        let root = snapshot_repository("pinned-query-graph");
+        let base = test_git_line(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("src/a.rs"), "fn original() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "original"]);
+        let original_head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let roots = Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap());
+        let engine = Engine::new(roots.clone());
+        let original = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &original_head),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let node_ref = engine
+            .search(&original.snapshot_id, "original", Some("function"), 8)
+            .unwrap()
+            .text
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned();
+
+        fs::write(root.join("src/a.rs"), "fn replacement() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "replacement"]);
+        let replacement_head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let replacement = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &original_head, &replacement_head),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let graph_directory = root.join(".git/graphr/v6/graphs");
+        let original_path = graph_directory.join(format!("{}.db", original.graph_image_id));
+        let replacement_path = graph_directory.join(format!("{}.db", replacement.graph_image_id));
+        fs::rename(&original_path, original_path.with_extension("validated")).unwrap();
+        fs::copy(replacement_path, original_path).unwrap();
+
+        let search = engine
+            .search(&original.snapshot_id, "original", Some("function"), 8)
+            .unwrap();
+        assert!(search.text.contains("original"), "{}", search.text);
+        assert!(!search.text.contains("replacement"), "{}", search.text);
+        let view = engine
+            .view(&original.snapshot_id, &node_ref, 1, 30)
+            .unwrap();
+        assert!(view.text.contains("original"), "{}", view.text);
+        assert!(!view.text.contains("replacement"), "{}", view.text);
+        let changes = engine
+            .changes(&original.snapshot_id, 1, 50, None, &AtomicBool::new(false))
+            .unwrap();
+        assert!(changes.text.contains("original"), "{}", changes.text);
+        assert!(!changes.text.contains("replacement"), "{}", changes.text);
+
+        let identity = roots.inspect(&root, &AtomicBool::new(false)).unwrap();
+        let fresh = SnapshotCatalog::new(roots);
+        fresh.attach(&identity, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            fresh.get(&original.snapshot_id).unwrap_err().code,
+            ErrorCode::CacheCorrupt
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_root_reports_foreign_snapshot_identity_without_cross_repository_capture() {
+        let first = snapshot_repository("inspect-foreign-first");
+        fs::write(first.join("src/a.rs"), "fn unique_first() {}\n").unwrap();
+        test_git(&first, &["commit", "--quiet", "-am", "unique first"]);
+        let second = snapshot_repository("inspect-foreign-second");
+        let roots = Arc::new(AllowedRoots::new(vec![first.clone(), second.clone()]).unwrap());
+        let engine = Engine::new(roots);
+        let snapshot = engine
+            .build_snapshot(
+                snapshot_request(&engine, &first, "HEAD~1", "HEAD"),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+
+        let inspection = engine
+            .inspect_root(
+                &second,
+                Some(&snapshot.snapshot_id),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert_eq!(inspection.snapshot_matches_worktree, Some(false));
+        assert_eq!(
+            inspection.changed_identity_fields,
+            [
+                "common_git_dir",
+                "git_dir",
+                "head_oid",
+                "repository_id",
+                "repository_root",
+                "workspace_id",
+                "worktree_root",
+            ]
+        );
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
+    }
+
+    #[test]
+    fn inspect_root_rejects_a_stale_foreign_root_before_snapshot_comparison() {
+        let first = snapshot_repository("inspect-stale-first");
+        let second = snapshot_repository("inspect-stale-second");
+        let roots = Arc::new(AllowedRoots::new(vec![first.clone(), second.clone()]).unwrap());
+        let engine = Engine::new(roots);
+        let snapshot = engine
+            .build_snapshot(
+                snapshot_request(&engine, &first, "HEAD", "HEAD"),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let original = second.with_extension("original");
+        fs::rename(&second, &original).unwrap();
+        fs::create_dir(&second).unwrap();
+
+        let error = engine
+            .inspect_root(
+                &second,
+                Some(&snapshot.snapshot_id),
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::RootStale);
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
+        fs::remove_dir_all(original).unwrap();
     }
 
     #[test]
@@ -3362,23 +3515,26 @@ mod tests {
     }
 
     #[test]
-    fn seed_copy_revalidates_bytes_after_candidate_replacement() {
+    fn seed_copy_uses_validated_graph_after_candidate_replacement() {
         let root = snapshot_repository("seed-replacement");
         let base = test_git_line(&root, &["rev-parse", "HEAD"]);
         let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
-        engine
+        let first = engine
             .build_snapshot(
                 snapshot_request(&engine, &root, &base, &base),
                 &AtomicBool::new(false),
                 |_| {},
             )
             .unwrap();
+        let graph = root
+            .join(".git/graphr/v6/graphs")
+            .join(format!("{}.db", first.graph_image_id));
         fs::write(root.join("src/a.rs"), "fn changed() {}\n").unwrap();
         test_git(&root, &["commit", "--quiet", "-am", "change one file"]);
         let head = test_git_line(&root, &["rev-parse", "HEAD"]);
-        set_before_seed_open_hook_for_test(|path| {
-            fs::rename(path, path.with_extension("validated")).unwrap();
-            fs::write(path, b"replacement after validation").unwrap();
+        set_before_seed_open_hook_for_test(move |_| {
+            fs::rename(&graph, graph.with_extension("validated")).unwrap();
+            fs::write(&graph, b"replacement after validation").unwrap();
         });
         let rejected = Mutex::new(Vec::new());
 
@@ -3394,8 +3550,9 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(completion.stats.files_parsed, 2);
-        assert!(!rejected.into_inner().unwrap().is_empty());
+        assert_eq!(completion.stats.files_reused, 1);
+        assert_eq!(completion.stats.files_parsed, 1);
+        assert!(rejected.into_inner().unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -226,7 +226,7 @@ impl Store {
 
     pub fn open_reader(path: &Path) -> Result<Self> {
         let mut flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        if !path.parent().is_some_and(is_process_descriptor_directory) {
+        if !has_process_descriptor_boundary(path) {
             flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
         }
         let connection = Connection::open_with_flags(path, flags)
@@ -796,14 +796,19 @@ impl Store {
 }
 
 pub fn validate_image(path: &Path) -> Result<State> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect database {}: {error}", path.display()))?;
+    let descriptor_file = is_process_descriptor_directory(path);
+    let metadata = if descriptor_file {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    }
+    .map_err(|error| format!("cannot inspect database {}: {error}", path.display()))?;
     if !metadata.is_file() {
         return Err("database image is not a regular file".into());
     }
     require_no_sidecars(path)?;
     let mut flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    if !path.parent().is_some_and(is_process_descriptor_directory) {
+    if !has_process_descriptor_boundary(path) {
         flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
     }
     let connection = Connection::open_with_flags(path, flags)
@@ -845,6 +850,11 @@ fn is_process_descriptor_directory(path: &Path) -> bool {
             .and_then(|part| part.as_os_str().to_str())
             .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit()))
         && components.next().is_none()
+}
+
+fn has_process_descriptor_boundary(path: &Path) -> bool {
+    is_process_descriptor_directory(path)
+        || path.parent().is_some_and(is_process_descriptor_directory)
 }
 
 fn require_no_sidecars(path: &Path) -> Result<()> {

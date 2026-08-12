@@ -258,7 +258,7 @@ pub struct SnapshotEntry {
     pub no_change_reason: Option<NoChangeReason>,
     pub dependency_mode: DependencyMode,
     pub provenance: Provenance,
-    _graph_directory: CacheDirectory,
+    _graph_file: File,
     graph_checksum: String,
 }
 
@@ -958,10 +958,8 @@ impl SnapshotCatalog {
                 "snapshot graph is not published",
             ));
         }
-        let graph_path = cache
-            .graphs
-            .stable_path(OsStr::new(&format!("{}.db", manifest.graph_image_id)));
-        match fs::symlink_metadata(&graph_path) {
+        let graph_name = format!("{}.db", manifest.graph_image_id);
+        let graph_file = match open_regular_at(&cache.graphs, OsStr::new(&graph_name), None) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(OperationError::new(
                     ErrorCode::SnapshotIncomplete,
@@ -969,8 +967,9 @@ impl SnapshotCatalog {
                 ));
             }
             Err(error) => return Err(cache_corrupt(error)),
-            Ok(_) => {}
-        }
+            Ok(file) => file,
+        };
+        let graph_path = stable_file_path(&graph_file);
         if hash_file(&graph_path, cancelled)? != manifest.graph_checksum
             || validate_published_image(&graph_path)?.generation
                 != manifest.provenance.index_generation
@@ -984,7 +983,7 @@ impl SnapshotCatalog {
             no_change_reason: manifest.no_change_reason,
             dependency_mode: manifest.dependency_mode,
             provenance: manifest.provenance,
-            _graph_directory: cache.graphs.clone(),
+            _graph_file: graph_file,
             graph_checksum: manifest.graph_checksum,
         }))
     }
@@ -1064,6 +1063,10 @@ impl CacheDirectory {
 
 fn stable_directory_path(directory: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+}
+
+fn stable_file_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
 fn cache_child(
@@ -1349,10 +1352,12 @@ fn quarantine_name(
 }
 
 fn open_regular(path: &Path, limit: Option<u64>) -> std::io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_CLOEXEC);
+    if !is_process_descriptor_path(path) {
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || limit.is_some_and(|limit| metadata.len() > limit) {
         return Err(std::io::Error::new(
@@ -1361,6 +1366,14 @@ fn open_regular(path: &Path, limit: Option<u64>) -> std::io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+fn is_process_descriptor_path(path: &Path) -> bool {
+    path.parent() == Some(Path::new("/proc/self/fd"))
+        && path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn read_bounded_at(
@@ -1421,7 +1434,12 @@ fn hash_file(path: &Path, cancelled: &AtomicBool) -> Result<String, OperationErr
 
 pub(crate) fn validate_published_image(path: &Path) -> Result<crate::store::State, OperationError> {
     let state = store::validate_image(path).map_err(cache_corrupt)?;
-    let metadata = fs::symlink_metadata(path).map_err(cache_corrupt)?;
+    let metadata = if is_process_descriptor_path(path) {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    }
+    .map_err(cache_corrupt)?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o222 != 0 {
         return Err(cache_corrupt("published graph image is not read-only"));
     }
