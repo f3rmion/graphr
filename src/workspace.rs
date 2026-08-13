@@ -1135,6 +1135,19 @@ fn stable_file_path(file: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
+// Portability seam. Every filesystem operation the cache performs goes through
+// this block, and each one takes a pinned directory descriptor plus a single
+// path component — never a composite path. `component_cstring` enforces the
+// single-component rule.
+//
+// This shape is what makes the cache portable. A Windows backend would replace
+// exactly these functions and nothing else: `openat` maps to `NtCreateFile`
+// with `OBJECT_ATTRIBUTES.RootDirectory`, `linkat` to `NtSetInformationFile`
+// with `FILE_LINK_INFORMATION`, `renameat` to `SetFileInformationByHandle` with
+// `FILE_RENAME_INFO`. See docs/superpowers/specs/2026-08-12-macos-portability-design.md.
+//
+// Do not add a path-taking helper here, and do not reconstruct a path from a
+// descriptor. That is what tied the cache to Linux `/proc/self/fd`.
 fn cache_child(
     parent: &CacheDirectory,
     name: &OsStr,

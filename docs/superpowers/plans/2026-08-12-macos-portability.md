@@ -70,39 +70,42 @@ code, so Linux behaviour is unaffected.
 
 ---
 
-### Task 1: Consolidate the descriptor primitives into one boundary
+### Task 1: Mark the descriptor boundary — COMPLETE (premise corrected)
 
-**Problem:** The descriptor operations are scattered through `src/workspace.rs` as free functions with inconsistent naming. The design requires them behind a narrow, named boundary so a future Windows backend is a contained change rather than an excavation. This is a requirement of the milestone, not a nicety.
+**The planned premise was wrong.** This task was written as "the descriptor
+operations are scattered through `src/workspace.rs` with inconsistent naming".
+They are not. Verified before starting: `cache_child`, `create_child_directory`,
+`open_child_directory`, `component_cstring`, `create_file_at`,
+`open_regular_at`, `link_file_at`, `unlink_at`, `rename_at`, and
+`entry_exists_at` already occupy one contiguous block at
+`src/workspace.rs:1138-1347`, with consistent `_at` naming. Higher-level
+functions begin at `private_name` (`:1349`) and path-based ones at
+`open_regular` (`:1420`).
 
-**Not an abstraction.** Do not introduce a trait, a factory, or a second implementation — `AGENTS.md` forbids single-implementation abstractions. This is co-location and consistent naming of existing free functions only. Behaviour must not change.
+The planned renames — `open_child_directory` → `open_child`,
+`create_child_directory` → `create_child` — were **dropped**. They are churn
+across every call site for no behavioural or structural gain, and `AGENTS.md`
+favours the simplest change that meets the requirement. `link_at`, `stat_at`,
+and `read_dir_at` arrive with Tasks 2, 5, and 4 respectively, where they have
+callers; adding them here would have landed unreachable code.
+
+What remained genuinely useful, and what was done: a header comment marking the
+block as the portability seam, stating the single-component invariant, naming
+the Windows mapping for each primitive, and forbidding the reintroduction of a
+path-taking helper.
 
 **Files:**
-- Modify: `src/workspace.rs:1138-1348` (existing `cache_child`, `create_child_directory`, `open_child_directory`, `open_regular_at`, `unlink_at`, `rename_at`)
-- Test: `src/workspace.rs` (existing tests must pass unmodified)
-
-**Interfaces:**
-
-```rust
-// One contiguous section, one doc comment naming it as the portability seam.
-// Every call takes a pinned directory descriptor plus a single component.
-fn open_child(parent: &CacheDirectory, name: &OsStr) -> std::io::Result<CacheDirectory>;
-fn create_child(parent: &CacheDirectory, name: &OsStr, exclusive: bool) -> std::io::Result<CacheDirectory>;
-fn open_regular_at(parent: &CacheDirectory, name: &OsStr, limit: Option<u64>) -> std::io::Result<File>;
-fn link_at(src: &CacheDirectory, src_name: &OsStr, dst: &CacheDirectory, dst_name: &OsStr) -> std::io::Result<()>;
-fn rename_at(src: &CacheDirectory, src_name: &OsStr, dst: &CacheDirectory, dst_name: &OsStr) -> std::io::Result<()>;
-fn unlink_at(dir: &CacheDirectory, name: &OsStr, flags: i32) -> std::io::Result<()>;
-fn stat_at(dir: &CacheDirectory, name: &OsStr) -> std::io::Result<libc::stat>;
-fn read_dir_at(dir: &CacheDirectory) -> Result<Vec<OsString>, OperationError>;
-```
+- Modify: `src/workspace.rs:1138` (section header comment only)
 
 **Steps:**
 
-- [ ] Move the existing `*at` wrappers into one contiguous section with a header comment stating that this is the single place the cache touches the filesystem, and that a Windows backend would replace exactly these functions.
-- [ ] Rename to the signatures above where they differ; update all call sites.
-- [ ] Leave `link_at`, `stat_at`, and `read_dir_at` as declarations backed by the current implementations where they exist, and as `todo!()`-free stubs only if a later task supplies them — do not land a stub that can be reached at runtime.
-- [ ] Confirm no behaviour change: the full existing test suite passes on Linux with no test edited.
+- [x] Verify the premise before acting; record that it did not hold.
+- [x] Add the seam header comment above `cache_child`.
+- [x] Drop the planned renames as unjustified churn.
 
-**Verification:** `cargo test` passes on Linux with zero test modifications. `git diff` shows only moves, renames, and call-site updates. No new `cfg`, trait, or type.
+**Verification:** Comment-only change. `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` pass; macOS failures stay at 24,
+confirming behaviour is untouched.
 
 ---
 
