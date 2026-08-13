@@ -82,6 +82,54 @@ Added:
   format, or `snapshot_id` derivation. This is a portability fix, not a format
   change.
 
+## Platform Scope
+
+This design targets **POSIX**: Linux, macOS, and the BSDs. Every replacement
+primitive is POSIX, and all 21 `libc::` symbols in `src/` already are.
+
+**Windows is out of scope and is not enabled by this work**, but this work is a
+precondition for it. The design's core move — expressing every operation as
+*(directory handle + single component)* rather than a composite path — is
+exactly the shape Windows requires. Today the cache layer is not expressible on
+Windows at all; afterwards there is a seam a second backend could plug into.
+
+To keep that option cheap, the descriptor operations must sit behind a narrow
+internal boundary — `open_child`, `create_child`, `link_at`, `rename_at`,
+`unlink_at`, `read_dir_at`, `stat_at` — rather than being scattered through
+`workspace.rs`. That costs nothing now and makes a future Windows backend a
+contained `cfg` split instead of an excavation. It is a requirement of this
+milestone, not a nicety.
+
+What Windows would additionally require, recorded so the question is not
+re-litigated:
+
+- A `windows-sys` dependency. `libc` supplies nothing on Windows, and
+  `AGENTS.md` pushes back on new dependencies.
+- `ntdll` for two of six primitives. Handle-relative open needs `NtCreateFile`
+  with `OBJECT_ATTRIBUTES.RootDirectory`; handle-relative hard link needs
+  `NtSetInformationFile` with `FILE_LINK_INFORMATION.RootDirectory`. There is no
+  Win32 route to either — `CreateHardLinkW` is path-only, has no fail-if-exists
+  flag, and does not work on ReFS. The NT form does map cleanly:
+  `ReplaceIfExists = FALSE` yields `STATUS_OBJECT_NAME_COLLISION`, matching the
+  `EEXIST` branch `publish_no_replace` depends on.
+- Rename, directory enumeration, and file identity have clean Win32 equivalents
+  (`FILE_RENAME_INFO` with `RootDirectory`, `GetFileInformationByHandleEx` with
+  `FileIdBothDirectoryInfo`, and `FILE_ID_INFO`). Note that 64-bit file IDs are
+  not unique on ReFS and identity is unreliable over SMB.
+- `FILE_FLAG_OPEN_REPARSE_POINT` *opens* a symlink rather than failing, so the
+  `O_NOFOLLOW` equivalent requires an explicit attribute check, and it protects
+  only the final component.
+- `std::os::windows::fs::FileExt::seek_read` is **not** equivalent to
+  `read_at`: it moves the file cursor, including on short reads, so the hashing
+  change in this design is not portable as written.
+- A rewrite of `src/git.rs`'s byte-oriented `OsStrExt` handling, which parses
+  git's NUL-separated `-z` output as bytes. Windows `OsStr` is WTF-16 with no
+  `as_bytes()`. This is a larger change than the cache layer itself, and the
+  `MetadataExt` device/inode worktree signature has no direct analogue.
+- No off-the-shelf help: `cap-std` supports Windows but reconstructs composite
+  paths via `GetFinalPathNameByHandleW` for link, rename, and directory reads —
+  the exact technique this design removes.
+
 ## Architectural Decision
 
 **Delete the need for a path rather than port the mechanism.** Each of the four
