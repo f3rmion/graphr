@@ -109,6 +109,33 @@ confirming behaviour is untouched.
 
 ---
 
+### Execution note: Tasks 3, 4, and 5 are one interlocked change
+
+Recorded during execution. The plan treats descriptor-native hashing (3),
+`fdopendir` enumeration (4), and predicate deletion plus check-enabling (5) as
+sequential and separable. They are not.
+
+`SnapshotEntry` (`src/workspace.rs:260`) holds **both** `graph_path: PathBuf` —
+a `/proc/self/fd/N` string — and `_graph_file: Arc<File>`, the descriptor that
+keeps that string resolvable. `CacheDirectory::stable_path` (`:1113`) likewise
+returns a `/proc` path whenever a handle is present, which is where
+`graph_path`, `review_path`, and `manifest_path` all come from. `index.rs` then
+passes `graph_path` to `Store::open_reader` for the SQLite open.
+
+So changing `hash_file` to take a descriptor forces `stable_path` to return a
+real path, which immediately forces the SQLite hardening that Task 5 owns —
+unconditional `SQLITE_OPEN_NOFOLLOW`, live `require_no_sidecars`, and post-open
+device/inode verification. Landing 3 or 4 alone would leave `SnapshotEntry`
+holding a path that resolves on Linux and not on macOS, which is the current
+defect in a different shape.
+
+**Revised sequencing:** Tasks 3, 4, and 5 land as one commit series in a single
+change, ordered internally as `stable_path` → hashing → enumeration →
+predicates → SQLite hardening. The task boundaries stay as review units and as
+the traceability anchors; they stop being separate landings.
+
+---
+
 ### Task 2: Replace `link_file_at` with `linkat` on a descriptor pair
 
 **Problem:** `link_file_at` (`src/workspace.rs:1266`) calls `linkat(AT_FDCWD, "/proc/self/fd/N", targetdir, name, AT_SYMLINK_FOLLOW)`. Its only caller, `publish_no_replace` (`:1370`), *already holds* `source_directory` and `source_name` and opens `source` from them at `:1375`. The `/proc` round-trip discards that pair and rebuilds a path. It is gratuitous even on Linux.
