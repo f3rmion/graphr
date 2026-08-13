@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -438,7 +438,7 @@ impl PrivateJob {
     pub(crate) fn graph_path(&self, graph_image_id: &str) -> PathBuf {
         self.cache
             .graphs
-            .stable_path(OsStr::new(&format!("{graph_image_id}.db")))
+            .child_path(OsStr::new(&format!("{graph_image_id}.db")))
     }
 
     pub(crate) fn copy_seed(
@@ -461,7 +461,8 @@ impl PrivateJob {
             target
                 .sync_all()
                 .map_err(|error| cache_internal("cannot sync graph seed", error))?;
-            if hash_file(&self.graph_temp, cancelled)? != seed.graph_checksum {
+            let copied = open_regular(&self.graph_temp, None).map_err(cache_corrupt)?;
+            if hash_file(&copied, cancelled)? != seed.graph_checksum {
                 return Err(cache_corrupt("copied graph seed checksum is invalid"));
             }
             Ok(())
@@ -475,7 +476,7 @@ impl PrivateJob {
 
 impl Drop for PrivateJob {
     fn drop(&mut self) {
-        if let Ok(entries) = fs::read_dir(self.directory.stable_path(OsStr::new("."))) {
+        if let Ok(entries) = fs::read_dir(self.directory.child_path(OsStr::new("."))) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
@@ -510,11 +511,11 @@ impl SnapshotCatalog {
             self.reconcile(root, &BTreeSet::new());
             return Ok(());
         };
-        let Some(directory) = cache.snapshots.handle.as_ref() else {
+        let Some(_directory) = cache.snapshots.handle.as_ref() else {
             self.reconcile(root, &BTreeSet::new());
             return Ok(());
         };
-        let mut manifests = fs::read_dir(stable_directory_path(directory))
+        let mut manifests = fs::read_dir(&cache.snapshots.path)
             .map_err(|error| cache_internal("cannot read snapshot catalog", error))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| cache_internal("cannot read snapshot catalog", error))?;
@@ -615,9 +616,9 @@ impl SnapshotCatalog {
                 (trusted._graph_file.clone(), trusted.graph_checksum.clone())
             }
             None => {
-                let path = stable_file_path(&current);
+                let path = job.cache.graphs.child_path(OsStr::new(&name));
                 validate_published_image(&path)?;
-                let checksum = hash_file(&path, cancelled)?;
+                let checksum = hash_file(&current, cancelled)?;
                 (current, checksum)
             }
         };
@@ -645,7 +646,7 @@ impl SnapshotCatalog {
         Ok(PrivateJob {
             root: root.clone(),
             cache,
-            graph_temp: directory.stable_path(OsStr::new("graph.db")),
+            graph_temp: directory.child_path(OsStr::new("graph.db")),
             directory,
             _capture_directory: capture,
             name,
@@ -826,15 +827,15 @@ impl SnapshotCatalog {
                 "published graph name changed after exact validation",
             ));
         }
-        let graph_path = stable_file_path(&graph_file);
+        let graph_path = job.cache.graphs.child_path(OsStr::new(&graph_name));
         let (state, graph_checksum) = match trusted_graph {
             Some(trusted) => (
-                validate_pinned_graph(trusted, cancelled)?,
+                validate_pinned_graph(trusted, &graph_path, cancelled)?,
                 trusted.checksum.clone(),
             ),
             None => (
                 validate_published_image(&graph_path)?,
-                hash_file(&graph_path, cancelled)?,
+                hash_file(&graph_file, cancelled)?,
             ),
         };
         provenance.index_generation = state.generation;
@@ -866,8 +867,8 @@ impl SnapshotCatalog {
         before_manifest_publication(&PublicationPoint {
             snapshot_id: manifest.provenance.snapshot_id.clone(),
             graph_path: graph_path.clone(),
-            review_path: job.cache.reviews.stable_path(OsStr::new(&review_name)),
-            manifest_path: job.cache.snapshots.stable_path(OsStr::new(&manifest_name)),
+            review_path: job.cache.reviews.child_path(OsStr::new(&review_name)),
+            manifest_path: job.cache.snapshots.child_path(OsStr::new(&manifest_name)),
         })?;
         publish_no_replace(
             &job.directory,
@@ -1035,8 +1036,8 @@ impl SnapshotCatalog {
             Err(error) => return Err(cache_corrupt(error)),
             Ok(file) => file,
         };
-        let graph_path = stable_file_path(&graph_file);
-        if hash_file(&graph_path, cancelled)? != manifest.graph_checksum
+        let graph_path = cache.graphs.child_path(OsStr::new(&graph_name));
+        if hash_file(&graph_file, cancelled)? != manifest.graph_checksum
             || validate_published_image(&graph_path)?.generation
                 != manifest.provenance.index_generation
         {
@@ -1107,11 +1108,11 @@ impl CacheDirectory {
         })
     }
 
-    fn stable_path(&self, name: &OsStr) -> PathBuf {
-        self.handle.as_ref().map_or_else(
-            || self.path.join(name),
-            |handle| stable_directory_path(handle).join(name),
-        )
+    /// Real filesystem path of a child. Callers that can act through a
+    /// descriptor should use the primitives below instead; this exists for the
+    /// one consumer that cannot take a descriptor, SQLite.
+    fn child_path(&self, name: &OsStr) -> PathBuf {
+        self.path.join(name)
     }
 
     fn file(&self) -> std::io::Result<&File> {
@@ -1125,14 +1126,6 @@ impl CacheDirectory {
             .and_then(File::sync_all)
             .map_err(|error| cache_internal("cannot sync cache directory", error))
     }
-}
-
-fn stable_directory_path(directory: &File) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
-}
-
-fn stable_file_path(file: &File) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
 // Portability seam. Every filesystem operation the cache performs goes through
@@ -1498,10 +1491,9 @@ fn quarantine_name(
 
 fn open_regular(path: &Path, limit: Option<u64>) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
-    options.read(true).custom_flags(libc::O_CLOEXEC);
-    if !is_process_descriptor_path(path) {
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    }
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || limit.is_some_and(|limit| metadata.len() > limit) {
@@ -1511,14 +1503,6 @@ fn open_regular(path: &Path, limit: Option<u64>) -> std::io::Result<File> {
         ));
     }
     Ok(file)
-}
-
-fn is_process_descriptor_path(path: &Path) -> bool {
-    path.parent() == Some(Path::new("/proc/self/fd"))
-        && path
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn read_bounded_at(
@@ -1555,13 +1539,13 @@ fn read_exact_bounded(
     Ok(bytes)
 }
 
-fn hash_file(path: &Path, cancelled: &AtomicBool) -> Result<String, OperationError> {
-    let mut file = open_regular(path, None).map_err(cache_corrupt)?;
+fn hash_file(file: &File, cancelled: &AtomicBool) -> Result<String, OperationError> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
+    let mut offset = 0_u64;
     loop {
         check_cache_cancelled(cancelled)?;
-        let read = file.read(&mut buffer).map_err(cache_corrupt)?;
+        let read = file.read_at(&mut buffer, offset).map_err(cache_corrupt)?;
         if read == 0 {
             break;
         }
@@ -1573,18 +1557,14 @@ fn hash_file(path: &Path, cancelled: &AtomicBool) -> Result<String, OperationErr
         });
         check_cache_cancelled(cancelled)?;
         hasher.update(&buffer[..read]);
+        offset += read as u64;
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub(crate) fn validate_published_image(path: &Path) -> Result<crate::store::State, OperationError> {
     let state = store::validate_image(path).map_err(cache_corrupt)?;
-    let metadata = if is_process_descriptor_path(path) {
-        fs::metadata(path)
-    } else {
-        fs::symlink_metadata(path)
-    }
-    .map_err(cache_corrupt)?;
+    let metadata = fs::symlink_metadata(path).map_err(cache_corrupt)?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o222 != 0 {
         return Err(cache_corrupt("published graph image is not read-only"));
     }
@@ -1595,7 +1575,7 @@ pub(crate) fn validate_entry_graph(
     entry: &SnapshotEntry,
     cancelled: &AtomicBool,
 ) -> Result<crate::store::State, OperationError> {
-    if hash_file(&entry.graph_path, cancelled)? != entry.graph_checksum {
+    if hash_file(&entry._graph_file, cancelled)? != entry.graph_checksum {
         return Err(cache_corrupt("snapshot graph checksum is invalid"));
     }
     validate_published_image(&entry.graph_path)
@@ -1603,13 +1583,13 @@ pub(crate) fn validate_entry_graph(
 
 fn validate_pinned_graph(
     graph: &PinnedGraph,
+    path: &Path,
     cancelled: &AtomicBool,
 ) -> Result<crate::store::State, OperationError> {
-    let path = stable_file_path(&graph.file);
-    if hash_file(&path, cancelled)? != graph.checksum {
+    if hash_file(&graph.file, cancelled)? != graph.checksum {
         return Err(cache_corrupt("snapshot graph checksum is invalid"));
     }
-    validate_published_image(&path)
+    validate_published_image(path)
 }
 
 fn same_file(left: &File, right: &File) -> Result<bool, OperationError> {

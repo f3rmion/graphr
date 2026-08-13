@@ -3552,14 +3552,16 @@ mod tests {
     }
 
     fn snapshot_repository(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "graphr-index-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!(
+                "graphr-index-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         fs::create_dir_all(root.join("src")).unwrap();
         test_git(&root, &["init", "--quiet", "--initial-branch=main"]);
         test_git(&root, &["config", "user.name", "Graphr Test"]);
@@ -3605,14 +3607,16 @@ mod tests {
     fn index_progress_counts_reuse_before_pending_parse_completion() {
         use std::os::unix::fs::DirBuilderExt;
 
-        let root = std::env::temp_dir().join(format!(
-            "graphr-index-progress-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!(
+                "graphr-index-progress-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         fs::create_dir_all(&root).unwrap();
         test_git(&root, &["init", "--quiet"]);
         test_git(&root, &["config", "user.name", "Graphr Test"]);
@@ -3694,14 +3698,16 @@ mod tests {
         use std::os::unix::fs::DirBuilderExt;
         use std::time::Duration;
 
-        let root = std::env::temp_dir().join(format!(
-            "graphr-index-parallel-progress-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!(
+                "graphr-index-parallel-progress-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         fs::create_dir_all(&root).unwrap();
         test_git(&root, &["init", "--quiet"]);
         test_git(&root, &["config", "user.name", "Graphr Test"]);
@@ -5470,14 +5476,16 @@ mod tests {
 
     #[test]
     fn target_layout_uses_captured_inventory_not_live_files() {
-        let fixture = std::env::temp_dir().join(format!(
-            "graphr-target-layout-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let fixture = fs::canonicalize(std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!(
+                "graphr-target-layout-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         fs::create_dir_all(fixture.join("src")).unwrap();
         fs::write(
             fixture.join("Cargo.toml"),
