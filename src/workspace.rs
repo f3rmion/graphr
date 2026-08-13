@@ -1276,25 +1276,74 @@ fn open_regular_at(
     Ok(file)
 }
 
-fn link_file_at(
-    source: &File,
+fn link_at(
+    source_directory: &CacheDirectory,
+    source_name: &OsStr,
     target_directory: &CacheDirectory,
     target_name: &OsStr,
 ) -> std::io::Result<()> {
-    let source_path = CString::new(format!("/proc/self/fd/{}", source.as_raw_fd())).unwrap();
-    let target_name = component_cstring(target_name)?;
-    // SAFETY: both C strings and descriptors remain valid for the duration of linkat.
+    let source = component_cstring(source_name)?;
+    let target = component_cstring(target_name)?;
+    let source_fd = source_directory.file()?.as_raw_fd();
+    let target_fd = target_directory.file()?.as_raw_fd();
+    let link = |flags| {
+        // SAFETY: both descriptors stay live for the call and both C strings
+        // are NUL-terminated single components.
+        unsafe {
+            libc::linkat(
+                source_fd,
+                source.as_ptr(),
+                target_fd,
+                target.as_ptr(),
+                flags,
+            )
+        }
+    };
+    if link(0) == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOTSUP) {
+        return Err(error);
+    }
+    // Some macOS filesystems reject linkat with flags = 0. Retrying with
+    // AT_SYMLINK_FOLLOW is safe here because publish_no_replace opened
+    // source_name with O_NOFOLLOW and confirmed it is a regular file, so it is
+    // not a symlink and following cannot redirect the link.
+    if link(libc::AT_SYMLINK_FOLLOW) == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn stat_at(directory: &CacheDirectory, name: &OsStr) -> std::io::Result<libc::stat> {
+    let name = component_cstring(name)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstatat receives a live directory descriptor and a valid C string.
     let result = unsafe {
-        libc::linkat(
-            libc::AT_FDCWD,
-            source_path.as_ptr(),
-            target_directory.file()?.as_raw_fd(),
-            target_name.as_ptr(),
-            libc::AT_SYMLINK_FOLLOW,
+        libc::fstatat(
+            directory.file()?.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
         )
     };
     if result == 0 {
-        Ok(())
+        // SAFETY: fstatat returned success, so metadata is initialized.
+        Ok(unsafe { metadata.assume_init() })
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn stat_fd(file: &File) -> std::io::Result<libc::stat> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat receives a live descriptor and an out pointer it fills.
+    let result = unsafe { libc::fstat(file.as_raw_fd(), metadata.as_mut_ptr()) };
+    if result == 0 {
+        // SAFETY: fstat returned success, so metadata is initialized.
+        Ok(unsafe { metadata.assume_init() })
     } else {
         Err(std::io::Error::last_os_error())
     }
@@ -1397,11 +1446,28 @@ fn publish_no_replace(
             "private cache path is not a regular file",
         ));
     }
-    let published = match link_file_at(&source, target_directory, target_name) {
+    let published = match link_at(source_directory, source_name, target_directory, target_name) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) => return Err(cache_internal("cannot publish cache file", error)),
     };
+    if published {
+        // linkat resolved source_name a second time. Confirm it reached the
+        // inode validated above rather than one substituted in between.
+        let linked = stat_at(target_directory, target_name)
+            .map_err(|error| cache_internal("cannot inspect published cache file", error))?;
+        // Compare raw stat fields: dev_t is i32 on macOS and u64 on Linux, so
+        // a Rust-level comparison would need a platform-dependent cast.
+        let validated = stat_fd(&source)
+            .map_err(|error| cache_internal("cannot inspect private cache file", error))?;
+        if linked.st_ino != validated.st_ino || linked.st_dev != validated.st_dev {
+            let _ = unlink_at(target_directory, target_name, 0);
+            return Err(OperationError::new(
+                ErrorCode::Internal,
+                "published cache file is not the validated file",
+            ));
+        }
+    }
     unlink_at(source_directory, source_name, 0)
         .map_err(|error| cache_internal("cannot remove private cache name", error))?;
     source_directory.sync()?;
