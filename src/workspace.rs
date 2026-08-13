@@ -2949,13 +2949,15 @@ mod tests {
     }
 
     fn temp_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "graphr-workspace-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        fs::canonicalize(std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!(
+                "graphr-workspace-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
     }
 }

@@ -27,6 +27,49 @@
 
 ---
 
+### Task 0: Canonicalise the test temp root — COMPLETE
+
+**Problem:** Discovered during execution, not planning. Of the 30 `cargo test`
+failures on macOS, six were **not** the `/proc` defect. The test helpers
+`temp_root` (`src/git.rs:6152`, `src/workspace.rs:2951`) return
+`std::env::temp_dir().join(..)` without canonicalising. On macOS `TMPDIR` is
+under `/var/folders/...`, and `/var` is a symlink to `/private/var`, so
+`fs::canonicalize(candidate) == candidate` — the regular-file safety check at
+`src/git.rs:1879`, `:1896`, and `:2091` — is never true and untracked source
+files are silently dropped.
+
+**This is test hygiene, not a product defect.** Production canonicalises the
+root at every entry point (`src/git.rs:374`, `:396`; `src/workspace.rs:314`,
+`:361`), so a real repository never reaches that check with a non-canonical
+root. The helpers constructed a root production cannot produce. Note the
+sibling helper `private_dir` (`src/git.rs:6120`) already canonicalises — the
+two helpers had drifted.
+
+**Files:**
+- Modify: `src/git.rs:6152` (`temp_root`)
+- Modify: `src/workspace.rs:2951` (`temp_root`)
+
+**Steps:**
+
+- [x] Confirm the mechanism: `/var/folders/…` canonicalises to
+      `/private/var/folders/…` on darwin 25.5.0.
+- [x] Verify by canonicalising the root in one failing test in isolation and
+      observing it pass.
+- [x] Canonicalise `std::env::temp_dir()` in both helpers before joining, with
+      `unwrap_or_else` falling back to the uncanonicalised base.
+- [x] Leave passing tests untouched — an inline third site was reverted to keep
+      the change minimal.
+- [x] Measure the split: 30 failures become 24, all six cleared are
+      `git::tests`, and no new failure appears.
+
+**Verification:** `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` pass. macOS failures drop from 30
+to 24, and the remaining 24 (`index` 11, `workspace` 12, `store` 1) are the
+`/proc` defect that Tasks 1 through 5 address. This task changes no production
+code, so Linux behaviour is unaffected.
+
+---
+
 ### Task 1: Consolidate the descriptor primitives into one boundary
 
 **Problem:** The descriptor operations are scattered through `src/workspace.rs` as free functions with inconsistent naming. The design requires them behind a narrow, named boundary so a future Windows backend is a contained change rather than an excavation. This is a requirement of the milestone, not a nicety.
