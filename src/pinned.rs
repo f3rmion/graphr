@@ -21,13 +21,13 @@
 //! to read-only opens, so the pinned read-only descriptor always satisfies the
 //! access mode SQLite asked for.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int};
 use std::fs::File;
-use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::{LazyLock, OnceLock};
 
 use rusqlite::ffi;
@@ -35,56 +35,64 @@ use rusqlite::ffi;
 /// The unix VFS `open` slot: `int (*)(const char*, int, int)`.
 type OpenCall = unsafe extern "C" fn(*const c_char, c_int, c_int) -> c_int;
 
-#[derive(Clone, Copy)]
 struct Pinned {
-    path: *const u8,
-    length: usize,
-    descriptor: RawFd,
+    token: Rc<()>,
+    path: Box<[u8]>,
+    file: File,
 }
 
 thread_local! {
-    /// The pin in force on this thread. Read from the override, which runs
-    /// inside SQLite and must neither allocate nor panic.
-    static PINNED: Cell<Option<Pinned>> = const { Cell::new(None) };
+    /// Pins on this thread. The override reads the last entry without
+    /// allocating or panicking.
+    static PINNED: RefCell<Vec<Pinned>> = const { RefCell::new(Vec::new()) };
 }
 
 static ORIGINAL_OPEN: OnceLock<OpenCall> = OnceLock::new();
 
-/// Live pin. Restores the previously pinned path on drop, so nesting is safe,
-/// and borrows both the path and the descriptor it publishes to the override.
-pub(crate) struct Pin<'a> {
-    previous: Option<Pinned>,
-    _pinned: PhantomData<(&'a Path, &'a File)>,
+/// Live pin. Removes only its own entry on drop, so nesting remains safe even
+/// when guards are dropped out of order.
+pub(crate) struct Pin {
+    token: Rc<()>,
 }
 
-impl Drop for Pin<'_> {
+impl Drop for Pin {
     fn drop(&mut self) {
-        PINNED.set(self.previous);
+        let _ = PINNED.try_with(|pins| {
+            let Ok(mut pins) = pins.try_borrow_mut() else {
+                return;
+            };
+            if let Some(index) = pins
+                .iter()
+                .rposition(|pinned| Rc::ptr_eq(&pinned.token, &self.token))
+            {
+                pins.remove(index);
+            }
+        });
     }
 }
 
 /// Diverts SQLite's `open` of `path` to `file` for the duration of the returned
 /// guard, on this thread only.
-pub(crate) fn pin<'a>(path: &'a Path, file: &'a File) -> Result<Pin<'a>, String> {
+pub(crate) fn pin(path: &Path, file: &File) -> Result<Pin, String> {
     INSTALLED.clone()?;
-    let bytes = path.as_os_str().as_bytes();
-    let previous = PINNED.replace(Some(Pinned {
-        path: bytes.as_ptr(),
-        length: bytes.len(),
-        descriptor: file.as_raw_fd(),
-    }));
-    Ok(Pin {
-        previous,
-        _pinned: PhantomData,
-    })
+    let token = Rc::new(());
+    let pinned = Pinned {
+        token: Rc::clone(&token),
+        path: path.as_os_str().as_bytes().into(),
+        file: file
+            .try_clone()
+            .map_err(|error| format!("cannot duplicate pinned descriptor: {error}"))?,
+    };
+    PINNED.with(|pins| pins.borrow_mut().push(pinned));
+    Ok(Pin { token })
 }
 
 /// Replacement for the unix VFS `open`. Runs on SQLite's thread inside
 /// `sqlite3_open_v2`, so it allocates nothing and cannot unwind.
 unsafe extern "C" fn pinned_open(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
     if let Some(descriptor) = diverted_descriptor(path, flags) {
-        // SAFETY: the descriptor belongs to the file borrowed by the live pin,
-        // and F_DUPFD_CLOEXEC only reads it. SQLite owns the duplicate and
+        // SAFETY: the descriptor belongs to the file owned by the thread-local
+        // pin, and F_DUPFD_CLOEXEC only reads it. SQLite owns the duplicate and
         // closes it; the pinned descriptor is untouched.
         return unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, MINIMUM_DESCRIPTOR) };
     }
@@ -107,16 +115,16 @@ fn diverted_descriptor(path: *const c_char, flags: c_int) -> Option<RawFd> {
     {
         return None;
     }
-    let pinned = PINNED.try_with(Cell::get).ok().flatten()?;
-    // SAFETY: SQLite passes a NUL-terminated path, and the pinned bytes belong
-    // to the path borrowed by the live pin.
-    let (requested, expected) = unsafe {
-        (
-            CStr::from_ptr(path).to_bytes(),
-            std::slice::from_raw_parts(pinned.path, pinned.length),
-        )
-    };
-    (requested == expected).then_some(pinned.descriptor)
+    // SAFETY: SQLite passes a NUL-terminated path for the duration of this call.
+    let requested = unsafe { CStr::from_ptr(path) }.to_bytes();
+    PINNED
+        .try_with(|pins| {
+            let pins = pins.try_borrow().ok()?;
+            let pinned = pins.last()?;
+            (requested == pinned.path.as_ref()).then(|| pinned.file.as_raw_fd())
+        })
+        .ok()
+        .flatten()
 }
 
 /// Captures the unix VFS `open` and installs the override, once per process.
@@ -295,6 +303,25 @@ mod tests {
 
         assert_eq!(nested, ("outer-substituted".into(), "inner".into()));
         assert_eq!(restored, ("outer".into(), "inner-substituted".into()));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dropping_an_outer_pin_keeps_the_inner_pin_active() {
+        let directory = temporary_directory("out-of-order");
+        let outer_path = directory.join("outer.db");
+        let inner_path = directory.join("inner.db");
+        let outer = write_marked_database(&outer_path, "outer");
+        let inner = write_marked_database(&inner_path, "inner");
+        replace_with_marked_database(&outer_path, "outer-substituted");
+        replace_with_marked_database(&inner_path, "inner-substituted");
+
+        let outer_pin = pin(&outer_path, &outer).unwrap();
+        let inner_pin = pin(&inner_path, &inner).unwrap();
+        drop(outer_pin);
+
+        assert_eq!(marker(&inner_path), "inner");
+        drop(inner_pin);
         fs::remove_dir_all(directory).unwrap();
     }
 
