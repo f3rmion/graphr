@@ -150,10 +150,10 @@ impl ScriptParser {
                 .enumerate()
                 .filter(|(parent, definition)| {
                     *parent != child
-                        && definition.range.start <= parsed.definitions[child].range.start
-                        && parsed.definitions[child].range.end <= definition.range.end
+                        && definition.structure.start <= parsed.definitions[child].structure.start
+                        && parsed.definitions[child].structure.end <= definition.structure.end
                 })
-                .min_by_key(|(_, definition)| definition.range.end - definition.range.start)
+                .min_by_key(|(_, definition)| definition.structure.end - definition.structure.start)
                 .map(|(parent, _)| parent);
         }
         collect_definition_bindings(&parsed.definitions, &mut parsed.bindings);
@@ -268,6 +268,7 @@ struct Definition {
     signature: String,
     body: ByteRange,
     range: ByteRange,
+    structure: ByteRange,
     binding: Option<ByteRange>,
 }
 
@@ -305,8 +306,13 @@ struct ParsedFile {
 }
 
 fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
-    let (kind, name, start) = if let Some(name) = test_name(node, path, source) {
-        (DefinitionKind::Test, name, definition_start(node))
+    let (kind, name, start, structure_start) = if let Some(name) = test_name(node, path, source) {
+        (
+            DefinitionKind::Test,
+            name,
+            definition_start(node),
+            node.start_byte(),
+        )
     } else {
         match node.kind() {
             "class_declaration" | "abstract_class_declaration" => (
@@ -317,6 +323,7 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
                     .map(str::to_owned)
                     .or_else(|| default_export(node).then(|| "default".to_owned()))?,
                 definition_start(node),
+                node.start_byte(),
             ),
             "interface_declaration" | "type_alias_declaration" => (
                 DefinitionKind::Type {
@@ -324,6 +331,7 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
                 },
                 field_text(node, "name", source)?.to_owned(),
                 definition_start(node),
+                node.start_byte(),
             ),
             "enum_declaration" | "internal_module" | "module" => (
                 DefinitionKind::Type {
@@ -331,6 +339,7 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
                 },
                 field_text(node, "name", source)?.to_owned(),
                 definition_start(node),
+                node.start_byte(),
             ),
             "function_declaration" | "generator_function_declaration" | "function_signature" => (
                 DefinitionKind::Function,
@@ -338,11 +347,13 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
                     .map(str::to_owned)
                     .or_else(|| default_export(node).then(|| "default".to_owned()))?,
                 definition_start(node),
+                node.start_byte(),
             ),
             "method_definition" | "method_signature" | "abstract_method_signature" => (
                 DefinitionKind::Method,
                 field_text(node, "name", source)?.to_owned(),
                 definition_start(node),
+                node.start_byte(),
             ),
             "function_expression" | "generator_function" | "arrow_function" | "class" => {
                 stable_initializer(node, source)?
@@ -370,10 +381,17 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
             start,
             end: node.end_byte(),
         },
+        structure: ByteRange {
+            start: structure_start,
+            end: node.end_byte(),
+        },
     })
 }
 
-fn stable_initializer(node: Node<'_>, source: &str) -> Option<(DefinitionKind, String, usize)> {
+fn stable_initializer(
+    node: Node<'_>,
+    source: &str,
+) -> Option<(DefinitionKind, String, usize, usize)> {
     let parent = node.parent()?;
     if parent.kind() == "variable_declarator"
         && parent
@@ -386,7 +404,8 @@ fn stable_initializer(node: Node<'_>, source: &str) -> Option<(DefinitionKind, S
         return Some((
             definition_kind(node),
             field_text(parent, "name", source)?.to_owned(),
-            declaration_start(parent),
+            declarator_start(parent),
+            parent.start_byte(),
         ));
     }
     if matches!(
@@ -402,6 +421,7 @@ fn stable_initializer(node: Node<'_>, source: &str) -> Option<(DefinitionKind, S
             DefinitionKind::Method,
             text(direct_field_name(parent)?, source).to_owned(),
             definition_start(parent),
+            parent.start_byte(),
         ));
     }
     if parent.kind() == "assignment_expression"
@@ -416,6 +436,7 @@ fn stable_initializer(node: Node<'_>, source: &str) -> Option<(DefinitionKind, S
             definition_kind(node),
             text(parent.child_by_field_name("left")?, source).to_owned(),
             definition_start(parent),
+            parent.start_byte(),
         ));
     }
     if default_export(node) {
@@ -423,6 +444,7 @@ fn stable_initializer(node: Node<'_>, source: &str) -> Option<(DefinitionKind, S
             definition_kind(node),
             "default".to_owned(),
             definition_start(node),
+            node.start_byte(),
         ));
     }
     None
@@ -463,14 +485,25 @@ fn definition_start(node: Node<'_>) -> usize {
     start
 }
 
-fn declaration_start(node: Node<'_>) -> usize {
+fn declarator_start(node: Node<'_>) -> usize {
     let declaration = node.parent().filter(|parent| {
         matches!(
             parent.kind(),
             "lexical_declaration" | "variable_declaration"
         )
     });
-    definition_start(declaration.unwrap_or(node))
+    let Some(declaration) = declaration else {
+        return definition_start(node);
+    };
+    let mut cursor = declaration.walk();
+    let first = declaration
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "variable_declarator");
+    if first.is_some_and(|first| first.id() == node.id()) {
+        definition_start(declaration)
+    } else {
+        node.start_byte()
+    }
 }
 
 fn default_export(node: Node<'_>) -> bool {
@@ -1149,6 +1182,45 @@ assigned = () => {};
                 .test_names()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn keeps_comma_declarator_definitions_as_siblings() {
+        let source = "const a = () => {}, b = () => {};\nexport const c = () => {}, d = () => {};";
+        let parsed = ScriptParsers::default()
+            .parse("src/siblings.ts", source)
+            .unwrap();
+
+        assert_eq!(parsed.definition_names(), ["a", "b", "c", "d"]);
+        for definition in &parsed.definitions {
+            assert_eq!(definition.parent, None, "{}", definition.name);
+        }
+        let a = parsed
+            .definitions
+            .iter()
+            .find(|definition| definition.name == "a")
+            .unwrap();
+        let b = parsed
+            .definitions
+            .iter()
+            .find(|definition| definition.name == "b")
+            .unwrap();
+        let c = parsed
+            .definitions
+            .iter()
+            .find(|definition| definition.name == "c")
+            .unwrap();
+        let d = parsed
+            .definitions
+            .iter()
+            .find(|definition| definition.name == "d")
+            .unwrap();
+        assert!(a.signature.starts_with("const a"));
+        assert!(b.signature.starts_with("b ="));
+        assert!(!b.signature.contains("a ="));
+        assert!(c.signature.starts_with("export const c"));
+        assert!(d.signature.starts_with("d ="));
+        assert!(!d.signature.contains("c ="));
     }
 
     fn binding_contains(parsed: &ParsedFile, source: &str, name: &str, text: &str) -> bool {
