@@ -1018,7 +1018,19 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
     let mut client = Client::start(&incremental.path);
     let search = client.search("Service", Some("type"));
     let search_text = response_text(&search);
-    let node_ref = search_text.split_whitespace().next().unwrap();
+    let service = search_text
+        .lines()
+        .find(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next().is_some()
+                && fields.next() == Some("Type")
+                && fields.next() == Some("Service")
+                && fields
+                    .next()
+                    .is_some_and(|location| location.starts_with("src/core.ts:"))
+        })
+        .unwrap_or_else(|| panic!("missing Service type in src/core.ts: {search_text}"));
+    let node_ref = service.split_whitespace().next().unwrap();
     let view = client.view(node_ref, 2, 30);
     assert!(view.contains("dispatch"), "{view}");
     assert!(view.contains("finish"), "{view}");
