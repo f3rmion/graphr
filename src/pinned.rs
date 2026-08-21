@@ -214,6 +214,24 @@ mod tests {
     }
 
     #[test]
+    fn a_pin_does_not_extend_to_a_sidecar_of_its_path() {
+        let directory = temporary_directory("sidecar");
+        let pinned_path = directory.join("pinned.db");
+        let sidecar_path = directory.join("pinned.db-wal");
+        let file = write_marked_database(&pinned_path, "validated");
+        replace_with_marked_database(&pinned_path, "substituted");
+        write_marked_database(&sidecar_path, "sidecar");
+
+        let _pin = pin(&pinned_path, &file).unwrap();
+
+        // The match is the whole path, not a prefix of it: a name SQLite derives
+        // from a pinned database is still resolved as itself.
+        assert_eq!(marker(&sidecar_path), "sidecar");
+        assert_eq!(marker(&pinned_path), "validated");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn a_pin_is_confined_to_the_thread_that_took_it() {
         let directory = temporary_directory("thread");
         let pinned_path = directory.join("pinned.db");
