@@ -380,6 +380,7 @@ const CORE: &str = r#"
 "#;
 const BRIDGE: &str = r#"
     export { run as execute } from "./core.js";
+    export { default as ForwardedService } from "./services";
     export * as widgets from "./widget";
     export * from "./types.js";
 "#;
@@ -411,10 +412,45 @@ const ENTRY: &str = r#"
     export function unresolved() { return duplicate(); }
     export function fromIndex() { return indexed(); }
 "#;
+const SERVICES: &str = r#"
+    class DefaultService {
+        static defaultCreate() { return new DefaultService(); }
+    }
+    class LocalService {
+        static renamedCreate() { return new LocalService(); }
+    }
+    export default DefaultService;
+    export { LocalService as RenamedService };
+"#;
+const CLASS_USER: &str = r#"
+    import DirectoryDefault, {
+        RenamedService as DirectoryRenamed,
+    } from "./services";
+    import IndexDefault, {
+        RenamedService as IndexRenamed,
+    } from "./services/index";
+    import { ForwardedService } from "./bridge";
+    export function useDirectoryDefault() {
+        return DirectoryDefault.defaultCreate();
+    }
+    export function useDirectoryRenamed() {
+        return DirectoryRenamed.renamedCreate();
+    }
+    export function useIndexDefault() {
+        return IndexDefault.defaultCreate();
+    }
+    export function useIndexRenamed() {
+        return IndexRenamed.renamedCreate();
+    }
+    export function useForwarded() {
+        return ForwardedService.defaultCreate();
+    }
+"#;
 
 fn write_script_fixture(root: &Path) {
     fs::create_dir_all(root.join("src/collision")).unwrap();
     fs::create_dir_all(root.join("src/directory")).unwrap();
+    fs::create_dir_all(root.join("src/services")).unwrap();
     fs::write(root.join("src/types.d.ts"), TYPES).unwrap();
     fs::write(root.join("src/core.ts"), CORE).unwrap();
     fs::write(root.join("src/bridge.js"), BRIDGE).unwrap();
@@ -422,6 +458,8 @@ fn write_script_fixture(root: &Path) {
     fs::write(root.join("src/ui.tsx"), UI).unwrap();
     fs::write(root.join("src/modern.mts"), MODERN).unwrap();
     fs::write(root.join("src/entry.mjs"), ENTRY).unwrap();
+    fs::write(root.join("src/services/index.ts"), SERVICES).unwrap();
+    fs::write(root.join("src/class-user.ts"), CLASS_USER).unwrap();
     fs::write(
         root.join("src/collision.js"),
         "export function duplicate() { return 1; }\n",
@@ -464,7 +502,7 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
 
     index_repository(&incremental.path);
     assert_eq!(language_file_count(&incremental.path, "javascript"), 4);
-    assert_eq!(language_file_count(&incremental.path, "typescript"), 6);
+    assert_eq!(language_file_count(&incremental.path, "typescript"), 8);
     assert_eq!(
         stored_file_language_and_context(&incremental.path, "src/widget.jsx"),
         ("javascript".to_owned(), "javascript".to_owned())
@@ -480,6 +518,61 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
             "run",
             "src/core.ts",
             "helper",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/class-user.ts",
+            "useDirectoryDefault",
+            "src/services/index.ts",
+            "defaultCreate",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/class-user.ts",
+            "useDirectoryRenamed",
+            "src/services/index.ts",
+            "renamedCreate",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/class-user.ts",
+            "useIndexDefault",
+            "src/services/index.ts",
+            "defaultCreate",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/class-user.ts",
+            "useIndexRenamed",
+            "src/services/index.ts",
+            "renamedCreate",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/class-user.ts",
+            "useForwarded",
+            "src/services/index.ts",
+            "defaultCreate",
             "CALLS",
         ),
         1

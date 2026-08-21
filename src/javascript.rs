@@ -467,6 +467,26 @@ pub(crate) fn add_file(
                 keys.push(key);
             }
         }
+        if !export.type_only && matches!(parsed.definitions[local].kind, DefinitionKind::Class) {
+            for (method, definition) in
+                parsed
+                    .definitions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, definition)| {
+                        definition.parent == Some(local)
+                            && matches!(definition.kind, DefinitionKind::Method)
+                    })
+            {
+                let keys = &mut graph.nodes[definition_node_start + method].keys;
+                for alias in &aliases {
+                    let key = method_key(alias, exported, &definition.name);
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+        }
     }
 
     let import_modules = parsed
@@ -915,6 +935,7 @@ fn strip_script_suffix(value: &str) -> &str {
 fn module_aliases(path: &str) -> Result<Vec<String>, String> {
     let source_path = Path::new(path);
     if ScriptDialect::for_path(path).is_none()
+        || path.chars().any(char::is_control)
         || source_path.is_absolute()
         || !source_path
             .components()
@@ -923,7 +944,7 @@ fn module_aliases(path: &str) -> Result<Vec<String>, String> {
         return Err("script module path is invalid".to_owned());
     }
     let stem = strip_script_suffix(path);
-    if stem.is_empty() {
+    if stem.is_empty() || stem.ends_with('/') {
         return Err("script module path is invalid".to_owned());
     }
     if stem.len() > QUALIFIED_PATH_LIMIT {
@@ -964,7 +985,11 @@ fn relative_module(importer: &str, specifier: &str) -> Result<Option<String>, St
             _ => None,
         })
         .collect::<Vec<_>>();
-    for component in Path::new(strip_script_suffix(specifier)).components() {
+    let specifier = strip_script_suffix(specifier);
+    if specifier.ends_with('/') {
+        return Ok(None);
+    }
+    for component in Path::new(specifier).components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir if normalized.pop().is_some() => {}
@@ -1914,6 +1939,8 @@ mod tests {
         assert_eq!(module_aliases("src/types.d.ts").unwrap(), ["src/types"]);
         assert!(module_aliases("../src/core.ts").is_err());
         assert!(module_aliases("/src/core.ts").is_err());
+        assert!(module_aliases("src/.ts").is_err());
+        assert!(module_aliases("src/\u{7}core.ts").is_err());
         assert_eq!(
             relative_module("src/client.ts", "./core.js")
                 .unwrap()
@@ -1926,6 +1953,8 @@ mod tests {
                 .as_deref(),
             Some("src/core")
         );
+        assert_eq!(relative_module("src/client.ts", "./.ts").unwrap(), None);
+        assert_eq!(relative_module("src/client.ts", "./").unwrap(), None);
         for rejected in [
             "react",
             "@/core",
