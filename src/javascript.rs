@@ -179,7 +179,21 @@ impl ScriptParser {
         }
         collect_definition_bindings(&parsed.definitions, &mut parsed.bindings);
         for capture in &captured {
-            if matches!(capture.name.as_str(), "module" | "typescript_module") {
+            if matches!(capture.name.as_str(), "module" | "typescript_module")
+                && capture.node.kind() == "import_statement"
+            {
+                collect_module(capture.node, source, &mut parsed);
+            }
+        }
+        for capture in &captured {
+            if capture.name == "call" && capture.node.kind() == "call_expression" {
+                collect_require(capture.node, path, source, &mut parsed);
+            }
+        }
+        for capture in &captured {
+            if matches!(capture.name.as_str(), "module" | "typescript_module")
+                && capture.node.kind() != "import_statement"
+            {
                 collect_module(capture.node, source, &mut parsed);
             }
         }
@@ -304,6 +318,7 @@ enum ImportedName {
     Default,
     Named(String),
     Namespace,
+    CommonJsModule,
 }
 
 struct ImportBinding {
@@ -336,6 +351,7 @@ struct Export {
     exported: Option<String>,
     type_only: bool,
     line: usize,
+    byte: usize,
 }
 
 struct LexicalBinding {
@@ -500,7 +516,7 @@ pub(crate) fn add_file(
         }
         for binding in &import.bindings {
             let key = match &binding.imported {
-                ImportedName::Namespace => module_key(module),
+                ImportedName::Namespace | ImportedName::CommonJsModule => module_key(module),
                 ImportedName::Default if binding.type_only => export_type_key(module, "default"),
                 ImportedName::Default => export_value_key(module, "default"),
                 ImportedName::Named(name) if binding.type_only => export_type_key(module, name),
@@ -515,6 +531,34 @@ pub(crate) fn add_file(
                 line: to_u32(import.line)?,
                 keys: vec![key],
                 alias_key: None,
+                resolved_target_key: None,
+            });
+        }
+    }
+
+    for export in &parsed.exports {
+        let ExportTarget::Local(local) = &export.target else {
+            continue;
+        };
+        let Some(exported) = export.exported.as_deref() else {
+            continue;
+        };
+        if export.type_only || unique_top_level_definition(&parsed, local).is_some() {
+            continue;
+        }
+        let Some((import, binding)) = visible_import(&parsed, local, export.byte) else {
+            continue;
+        };
+        let Some(key) = import_value_key(&parsed, &import_modules, import, binding, None) else {
+            continue;
+        };
+        for alias in &aliases {
+            graph.refs.push(RefInput {
+                source_key: file_key.clone(),
+                kind: RefKind::Imports,
+                line: to_u32(export.line)?,
+                keys: vec![key.clone()],
+                alias_key: Some(export_value_key(alias, exported)),
                 resolved_target_key: None,
             });
         }
@@ -574,7 +618,7 @@ pub(crate) fn add_file(
                             .collect()
                     }),
             ),
-            Some(ImportedName::Namespace) => (
+            Some(ImportedName::Namespace | ImportedName::CommonJsModule) => (
                 module_key(&module),
                 export
                     .exported
@@ -784,6 +828,35 @@ enum VisibleValue {
     Missing,
 }
 
+fn is_lexically_bound(parsed: &ParsedFile, name: &str, byte: usize) -> bool {
+    parsed.bindings.iter().any(|binding| {
+        binding.name == name && binding.range.start <= byte && byte < binding.range.end
+    })
+}
+
+fn visible_import(parsed: &ParsedFile, name: &str, byte: usize) -> Option<(usize, usize)> {
+    let bindings = parsed
+        .bindings
+        .iter()
+        .filter(|binding| {
+            binding.name == name && binding.range.start <= byte && byte < binding.range.end
+        })
+        .collect::<Vec<_>>();
+    let width = bindings
+        .iter()
+        .map(|binding| binding.range.end - binding.range.start)
+        .min()?;
+    let mut selected = bindings
+        .into_iter()
+        .filter(|binding| binding.range.end - binding.range.start == width);
+    let binding = selected.next()?;
+    if selected.next().is_some() {
+        return None;
+    }
+    let (import, imported) = binding.import?;
+    (!parsed.imports[import].bindings[imported].type_only).then_some((import, imported))
+}
+
 fn visible_value(call: &Call, name: &str, parsed: &ParsedFile) -> VisibleValue {
     let bindings = parsed
         .bindings
@@ -884,6 +957,8 @@ fn import_value_key(
         (ImportedName::Default, Some(member)) => Some(export_method_key(module, "default", member)),
         (ImportedName::Named(name), None) => Some(export_value_key(module, name)),
         (ImportedName::Default, None) => Some(export_value_key(module, "default")),
+        (ImportedName::CommonJsModule, Some(member)) => Some(export_value_key(module, member)),
+        (ImportedName::CommonJsModule, None) => Some(export_value_key(module, "default")),
         (ImportedName::Namespace, None) => None,
     }
 }
@@ -1345,7 +1420,19 @@ fn collect_binding(node: Node<'_>, source: &str, bindings: &mut Vec<LexicalBindi
         "catch_clause" => node.child_by_field_name("parameter").unwrap_or(node),
         _ => return,
     };
-    let range = match node.kind() {
+    let range = lexical_scope(node, source);
+    for identifier in binding_identifiers(target) {
+        bindings.push(LexicalBinding {
+            name: text(identifier, source).to_owned(),
+            range,
+            byte: identifier.start_byte(),
+            import: None,
+        });
+    }
+}
+
+fn lexical_scope(node: Node<'_>, source: &str) -> ByteRange {
+    match node.kind() {
         "formal_parameters" => function_scope(node, source),
         "variable_declarator" if is_var(node) => function_scope(node, source),
         "variable_declarator" => block_scope(node, source),
@@ -1354,14 +1441,6 @@ fn collect_binding(node: Node<'_>, source: &str, bindings: &mut Vec<LexicalBindi
             .map(range)
             .unwrap_or_else(|| module_scope(source)),
         _ => module_scope(source),
-    };
-    for identifier in identifiers(target) {
-        bindings.push(LexicalBinding {
-            name: text(identifier, source).to_owned(),
-            range,
-            byte: identifier.start_byte(),
-            import: None,
-        });
     }
 }
 
@@ -1372,6 +1451,21 @@ fn collect_import(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
     let statement_type_only = has_direct_token(node, "type");
     let mut bindings = Vec::new();
     let mut binding_bytes = Vec::new();
+    let mut cursor = node.walk();
+    if let Some(require_clause) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "import_require_clause")
+        && let Some(local) = identifiers(require_clause).into_iter().next()
+    {
+        push_import_binding(
+            local,
+            ImportedName::CommonJsModule,
+            false,
+            source,
+            &mut bindings,
+            &mut binding_bytes,
+        );
+    }
     let mut cursor = node.walk();
     if let Some(clause) = node
         .named_children(&mut cursor)
@@ -1434,20 +1528,134 @@ fn collect_import(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
             }
         }
     }
+    finish_import(
+        parsed,
+        module,
+        containing_definition(node.start_byte(), &parsed.definitions),
+        line_start(node),
+        bindings,
+        binding_bytes,
+        module_scope(source),
+    );
+}
+
+fn collect_require(node: Node<'_>, path: &str, source: &str, parsed: &mut ParsedFile) {
+    let Some(module) = static_require(node, source) else {
+        return;
+    };
+    if !matches!(relative_module(path, module), Ok(Some(_)))
+        || is_lexically_bound(parsed, "require", node.start_byte())
+    {
+        return;
+    }
+
+    let mut bindings = Vec::new();
+    let mut binding_bytes = Vec::new();
+    let declarator = node.parent().filter(|parent| {
+        parent.kind() == "variable_declarator"
+            && parent
+                .child_by_field_name("value")
+                .is_some_and(|value| value.id() == node.id())
+    });
+    if let Some(name) = declarator.and_then(|declarator| declarator.child_by_field_name("name")) {
+        match name.kind() {
+            "identifier" => push_import_binding(
+                name,
+                ImportedName::CommonJsModule,
+                false,
+                source,
+                &mut bindings,
+                &mut binding_bytes,
+            ),
+            "object_pattern" => {
+                let mut cursor = name.walk();
+                for property in name.named_children(&mut cursor) {
+                    match property.kind() {
+                        "shorthand_property_identifier_pattern" => push_import_binding(
+                            property,
+                            ImportedName::Named(text(property, source).to_owned()),
+                            false,
+                            source,
+                            &mut bindings,
+                            &mut binding_bytes,
+                        ),
+                        "pair_pattern" => {
+                            let Some(imported) = property
+                                .child_by_field_name("key")
+                                .filter(|key| key.kind() == "property_identifier")
+                            else {
+                                continue;
+                            };
+                            let Some(local) = property
+                                .child_by_field_name("value")
+                                .filter(|value| value.kind() == "identifier")
+                            else {
+                                continue;
+                            };
+                            push_import_binding(
+                                local,
+                                ImportedName::Named(text(imported, source).to_owned()),
+                                false,
+                                source,
+                                &mut bindings,
+                                &mut binding_bytes,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let binding_range = declarator.map_or_else(
+        || module_scope(source),
+        |declarator| lexical_scope(declarator, source),
+    );
+    finish_import(
+        parsed,
+        module,
+        containing_definition(node.start_byte(), &parsed.definitions),
+        line_start(node),
+        bindings,
+        binding_bytes,
+        binding_range,
+    );
+}
+
+fn finish_import(
+    parsed: &mut ParsedFile,
+    module: &str,
+    source: Option<usize>,
+    line: usize,
+    bindings: Vec<ImportBinding>,
+    binding_bytes: Vec<usize>,
+    range: ByteRange,
+) {
     let import = parsed.imports.len();
     parsed.imports.push(Import {
-        source: containing_definition(node.start_byte(), &parsed.definitions),
+        source,
         module: module.to_owned(),
         bindings,
-        line: line_start(node),
+        line,
     });
     for (binding, byte) in binding_bytes.into_iter().enumerate() {
-        parsed.bindings.push(LexicalBinding {
-            name: parsed.imports[import].bindings[binding].local.clone(),
-            range: module_scope(source),
-            byte,
-            import: Some((import, binding)),
-        });
+        let name = &parsed.imports[import].bindings[binding].local;
+        if let Some(existing) = parsed.bindings.iter_mut().find(|existing| {
+            existing.name == *name
+                && existing.byte == byte
+                && existing.range.start == range.start
+                && existing.range.end == range.end
+        }) {
+            existing.import = Some((import, binding));
+        } else {
+            parsed.bindings.push(LexicalBinding {
+                name: name.clone(),
+                range,
+                byte,
+                import: Some((import, binding)),
+            });
+        }
     }
 }
 
@@ -1468,6 +1676,17 @@ fn push_import_binding(
 }
 
 fn collect_export(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
+    if has_direct_token(node, "=") {
+        let value = node.child_by_field_name("value").or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "identifier")
+        });
+        if let Some(value) = value.filter(|value| value.kind() == "identifier") {
+            add_local_export(parsed, text(value, source), "default", node);
+        }
+        return;
+    }
     let module = static_module(node, source);
     let statement_type_only = has_direct_token(node, "type");
     let mut cursor = node.walk();
@@ -1497,6 +1716,7 @@ fn collect_export(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
                 exported: Some(text(exported, source).to_owned()),
                 type_only: statement_type_only || has_direct_token(specifier, "type"),
                 line: line_start(node),
+                byte: node.start_byte(),
             });
         }
         return;
@@ -1519,6 +1739,7 @@ fn collect_export(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
                 exported: Some(text(exported, source).to_owned()),
                 type_only: statement_type_only,
                 line: line_start(node),
+                byte: node.start_byte(),
             });
         }
         return;
@@ -1532,6 +1753,7 @@ fn collect_export(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
             exported: None,
             type_only: statement_type_only,
             line: line_start(node),
+            byte: node.start_byte(),
         });
         return;
     }
@@ -1559,6 +1781,7 @@ fn collect_export(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
                 }),
                 type_only: statement_type_only,
                 line: line_start(node),
+                byte: node.start_byte(),
             });
         }
     } else if default
@@ -1571,46 +1794,143 @@ fn collect_export(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
             exported: Some("default".to_owned()),
             type_only: false,
             line: line_start(node),
+            byte: node.start_byte(),
         });
     }
 }
 
 fn collect_assignment_export(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "assignment_expression")
+    {
+        return;
+    }
     let Some(left) = node.child_by_field_name("left") else {
         return;
     };
-    if left.kind() == "member_expression" {
-        let object = left.child_by_field_name("object");
-        let property = left.child_by_field_name("property");
-        if object.is_some_and(|object| text(object, source) == "exports") {
-            if let Some(property) =
-                property.filter(|property| property.kind() == "property_identifier")
-            {
-                add_local_export(parsed, text(property, source), line_start(node));
-            }
-        } else if object.is_some_and(|object| text(object, source) == "module.exports")
-            && let Some(property) =
-                property.filter(|property| property.kind() == "property_identifier")
-        {
-            add_local_export(parsed, text(property, source), line_start(node));
+    let Some(right) = node.child_by_field_name("right") else {
+        return;
+    };
+
+    if let Some((special, exported)) = commonjs_named_export(left, source) {
+        if is_lexically_bound(parsed, special, node.start_byte()) {
+            return;
         }
-    } else if text(left, source) == "module.exports" {
-        add_local_export(parsed, "default", line_start(node));
+        if let Some(local) = (right.kind() == "identifier").then(|| text(right, source)) {
+            add_local_export(parsed, local, text(exported, source), node);
+        }
+        return;
+    }
+
+    if !is_module_exports(left, source) || is_lexically_bound(parsed, "module", node.start_byte()) {
+        return;
+    }
+    if right.kind() == "identifier" {
+        add_local_export(parsed, text(right, source), "default", node);
+    } else if right.kind() == "object" {
+        let mut cursor = right.walk();
+        for property in right.named_children(&mut cursor) {
+            match property.kind() {
+                "shorthand_property_identifier" => {
+                    let name = text(property, source);
+                    add_local_export(parsed, name, name, node);
+                }
+                "pair" => {
+                    let Some(exported) = property
+                        .child_by_field_name("key")
+                        .filter(|key| key.kind() == "property_identifier")
+                    else {
+                        continue;
+                    };
+                    let Some(local) = property
+                        .child_by_field_name("value")
+                        .filter(|value| value.kind() == "identifier")
+                    else {
+                        continue;
+                    };
+                    add_local_export(parsed, text(local, source), text(exported, source), node);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
-fn add_local_export(parsed: &mut ParsedFile, name: &str, line: usize) {
+fn add_local_export(parsed: &mut ParsedFile, local: &str, exported: &str, node: Node<'_>) {
     parsed.exports.push(Export {
-        target: ExportTarget::Local(name.to_owned()),
-        exported: Some(name.to_owned()),
+        target: ExportTarget::Local(local.to_owned()),
+        exported: Some(exported.to_owned()),
         type_only: false,
-        line,
+        line: line_start(node),
+        byte: node.start_byte(),
     });
 }
 
+fn is_module_exports(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "member_expression"
+        && node
+            .child_by_field_name("object")
+            .is_some_and(|object| object.kind() == "identifier" && text(object, source) == "module")
+        && node
+            .child_by_field_name("property")
+            .is_some_and(|property| {
+                property.kind() == "property_identifier" && text(property, source) == "exports"
+            })
+}
+
+fn commonjs_named_export<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(&'static str, Node<'tree>)> {
+    if node.kind() != "member_expression" {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    let property = node
+        .child_by_field_name("property")
+        .filter(|property| property.kind() == "property_identifier")?;
+    if object.kind() == "identifier" && text(object, source) == "exports" {
+        Some(("exports", property))
+    } else if is_module_exports(object, source) {
+        Some(("module", property))
+    } else {
+        None
+    }
+}
+
 fn static_module<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
-    node.child_by_field_name("source")
-        .map(|module| text(module, source).trim_matches(['\'', '"']))
+    let module = node.child_by_field_name("source").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "import_require_clause")?
+            .child_by_field_name("source")
+    })?;
+    Some(text(module, source).trim_matches(['\'', '"']))
+}
+
+fn static_require<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    if node
+        .child_by_field_name("function")
+        .filter(|function| function.kind() == "identifier")
+        .is_none_or(|function| text(function, source) != "require")
+    {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let mut arguments = arguments.named_children(&mut cursor);
+    let argument = arguments.next()?;
+    if arguments.next().is_some() || argument.kind() != "string" {
+        return None;
+    }
+    let literal = text(argument, source);
+    match literal.as_bytes() {
+        [b'"', content @ .., b'"'] | [b'\'', content @ .., b'\''] => {
+            std::str::from_utf8(content).ok()
+        }
+        _ => None,
+    }
 }
 
 fn has_direct_token(node: Node<'_>, kind: &str) -> bool {
@@ -1723,6 +2043,40 @@ fn identifiers(node: Node<'_>) -> Vec<Node<'_>> {
         }
         let mut cursor = node.walk();
         pending.extend(node.named_children(&mut cursor));
+    }
+    identifiers
+}
+
+fn binding_identifiers(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut identifiers = Vec::new();
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => identifiers.push(node),
+            "assignment_pattern" | "object_assignment_pattern" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    pending.push(left);
+                }
+            }
+            "pair_pattern" => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    pending.push(value);
+                }
+            }
+            "required_parameter" | "optional_parameter" => {
+                if let Some(binding) = node
+                    .child_by_field_name("pattern")
+                    .or_else(|| node.child_by_field_name("name"))
+                {
+                    pending.push(binding);
+                }
+            }
+            "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+            _ => {}
+        }
     }
     identifiers
 }
@@ -1990,6 +2344,136 @@ mod tests {
         );
         assert_eq!(javascript.relative_modules(), ["./worker.js"]);
         assert_eq!(javascript.call_names(), ["execute", "run"]);
+
+        let commonjs = parsers
+            .parse(
+                "src/common.cjs",
+                r#"
+                    const { run: execute } = require("./core");
+                    const invoke = () => execute();
+                    module.exports = { invoke };
+                    exports.direct = execute;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(commonjs.relative_modules(), ["./core"]);
+        assert_eq!(commonjs.export_names(), ["invoke", "direct"]);
+
+        let cts = parsers
+            .parse(
+                "src/consumer.cts",
+                r#"
+                    import core = require("./common.cjs");
+                    const consume = () => core.invoke();
+                    export = consume;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(cts.relative_modules(), ["./common.cjs"]);
+        assert_eq!(cts.export_names(), ["default"]);
+
+        let guarded = parsers
+            .parse(
+                "src/guarded.cjs",
+                r#"
+                    require("./side");
+                    const whole = require("./whole");
+                    const {
+                        named,
+                        original: local,
+                        defaulted = fallback,
+                        [key]: computed,
+                        nested: { deep },
+                        ...rest
+                    } = require("./named");
+                    const dynamic = require(path);
+                    const member = require("./member").value;
+                    function shadowed(require, module, exports) {
+                        require("./shadowed");
+                        module.exports = whole;
+                        exports.named = named;
+                    }
+                    module["exports"] = whole;
+                    exports["computed"] = named;
+                    module.exports = chained = whole;
+                    module.exports = {
+                        named,
+                        renamed: local,
+                        called: factory(),
+                        [key]: named,
+                        ...rest,
+                        method() {}
+                    };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            guarded.relative_modules(),
+            ["./side", "./whole", "./named", "./member"]
+        );
+        assert_eq!(guarded.export_names(), ["named", "renamed"]);
+
+        let mut graph = Graph::default();
+        add_file(
+            &mut graph,
+            &Source {
+                path: "src/common.cjs".to_owned(),
+                text: r#"
+                    const { run: execute } = require("./core");
+                    const invoke = () => execute();
+                    module.exports = { invoke };
+                    exports.direct = execute;
+                "#
+                .to_owned(),
+            },
+            StoredLanguage::JavaScript,
+            &mut ScriptParsers::default(),
+        )
+        .unwrap();
+        assert!(has_ref(
+            &graph,
+            "invoke",
+            "script:export-value:src/core::run"
+        ));
+        assert!(graph.nodes.iter().any(|node| {
+            node.name == "invoke"
+                && node
+                    .keys
+                    .iter()
+                    .any(|key| key == "script:export-value:src/common::invoke")
+        }));
+        assert!(graph.refs.iter().any(|reference| {
+            reference.alias_key.as_deref() == Some("script:export-value:src/common::direct")
+                && reference.keys == ["script:export-value:src/core::run"]
+        }));
+
+        add_file(
+            &mut graph,
+            &Source {
+                path: "src/consumer.cts".to_owned(),
+                text: r#"
+                    import core = require("./common.cjs");
+                    const consume = () => core.invoke();
+                    export = consume;
+                "#
+                .to_owned(),
+            },
+            StoredLanguage::TypeScript,
+            &mut ScriptParsers::default(),
+        )
+        .unwrap();
+        assert!(has_ref(
+            &graph,
+            "consume",
+            "script:export-value:src/common::invoke"
+        ));
+        assert!(graph.nodes.iter().any(|node| {
+            node.name == "consume"
+                && node
+                    .keys
+                    .iter()
+                    .any(|key| key == "script:export-value:src/consumer::default")
+        }));
 
         let typescript = parsers
             .parse(

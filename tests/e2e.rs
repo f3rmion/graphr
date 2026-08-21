@@ -404,6 +404,16 @@ const MODERN: &str = r#"
         return exposedHelper({ value: "local" });
     }
 "#;
+const COMMON: &str = r#"
+    const { run } = require("./core");
+    const invokeCommon = () => run({ value: "cjs" });
+    module.exports = { invokeCommon };
+"#;
+const CONSUMER: &str = r#"
+    import common = require("./common.cjs");
+    const consume = () => common.invokeCommon();
+    export = consume;
+"#;
 const ENTRY: &str = r#"
     import "./bridge";
     import { duplicate } from "./collision";
@@ -487,6 +497,8 @@ fn write_script_fixture(root: &Path) {
     fs::write(root.join("src/widget.jsx"), WIDGET).unwrap();
     fs::write(root.join("src/ui.tsx"), UI).unwrap();
     fs::write(root.join("src/modern.mts"), MODERN).unwrap();
+    fs::write(root.join("src/common.cjs"), COMMON).unwrap();
+    fs::write(root.join("src/consumer.cts"), CONSUMER).unwrap();
     fs::write(root.join("src/entry.mjs"), ENTRY).unwrap();
     fs::write(root.join("src/services/index.ts"), SERVICES).unwrap();
     fs::write(root.join("src/class-user.ts"), CLASS_USER).unwrap();
@@ -542,8 +554,8 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
     }
 
     index_repository(&incremental.path);
-    assert_eq!(language_file_count(&incremental.path, "javascript"), 4);
-    assert_eq!(language_file_count(&incremental.path, "typescript"), 11);
+    assert_eq!(language_file_count(&incremental.path, "javascript"), 5);
+    assert_eq!(language_file_count(&incremental.path, "typescript"), 12);
     assert_eq!(
         stored_file_language_and_context(&incremental.path, "src/widget.jsx"),
         ("javascript".to_owned(), "javascript".to_owned())
@@ -687,6 +699,28 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
             "invoke",
             "src/core.ts",
             "run",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/common.cjs",
+            "invokeCommon",
+            "src/core.ts",
+            "run",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/consumer.cts",
+            "consume",
+            "src/common.cjs",
+            "invokeCommon",
             "CALLS",
         ),
         1
