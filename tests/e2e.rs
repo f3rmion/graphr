@@ -396,6 +396,20 @@ const UI: &str = r#"
     export const Panel = () =>
         <><DefaultWidget /><Widget /><UI.Widget /><div /></>;
 "#;
+const SCRIPT_TESTS: &str = r#"
+    import { execute } from "../src/bridge";
+    import { Service } from "../src/core";
+    import { Panel } from "../src/ui";
+    import { future } from "../src/future";
+
+    test.only("runs", () => execute?.({ value: "test" }));
+    describe("nested", () => {
+        it.skip("constructs", () => new Service());
+    });
+    test("static factory", () => Service.create());
+    test("renders", () => Panel());
+    test("future", () => future());
+"#;
 const MODERN: &str = r#"
     import { execute } from "./bridge";
     import { exposedHelper } from "./core";
@@ -491,6 +505,7 @@ fn write_script_fixture(root: &Path) {
     fs::create_dir_all(root.join("src/directory")).unwrap();
     fs::create_dir_all(root.join("src/services")).unwrap();
     fs::create_dir_all(root.join("src/ambiguous-service")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
     fs::write(root.join("src/types.d.ts"), TYPES).unwrap();
     fs::write(root.join("src/core.ts"), CORE).unwrap();
     fs::write(root.join("src/bridge.js"), BRIDGE).unwrap();
@@ -513,6 +528,7 @@ fn write_script_fixture(root: &Path) {
     )
     .unwrap();
     fs::write(root.join("src/not-a-class.ts"), NOT_A_CLASS).unwrap();
+    fs::write(root.join("tests/core.test.ts"), SCRIPT_TESTS).unwrap();
     fs::write(
         root.join("src/collision.js"),
         "export function duplicate() { return 1; }\n",
@@ -555,14 +571,102 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
 
     index_repository(&incremental.path);
     assert_eq!(language_file_count(&incremental.path, "javascript"), 5);
-    assert_eq!(language_file_count(&incremental.path, "typescript"), 12);
+    assert_eq!(language_file_count(&incremental.path, "typescript"), 13);
+    for (path, language, context) in [
+        ("src/bridge.js", "javascript", "javascript"),
+        ("src/widget.jsx", "javascript", "javascript"),
+        ("src/entry.mjs", "javascript", "javascript"),
+        ("src/common.cjs", "javascript", "javascript"),
+        ("src/core.ts", "typescript", "typescript"),
+        ("src/types.d.ts", "typescript", "typescript"),
+        ("src/modern.mts", "typescript", "typescript"),
+        ("src/consumer.cts", "typescript", "typescript"),
+        ("src/ui.tsx", "typescript", "tsx"),
+        ("tests/core.test.ts", "typescript", "typescript"),
+    ] {
+        assert_eq!(
+            stored_file_language_and_context(&incremental.path, path),
+            (language.to_owned(), context.to_owned()),
+            "{path}"
+        );
+    }
     assert_eq!(
-        stored_file_language_and_context(&incremental.path, "src/widget.jsx"),
-        ("javascript".to_owned(), "javascript".to_owned())
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "runs",
+            "src/core.ts",
+            "run",
+            "TEST_CALLS",
+        ),
+        1
     );
     assert_eq!(
-        stored_file_language_and_context(&incremental.path, "src/ui.tsx"),
-        ("typescript".to_owned(), "tsx".to_owned())
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "static factory",
+            "src/core.ts",
+            "create",
+            "TEST_CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "constructs",
+            "src/core.ts",
+            "Service",
+            "TEST_CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "renders",
+            "src/ui.tsx",
+            "Panel",
+            "TEST_CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/ui.tsx",
+            "Panel",
+            "src/widget.jsx",
+            "Widget",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/ui.tsx",
+            "Panel",
+            "src/widget.jsx",
+            "DefaultWidget",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(named_edge_count(&incremental.path, "Panel", "div"), 0);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/future.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        0
     );
     assert_eq!(
         named_edge_kind_count(

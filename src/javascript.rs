@@ -212,14 +212,20 @@ impl ScriptParser {
         });
         for capture in &captured {
             if capture.name == "call"
+                && test_parts(capture.node, path, source).is_none()
                 && let Some(call) = call(capture.node, source)
             {
                 parsed.calls.push(call);
             }
             if capture.name == "jsx"
-                && let Some(call) = jsx_call(capture.node, source)
+                && let Some(target) = jsx_target(capture.node, source.as_bytes())
             {
-                parsed.calls.push(call);
+                parsed.calls.push(Call {
+                    source: None,
+                    byte: capture.node.start_byte(),
+                    target,
+                    line: line_start(capture.node),
+                });
             }
         }
         parsed.calls.sort_unstable_by_key(|call| call.byte);
@@ -365,7 +371,6 @@ enum CallTarget {
     Identifier(String),
     Member { object: String, property: String },
     ThisMethod(String),
-    Jsx(String),
 }
 
 struct Call {
@@ -801,23 +806,6 @@ fn call_keys(
                 Vec::new()
             }
         },
-        CallTarget::Jsx(name) => {
-            let (root, member) = name
-                .split_once('.')
-                .map_or((name.as_str(), None), |(root, member)| (root, Some(member)));
-            match visible_value(call, root, parsed) {
-                VisibleValue::Definition(target) => vec![local_value_key(
-                    stem,
-                    paths.get(target).map_or(root, String::as_str),
-                )],
-                VisibleValue::Import(import, binding) => {
-                    import_value_key(parsed, import_modules, import, binding, member)
-                        .into_iter()
-                        .collect()
-                }
-                VisibleValue::Ambiguous | VisibleValue::Missing => Vec::new(),
-            }
-        }
     }
 }
 
@@ -2087,29 +2075,26 @@ fn binding_identifiers(node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn test_name(node: Node<'_>, path: &str, source: &str) -> Option<String> {
-    if !is_test_path(path) {
+    if !matches!(node.kind(), "arrow_function" | "function_expression") {
         return None;
     }
-    let mut current = node;
-    let call = loop {
-        let parent = current.parent()?;
-        if parent.kind() == "call_expression" {
-            break parent;
-        }
-        if !matches!(parent.kind(), "arguments" | "parenthesized_expression") {
-            return None;
-        }
-        current = parent;
-    };
-    let function = call.child_by_field_name("function")?;
-    if !test_callee(function, source) {
+    let mut argument = node;
+    while argument
+        .parent()
+        .is_some_and(|parent| parent.kind() == "parenthesized_expression")
+    {
+        argument = argument.parent()?;
+    }
+    let arguments = argument
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")?;
+    let call = arguments
+        .parent()
+        .filter(|parent| parent.kind() == "call_expression")?;
+    let (title, callback) = test_parts(call, path, source)?;
+    if callback.id() != node.id() {
         return None;
     }
-    let arguments = call.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    let title = arguments
-        .named_children(&mut cursor)
-        .find(|child| child.id() != node.id())?;
     let title = text(title, source);
     if (title.starts_with(['\'', '"']) && title.ends_with(['\'', '"']))
         || (title.starts_with('`') && title.ends_with('`') && !title.contains("${"))
@@ -2121,25 +2106,49 @@ fn test_name(node: Node<'_>, path: &str, source: &str) -> Option<String> {
 
 fn is_test_path(path: &str) -> bool {
     path.split('/').any(|component| component == "__tests__")
-        || [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"]
-            .iter()
-            .any(|extension| {
-                path.strip_suffix(extension)
-                    .is_some_and(|stem| stem.ends_with(".test") || stem.ends_with(".spec"))
-            })
+        || SCRIPT_SUFFIXES.iter().any(|suffix| {
+            path.strip_suffix(suffix)
+                .is_some_and(|stem| stem.ends_with(".test") || stem.ends_with(".spec"))
+        })
 }
 
-fn test_callee(node: Node<'_>, source: &str) -> bool {
-    if matches!(text(node, source), "test" | "it") {
-        return true;
+fn test_parts<'tree>(
+    call: Node<'tree>,
+    path: &str,
+    source: &str,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    if !is_test_path(path) || call.kind() != "call_expression" {
+        return None;
     }
-    node.kind() == "member_expression"
-        && node
-            .child_by_field_name("object")
-            .is_some_and(|object| matches!(text(object, source), "test" | "it"))
-        && node
-            .child_by_field_name("property")
-            .is_some_and(|property| matches!(text(property, source), "only" | "skip"))
+    test_callee(call.child_by_field_name("function")?, source.as_bytes())?;
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let mut children = arguments.named_children(&mut cursor);
+    let title = children.next()?;
+    let mut callback = children.next()?;
+    if children.next().is_some() {
+        return None;
+    }
+    drop(children);
+    while callback.kind() == "parenthesized_expression" {
+        let mut cursor = callback.walk();
+        let mut children = callback.named_children(&mut cursor);
+        callback = children.next()?;
+        if children.next().is_some() {
+            return None;
+        }
+    }
+    matches!(callback.kind(), "arrow_function" | "function_expression").then_some((title, callback))
+}
+
+fn test_callee(node: Node<'_>, source: &[u8]) -> Option<&'static str> {
+    match (node.kind(), source.get(node.byte_range())?) {
+        ("identifier", b"test") | ("member_expression", b"test.only" | b"test.skip") => {
+            Some("test")
+        }
+        ("identifier", b"it") | ("member_expression", b"it.only" | b"it.skip") => Some("it"),
+        _ => None,
+    }
 }
 
 fn call(node: Node<'_>, source: &str) -> Option<Call> {
@@ -2174,19 +2183,28 @@ fn call(node: Node<'_>, source: &str) -> Option<Call> {
     })
 }
 
-fn jsx_call(node: Node<'_>, source: &str) -> Option<Call> {
-    if node.kind() == "identifier" || node.kind() == "member_expression" {
-        let name = text(node, source);
-        if name.chars().next().is_some_and(char::is_uppercase) {
-            return Some(Call {
-                source: None,
-                byte: node.start_byte(),
-                target: CallTarget::Jsx(name.to_owned()),
-                line: line_start(node),
-            });
-        }
+fn jsx_target(node: Node<'_>, source: &[u8]) -> Option<CallTarget> {
+    let node_text = |node: Node<'_>| std::str::from_utf8(source.get(node.byte_range())?).ok();
+    if node.kind() == "identifier" {
+        let name = node_text(node)?;
+        return name
+            .chars()
+            .next()
+            .is_some_and(char::is_uppercase)
+            .then(|| CallTarget::Identifier(name.to_owned()));
     }
-    None
+    let object = node.child_by_field_name("object")?;
+    let property = node.child_by_field_name("property")?;
+    let object = (object.kind() == "identifier").then(|| node_text(object))??;
+    let property = (property.kind() == "property_identifier").then(|| node_text(property))??;
+    object
+        .chars()
+        .next()
+        .is_some_and(char::is_uppercase)
+        .then(|| CallTarget::Member {
+            object: object.to_owned(),
+            property: property.to_owned(),
+        })
 }
 
 fn signature(start: usize, end: usize, source: &str) -> String {
@@ -2263,11 +2281,20 @@ impl ParsedFile {
             .collect()
     }
 
-    fn jsx_component_names(&self) -> Vec<&str> {
+    fn jsx_component_names(&self) -> Vec<String> {
         self.calls
             .iter()
             .filter_map(|call| match &call.target {
-                CallTarget::Jsx(name) => Some(name.as_str()),
+                CallTarget::Identifier(name)
+                    if name.chars().next().is_some_and(char::is_uppercase) =>
+                {
+                    Some(name.clone())
+                }
+                CallTarget::Member { object, property }
+                    if object.chars().next().is_some_and(char::is_uppercase) =>
+                {
+                    Some(format!("{object}.{property}"))
+                }
                 _ => None,
             })
             .collect()
@@ -2283,6 +2310,17 @@ mod tests {
     #[test]
     fn analyzes_javascript_typescript_and_tsx() {
         let mut parsers = ScriptParsers::default();
+
+        for path in [
+            "tests/core.test.ts",
+            "tests/core.spec.tsx",
+            "src/__tests__/core.js",
+        ] {
+            assert!(is_test_path(path), "{path}");
+        }
+        for path in ["src/core.ts", "src/contest.ts", "src/test-helper.ts"] {
+            assert!(!is_test_path(path), "{path}");
+        }
 
         assert_eq!(module_aliases("src/core.ts").unwrap(), ["src/core"]);
         assert_eq!(
@@ -2563,6 +2601,69 @@ mod tests {
             .unwrap();
         assert_eq!(tsx.definition_names(), ["Panel"]);
         assert_eq!(tsx.jsx_component_names(), ["View"]);
+
+        let tests = parsers
+            .parse(
+                "tests/core.test.ts",
+                "test.only(\"runs\", () => run());\n\
+                 describe(\"nested\", () => {\n\
+                   it.skip(\"renders\", () => Panel());\n\
+                 });\n\
+                 test(title, () => fallback());\n",
+            )
+            .unwrap();
+        assert_eq!(tests.test_names(), ["runs", "renders", "test@5"]);
+
+        let ordinary = parsers
+            .parse("src/core.ts", r#"test("not a test", () => run());"#)
+            .unwrap();
+        assert!(ordinary.test_names().is_empty());
+
+        let jsx = parsers
+            .parse(
+                "src/panel.tsx",
+                r#"const Panel = () => <><Widget /><UI.Widget /><div /><ui.Widget /></>;"#,
+            )
+            .unwrap();
+        assert_eq!(jsx.jsx_component_names(), ["Widget", "UI.Widget"]);
+
+        let ownership = parsers
+            .parse(
+                "tests/ownership.test.ts",
+                "topLevel();\ntest(\"owned\", () => inside());\n",
+            )
+            .unwrap();
+        let test = ownership
+            .definitions
+            .iter()
+            .position(|definition| matches!(definition.kind, DefinitionKind::Test))
+            .unwrap();
+        assert_eq!(
+            ownership
+                .calls
+                .iter()
+                .filter_map(|call| match &call.target {
+                    CallTarget::Identifier(name) => Some((name.as_str(), call.source)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [("topLevel", None), ("inside", Some(test))]
+        );
+        assert!(is_test_path("tests/core.test.d.ts"));
+
+        let exact_callbacks = parsers
+            .parse(
+                "tests/exact.test.ts",
+                "test(() => reversed(), \"reversed\");\n\
+                 test(\"third\", 0, () => third());\n\
+                 test(\"generator\", function* () { generator(); });\n\
+                 test?.only(\"optional\", () => optional());\n\
+                 describe(\"suite\", () => {\n\
+                   it(\"nested\", function () { nested(); });\n\
+                 });\n",
+            )
+            .unwrap();
+        assert_eq!(exact_callbacks.test_names(), ["nested"]);
 
         for (path, context) in [
             ("a.js", "javascript"),
