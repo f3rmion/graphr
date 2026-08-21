@@ -4,6 +4,7 @@ mod index;
 pub mod job;
 mod mcp;
 mod parse;
+mod pinned;
 mod python;
 mod store;
 pub mod workspace;

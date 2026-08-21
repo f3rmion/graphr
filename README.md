@@ -11,6 +11,8 @@ Graphr is inspired by [code-review-graph](https://github.com/tirth8205/code-revi
 cargo install graphr --locked
 ```
 
+Supported platforms are Linux and macOS. Windows is not supported.
+
 Register the installed binary with either client:
 
 ```text

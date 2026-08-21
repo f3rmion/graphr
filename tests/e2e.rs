@@ -5,6 +5,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -4239,7 +4240,7 @@ fn linked_worktrees(label: &str) -> LinkedWorktrees {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
+    let root = temp_root().join(format!(
         "graphr-e2e-linked-{label}-{}-{unique}",
         std::process::id()
     ));
@@ -4767,14 +4768,32 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        // The clock alone is not a unique name. macOS reports a coarser
+        // realtime granularity than Linux, so two fixtures constructed on
+        // parallel test threads can read the same nanosecond and collide on
+        // `create_dir`. An ordinal makes the name unique within the process,
+        // and the pid keeps concurrent `cargo test` runs apart.
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("graphr-e2e-{}-{unique}", std::process::id()));
+        let ordinal = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let path = temp_root().join(format!(
+            "graphr-e2e-{}-{unique}-{ordinal}",
+            std::process::id()
+        ));
         fs::create_dir(&path).unwrap();
         Self { path }
     }
+}
+
+/// macOS resolves `TMPDIR` under `/var`, a symlink to `/private/var`, and the
+/// server reports canonical roots. Canonicalising here keeps a fixture root
+/// comparable with what the server answers.
+fn temp_root() -> PathBuf {
+    let base = std::env::temp_dir();
+    fs::canonicalize(&base).unwrap_or(base)
 }
 
 impl Drop for Fixture {

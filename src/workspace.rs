@@ -1,12 +1,12 @@
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -264,8 +264,19 @@ pub struct SnapshotEntry {
     pub no_change_reason: Option<NoChangeReason>,
     pub dependency_mode: DependencyMode,
     pub provenance: Provenance,
-    _graph_file: Arc<File>,
+    graph_file: Arc<File>,
     graph_checksum: String,
+}
+
+impl SnapshotEntry {
+    /// Opens the graph image this entry validated. SQLite cannot take a
+    /// descriptor, so the open is pinned to the descriptor retained at load
+    /// time: renaming `graph_path` afterwards cannot redirect the read to
+    /// another inode.
+    pub(crate) fn open_graph(&self) -> std::result::Result<store::Store, String> {
+        let _pin = crate::pinned::pin(&self.graph_path, &self.graph_file)?;
+        store::Store::open_reader(&self.graph_path)
+    }
 }
 
 pub(crate) struct PinnedGraph {
@@ -438,7 +449,7 @@ impl PrivateJob {
     pub(crate) fn graph_path(&self, graph_image_id: &str) -> PathBuf {
         self.cache
             .graphs
-            .stable_path(OsStr::new(&format!("{graph_image_id}.db")))
+            .child_path(OsStr::new(&format!("{graph_image_id}.db")))
     }
 
     pub(crate) fn copy_seed(
@@ -453,15 +464,14 @@ impl PrivateJob {
             }
         });
         let result = (|| {
-            let mut source = open_regular(&seed.graph_path, None).map_err(cache_corrupt)?;
             let mut target = create_file_at(&self.directory, OsStr::new("graph.db"), 0o600)
                 .map_err(|error| cache_internal("cannot create private graph image", error))?;
-            std::io::copy(&mut source, &mut target)
-                .map_err(|error| cache_internal("cannot copy graph seed", error))?;
+            copy_descriptor(&seed.graph_file, &mut target)?;
             target
                 .sync_all()
                 .map_err(|error| cache_internal("cannot sync graph seed", error))?;
-            if hash_file(&self.graph_temp, cancelled)? != seed.graph_checksum {
+            let copied = open_regular(&self.graph_temp, None).map_err(cache_corrupt)?;
+            if hash_file(&copied, cancelled)? != seed.graph_checksum {
                 return Err(cache_corrupt("copied graph seed checksum is invalid"));
             }
             Ok(())
@@ -475,13 +485,15 @@ impl PrivateJob {
 
 impl Drop for PrivateJob {
     fn drop(&mut self) {
-        if let Ok(entries) = fs::read_dir(self.directory.stable_path(OsStr::new("."))) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let _ = fs::remove_dir_all(path);
-                } else {
-                    let _ = fs::remove_file(path);
+        if let Ok(entries) = read_dir_at(&self.directory) {
+            for entry in entries {
+                match stat_at(&self.directory, &entry) {
+                    Ok(metadata) if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR => {
+                        let _ = remove_tree_at(&self.directory, &entry);
+                    }
+                    _ => {
+                        let _ = unlink_at(&self.directory, &entry, 0);
+                    }
                 }
             }
         }
@@ -510,19 +522,16 @@ impl SnapshotCatalog {
             self.reconcile(root, &BTreeSet::new());
             return Ok(());
         };
-        let Some(directory) = cache.snapshots.handle.as_ref() else {
+        let Some(_directory) = cache.snapshots.handle.as_ref() else {
             self.reconcile(root, &BTreeSet::new());
             return Ok(());
         };
-        let mut manifests = fs::read_dir(stable_directory_path(directory))
-            .map_err(|error| cache_internal("cannot read snapshot catalog", error))?
-            .collect::<Result<Vec<_>, _>>()
+        let mut manifests = read_dir_at(&cache.snapshots)
             .map_err(|error| cache_internal("cannot read snapshot catalog", error))?;
-        manifests.sort_by_key(fs::DirEntry::file_name);
+        manifests.sort();
         let mut seen = BTreeSet::new();
-        for manifest in manifests {
+        for file_name in manifests {
             check_cache_cancelled(cancelled)?;
-            let file_name = manifest.file_name();
             let Some(snapshot_id) = file_name
                 .to_str()
                 .and_then(|name| name.strip_suffix(".json"))
@@ -606,18 +615,18 @@ impl SnapshotCatalog {
         };
         let (file, checksum) = match trusted {
             Some(trusted) => {
-                if !same_file(&current, &trusted._graph_file)? {
+                if !same_file(&current, &trusted.graph_file)? {
                     return Err(cache_corrupt(
                         "published graph name changed after exact validation",
                     ));
                 }
                 validate_entry_graph(trusted, cancelled)?;
-                (trusted._graph_file.clone(), trusted.graph_checksum.clone())
+                (trusted.graph_file.clone(), trusted.graph_checksum.clone())
             }
             None => {
-                let path = stable_file_path(&current);
+                let path = job.cache.graphs.child_path(OsStr::new(&name));
                 validate_published_image(&path)?;
-                let checksum = hash_file(&path, cancelled)?;
+                let checksum = hash_file(&current, cancelled)?;
                 (current, checksum)
             }
         };
@@ -645,7 +654,7 @@ impl SnapshotCatalog {
         Ok(PrivateJob {
             root: root.clone(),
             cache,
-            graph_temp: directory.stable_path(OsStr::new("graph.db")),
+            graph_temp: directory.child_path(OsStr::new("graph.db")),
             directory,
             _capture_directory: capture,
             name,
@@ -826,15 +835,15 @@ impl SnapshotCatalog {
                 "published graph name changed after exact validation",
             ));
         }
-        let graph_path = stable_file_path(&graph_file);
+        let graph_path = job.cache.graphs.child_path(OsStr::new(&graph_name));
         let (state, graph_checksum) = match trusted_graph {
             Some(trusted) => (
-                validate_pinned_graph(trusted, cancelled)?,
+                validate_pinned_graph(trusted, &graph_path, cancelled)?,
                 trusted.checksum.clone(),
             ),
             None => (
                 validate_published_image(&graph_path)?,
-                hash_file(&graph_path, cancelled)?,
+                hash_file(&graph_file, cancelled)?,
             ),
         };
         provenance.index_generation = state.generation;
@@ -866,8 +875,8 @@ impl SnapshotCatalog {
         before_manifest_publication(&PublicationPoint {
             snapshot_id: manifest.provenance.snapshot_id.clone(),
             graph_path: graph_path.clone(),
-            review_path: job.cache.reviews.stable_path(OsStr::new(&review_name)),
-            manifest_path: job.cache.snapshots.stable_path(OsStr::new(&manifest_name)),
+            review_path: job.cache.reviews.child_path(OsStr::new(&review_name)),
+            manifest_path: job.cache.snapshots.child_path(OsStr::new(&manifest_name)),
         })?;
         publish_no_replace(
             &job.directory,
@@ -1035,8 +1044,8 @@ impl SnapshotCatalog {
             Err(error) => return Err(cache_corrupt(error)),
             Ok(file) => file,
         };
-        let graph_path = stable_file_path(&graph_file);
-        if hash_file(&graph_path, cancelled)? != manifest.graph_checksum
+        let graph_path = cache.graphs.child_path(OsStr::new(&graph_name));
+        if hash_file(&graph_file, cancelled)? != manifest.graph_checksum
             || validate_published_image(&graph_path)?.generation
                 != manifest.provenance.index_generation
         {
@@ -1049,7 +1058,7 @@ impl SnapshotCatalog {
             no_change_reason: manifest.no_change_reason,
             dependency_mode: manifest.dependency_mode,
             provenance: manifest.provenance,
-            _graph_file: Arc::new(graph_file),
+            graph_file: Arc::new(graph_file),
             graph_checksum: manifest.graph_checksum,
         }))
     }
@@ -1107,11 +1116,11 @@ impl CacheDirectory {
         })
     }
 
-    fn stable_path(&self, name: &OsStr) -> PathBuf {
-        self.handle.as_ref().map_or_else(
-            || self.path.join(name),
-            |handle| stable_directory_path(handle).join(name),
-        )
+    /// Real filesystem path of a child. Callers that can act through a
+    /// descriptor should use the primitives below instead; this exists for the
+    /// one consumer that cannot take a descriptor, SQLite.
+    fn child_path(&self, name: &OsStr) -> PathBuf {
+        self.path.join(name)
     }
 
     fn file(&self) -> std::io::Result<&File> {
@@ -1127,14 +1136,19 @@ impl CacheDirectory {
     }
 }
 
-fn stable_directory_path(directory: &File) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
-}
-
-fn stable_file_path(file: &File) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
-}
-
+// Portability seam. Every filesystem operation the cache performs goes through
+// this block, and each one takes a pinned directory descriptor plus a single
+// path component — never a composite path. `component_cstring` enforces the
+// single-component rule.
+//
+// This shape is what makes the cache portable. A Windows backend would replace
+// exactly these functions and nothing else: `openat` maps to `NtCreateFile`
+// with `OBJECT_ATTRIBUTES.RootDirectory`, `linkat` to `NtSetInformationFile`
+// with `FILE_LINK_INFORMATION`, `renameat` to `SetFileInformationByHandle` with
+// `FILE_RENAME_INFO`. See docs/superpowers/specs/2026-08-12-macos-portability-design.md.
+//
+// Do not add a path-taking helper here, and do not reconstruct a path from a
+// descriptor. That is what tied the cache to Linux `/proc/self/fd`.
 fn cache_child(
     parent: &CacheDirectory,
     name: &OsStr,
@@ -1263,25 +1277,142 @@ fn open_regular_at(
     Ok(file)
 }
 
-fn link_file_at(
-    source: &File,
+/// Owns a `DIR*` and the descriptor `fdopendir` took over. Deliberately exposes
+/// no descriptor: after `fdopendir` the descriptor belongs to the stream, and
+/// touching it separately — including closing it — is undefined behaviour.
+struct DirStream(*mut libc::DIR);
+
+impl Drop for DirStream {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from a successful fdopendir, is never copied
+        // out of this owner, and is closed exactly once.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+/// Lists the names in a pinned directory, `.` and `..` excluded.
+///
+/// The stream runs on an independent description obtained with `openat(".")`,
+/// never on the long-lived `CacheDirectory` handle: `closedir` would close that
+/// handle out from under every other user of it, and `dup` would share one
+/// directory position with them. `readdir_r` reports failure as a return code,
+/// so end-of-directory never has to be told apart from an error by inspecting
+/// `errno`, whose accessor is spelled differently per platform.
+fn read_dir_at(directory: &CacheDirectory) -> std::io::Result<Vec<OsString>> {
+    let dot = component_cstring(OsStr::new("."))?;
+    // SAFETY: openat receives a live directory descriptor and a valid C string.
+    let fd = unsafe {
+        libc::openat(
+            directory.file()?.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a freshly opened directory descriptor. On success fdopendir
+    // takes ownership of it; on failure ownership stays here, so this is the
+    // only path that closes it directly.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: ownership did not transfer, and fd is closed exactly once.
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    let stream = DirStream(stream);
+    let mut names = Vec::new();
+    loop {
+        let mut entry = std::mem::MaybeUninit::<libc::dirent>::uninit();
+        let mut current = std::ptr::null_mut();
+        // SAFETY: the stream is live, and the entry buffer is a whole dirent,
+        // which is what this platform's readdir_r fills.
+        let code = unsafe { libc::readdir_r(stream.0, entry.as_mut_ptr(), &mut current) };
+        if code != 0 {
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
+        if current.is_null() {
+            return Ok(names);
+        }
+        // SAFETY: readdir_r reported an entry, so it initialized the buffer and
+        // pointed current at it. d_name is NUL-terminated within the struct.
+        let name = unsafe { CStr::from_ptr((*current).d_name.as_ptr()) };
+        let name = OsStr::from_bytes(name.to_bytes());
+        if name != OsStr::new(".") && name != OsStr::new("..") {
+            names.push(name.to_owned());
+        }
+    }
+}
+
+fn link_at(
+    source_directory: &CacheDirectory,
+    source_name: &OsStr,
     target_directory: &CacheDirectory,
     target_name: &OsStr,
 ) -> std::io::Result<()> {
-    let source_path = CString::new(format!("/proc/self/fd/{}", source.as_raw_fd())).unwrap();
-    let target_name = component_cstring(target_name)?;
-    // SAFETY: both C strings and descriptors remain valid for the duration of linkat.
+    let source = component_cstring(source_name)?;
+    let target = component_cstring(target_name)?;
+    let source_fd = source_directory.file()?.as_raw_fd();
+    let target_fd = target_directory.file()?.as_raw_fd();
+    let link = |flags| {
+        // SAFETY: both descriptors stay live for the call and both C strings
+        // are NUL-terminated single components.
+        unsafe {
+            libc::linkat(
+                source_fd,
+                source.as_ptr(),
+                target_fd,
+                target.as_ptr(),
+                flags,
+            )
+        }
+    };
+    if link(0) == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOTSUP) {
+        return Err(error);
+    }
+    // Some macOS filesystems reject linkat with flags = 0. Retrying with
+    // AT_SYMLINK_FOLLOW is safe here because publish_no_replace opened
+    // source_name with O_NOFOLLOW and confirmed it is a regular file, so it is
+    // not a symlink and following cannot redirect the link.
+    if link(libc::AT_SYMLINK_FOLLOW) == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn stat_at(directory: &CacheDirectory, name: &OsStr) -> std::io::Result<libc::stat> {
+    let name = component_cstring(name)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstatat receives a live directory descriptor and a valid C string.
     let result = unsafe {
-        libc::linkat(
-            libc::AT_FDCWD,
-            source_path.as_ptr(),
-            target_directory.file()?.as_raw_fd(),
-            target_name.as_ptr(),
-            libc::AT_SYMLINK_FOLLOW,
+        libc::fstatat(
+            directory.file()?.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
         )
     };
     if result == 0 {
-        Ok(())
+        // SAFETY: fstatat returned success, so metadata is initialized.
+        Ok(unsafe { metadata.assume_init() })
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn stat_fd(file: &File) -> std::io::Result<libc::stat> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat receives a live descriptor and an out pointer it fills.
+    let result = unsafe { libc::fstat(file.as_raw_fd(), metadata.as_mut_ptr()) };
+    if result == 0 {
+        // SAFETY: fstat returned success, so metadata is initialized.
+        Ok(unsafe { metadata.assume_init() })
     } else {
         Err(std::io::Error::last_os_error())
     }
@@ -1296,6 +1427,20 @@ fn unlink_at(directory: &CacheDirectory, name: &OsStr, flags: i32) -> std::io::R
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// Removes `name` and everything beneath it, descending through directory
+/// descriptors so no composite path is ever handed to the kernel.
+fn remove_tree_at(parent: &CacheDirectory, name: &OsStr) -> std::io::Result<()> {
+    let directory = open_child_directory(parent, name)?;
+    for entry in read_dir_at(&directory)? {
+        if stat_at(&directory, &entry)?.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            remove_tree_at(&directory, &entry)?;
+        } else {
+            unlink_at(&directory, &entry, 0)?;
+        }
+    }
+    unlink_at(parent, name, libc::AT_REMOVEDIR)
 }
 
 fn rename_at(
@@ -1384,11 +1529,28 @@ fn publish_no_replace(
             "private cache path is not a regular file",
         ));
     }
-    let published = match link_file_at(&source, target_directory, target_name) {
+    let published = match link_at(source_directory, source_name, target_directory, target_name) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) => return Err(cache_internal("cannot publish cache file", error)),
     };
+    if published {
+        // linkat resolved source_name a second time. Confirm it reached the
+        // inode validated above rather than one substituted in between.
+        let linked = stat_at(target_directory, target_name)
+            .map_err(|error| cache_internal("cannot inspect published cache file", error))?;
+        // Compare raw stat fields: dev_t is i32 on macOS and u64 on Linux, so
+        // a Rust-level comparison would need a platform-dependent cast.
+        let validated = stat_fd(&source)
+            .map_err(|error| cache_internal("cannot inspect private cache file", error))?;
+        if linked.st_ino != validated.st_ino || linked.st_dev != validated.st_dev {
+            let _ = unlink_at(target_directory, target_name, 0);
+            return Err(OperationError::new(
+                ErrorCode::Internal,
+                "published cache file is not the validated file",
+            ));
+        }
+    }
     unlink_at(source_directory, source_name, 0)
         .map_err(|error| cache_internal("cannot remove private cache name", error))?;
     source_directory.sync()?;
@@ -1419,10 +1581,9 @@ fn quarantine_name(
 
 fn open_regular(path: &Path, limit: Option<u64>) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
-    options.read(true).custom_flags(libc::O_CLOEXEC);
-    if !is_process_descriptor_path(path) {
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    }
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || limit.is_some_and(|limit| metadata.len() > limit) {
@@ -1432,14 +1593,6 @@ fn open_regular(path: &Path, limit: Option<u64>) -> std::io::Result<File> {
         ));
     }
     Ok(file)
-}
-
-fn is_process_descriptor_path(path: &Path) -> bool {
-    path.parent() == Some(Path::new("/proc/self/fd"))
-        && path
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn read_bounded_at(
@@ -1476,13 +1629,31 @@ fn read_exact_bounded(
     Ok(bytes)
 }
 
-fn hash_file(path: &Path, cancelled: &AtomicBool) -> Result<String, OperationError> {
-    let mut file = open_regular(path, None).map_err(cache_corrupt)?;
+/// Copies all of `source` into `target` through `read_at`, so a seed is read
+/// from the descriptor its entry validated rather than from a name that may
+/// have been repointed, and the descriptor's shared offset is left alone.
+fn copy_descriptor(source: &File, target: &mut File) -> Result<(), OperationError> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut offset = 0_u64;
+    loop {
+        let read = source.read_at(&mut buffer, offset).map_err(cache_corrupt)?;
+        if read == 0 {
+            return Ok(());
+        }
+        target
+            .write_all(&buffer[..read])
+            .map_err(|error| cache_internal("cannot copy graph seed", error))?;
+        offset += read as u64;
+    }
+}
+
+fn hash_file(file: &File, cancelled: &AtomicBool) -> Result<String, OperationError> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
+    let mut offset = 0_u64;
     loop {
         check_cache_cancelled(cancelled)?;
-        let read = file.read(&mut buffer).map_err(cache_corrupt)?;
+        let read = file.read_at(&mut buffer, offset).map_err(cache_corrupt)?;
         if read == 0 {
             break;
         }
@@ -1494,18 +1665,14 @@ fn hash_file(path: &Path, cancelled: &AtomicBool) -> Result<String, OperationErr
         });
         check_cache_cancelled(cancelled)?;
         hasher.update(&buffer[..read]);
+        offset += read as u64;
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub(crate) fn validate_published_image(path: &Path) -> Result<crate::store::State, OperationError> {
     let state = store::validate_image(path).map_err(cache_corrupt)?;
-    let metadata = if is_process_descriptor_path(path) {
-        fs::metadata(path)
-    } else {
-        fs::symlink_metadata(path)
-    }
-    .map_err(cache_corrupt)?;
+    let metadata = fs::symlink_metadata(path).map_err(cache_corrupt)?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o222 != 0 {
         return Err(cache_corrupt("published graph image is not read-only"));
     }
@@ -1516,21 +1683,34 @@ pub(crate) fn validate_entry_graph(
     entry: &SnapshotEntry,
     cancelled: &AtomicBool,
 ) -> Result<crate::store::State, OperationError> {
-    if hash_file(&entry.graph_path, cancelled)? != entry.graph_checksum {
+    if hash_file(&entry.graph_file, cancelled)? != entry.graph_checksum {
         return Err(cache_corrupt("snapshot graph checksum is invalid"));
     }
-    validate_published_image(&entry.graph_path)
+    validate_pinned_image(&entry.graph_file, &entry.graph_path)
 }
 
 fn validate_pinned_graph(
     graph: &PinnedGraph,
+    path: &Path,
     cancelled: &AtomicBool,
 ) -> Result<crate::store::State, OperationError> {
-    let path = stable_file_path(&graph.file);
-    if hash_file(&path, cancelled)? != graph.checksum {
+    if hash_file(&graph.file, cancelled)? != graph.checksum {
         return Err(cache_corrupt("snapshot graph checksum is invalid"));
     }
-    validate_published_image(&path)
+    validate_pinned_image(&graph.file, path)
+}
+
+/// Validates the image a descriptor is already held open on. The regular-file
+/// and read-only checks run as an `fstat` on that descriptor, and SQLite's own
+/// open is pinned to it, so nothing here re-resolves `path` to reach the image.
+/// `path` is still the name whose sidecars must be absent.
+fn validate_pinned_image(file: &File, path: &Path) -> Result<crate::store::State, OperationError> {
+    let metadata = file.metadata().map_err(cache_corrupt)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o222 != 0 {
+        return Err(cache_corrupt("published graph image is not read-only"));
+    }
+    let _pin = crate::pinned::pin(path, file).map_err(cache_corrupt)?;
+    store::validate_image(path).map_err(cache_corrupt)
 }
 
 fn same_file(left: &File, right: &File) -> Result<bool, OperationError> {
@@ -1920,7 +2100,9 @@ fn hash_fields(domain: &[u8], fields: &[&dyn HashField]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::{OsStr, OsString};
     use std::fs;
+    use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::AtomicBool;
@@ -1931,11 +2113,64 @@ mod tests {
     use crate::store;
 
     use super::{
-        AllowedRoots, ErrorCode, IndexRequest, OperationError, PublicationPoint, SnapshotCatalog,
-        SnapshotKeyInput, SnapshotTarget, graph_image_key, resolve_request,
-        set_after_repository_discovery_hook_for_test, set_before_manifest_hook_for_test,
-        set_before_review_hook_for_test, snapshot_key,
+        AllowedRoots, CacheDirectory, ErrorCode, IndexRequest, OperationError, PublicationPoint,
+        SnapshotCatalog, SnapshotKeyInput, SnapshotTarget, graph_image_key, read_dir_at,
+        remove_tree_at, resolve_request, set_after_repository_discovery_hook_for_test,
+        set_before_manifest_hook_for_test, set_before_review_hook_for_test, snapshot_key,
     };
+
+    #[test]
+    fn enumeration_reads_every_name_and_leaves_the_directory_handle_usable() {
+        let root = temp_root("enumerate");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["first.json", "second.json"] {
+            fs::write(root.join(name), b"{}").unwrap();
+        }
+        // APFS refuses a non-UTF-8 name with EILSEQ where ext4 accepts it, so
+        // byte preservation is asserted wherever the filesystem can express it.
+        let raw = OsStr::from_bytes(b"invalid-\xff-name.json");
+        let raw_exists = fs::write(root.join(raw), b"{}").is_ok();
+        fs::create_dir(root.join("nested")).unwrap();
+        let directory =
+            CacheDirectory::open_root(&root, &fs::symlink_metadata(&root).unwrap()).unwrap();
+
+        let mut first = read_dir_at(&directory).unwrap();
+        let mut second = read_dir_at(&directory).unwrap();
+        first.sort();
+        second.sort();
+
+        let mut expected = vec![
+            OsString::from("first.json"),
+            OsString::from("nested"),
+            OsString::from("second.json"),
+        ];
+        if raw_exists {
+            expected.push(raw.to_owned());
+        }
+        expected.sort();
+        assert_eq!(first, expected);
+        assert_eq!(first, second, "a shared directory position would drift");
+        directory
+            .sync()
+            .expect("the pinned handle survives closedir");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tree_removal_descends_through_descriptors() {
+        let root = temp_root("remove-tree");
+        fs::create_dir_all(root.join("job/capture/src")).unwrap();
+        fs::write(root.join("job/capture/src/a.rs"), b"fn a() {}\n").unwrap();
+        fs::write(root.join("job/graph.db"), b"image").unwrap();
+        let directory =
+            CacheDirectory::open_root(&root, &fs::symlink_metadata(&root).unwrap()).unwrap();
+
+        remove_tree_at(&directory, OsStr::new("job")).unwrap();
+
+        assert!(!root.join("job").exists());
+        assert!(read_dir_at(&directory).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn graph_image_key_covers_repository_content_context_and_versions() {
@@ -2949,13 +3184,15 @@ mod tests {
     }
 
     fn temp_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "graphr-workspace-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        fs::canonicalize(std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!(
+                "graphr-workspace-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
     }
 }
