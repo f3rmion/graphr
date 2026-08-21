@@ -20,10 +20,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS is not optional cover. Snapshot publication uses /proc/self/fd
-        # (src/workspace.rs), which exists only on Linux, so a Linux-only
-        # workflow reports green while the published binary cannot index on
-        # macOS at all. This job is expected to fail until that is fixed.
+        # macOS is not optional cover. Snapshot publication reaches the
+        # filesystem through pinned directory descriptors, and the primitives
+        # differ per platform, so a Linux-only workflow can report green while
+        # the published binary cannot index on macOS at all. Both jobs are
+        # required.
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5

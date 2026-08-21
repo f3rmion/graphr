@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "graphr"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "blake3",
  "libc",
