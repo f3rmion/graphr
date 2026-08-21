@@ -78,10 +78,18 @@ impl ScriptParser {
         })
     }
 
-    fn parse(&mut self, dialect: ScriptDialect, source: &str) -> Result<ParsedFile, String> {
-        let Some(tree) = self.parser.parse(source, None) else {
-            return Ok(ParsedFile::default());
-        };
+    fn parse(
+        &mut self,
+        dialect: ScriptDialect,
+        path: &str,
+        source: &str,
+    ) -> Result<ParsedFile, String> {
+        let tree = self.parser.parse(source, None).ok_or_else(|| {
+            format!(
+                "{} parser did not return a syntax tree",
+                dialect.parse_context()
+            )
+        })?;
         let mut captured = Vec::new();
         let mut matches = self
             .cursor
@@ -123,13 +131,12 @@ impl ScriptParser {
         for capture in &captured {
             match capture.name.as_str() {
                 "definition" | "typescript_definition" => {
-                    if let Some(definition) = definition(capture.node, source) {
+                    if let Some(definition) = definition(capture.node, path, source) {
                         parsed.definitions.push(definition);
                     }
                 }
                 "module" | "typescript_module" => collect_module(capture.node, source, &mut parsed),
                 "binding" => collect_binding(capture.node, source, &mut parsed.bindings),
-                "jsx" => collect_jsx(capture.node, source, &mut parsed.jsx),
                 _ => {}
             }
         }
@@ -149,9 +156,28 @@ impl ScriptParser {
                 .min_by_key(|(_, definition)| definition.range.end - definition.range.start)
                 .map(|(parent, _)| parent);
         }
+        collect_definition_bindings(&parsed.definitions, &mut parsed.bindings);
+        parsed.bindings.sort_unstable_by(|left, right| {
+            (left.byte, left.range.start, &left.name).cmp(&(
+                right.byte,
+                right.range.start,
+                &right.name,
+            ))
+        });
+        parsed.bindings.dedup_by(|left, right| {
+            left.name == right.name
+                && left.byte == right.byte
+                && left.range.start == right.range.start
+                && left.range.end == right.range.end
+        });
         for capture in &captured {
             if capture.name == "call"
                 && let Some(call) = call(capture.node, source)
+            {
+                parsed.calls.push(call);
+            }
+            if capture.name == "jsx"
+                && let Some(call) = jsx_call(capture.node, source)
             {
                 parsed.calls.push(call);
             }
@@ -216,7 +242,7 @@ impl ScriptParsers {
             ScriptDialect::TypeScript => self.typescript.get_or_insert(ScriptParser::new(dialect)?),
             ScriptDialect::Tsx => self.tsx.get_or_insert(ScriptParser::new(dialect)?),
         };
-        parser.parse(dialect, source)
+        parser.parse(dialect, path, source)
     }
 }
 
@@ -242,6 +268,7 @@ struct Definition {
     signature: String,
     body: ByteRange,
     range: ByteRange,
+    binding: Option<ByteRange>,
 }
 
 struct ModuleStatement {
@@ -251,6 +278,7 @@ struct ModuleStatement {
 struct LexicalBinding {
     name: String,
     range: ByteRange,
+    byte: usize,
 }
 
 enum CallTarget {
@@ -273,103 +301,185 @@ struct ParsedFile {
     modules: Vec<ModuleStatement>,
     bindings: Vec<LexicalBinding>,
     calls: Vec<Call>,
-    jsx: Vec<String>,
+    exports: Vec<String>,
 }
 
-fn definition(node: Node<'_>, source: &str) -> Option<Definition> {
-    let (kind, name) = match node.kind() {
-        "class_declaration" | "abstract_class_declaration" => (
-            DefinitionKind::Type {
-                runtime_value: true,
-            },
-            field_text(node, "name", source)?,
-        ),
-        "interface_declaration" | "type_alias_declaration" => (
-            DefinitionKind::Type {
-                runtime_value: false,
-            },
-            field_text(node, "name", source)?,
-        ),
-        "enum_declaration" | "internal_module" | "module" => (
-            DefinitionKind::Type {
-                runtime_value: true,
-            },
-            field_text(node, "name", source)?,
-        ),
-        "function_declaration" | "generator_function_declaration" | "function_signature" => {
-            (DefinitionKind::Function, field_text(node, "name", source)?)
+fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
+    let (kind, name, start) = if let Some(name) = test_name(node, path, source) {
+        (DefinitionKind::Test, name, definition_start(node))
+    } else {
+        match node.kind() {
+            "class_declaration" | "abstract_class_declaration" => (
+                DefinitionKind::Type {
+                    runtime_value: true,
+                },
+                field_text(node, "name", source)
+                    .map(str::to_owned)
+                    .or_else(|| default_export(node, source).then(|| "default".to_owned()))?,
+                definition_start(node),
+            ),
+            "interface_declaration" | "type_alias_declaration" => (
+                DefinitionKind::Type {
+                    runtime_value: false,
+                },
+                field_text(node, "name", source)?.to_owned(),
+                definition_start(node),
+            ),
+            "enum_declaration" | "internal_module" | "module" => (
+                DefinitionKind::Type {
+                    runtime_value: true,
+                },
+                field_text(node, "name", source)?.to_owned(),
+                definition_start(node),
+            ),
+            "function_declaration" | "generator_function_declaration" | "function_signature" => (
+                DefinitionKind::Function,
+                field_text(node, "name", source)
+                    .map(str::to_owned)
+                    .or_else(|| default_export(node, source).then(|| "default".to_owned()))?,
+                definition_start(node),
+            ),
+            "method_definition" | "method_signature" | "abstract_method_signature" => (
+                DefinitionKind::Method,
+                field_text(node, "name", source)?.to_owned(),
+                definition_start(node),
+            ),
+            "function_expression" | "generator_function" | "arrow_function" | "class" => {
+                stable_initializer(node, source)?
+            }
+            _ => return None,
         }
-        "method_definition" | "method_signature" | "abstract_method_signature" => {
-            (DefinitionKind::Method, field_text(node, "name", source)?)
-        }
-        "function_expression" | "generator_function" | "arrow_function" | "class" => {
-            let (name, kind) = stable_initializer(node, source)?;
-            (kind, name)
-        }
-        _ => return None,
     };
-    let body = node.child_by_field_name("body").unwrap_or(node);
+    let body = node.child_by_field_name("body");
+    let signature_end = body.map_or(node.end_byte(), |body| body.start_byte());
+    let body = body.unwrap_or(node);
     Some(Definition {
+        binding: (!matches!(kind, DefinitionKind::Test)).then(|| definition_scope(node, source)),
         kind,
-        name: name.to_owned(),
+        name,
         parent: None,
-        line_start: line_start(node),
+        line_start: line_at(source, start),
         line_end: line_end(node),
-        signature: signature(node, source),
+        signature: signature(start, signature_end, source),
         body: ByteRange {
             start: body.start_byte(),
             end: body.end_byte(),
         },
         range: ByteRange {
-            start: node.start_byte(),
+            start,
             end: node.end_byte(),
         },
     })
 }
 
-fn stable_initializer<'source>(
-    node: Node<'_>,
-    source: &'source str,
-) -> Option<(&'source str, DefinitionKind)> {
+fn stable_initializer(node: Node<'_>, source: &str) -> Option<(DefinitionKind, String, usize)> {
     let parent = node.parent()?;
     if parent.kind() == "variable_declarator"
         && parent
             .child_by_field_name("value")
             .is_some_and(|value| value.id() == node.id())
+        && parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.kind() == "identifier")
     {
         return Some((
-            field_text(parent, "name", source)?,
-            DefinitionKind::Function,
+            definition_kind(node),
+            field_text(parent, "name", source)?.to_owned(),
+            definition_start(parent),
         ));
     }
-    if parent.kind() == "field_definition"
-        && parent
-            .child_by_field_name("value")
-            .is_some_and(|value| value.id() == node.id())
+    if matches!(
+        parent.kind(),
+        "field_definition" | "public_field_definition"
+    ) && parent
+        .child_by_field_name("value")
+        .is_some_and(|value| value.id() == node.id())
+        && direct_field_name(parent)
+            .is_some_and(|name| name.kind() == "property_identifier" || name.kind() == "identifier")
     {
         return Some((
-            field_text(parent, "property", source)?,
             DefinitionKind::Method,
+            text(direct_field_name(parent)?, source).to_owned(),
+            definition_start(parent),
+        ));
+    }
+    if parent.kind() == "assignment_expression"
+        && parent
+            .child_by_field_name("right")
+            .is_some_and(|right| right.id() == node.id())
+        && parent
+            .child_by_field_name("left")
+            .is_some_and(|left| left.kind() == "identifier")
+    {
+        return Some((
+            definition_kind(node),
+            text(parent.child_by_field_name("left")?, source).to_owned(),
+            definition_start(parent),
+        ));
+    }
+    if default_export(node, source) {
+        return Some((
+            definition_kind(node),
+            "default".to_owned(),
+            definition_start(node),
         ));
     }
     None
 }
 
-fn collect_module(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
-    if node.kind() != "import_statement" {
-        return;
+fn definition_kind(node: Node<'_>) -> DefinitionKind {
+    if node.kind() == "class" {
+        DefinitionKind::Type {
+            runtime_value: true,
+        }
+    } else {
+        DefinitionKind::Function
     }
-    let Some(module) = node
-        .child_by_field_name("source")
-        .map(|source_node| text(source_node, source))
-    else {
-        return;
-    };
-    let module = module.trim_matches(['\'', '"']);
-    if module.starts_with("./") || module.starts_with("../") {
-        parsed.modules.push(ModuleStatement {
-            module: module.into(),
-        });
+}
+
+fn direct_field_name(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("property")
+        .or_else(|| node.child_by_field_name("name"))
+}
+
+fn definition_start(node: Node<'_>) -> usize {
+    let mut start = node.start_byte();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "export_statement" {
+            start = parent.start_byte();
+            current = parent;
+            continue;
+        }
+        let mut cursor = parent.walk();
+        for sibling in parent.named_children(&mut cursor) {
+            if sibling.end_byte() <= start && sibling.kind() == "decorator" {
+                start = sibling.start_byte();
+            }
+        }
+        break;
+    }
+    start
+}
+
+fn default_export(node: Node<'_>, source: &str) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "export_statement" && text(parent, source).starts_with("export default")
+    })
+}
+
+fn collect_module(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
+    match node.kind() {
+        "import_statement" => {
+            collect_relative_module(node, source, &mut parsed.modules);
+            collect_import_bindings(node, source, &mut parsed.bindings);
+        }
+        "export_statement" => {
+            collect_relative_module(node, source, &mut parsed.modules);
+            collect_exports(node, source, &mut parsed.exports);
+        }
+        "assignment_expression" => collect_assignment_export(node, source, &mut parsed.exports),
+        _ => {}
     }
 }
 
@@ -380,21 +490,316 @@ fn collect_binding(node: Node<'_>, source: &str, bindings: &mut Vec<LexicalBindi
         "catch_clause" => node.child_by_field_name("parameter").unwrap_or(node),
         _ => return,
     };
-    let mut pending = vec![target];
-    while let Some(identifier) = pending.pop() {
-        if identifier.kind() == "identifier" {
+    let range = match node.kind() {
+        "formal_parameters" => function_scope(node, source),
+        "variable_declarator" if is_var(node) => function_scope(node, source),
+        "variable_declarator" => block_scope(node, source),
+        "catch_clause" => node
+            .child_by_field_name("body")
+            .map(range)
+            .unwrap_or_else(|| module_scope(source)),
+        _ => module_scope(source),
+    };
+    for identifier in identifiers(target) {
+        bindings.push(LexicalBinding {
+            name: text(identifier, source).to_owned(),
+            range,
+            byte: identifier.start_byte(),
+        });
+    }
+}
+
+fn collect_relative_module(node: Node<'_>, source: &str, modules: &mut Vec<ModuleStatement>) {
+    let Some(module) = node
+        .child_by_field_name("source")
+        .map(|source_node| text(source_node, source).trim_matches(['\'', '"']))
+    else {
+        return;
+    };
+    if module.starts_with("./") || module.starts_with("../") {
+        modules.push(ModuleStatement {
+            module: module.to_owned(),
+        });
+    }
+}
+
+fn collect_import_bindings(node: Node<'_>, source: &str, bindings: &mut Vec<LexicalBinding>) {
+    let module = module_scope(source);
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "import_specifier" => {
+                let name = node
+                    .child_by_field_name("alias")
+                    .or_else(|| node.child_by_field_name("name"));
+                if let Some(name) = name.filter(|name| name.kind() == "identifier") {
+                    bindings.push(LexicalBinding {
+                        name: text(name, source).to_owned(),
+                        range: module,
+                        byte: name.start_byte(),
+                    });
+                }
+                continue;
+            }
+            "namespace_import" => {
+                if let Some(name) = identifiers(node).into_iter().next() {
+                    bindings.push(LexicalBinding {
+                        name: text(name, source).to_owned(),
+                        range: module,
+                        byte: name.start_byte(),
+                    });
+                }
+                continue;
+            }
+            "identifier"
+                if node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "import_clause") =>
+            {
+                bindings.push(LexicalBinding {
+                    name: text(node, source).to_owned(),
+                    range: module,
+                    byte: node.start_byte(),
+                });
+                continue;
+            }
+            "string" | "comment" => continue,
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+}
+
+fn collect_exports(node: Node<'_>, source: &str, exports: &mut Vec<String>) {
+    let raw = text(node, source);
+    if raw.starts_with("export default") {
+        add_export(exports, "default");
+        return;
+    }
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "export_specifier" => {
+                if let Some(name) = node
+                    .child_by_field_name("alias")
+                    .or_else(|| node.child_by_field_name("name"))
+                {
+                    add_export(exports, text(name, source));
+                }
+                continue;
+            }
+            "class_declaration"
+            | "function_declaration"
+            | "generator_function_declaration"
+            | "interface_declaration"
+            | "type_alias_declaration"
+            | "enum_declaration"
+            | "internal_module"
+            | "module" => {
+                if let Some(name) = field_text(node, "name", source) {
+                    add_export(exports, name);
+                }
+                continue;
+            }
+            "variable_declarator" => {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .filter(|name| name.kind() == "identifier")
+                {
+                    add_export(exports, text(name, source));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+}
+
+fn collect_assignment_export(node: Node<'_>, source: &str, exports: &mut Vec<String>) {
+    let Some(left) = node.child_by_field_name("left") else {
+        return;
+    };
+    if left.kind() == "member_expression" {
+        let object = left.child_by_field_name("object");
+        let property = left.child_by_field_name("property");
+        if object.is_some_and(|object| text(object, source) == "exports") {
+            if let Some(property) =
+                property.filter(|property| property.kind() == "property_identifier")
+            {
+                add_export(exports, text(property, source));
+            }
+        } else if object.is_some_and(|object| text(object, source) == "module.exports")
+            && let Some(property) =
+                property.filter(|property| property.kind() == "property_identifier")
+        {
+            add_export(exports, text(property, source));
+        }
+    } else if text(left, source) == "module.exports" {
+        add_export(exports, "default");
+    }
+}
+
+fn add_export(exports: &mut Vec<String>, name: &str) {
+    if !name.is_empty() && !exports.iter().any(|export| export == name) {
+        exports.push(name.to_owned());
+    }
+}
+
+fn collect_definition_bindings(definitions: &[Definition], bindings: &mut Vec<LexicalBinding>) {
+    for definition in definitions {
+        let Some(parent) = definition.binding else {
+            continue;
+        };
+        bindings.push(LexicalBinding {
+            name: definition.name.clone(),
+            range: parent,
+            byte: definition.range.start,
+        });
+        if parent.start != definition.body.start || parent.end != definition.body.end {
             bindings.push(LexicalBinding {
-                name: text(identifier, source).to_owned(),
-                range: ByteRange {
-                    start: target.start_byte(),
-                    end: target.end_byte(),
-                },
+                name: definition.name.clone(),
+                range: definition.body,
+                byte: definition.range.start,
             });
+        }
+    }
+}
+
+fn is_var(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|declaration| declaration.kind() == "variable_declaration")
+}
+
+fn function_scope(node: Node<'_>, source: &str) -> ByteRange {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "function_declaration"
+                | "generator_function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "method_definition"
+        ) {
+            return parent
+                .child_by_field_name("body")
+                .map(range)
+                .unwrap_or_else(|| range(parent));
+        }
+        current = parent;
+    }
+    module_scope(source)
+}
+
+fn block_scope(node: Node<'_>, source: &str) -> ByteRange {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "statement_block" | "class_body" | "program") {
+            return range(parent);
+        }
+        current = parent;
+    }
+    module_scope(source)
+}
+
+fn definition_scope(node: Node<'_>, source: &str) -> ByteRange {
+    let parent = node.parent();
+    if parent.is_some_and(|parent| parent.kind() == "variable_declarator" && is_var(parent)) {
+        function_scope(node, source)
+    } else {
+        block_scope(node, source)
+    }
+}
+
+fn module_scope(source: &str) -> ByteRange {
+    ByteRange {
+        start: 0,
+        end: source.len(),
+    }
+}
+
+fn range(node: Node<'_>) -> ByteRange {
+    ByteRange {
+        start: node.start_byte(),
+        end: node.end_byte(),
+    }
+}
+
+fn identifiers(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut identifiers = Vec::new();
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "identifier" {
+            identifiers.push(node);
             continue;
         }
-        let mut cursor = identifier.walk();
-        pending.extend(identifier.named_children(&mut cursor));
+        if matches!(node.kind(), "type_annotation" | "comment") {
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
     }
+    identifiers
+}
+
+fn test_name(node: Node<'_>, path: &str, source: &str) -> Option<String> {
+    if !is_test_path(path) {
+        return None;
+    }
+    let mut current = node;
+    let call = loop {
+        let parent = current.parent()?;
+        if parent.kind() == "call_expression" {
+            break parent;
+        }
+        if !matches!(parent.kind(), "arguments" | "parenthesized_expression") {
+            return None;
+        }
+        current = parent;
+    };
+    let function = call.child_by_field_name("function")?;
+    if !test_callee(function, source) {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let title = arguments
+        .named_children(&mut cursor)
+        .find(|child| child.id() != node.id())?;
+    let title = text(title, source);
+    if (title.starts_with(['\'', '"']) && title.ends_with(['\'', '"']))
+        || (title.starts_with('`') && title.ends_with('`') && !title.contains("${"))
+    {
+        return Some(title[1..title.len() - 1].to_owned());
+    }
+    Some(format!("test@{}", line_start(call)))
+}
+
+fn is_test_path(path: &str) -> bool {
+    path.contains("/__tests__/")
+        || [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"]
+            .iter()
+            .any(|extension| {
+                path.strip_suffix(extension)
+                    .is_some_and(|stem| stem.ends_with(".test") || stem.ends_with(".spec"))
+            })
+}
+
+fn test_callee(node: Node<'_>, source: &str) -> bool {
+    if matches!(text(node, source), "test" | "it") {
+        return true;
+    }
+    node.kind() == "member_expression"
+        && node
+            .child_by_field_name("object")
+            .is_some_and(|object| matches!(text(object, source), "test" | "it"))
+        && node
+            .child_by_field_name("property")
+            .is_some_and(|property| matches!(text(property, source), "only" | "skip"))
 }
 
 fn call(node: Node<'_>, source: &str) -> Option<Call> {
@@ -429,23 +834,23 @@ fn call(node: Node<'_>, source: &str) -> Option<Call> {
     })
 }
 
-fn collect_jsx(node: Node<'_>, source: &str, jsx: &mut Vec<String>) {
+fn jsx_call(node: Node<'_>, source: &str) -> Option<Call> {
     if node.kind() == "identifier" || node.kind() == "member_expression" {
         let name = text(node, source);
         if name.chars().next().is_some_and(char::is_uppercase) {
-            jsx.push(name.to_owned());
+            return Some(Call {
+                source: None,
+                byte: node.start_byte(),
+                target: CallTarget::Jsx(name.to_owned()),
+                line: line_start(node),
+            });
         }
     }
+    None
 }
 
-fn signature(node: Node<'_>, source: &str) -> String {
-    let end = node
-        .child_by_field_name("body")
-        .map_or(node.end_byte(), |body| body.start_byte());
-    let text = source
-        .get(node.start_byte()..end)
-        .unwrap_or_default()
-        .trim_end();
+fn signature(start: usize, end: usize, source: &str) -> String {
+    let text = source.get(start..end).unwrap_or_default().trim_end();
     let mut end = text.len().min(SIGNATURE_LIMIT);
     while !text.is_char_boundary(end) {
         end -= 1;
@@ -464,6 +869,12 @@ fn text<'source>(node: Node<'_>, source: &'source str) -> &'source str {
 
 fn line_start(node: Node<'_>) -> usize {
     node.start_position().row + 1
+}
+
+fn line_at(source: &str, byte: usize) -> usize {
+    source.get(..byte).map_or(1, |prefix| {
+        prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
+    })
 }
 
 fn line_end(node: Node<'_>) -> usize {
@@ -497,15 +908,26 @@ impl ParsedFile {
     }
 
     fn export_names(&self) -> Vec<&str> {
-        Vec::new()
+        self.exports.iter().map(String::as_str).collect()
     }
 
     fn test_names(&self) -> Vec<&str> {
-        Vec::new()
+        self.definitions
+            .iter()
+            .filter_map(|definition| {
+                matches!(definition.kind, DefinitionKind::Test).then_some(definition.name.as_str())
+            })
+            .collect()
     }
 
     fn jsx_component_names(&self) -> Vec<&str> {
-        self.jsx.iter().map(String::as_str).collect()
+        self.calls
+            .iter()
+            .filter_map(|call| match &call.target {
+                CallTarget::Jsx(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -566,5 +988,80 @@ mod tests {
             .unwrap();
         assert_eq!(tsx.definition_names(), ["Panel"]);
         assert_eq!(tsx.jsx_component_names(), ["View"]);
+    }
+
+    #[test]
+    fn retains_script_scopes_exports_tests_stable_initializers_and_jsx_calls() {
+        let source = r#"
+import main, { value as alias } from "./dep";
+export default function () {}
+export const stable = () => {};
+assigned = () => {};
+const [unstable] = [() => {}];
+thing.member = () => {};
+class Box {
+    method = () => {};
+    ['computed'] = () => {};
+}
+function outer(param) {
+    var hoisted = () => {};
+    { let local = () => {}; local(); }
+    try {} catch (caught) { caught(); }
+    function nested() { nested(); }
+    param(); hoisted();
+}
+test.only("works", () => stable());
+const panel = <View />;
+"#;
+        let parsed = ScriptParsers::default()
+            .parse("src/item.test.tsx", source)
+            .unwrap();
+
+        assert_eq!(
+            parsed.definition_names(),
+            [
+                "default", "stable", "assigned", "Box", "method", "outer", "hoisted", "local",
+                "nested", "works"
+            ]
+        );
+        assert_eq!(parsed.export_names(), ["default", "stable"]);
+        assert_eq!(parsed.test_names(), ["works"]);
+        assert_eq!(parsed.jsx_component_names(), ["View"]);
+        assert!(binding_contains(&parsed, source, "main", "stable"));
+        assert!(binding_contains(&parsed, source, "alias", "stable"));
+        assert!(binding_contains(&parsed, source, "param", "param();"));
+        assert!(binding_contains(&parsed, source, "hoisted", "hoisted();"));
+        assert!(binding_contains(&parsed, source, "local", "local();"));
+        assert!(binding_contains(&parsed, source, "caught", "caught();"));
+        assert!(binding_contains(&parsed, source, "nested", "nested();"));
+        assert!(!binding_contains(&parsed, source, "local", "param();"));
+        assert!(!binding_contains(&parsed, source, "caught", "param();"));
+        assert!(!parsed.definition_names().contains(&"unstable"));
+        assert!(!parsed.definition_names().contains(&"member"));
+        assert!(!parsed.definition_names().contains(&"computed"));
+    }
+
+    #[test]
+    fn selects_every_supported_script_dialect() {
+        for (path, dialect) in [
+            ("a.js", ScriptDialect::JavaScript),
+            ("a.jsx", ScriptDialect::JavaScript),
+            ("a.mjs", ScriptDialect::JavaScript),
+            ("a.cjs", ScriptDialect::JavaScript),
+            ("a.ts", ScriptDialect::TypeScript),
+            ("a.d.ts", ScriptDialect::TypeScript),
+            ("a.mts", ScriptDialect::TypeScript),
+            ("a.cts", ScriptDialect::TypeScript),
+            ("a.tsx", ScriptDialect::Tsx),
+        ] {
+            assert_eq!(ScriptDialect::for_path(path), Some(dialect), "{path}");
+        }
+    }
+
+    fn binding_contains(parsed: &ParsedFile, source: &str, name: &str, text: &str) -> bool {
+        let offset = source.find(text).unwrap();
+        parsed.bindings.iter().any(|binding| {
+            binding.name == name && binding.range.start <= offset && offset < binding.range.end
+        })
     }
 }
