@@ -1305,7 +1305,10 @@ fn capture_target_changes(
         &[],
         cancelled,
     )?;
-    let mut source_paths = vec!["*.rs", "*.py"];
+    let mut source_paths = vec![
+        "*.rs", "*.py", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.mts", "*.cts",
+        "*.d.ts",
+    ];
     if dependency_mode == DependencyMode::Boundary {
         source_paths.push(":(glob,exclude).cargo/vendor/*/**");
     }
@@ -1338,7 +1341,20 @@ fn capture_target_changes(
         &source_paths,
         cancelled,
     )?;
-    let mut artifact_paths = vec![".", ":(exclude)*.rs", ":(exclude)*.py"];
+    let mut artifact_paths = vec![
+        ".",
+        ":(exclude)*.rs",
+        ":(exclude)*.py",
+        ":(exclude)*.js",
+        ":(exclude)*.jsx",
+        ":(exclude)*.mjs",
+        ":(exclude)*.cjs",
+        ":(exclude)*.ts",
+        ":(exclude)*.tsx",
+        ":(exclude)*.mts",
+        ":(exclude)*.cts",
+        ":(exclude)*.d.ts",
+    ];
     if dependency_mode == DependencyMode::Boundary {
         artifact_paths.push(":(glob,exclude).cargo/vendor/*/**");
     }
@@ -3506,14 +3522,29 @@ fn parse_inventory_path(
     raw_path: &[u8],
     skipped: &mut usize,
 ) -> Result<Option<(String, InventoryKind)>, String> {
+    let supported_source_suffix = [
+        b".rs".as_slice(),
+        b".py",
+        b".js",
+        b".jsx",
+        b".mjs",
+        b".cjs",
+        b".ts",
+        b".tsx",
+        b".mts",
+        b".cts",
+        b".d.ts",
+    ]
+    .iter()
+    .any(|suffix| raw_path.ends_with(suffix));
     let Ok(path) = std::str::from_utf8(raw_path) else {
-        if raw_path.ends_with(b".rs") || raw_path.ends_with(b".py") {
+        if supported_source_suffix {
             *skipped += 1;
         }
         return Ok(None);
     };
     let Some(path) = parse_change_path(path.as_bytes())? else {
-        if path.ends_with(".rs") || path.ends_with(".py") {
+        if supported_source_suffix {
             *skipped += 1;
         }
         return Ok(None);
@@ -3554,22 +3585,15 @@ fn language_for_path(path: &str) -> Option<Language> {
     {
         return None;
     }
-    if path.ends_with(".rs") {
-        Some(Language::Rust)
-    } else if path.ends_with(".py") {
-        Some(Language::Python)
-    } else if [".js", ".jsx", ".mjs", ".cjs"]
-        .iter()
-        .any(|extension| path.ends_with(extension))
-    {
-        Some(Language::JavaScript)
-    } else if [".ts", ".tsx", ".mts", ".cts"]
-        .iter()
-        .any(|extension| path.ends_with(extension))
-    {
-        Some(Language::TypeScript)
-    } else {
-        None
+    if path.ends_with(".d.ts") {
+        return Some(Language::TypeScript);
+    }
+    match relative.extension().and_then(OsStr::to_str) {
+        Some("rs") => Some(Language::Rust),
+        Some("py") => Some(Language::Python),
+        Some("js" | "jsx" | "mjs" | "cjs") => Some(Language::JavaScript),
+        Some("ts" | "tsx" | "mts" | "cts") => Some(Language::TypeScript),
+        _ => None,
     }
 }
 
@@ -4686,6 +4710,145 @@ mod tests {
         assert_eq!(inventory.sources.len(), 1);
         assert!(inventory.sources.contains_key("src/lib.rs"));
         assert_eq!(inventory.skipped, 0);
+    }
+
+    #[test]
+    fn classifies_every_script_extension_case_sensitively() {
+        let cases = [
+            ("src/a.js", Language::JavaScript),
+            ("src/a.jsx", Language::JavaScript),
+            ("src/a.mjs", Language::JavaScript),
+            ("src/a.cjs", Language::JavaScript),
+            ("src/a.ts", Language::TypeScript),
+            ("src/a.tsx", Language::TypeScript),
+            ("src/a.mts", Language::TypeScript),
+            ("src/a.cts", Language::TypeScript),
+            ("src/a.d.ts", Language::TypeScript),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(language_for_path(path), Some(expected), "{path}");
+        }
+        assert_eq!(language_for_path("src/a.JS"), None);
+        assert_eq!(language_for_path("src/a.TS"), None);
+    }
+
+    #[test]
+    fn routes_script_sources_away_from_artifact_capture() {
+        let root = initialized_repository("script-source-routing");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("README.md"), "baseline\n").unwrap();
+        test_git(&root, &["add", "--", "README.md"]);
+        test_git(&root, &["commit", "--quiet", "-m", "baseline"]);
+        let expected = [
+            ("src/a.cjs", Language::JavaScript),
+            ("src/a.cts", Language::TypeScript),
+            ("src/a.d.ts", Language::TypeScript),
+            ("src/a.js", Language::JavaScript),
+            ("src/a.jsx", Language::JavaScript),
+            ("src/a.mjs", Language::JavaScript),
+            ("src/a.mts", Language::TypeScript),
+            ("src/a.ts", Language::TypeScript),
+            ("src/a.tsx", Language::TypeScript),
+        ];
+        for (path, _) in expected {
+            fs::write(root.join(path), "export const before = 1;\n").unwrap();
+        }
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let capture_root = private_dir("script-source-routing-output");
+        let sources = repository
+            .capture_sources(
+                &repository.head_oid,
+                &SnapshotTarget::Worktree {
+                    include_untracked: true,
+                },
+                &capture_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            sources
+                .files
+                .iter()
+                .map(|source| (source.path.as_str(), source.language))
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        let mut untracked_inventory = Vec::new();
+        for (path, _) in expected {
+            untracked_inventory.extend_from_slice(path.as_bytes());
+            untracked_inventory.push(0);
+        }
+        let untracked = capture_untracked(
+            &root,
+            &untracked_inventory,
+            DependencyMode::Boundary,
+            true,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(untracked.artifacts.files.is_empty());
+        assert!(untracked.artifacts.analysis.is_empty());
+        for (path, _) in expected {
+            assert!(String::from_utf8_lossy(&untracked.source_patch).contains(path));
+        }
+
+        test_git(&root, &["add", "--", "src"]);
+        test_git(&root, &["commit", "--quiet", "-m", "scripts"]);
+        for (path, _) in expected {
+            fs::write(root.join(path), "export const after = 2;\n").unwrap();
+        }
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let changes = capture_current_review(&repository, DependencyMode::Boundary);
+        assert!(changes.artifacts.files.is_empty());
+        assert!(changes.artifacts.analysis.is_empty());
+        for (path, _) in expected {
+            assert!(changes.source_patch.contains(path), "{path}");
+        }
+
+        for suffix in [
+            b".js".as_slice(),
+            b".jsx",
+            b".mjs",
+            b".cjs",
+            b".ts",
+            b".tsx",
+            b".mts",
+            b".cts",
+            b".d.ts",
+        ] {
+            let mut invalid = vec![0xff];
+            invalid.extend_from_slice(suffix);
+            let mut skipped = 0;
+            assert!(
+                parse_inventory_path(&invalid, &mut skipped)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(skipped, 1);
+
+            let mut skipped = 0;
+            let control = format!("src/a\n{}", String::from_utf8_lossy(suffix));
+            assert!(
+                parse_inventory_path(control.as_bytes(), &mut skipped)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(skipped, 1);
+        }
+        for path in ["/tmp/a.js", "../a.ts"] {
+            let mut skipped = 0;
+            assert_eq!(
+                parse_inventory_path(path.as_bytes(), &mut skipped)
+                    .err()
+                    .unwrap(),
+                "Git returned an unsafe changed path"
+            );
+            assert_eq!(skipped, 0);
+        }
+
+        fs::remove_dir_all(capture_root).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
