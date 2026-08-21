@@ -381,6 +381,7 @@ const CORE: &str = r#"
 const BRIDGE: &str = r#"
     export { run as execute } from "./core.js";
     export { default as ForwardedService } from "./services";
+    export { Factory as ForwardedFactory } from "./not-a-class";
     export * as widgets from "./widget";
     export * from "./types.js";
 "#;
@@ -430,6 +431,8 @@ const CLASS_USER: &str = r#"
         RenamedService as IndexRenamed,
     } from "./services/index";
     import { ForwardedService } from "./bridge";
+    import { AmbiguousService } from "./ambiguous-service";
+    import { ForwardedFactory } from "./bridge";
     export function useDirectoryDefault() {
         return DirectoryDefault.defaultCreate();
     }
@@ -445,12 +448,39 @@ const CLASS_USER: &str = r#"
     export function useForwarded() {
         return ForwardedService.defaultCreate();
     }
+    export function useAmbiguousFileMethod() {
+        return AmbiguousService.fileOnly();
+    }
+    export function useAmbiguousIndexMethod() {
+        return AmbiguousService.indexOnly();
+    }
+    export function useForwardedFactory() {
+        return ForwardedFactory.fakeCreate();
+    }
+"#;
+const AMBIGUOUS_SERVICE_FILE: &str = r#"
+    export class AmbiguousService {
+        static fileOnly() { return 1; }
+    }
+"#;
+const AMBIGUOUS_SERVICE_INDEX: &str = r#"
+    export class AmbiguousService {
+        static indexOnly() { return 2; }
+    }
+"#;
+const NOT_A_CLASS: &str = r#"
+    export function Factory() {
+        return {
+            fakeCreate() { return 3; }
+        };
+    }
 "#;
 
 fn write_script_fixture(root: &Path) {
     fs::create_dir_all(root.join("src/collision")).unwrap();
     fs::create_dir_all(root.join("src/directory")).unwrap();
     fs::create_dir_all(root.join("src/services")).unwrap();
+    fs::create_dir_all(root.join("src/ambiguous-service")).unwrap();
     fs::write(root.join("src/types.d.ts"), TYPES).unwrap();
     fs::write(root.join("src/core.ts"), CORE).unwrap();
     fs::write(root.join("src/bridge.js"), BRIDGE).unwrap();
@@ -460,6 +490,17 @@ fn write_script_fixture(root: &Path) {
     fs::write(root.join("src/entry.mjs"), ENTRY).unwrap();
     fs::write(root.join("src/services/index.ts"), SERVICES).unwrap();
     fs::write(root.join("src/class-user.ts"), CLASS_USER).unwrap();
+    fs::write(
+        root.join("src/ambiguous-service.ts"),
+        AMBIGUOUS_SERVICE_FILE,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/ambiguous-service/index.ts"),
+        AMBIGUOUS_SERVICE_INDEX,
+    )
+    .unwrap();
+    fs::write(root.join("src/not-a-class.ts"), NOT_A_CLASS).unwrap();
     fs::write(
         root.join("src/collision.js"),
         "export function duplicate() { return 1; }\n",
@@ -502,7 +543,7 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
 
     index_repository(&incremental.path);
     assert_eq!(language_file_count(&incremental.path, "javascript"), 4);
-    assert_eq!(language_file_count(&incremental.path, "typescript"), 8);
+    assert_eq!(language_file_count(&incremental.path, "typescript"), 11);
     assert_eq!(
         stored_file_language_and_context(&incremental.path, "src/widget.jsx"),
         ("javascript".to_owned(), "javascript".to_owned())
@@ -521,6 +562,35 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
             "CALLS",
         ),
         1
+    );
+    assert_eq!(
+        [
+            named_edge_kind_count(
+                &incremental.path,
+                "src/class-user.ts",
+                "useAmbiguousFileMethod",
+                "src/ambiguous-service.ts",
+                "fileOnly",
+                "CALLS",
+            ),
+            named_edge_kind_count(
+                &incremental.path,
+                "src/class-user.ts",
+                "useAmbiguousIndexMethod",
+                "src/ambiguous-service/index.ts",
+                "indexOnly",
+                "CALLS",
+            ),
+            named_edge_kind_count(
+                &incremental.path,
+                "src/class-user.ts",
+                "useForwardedFactory",
+                "src/not-a-class.ts",
+                "fakeCreate",
+                "CALLS",
+            ),
+        ],
+        [0, 0, 0]
     );
     assert_eq!(
         named_edge_kind_count(
@@ -684,6 +754,73 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
     assert_eq!(
         named_edge_count(&incremental.path, "unresolved", "duplicate"),
         0
+    );
+}
+
+#[test]
+fn javascript_direct_class_reexport_methods_match_fresh_graph_after_targeted_edits() {
+    const FIRST_BEFORE: &str = "export class First { static before() {} static create() {} }\n";
+    const FIRST_AFTER: &str = "export class First { static after() {} static create() {} }\n";
+    const SECOND: &str = "export class Second { static create() {} }\n";
+    const BRIDGE_BEFORE: &str =
+        "export { First as TargetEdited, First as Retargeted } from './first';\n";
+    const BRIDGE_AFTER: &str = "export { First as TargetEdited } from './first';\n\
+         export { Second as Retargeted } from './second';\n";
+    const USER: &str = r#"
+        import { TargetEdited, Retargeted } from "./bridge";
+        export function useTargetEdited() { return TargetEdited.after(); }
+        export function useRetargeted() { return Retargeted.create(); }
+    "#;
+
+    let incremental = Fixture::new();
+    let oracle = Fixture::new();
+    for root in [&incremental.path, &oracle.path] {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/first.ts"), FIRST_BEFORE).unwrap();
+        fs::write(root.join("src/second.ts"), SECOND).unwrap();
+        fs::write(root.join("src/bridge.ts"), BRIDGE_BEFORE).unwrap();
+        fs::write(root.join("src/user.ts"), USER).unwrap();
+        init_git(root);
+    }
+    index_repository(&incremental.path);
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(root.join("src/first.ts"), FIRST_AFTER).unwrap();
+        fs::write(root.join("src/bridge.ts"), BRIDGE_AFTER).unwrap();
+    }
+    index_repository(&incremental.path);
+    index_repository(&oracle.path);
+    assert_eq!(
+        [
+            named_edge_kind_count(
+                &incremental.path,
+                "src/user.ts",
+                "useTargetEdited",
+                "src/first.ts",
+                "after",
+                "CALLS",
+            ),
+            named_edge_kind_count(
+                &incremental.path,
+                "src/user.ts",
+                "useRetargeted",
+                "src/second.ts",
+                "create",
+                "CALLS",
+            ),
+            named_edge_kind_count(
+                &incremental.path,
+                "src/user.ts",
+                "useRetargeted",
+                "src/first.ts",
+                "create",
+                "CALLS",
+            ),
+        ],
+        [1, 1, 0]
+    );
+    assert_eq!(
+        semantic_graph(&incremental.path),
+        semantic_graph(&oracle.path)
     );
 }
 

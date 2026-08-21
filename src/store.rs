@@ -314,6 +314,7 @@ impl Store {
         let changed = if full {
             create_schema(&tx)?;
             let (_, implementations) = insert_graph(&tx, &graph, cancelled, false)?;
+            refresh_script_export_methods(&tx, cancelled)?;
             resolve_trait_implementations(&tx, implementations.into_iter().collect(), cancelled)?;
             graph.files.len()
         } else {
@@ -2345,9 +2346,112 @@ fn apply_incremental(
     affected_refs.extend(new_refs);
     affected_implementations.extend(new_implementations);
     resolve_references(tx, affected_refs, cancelled)?;
+    refresh_script_export_methods(tx, cancelled)?;
     resolve_trait_implementations(tx, affected_implementations, cancelled)?;
     reparent_methods(tx, affected_owners, cancelled)?;
     Ok(changed)
+}
+
+fn refresh_script_export_methods(tx: &Transaction<'_>, cancelled: &AtomicBool) -> Result<()> {
+    tx.execute(
+        "DELETE FROM node_keys WHERE key LIKE 'script:export-method:%'",
+        [],
+    )
+    .map_err(db_error)?;
+
+    let owner_keys = tx
+        .prepare(
+            "SELECT key FROM (
+                 SELECT key FROM node_keys WHERE key LIKE 'script:export-value:%'
+                 UNION
+                 SELECT alias_key AS key FROM refs
+                  WHERE alias_key LIKE 'script:export-value:%'
+             ) ORDER BY key",
+        )
+        .map_err(db_error)?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?;
+
+    let mut candidates = tx
+        .prepare("SELECT node_id FROM node_keys WHERE key=?1 ORDER BY node_id LIMIT 2")
+        .map_err(db_error)?;
+    let mut alias_candidates = tx
+        .prepare(
+            "SELECT count(*), count(resolved_target_id),
+                    count(DISTINCT resolved_target_id), min(resolved_target_id)
+               FROM refs WHERE alias_key=?1",
+        )
+        .map_err(db_error)?;
+    let mut is_class = tx
+        .prepare(
+            "SELECT EXISTS(
+                 SELECT 1 FROM node_keys
+                  WHERE node_id=?1 AND key LIKE 'script:class:%'
+             )",
+        )
+        .map_err(db_error)?;
+    let mut methods = tx
+        .prepare(
+            "SELECT method.id, method.name FROM nodes method
+              WHERE method.parent_id=?1
+                AND EXISTS(
+                    SELECT 1 FROM node_keys key
+                     WHERE key.node_id=method.id AND key.key LIKE 'script:method:%'
+                )
+              ORDER BY method.id",
+        )
+        .map_err(db_error)?;
+    let mut insert = tx
+        .prepare("INSERT INTO node_keys(key, node_id) VALUES(?1, ?2)")
+        .map_err(db_error)?;
+    for owner_key in owner_keys {
+        check_cancelled(cancelled)?;
+        let DbCandidate::Unique(owner) = merge_candidates(
+            candidate(&mut candidates, &owner_key)?,
+            alias_candidate(&mut alias_candidates, &owner_key)?,
+        ) else {
+            continue;
+        };
+        if !is_class
+            .query_row([owner], |row| row.get::<_, bool>(0))
+            .map_err(db_error)?
+        {
+            continue;
+        }
+        let Some(owner_key) = owner_key.strip_prefix("script:export-value:") else {
+            continue;
+        };
+        for row in methods
+            .query_map([owner], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_error)?
+        {
+            let (method, name) = row.map_err(db_error)?;
+            insert
+                .execute(params![
+                    format!("script:export-method:{owner_key}::{name}"),
+                    method
+                ])
+                .map_err(db_error)?;
+        }
+    }
+
+    let references = tx
+        .prepare(
+            "SELECT DISTINCT ref.id FROM refs ref
+               JOIN ref_keys key ON key.ref_id=ref.id
+              WHERE key.key LIKE 'script:export-method:%'
+              ORDER BY ref.id",
+        )
+        .map_err(db_error)?
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(db_error)?;
+    resolve_references(tx, references, cancelled)
 }
 
 fn resolve_references(

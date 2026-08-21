@@ -440,7 +440,14 @@ pub(crate) fn add_file(
             line_start: to_u32(definition.line_start)?,
             line_end: to_u32(definition.line_end)?,
             signature: definition.signature.clone(),
-            keys: definition_keys(definition, &paths[local], stem, &aliases),
+            keys: definition_keys(
+                definition,
+                &paths[local],
+                stem,
+                definition.parent.is_some_and(|parent| {
+                    matches!(parsed.definitions[parent].kind, DefinitionKind::Class)
+                }),
+            ),
         });
     }
 
@@ -465,26 +472,6 @@ pub(crate) fn add_file(
         ) {
             if !keys.contains(&key) {
                 keys.push(key);
-            }
-        }
-        if !export.type_only && matches!(parsed.definitions[local].kind, DefinitionKind::Class) {
-            for (method, definition) in
-                parsed
-                    .definitions
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, definition)| {
-                        definition.parent == Some(local)
-                            && matches!(definition.kind, DefinitionKind::Method)
-                    })
-            {
-                let keys = &mut graph.nodes[definition_node_start + method].keys;
-                for alias in &aliases {
-                    let key = method_key(alias, exported, &definition.name);
-                    if !keys.contains(&key) {
-                        keys.push(key);
-                    }
-                }
             }
         }
     }
@@ -648,26 +635,25 @@ fn definition_keys(
     definition: &Definition,
     path: &str,
     stem: &str,
-    aliases: &[String],
+    parent_is_class: bool,
 ) -> Vec<String> {
     match definition.kind {
-        DefinitionKind::Class
-        | DefinitionKind::Type {
+        DefinitionKind::Class => vec![
+            class_key(stem, path),
+            local_type_key(stem, path),
+            local_value_key(stem, path),
+        ],
+        DefinitionKind::Type {
             runtime_value: true,
         } => vec![local_type_key(stem, path), local_value_key(stem, path)],
         DefinitionKind::Type {
             runtime_value: false,
         } => vec![local_type_key(stem, path)],
-        DefinitionKind::Method => definition.parent.map_or_else(
-            || vec![local_value_key(stem, path)],
-            |_| {
-                let (owner, _) = path.rsplit_once("::").unwrap_or(("", path));
-                aliases
-                    .iter()
-                    .map(|alias| method_key(alias, owner, &definition.name))
-                    .collect()
-            },
-        ),
+        DefinitionKind::Method if parent_is_class => {
+            let (owner, _) = path.rsplit_once("::").unwrap_or(("", path));
+            vec![method_key(stem, owner, &definition.name)]
+        }
+        DefinitionKind::Method => Vec::new(),
         DefinitionKind::Function => vec![local_value_key(stem, path)],
         DefinitionKind::Test => Vec::new(),
     }
@@ -894,8 +880,8 @@ fn import_value_key(
         member,
     ) {
         (ImportedName::Namespace, Some(member)) => Some(export_value_key(module, member)),
-        (ImportedName::Named(name), Some(member)) => Some(method_key(module, name, member)),
-        (ImportedName::Default, Some(member)) => Some(method_key(module, "default", member)),
+        (ImportedName::Named(name), Some(member)) => Some(export_method_key(module, name, member)),
+        (ImportedName::Default, Some(member)) => Some(export_method_key(module, "default", member)),
         (ImportedName::Named(name), None) => Some(export_value_key(module, name)),
         (ImportedName::Default, None) => Some(export_value_key(module, "default")),
         (ImportedName::Namespace, None) => None,
@@ -986,7 +972,7 @@ fn relative_module(importer: &str, specifier: &str) -> Result<Option<String>, St
         })
         .collect::<Vec<_>>();
     let specifier = strip_script_suffix(specifier);
-    if specifier.ends_with('/') {
+    if matches!(specifier.rsplit('/').next(), None | Some("" | "." | "..")) {
         return Ok(None);
     }
     for component in Path::new(specifier).components() {
@@ -1068,6 +1054,10 @@ fn local_type_key(stem: &str, lexical_path: &str) -> String {
     format!("script:type:{stem}::{lexical_path}")
 }
 
+fn class_key(stem: &str, lexical_path: &str) -> String {
+    format!("script:class:{stem}::{lexical_path}")
+}
+
 fn export_value_key(stem: &str, name: &str) -> String {
     format!("script:export-value:{stem}::{name}")
 }
@@ -1078,6 +1068,10 @@ fn export_type_key(stem: &str, name: &str) -> String {
 
 fn method_key(stem: &str, owner_path: &str, name: &str) -> String {
     format!("script:method:{stem}::{owner_path}::{name}")
+}
+
+fn export_method_key(stem: &str, owner: &str, name: &str) -> String {
+    format!("script:export-method:{stem}::{owner}::{name}")
 }
 
 fn node_kind(kind: DefinitionKind) -> NodeKind {
@@ -1955,6 +1949,12 @@ mod tests {
         );
         assert_eq!(relative_module("src/client.ts", "./.ts").unwrap(), None);
         assert_eq!(relative_module("src/client.ts", "./").unwrap(), None);
+        assert_eq!(relative_module("src/client.ts", "./.").unwrap(), None);
+        assert_eq!(
+            relative_module("src/client.ts", "./nested/..").unwrap(),
+            None
+        );
+        assert_eq!(relative_module("src/client.ts", "../src/.").unwrap(), None);
         for rejected in [
             "react",
             "@/core",

@@ -2095,58 +2095,6 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
         }
     }
 
-    let mut methods_by_parent = HashMap::<&str, Vec<usize>>::new();
-    for (node, input) in graph.nodes.iter().enumerate() {
-        check_progress(node, cancelled)?;
-        if input
-            .keys
-            .iter()
-            .any(|key| key.starts_with("script:method:"))
-            && let Some(parent) = input.parent_key.as_deref()
-        {
-            methods_by_parent.entry(parent).or_default().push(node);
-        }
-    }
-
-    let mut method_aliases = Vec::new();
-    for (index, reference) in graph.refs.iter().enumerate() {
-        check_progress(index, cancelled)?;
-        let Some(alias) = reference.alias_key.as_deref() else {
-            continue;
-        };
-        let Some((module, owner)) = script_export_value(alias) else {
-            continue;
-        };
-        let Some(target) = reference_target(&reference.keys, &candidates, None) else {
-            continue;
-        };
-        let Some(methods) = methods_by_parent.get(graph.nodes[target].key.as_str()) else {
-            continue;
-        };
-        for method in methods {
-            let Some(key) = graph.nodes[*method]
-                .keys
-                .iter()
-                .find(|key| key.starts_with("script:method:"))
-            else {
-                continue;
-            };
-            method_aliases.push(RefInput {
-                source_key: reference.source_key.clone(),
-                kind: reference.kind,
-                line: reference.line,
-                keys: vec![key.clone()],
-                alias_key: Some(format!(
-                    "script:method:{module}::{owner}::{}",
-                    graph.nodes[*method].name
-                )),
-                resolved_target_key: None,
-            });
-        }
-    }
-    drop(methods_by_parent);
-    graph.refs.extend(method_aliases);
-
     let mut aliases = HashMap::<String, Candidate>::new();
     for (index, reference) in graph.refs.iter().enumerate() {
         check_progress(index, cancelled)?;
@@ -2241,10 +2189,6 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
         graph.nodes[node].parent_key = Some(parent_key);
     }
     check_cancelled(cancelled)
-}
-
-fn script_export_value(key: &str) -> Option<(&str, &str)> {
-    key.strip_prefix("script:export-value:")?.rsplit_once("::")
 }
 
 fn reference_target(
