@@ -361,6 +361,239 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
     client.close();
 }
 
+const TYPES: &str = r#"
+    export interface Config { value: string }
+"#;
+const CORE: &str = r#"
+    import type { Config } from "./types.js";
+    function helper(config: Config) { return config.value; }
+    export { helper as exposedHelper };
+    export function run(config: Config) { return helper(config); }
+    export class Service {
+        static create() { return new Service(); }
+        dispatch(config: Config) { return this.finish(config); }
+        finish(config: Config) { return run(config); }
+    }
+    export function makeService() { return Service.create(); }
+    export function misuseType() { return Config(); }
+    export function shadow(run: () => void) { run(); }
+"#;
+const BRIDGE: &str = r#"
+    export { run as execute } from "./core.js";
+    export * as widgets from "./widget";
+    export * from "./types.js";
+"#;
+const WIDGET: &str = r#"
+    export default function DefaultWidget() { return <section />; }
+    export function Widget() { return <div />; }
+    export function div() { return null; }
+"#;
+const UI: &str = r#"
+    import DefaultWidget, { Widget, div } from "./widget";
+    import * as UI from "./widget";
+    export const Panel = () =>
+        <><DefaultWidget /><Widget /><UI.Widget /><div /></>;
+"#;
+const MODERN: &str = r#"
+    import { execute } from "./bridge";
+    import { exposedHelper } from "./core";
+    export function invoke() { return execute({ value: "mts" }); }
+    export function invokeLocalExport() {
+        return exposedHelper({ value: "local" });
+    }
+"#;
+const ENTRY: &str = r#"
+    import "./bridge";
+    import { duplicate } from "./collision";
+    import { indexed } from "./directory";
+    function bootstrap() { return true; }
+    bootstrap();
+    export function unresolved() { return duplicate(); }
+    export function fromIndex() { return indexed(); }
+"#;
+
+fn write_script_fixture(root: &Path) {
+    fs::create_dir_all(root.join("src/collision")).unwrap();
+    fs::create_dir_all(root.join("src/directory")).unwrap();
+    fs::write(root.join("src/types.d.ts"), TYPES).unwrap();
+    fs::write(root.join("src/core.ts"), CORE).unwrap();
+    fs::write(root.join("src/bridge.js"), BRIDGE).unwrap();
+    fs::write(root.join("src/widget.jsx"), WIDGET).unwrap();
+    fs::write(root.join("src/ui.tsx"), UI).unwrap();
+    fs::write(root.join("src/modern.mts"), MODERN).unwrap();
+    fs::write(root.join("src/entry.mjs"), ENTRY).unwrap();
+    fs::write(
+        root.join("src/collision.js"),
+        "export function duplicate() { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/collision/index.ts"),
+        "export function duplicate() { return 2; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/directory/index.ts"),
+        "export function indexed() { return 3; }\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
+    let incremental = Fixture::new();
+    let oracle = Fixture::new();
+    for root in [&incremental.path, &oracle.path] {
+        write_script_fixture(root);
+        init_git(root);
+        git(root, &["add", "--", "."]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Graphr Test",
+                "-c",
+                "user.email=graphr@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+    }
+
+    index_repository(&incremental.path);
+    assert_eq!(language_file_count(&incremental.path, "javascript"), 4);
+    assert_eq!(language_file_count(&incremental.path, "typescript"), 6);
+    assert_eq!(
+        stored_file_language_and_context(&incremental.path, "src/widget.jsx"),
+        ("javascript".to_owned(), "javascript".to_owned())
+    );
+    assert_eq!(
+        stored_file_language_and_context(&incremental.path, "src/ui.tsx"),
+        ("typescript".to_owned(), "tsx".to_owned())
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/core.ts",
+            "run",
+            "src/core.ts",
+            "helper",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/entry.mjs",
+            "fromIndex",
+            "src/directory/index.ts",
+            "indexed",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/entry.mjs",
+            "src/entry.mjs",
+            "src/entry.mjs",
+            "bootstrap",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/core.ts",
+            "makeService",
+            "src/core.ts",
+            "create",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/modern.mts",
+            "invoke",
+            "src/core.ts",
+            "run",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/modern.mts",
+            "invokeLocalExport",
+            "src/core.ts",
+            "helper",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/entry.mjs",
+            "src/entry.mjs",
+            "src/bridge.js",
+            "src/bridge.js",
+            "IMPORTS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/bridge.js",
+            "src/bridge.js",
+            "src/types.d.ts",
+            "src/types.d.ts",
+            "IMPORTS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/bridge.js",
+            "src/bridge.js",
+            "src/widget.jsx",
+            "src/widget.jsx",
+            "IMPORTS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/core.ts",
+            "src/core.ts",
+            "src/types.d.ts",
+            "Config",
+            "IMPORTS",
+        ),
+        1
+    );
+    assert_eq!(named_edge_count(&incremental.path, "shadow", "run"), 0);
+    assert_eq!(
+        named_edge_count(&incremental.path, "misuseType", "Config"),
+        0
+    );
+    assert_eq!(
+        named_edge_count(&incremental.path, "unresolved", "duplicate"),
+        0
+    );
+}
+
 #[test]
 fn immutable_snapshots_match_fresh_graphs_through_mutations() {
     const CALLER: &str = "use crate::target::answer;\npub fn call() { answer(); answer(); }\n";
@@ -3981,6 +4214,52 @@ fn named_edge_count(path: &Path, source: &str, target: &str) -> i64 {
               WHERE source.name=?1 AND target.name=?2",
             [source, target],
             |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn named_edge_kind_count(
+    path: &Path,
+    source_path: &str,
+    source: &str,
+    target_path: &str,
+    target: &str,
+    kind: &str,
+) -> i64 {
+    Connection::open(graph_path(path))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM edges edge
+               JOIN nodes source ON source.id=edge.source_id
+               JOIN files source_file ON source_file.id=source.file_id
+               JOIN nodes target ON target.id=edge.target_id
+               JOIN files target_file ON target_file.id=target.file_id
+              WHERE source_file.path=?1 AND source.name=?2
+                AND target_file.path=?3 AND target.name=?4 AND edge.kind=?5",
+            [source_path, source, target_path, target, kind],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn language_file_count(path: &Path, language: &str) -> i64 {
+    Connection::open(graph_path(path))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM files WHERE language=?1",
+            [language],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn stored_file_language_and_context(path: &Path, source_path: &str) -> (String, String) {
+    Connection::open(graph_path(path))
+        .unwrap()
+        .query_row(
+            "SELECT language, parse_context FROM files WHERE path=?1",
+            [source_path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap()
 }

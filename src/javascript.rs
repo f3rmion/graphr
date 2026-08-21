@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::path::{Component, Path};
 
 use tree_sitter::{
     Language as TreeSitterLanguage, Node, Parser, Query, QueryCursor, StreamingIterator,
@@ -14,6 +14,9 @@ const TYPESCRIPT_QUERY: &str = include_str!("../queries/typescript.scm");
 const JSX_QUERY: &str = include_str!("../queries/jsx.scm");
 const SIGNATURE_LIMIT: usize = 200;
 const QUALIFIED_PATH_LIMIT: usize = 1024;
+const SCRIPT_SUFFIXES: [&str; 9] = [
+    ".d.ts", ".jsx", ".mjs", ".cjs", ".tsx", ".mts", ".cts", ".js", ".ts",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScriptDialect {
@@ -154,7 +157,6 @@ impl ScriptParser {
                         parsed.definitions.push(definition);
                     }
                 }
-                "module" | "typescript_module" => collect_module(capture.node, source, &mut parsed),
                 "binding" => collect_binding(capture.node, source, &mut parsed.bindings),
                 _ => {}
             }
@@ -176,6 +178,11 @@ impl ScriptParser {
                 .map(|(parent, _)| parent);
         }
         collect_definition_bindings(&parsed.definitions, &mut parsed.bindings);
+        for capture in &captured {
+            if matches!(capture.name.as_str(), "module" | "typescript_module") {
+                collect_module(capture.node, source, &mut parsed);
+            }
+        }
         parsed.bindings.sort_unstable_by(|left, right| {
             (left.byte, left.range.start, &left.name).cmp(&(
                 right.byte,
@@ -293,14 +300,49 @@ struct Definition {
     binding: Option<ByteRange>,
 }
 
-struct ModuleStatement {
+enum ImportedName {
+    Default,
+    Named(String),
+    Namespace,
+}
+
+struct ImportBinding {
+    local: String,
+    imported: ImportedName,
+    type_only: bool,
+}
+
+struct Import {
+    source: Option<usize>,
     module: String,
+    bindings: Vec<ImportBinding>,
+    line: usize,
+}
+
+enum ExportTarget {
+    Definition(usize),
+    Local(String),
+    ReExport {
+        module: String,
+        imported: ImportedName,
+    },
+    Star {
+        module: String,
+    },
+}
+
+struct Export {
+    target: ExportTarget,
+    exported: Option<String>,
+    type_only: bool,
+    line: usize,
 }
 
 struct LexicalBinding {
     name: String,
     range: ByteRange,
     byte: usize,
+    import: Option<(usize, usize)>,
 }
 
 enum CallTarget {
@@ -320,10 +362,10 @@ struct Call {
 #[derive(Default)]
 struct ParsedFile {
     definitions: Vec<Definition>,
-    modules: Vec<ModuleStatement>,
+    imports: Vec<Import>,
     bindings: Vec<LexicalBinding>,
     calls: Vec<Call>,
-    exports: Vec<String>,
+    exports: Vec<Export>,
 }
 
 pub(crate) fn add_file(
@@ -341,7 +383,8 @@ pub(crate) fn add_file(
             dialect.language().as_str()
         ));
     }
-    let stem = module_stem(&source.path)?;
+    let aliases = module_aliases(&source.path)?;
+    let stem = &aliases[0];
     let parsed = parsers.parse(&source.path, &source.text)?;
     let file_key = identity(language, &source.path, "file", &source.path, 0, 0);
     graph.nodes.push(NodeInput {
@@ -355,7 +398,7 @@ pub(crate) fn add_file(
         line_start: 1,
         line_end: to_u32(source.text.lines().count().max(1))?,
         signature: String::new(),
-        keys: vec![module_key(&stem)],
+        keys: aliases.iter().map(|alias| module_key(alias)).collect(),
     });
 
     let mut paths = Vec::with_capacity(parsed.definitions.len());
@@ -365,7 +408,7 @@ pub(crate) fn add_file(
             .parent
             .and_then(|parent| paths.get(parent))
             .map_or("", String::as_str);
-        let path = checked_lexical_path(&stem, parent, &definition.name)?;
+        let path = checked_lexical_path(stem, parent, &definition.name)?;
         let kind = node_kind(definition.kind);
         node_keys.push(identity(
             language,
@@ -378,11 +421,7 @@ pub(crate) fn add_file(
         paths.push(path);
     }
 
-    let exports = parsed
-        .exports
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
+    let definition_node_start = graph.nodes.len();
     for (local, definition) in parsed.definitions.iter().enumerate() {
         let key = node_keys[local].clone();
         graph.nodes.push(NodeInput {
@@ -401,17 +440,172 @@ pub(crate) fn add_file(
             line_start: to_u32(definition.line_start)?,
             line_end: to_u32(definition.line_end)?,
             signature: definition.signature.clone(),
-            keys: definition_keys(
-                definition,
-                &paths[local],
-                &stem,
-                definition.parent.is_none() && exports.contains(definition.name.as_str()),
-            ),
+            keys: definition_keys(definition, &paths[local], stem, &aliases),
         });
     }
 
+    for export in &parsed.exports {
+        let Some(exported) = export.exported.as_deref() else {
+            continue;
+        };
+        let local = match &export.target {
+            ExportTarget::Definition(local) => Some(*local),
+            ExportTarget::Local(name) => unique_top_level_definition(&parsed, name),
+            ExportTarget::ReExport { .. } | ExportTarget::Star { .. } => None,
+        };
+        let Some(local) = local else {
+            continue;
+        };
+        let keys = &mut graph.nodes[definition_node_start + local].keys;
+        for key in export_definition_keys(
+            parsed.definitions[local].kind,
+            &aliases,
+            exported,
+            export.type_only,
+        ) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+
+    let import_modules = parsed
+        .imports
+        .iter()
+        .map(|import| relative_module(&source.path, &import.module))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (import, module) in parsed.imports.iter().zip(&import_modules) {
+        let Some(module) = module.as_deref() else {
+            continue;
+        };
+        if import.bindings.is_empty() {
+            graph.refs.push(RefInput {
+                source_key: import
+                    .source
+                    .and_then(|source| node_keys.get(source).cloned())
+                    .unwrap_or_else(|| file_key.clone()),
+                kind: RefKind::Imports,
+                line: to_u32(import.line)?,
+                keys: vec![module_key(module)],
+                alias_key: None,
+                resolved_target_key: None,
+            });
+        }
+        for binding in &import.bindings {
+            let key = match &binding.imported {
+                ImportedName::Namespace => module_key(module),
+                ImportedName::Default if binding.type_only => export_type_key(module, "default"),
+                ImportedName::Default => export_value_key(module, "default"),
+                ImportedName::Named(name) if binding.type_only => export_type_key(module, name),
+                ImportedName::Named(name) => export_value_key(module, name),
+            };
+            graph.refs.push(RefInput {
+                source_key: import
+                    .source
+                    .and_then(|source| node_keys.get(source).cloned())
+                    .unwrap_or_else(|| file_key.clone()),
+                kind: RefKind::Imports,
+                line: to_u32(import.line)?,
+                keys: vec![key],
+                alias_key: None,
+                resolved_target_key: None,
+            });
+        }
+    }
+
+    for export in &parsed.exports {
+        let (module, imported) = match &export.target {
+            ExportTarget::ReExport { module, imported } => (module, Some(imported)),
+            ExportTarget::Star { module } => (module, None),
+            ExportTarget::Definition(_) | ExportTarget::Local(_) => continue,
+        };
+        let Some(module) = relative_module(&source.path, module)? else {
+            continue;
+        };
+        let (key, alias_keys) = match imported {
+            Some(ImportedName::Default) => (
+                if export.type_only {
+                    export_type_key(&module, "default")
+                } else {
+                    export_value_key(&module, "default")
+                },
+                export
+                    .exported
+                    .as_deref()
+                    .map_or_else(Vec::new, |exported| {
+                        aliases
+                            .iter()
+                            .map(|alias| {
+                                if export.type_only {
+                                    export_type_key(alias, exported)
+                                } else {
+                                    export_value_key(alias, exported)
+                                }
+                            })
+                            .collect()
+                    }),
+            ),
+            Some(ImportedName::Named(imported)) => (
+                if export.type_only {
+                    export_type_key(&module, imported)
+                } else {
+                    export_value_key(&module, imported)
+                },
+                export
+                    .exported
+                    .as_deref()
+                    .map_or_else(Vec::new, |exported| {
+                        aliases
+                            .iter()
+                            .map(|alias| {
+                                if export.type_only {
+                                    export_type_key(alias, exported)
+                                } else {
+                                    export_value_key(alias, exported)
+                                }
+                            })
+                            .collect()
+                    }),
+            ),
+            Some(ImportedName::Namespace) => (
+                module_key(&module),
+                export
+                    .exported
+                    .as_deref()
+                    .map_or_else(Vec::new, |exported| {
+                        aliases
+                            .iter()
+                            .map(|alias| export_value_key(alias, exported))
+                            .collect()
+                    }),
+            ),
+            None => (module_key(&module), Vec::new()),
+        };
+        if alias_keys.is_empty() {
+            graph.refs.push(RefInput {
+                source_key: file_key.clone(),
+                kind: RefKind::Imports,
+                line: to_u32(export.line)?,
+                keys: vec![key],
+                alias_key: None,
+                resolved_target_key: None,
+            });
+        } else {
+            for alias_key in alias_keys {
+                graph.refs.push(RefInput {
+                    source_key: file_key.clone(),
+                    kind: RefKind::Imports,
+                    line: to_u32(export.line)?,
+                    keys: vec![key.clone()],
+                    alias_key: Some(alias_key),
+                    resolved_target_key: None,
+                });
+            }
+        }
+    }
+
     for call in &parsed.calls {
-        let keys = call_keys(call, &parsed, &paths, &stem);
+        let keys = call_keys(call, &parsed, &paths, stem, &import_modules);
         if keys.is_empty() {
             continue;
         }
@@ -430,8 +624,13 @@ pub(crate) fn add_file(
     Ok(())
 }
 
-fn definition_keys(definition: &Definition, path: &str, stem: &str, exported: bool) -> Vec<String> {
-    let mut keys = match definition.kind {
+fn definition_keys(
+    definition: &Definition,
+    path: &str,
+    stem: &str,
+    aliases: &[String],
+) -> Vec<String> {
+    match definition.kind {
         DefinitionKind::Class
         | DefinitionKind::Type {
             runtime_value: true,
@@ -443,54 +642,143 @@ fn definition_keys(definition: &Definition, path: &str, stem: &str, exported: bo
             || vec![local_value_key(stem, path)],
             |_| {
                 let (owner, _) = path.rsplit_once("::").unwrap_or(("", path));
-                vec![method_key(stem, owner, &definition.name)]
+                aliases
+                    .iter()
+                    .map(|alias| method_key(alias, owner, &definition.name))
+                    .collect()
             },
         ),
         DefinitionKind::Function => vec![local_value_key(stem, path)],
         DefinitionKind::Test => Vec::new(),
-    };
-    if exported {
-        match definition.kind {
+    }
+}
+
+fn export_definition_keys(
+    kind: DefinitionKind,
+    aliases: &[String],
+    exported: &str,
+    type_only: bool,
+) -> Vec<String> {
+    match (kind, type_only) {
+        (DefinitionKind::Class | DefinitionKind::Type { .. }, true) => aliases
+            .iter()
+            .map(|alias| export_type_key(alias, exported))
+            .collect(),
+        (
             DefinitionKind::Class
             | DefinitionKind::Type {
                 runtime_value: true,
-            } => {
-                keys.push(export_type_key(stem, &definition.name));
-                keys.push(export_value_key(stem, &definition.name));
-            }
+            },
+            false,
+        ) => aliases
+            .iter()
+            .flat_map(|alias| {
+                [
+                    export_type_key(alias, exported),
+                    export_value_key(alias, exported),
+                ]
+            })
+            .collect(),
+        (
             DefinitionKind::Type {
                 runtime_value: false,
-            } => keys.push(export_type_key(stem, &definition.name)),
-            DefinitionKind::Function => {
-                keys.push(export_value_key(stem, &definition.name));
-            }
-            DefinitionKind::Method | DefinitionKind::Test => {}
-        }
+            },
+            false,
+        ) => aliases
+            .iter()
+            .map(|alias| export_type_key(alias, exported))
+            .collect(),
+        (DefinitionKind::Function, false) => aliases
+            .iter()
+            .map(|alias| export_value_key(alias, exported))
+            .collect(),
+        (DefinitionKind::Function | DefinitionKind::Method | DefinitionKind::Test, true)
+        | (DefinitionKind::Method | DefinitionKind::Test, false) => Vec::new(),
     }
-    keys
 }
 
-fn call_keys(call: &Call, parsed: &ParsedFile, paths: &[String], stem: &str) -> Vec<String> {
-    let key = match &call.target {
-        CallTarget::Identifier(name) => visible_value_definition(call, name, parsed)
-            .map(|target| local_value_key(stem, paths.get(target).map_or(name, String::as_str))),
+fn unique_top_level_definition(parsed: &ParsedFile, name: &str) -> Option<usize> {
+    let mut definitions = parsed
+        .definitions
+        .iter()
+        .enumerate()
+        .filter(|(_, definition)| definition.parent.is_none() && definition.name == name);
+    let definition = definitions.next().map(|(definition, _)| definition);
+    definition.filter(|_| definitions.next().is_none())
+}
+
+fn call_keys(
+    call: &Call,
+    parsed: &ParsedFile,
+    paths: &[String],
+    stem: &str,
+    import_modules: &[Option<String>],
+) -> Vec<String> {
+    match &call.target {
+        CallTarget::Identifier(name) => match visible_value(call, name, parsed) {
+            VisibleValue::Definition(target) => vec![local_value_key(
+                stem,
+                paths.get(target).map_or(name, String::as_str),
+            )],
+            VisibleValue::Import(import, binding) => {
+                import_value_key(parsed, import_modules, import, binding, None)
+                    .into_iter()
+                    .collect()
+            }
+            VisibleValue::Ambiguous | VisibleValue::Missing => Vec::new(),
+        },
         CallTarget::ThisMethod(name) => containing_class(call.source, &parsed.definitions)
             .and_then(|owner| paths.get(owner))
-            .map(|owner| method_key(stem, owner, name)),
-        CallTarget::Member { object, property } => visible_value_definition(call, object, parsed)
-            .filter(|target| matches!(parsed.definitions[*target].kind, DefinitionKind::Class))
-            .and_then(|owner| paths.get(owner))
-            .map(|owner| method_key(stem, owner, property)),
+            .map(|owner| method_key(stem, owner, name))
+            .into_iter()
+            .collect(),
+        CallTarget::Member { object, property } => match visible_value(call, object, parsed) {
+            VisibleValue::Definition(target)
+                if matches!(parsed.definitions[target].kind, DefinitionKind::Class) =>
+            {
+                paths
+                    .get(target)
+                    .map(|owner| method_key(stem, owner, property))
+                    .into_iter()
+                    .collect()
+            }
+            VisibleValue::Import(import, binding) => {
+                import_value_key(parsed, import_modules, import, binding, Some(property))
+                    .into_iter()
+                    .collect()
+            }
+            VisibleValue::Definition(_) | VisibleValue::Ambiguous | VisibleValue::Missing => {
+                Vec::new()
+            }
+        },
         CallTarget::Jsx(name) => {
-            let root = name.split('.').next().unwrap_or(name);
-            visible_value_definition(call, root, parsed)
-                .map(|target| local_value_key(stem, paths.get(target).map_or(root, String::as_str)))
+            let (root, member) = name
+                .split_once('.')
+                .map_or((name.as_str(), None), |(root, member)| (root, Some(member)));
+            match visible_value(call, root, parsed) {
+                VisibleValue::Definition(target) => vec![local_value_key(
+                    stem,
+                    paths.get(target).map_or(root, String::as_str),
+                )],
+                VisibleValue::Import(import, binding) => {
+                    import_value_key(parsed, import_modules, import, binding, member)
+                        .into_iter()
+                        .collect()
+                }
+                VisibleValue::Ambiguous | VisibleValue::Missing => Vec::new(),
+            }
         }
-    };
-    key.into_iter().collect()
+    }
 }
 
-fn visible_value_definition(call: &Call, name: &str, parsed: &ParsedFile) -> Option<usize> {
+enum VisibleValue {
+    Definition(usize),
+    Import(usize, usize),
+    Ambiguous,
+    Missing,
+}
+
+fn visible_value(call: &Call, name: &str, parsed: &ParsedFile) -> VisibleValue {
     let bindings = parsed
         .bindings
         .iter()
@@ -505,30 +793,33 @@ fn visible_value_definition(call: &Call, name: &str, parsed: &ParsedFile) -> Opt
         .map(|binding| binding.range.end - binding.range.start)
         .min()
     {
-        let mut target = None;
-        for binding in bindings
+        let mut selected = bindings
             .into_iter()
-            .filter(|binding| binding.range.end - binding.range.start == width)
-        {
-            let candidate =
-                parsed
-                    .definitions
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, definition)| {
-                        (definition.name == name
-                            && definition.range.start == binding.byte
-                            && is_runtime_value(definition.kind))
-                        .then_some(index)
-                    })?;
-            if target
-                .replace(candidate)
-                .is_some_and(|current| current != candidate)
-            {
-                return None;
-            }
+            .filter(|binding| binding.range.end - binding.range.start == width);
+        let Some(binding) = selected.next() else {
+            return VisibleValue::Missing;
+        };
+        if selected.next().is_some() {
+            return VisibleValue::Ambiguous;
         }
-        return target;
+        if let Some((import, imported)) = binding.import {
+            return if parsed.imports[import].bindings[imported].type_only {
+                VisibleValue::Ambiguous
+            } else {
+                VisibleValue::Import(import, imported)
+            };
+        }
+        return parsed
+            .definitions
+            .iter()
+            .enumerate()
+            .find_map(|(index, definition)| {
+                (definition.name == name
+                    && definition.range.start == binding.byte
+                    && is_runtime_value(definition.kind))
+                .then_some(index)
+            })
+            .map_or(VisibleValue::Ambiguous, VisibleValue::Definition);
     }
 
     let mut owner = call.source;
@@ -544,12 +835,12 @@ fn visible_value_definition(call: &Call, name: &str, parsed: &ParsedFile) -> Opt
             });
         let candidate = candidates.next().map(|(index, _)| index);
         if candidate.is_some() && candidates.next().is_none() {
-            return candidate;
+            return candidate.map_or(VisibleValue::Missing, VisibleValue::Definition);
         }
         if candidate.is_some() {
-            return None;
+            return VisibleValue::Ambiguous;
         }
-        owner = owner.and_then(|scope| parsed.definitions.get(scope)?.parent);
+        owner = owner.and_then(|scope| parsed.definitions.get(scope).and_then(|item| item.parent));
         if owner.is_none() {
             let mut top_level = parsed
                 .definitions
@@ -561,8 +852,33 @@ fn visible_value_definition(call: &Call, name: &str, parsed: &ParsedFile) -> Opt
                         && is_runtime_value(definition.kind)
                 });
             let candidate = top_level.next().map(|(index, _)| index);
-            return candidate.filter(|_| top_level.next().is_none());
+            return match (candidate, top_level.next()) {
+                (Some(candidate), None) => VisibleValue::Definition(candidate),
+                (Some(_), Some(_)) => VisibleValue::Ambiguous,
+                (None, _) => VisibleValue::Missing,
+            };
         }
+    }
+}
+
+fn import_value_key(
+    parsed: &ParsedFile,
+    import_modules: &[Option<String>],
+    import: usize,
+    binding: usize,
+    member: Option<&str>,
+) -> Option<String> {
+    let module = import_modules.get(import)?.as_deref()?;
+    match (
+        &parsed.imports.get(import)?.bindings.get(binding)?.imported,
+        member,
+    ) {
+        (ImportedName::Namespace, Some(member)) => Some(export_value_key(module, member)),
+        (ImportedName::Named(name), Some(member)) => Some(method_key(module, name, member)),
+        (ImportedName::Default, Some(member)) => Some(method_key(module, "default", member)),
+        (ImportedName::Named(name), None) => Some(export_value_key(module, name)),
+        (ImportedName::Default, None) => Some(export_value_key(module, "default")),
+        (ImportedName::Namespace, None) => None,
     }
 }
 
@@ -589,17 +905,86 @@ fn containing_class(source: Option<usize>, definitions: &[Definition]) -> Option
     None
 }
 
-fn module_stem(path: &str) -> Result<String, String> {
-    let stem = path.strip_suffix(".d.ts").or_else(|| {
-        ScriptDialect::for_path(path).and_then(|_| path.rsplit_once('.').map(|(stem, _)| stem))
-    });
-    let stem = stem
-        .filter(|stem| !stem.is_empty())
-        .ok_or_else(|| "script module path is invalid".to_owned())?;
+fn strip_script_suffix(value: &str) -> &str {
+    SCRIPT_SUFFIXES
+        .iter()
+        .find_map(|suffix| value.strip_suffix(suffix))
+        .unwrap_or(value)
+}
+
+fn module_aliases(path: &str) -> Result<Vec<String>, String> {
+    let source_path = Path::new(path);
+    if ScriptDialect::for_path(path).is_none()
+        || source_path.is_absolute()
+        || !source_path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err("script module path is invalid".to_owned());
+    }
+    let stem = strip_script_suffix(path);
+    if stem.is_empty() {
+        return Err("script module path is invalid".to_owned());
+    }
     if stem.len() > QUALIFIED_PATH_LIMIT {
         return Err("Script qualified path exceeds 1024 bytes".to_owned());
     }
-    Ok(stem.to_owned())
+    let mut aliases = vec![stem.to_owned()];
+    if let Some(parent) = stem
+        .strip_suffix("/index")
+        .filter(|parent| !parent.is_empty())
+    {
+        aliases.push(parent.to_owned());
+    }
+    Ok(aliases)
+}
+
+fn relative_module(importer: &str, specifier: &str) -> Result<Option<String>, String> {
+    if !(specifier.starts_with("./") || specifier.starts_with("../"))
+        || specifier.contains(['\\', '?', '#'])
+        || specifier.chars().any(char::is_control)
+    {
+        return Ok(None);
+    }
+    let importer = Path::new(importer);
+    if importer.is_absolute()
+        || !importer
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Ok(None);
+    }
+
+    let mut normalized = importer
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|component| match component {
+            Component::Normal(component) => component.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for component in Path::new(strip_script_suffix(specifier)).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if normalized.pop().is_some() => {}
+            Component::Normal(component) => {
+                let Some(component) = component.to_str() else {
+                    return Ok(None);
+                };
+                normalized.push(component);
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return Ok(None),
+        }
+    }
+    let normalized = normalized.join("/");
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if normalized.len() > QUALIFIED_PATH_LIMIT {
+        return Err("Script qualified path exceeds 1024 bytes".to_owned());
+    }
+    Ok(Some(normalized))
 }
 
 fn checked_lexical_path(stem: &str, parent: &str, name: &str) -> Result<String, String> {
@@ -927,15 +1312,9 @@ fn definition_binding(
 
 fn collect_module(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
     match node.kind() {
-        "import_statement" => {
-            collect_relative_module(node, source, &mut parsed.modules);
-            collect_import_bindings(node, source, &mut parsed.bindings);
-        }
-        "export_statement" => {
-            collect_relative_module(node, source, &mut parsed.modules);
-            collect_exports(node, source, &mut parsed.exports);
-        }
-        "assignment_expression" => collect_assignment_export(node, source, &mut parsed.exports),
+        "import_statement" => collect_import(node, source, parsed),
+        "export_statement" => collect_export(node, source, parsed),
+        "assignment_expression" => collect_assignment_export(node, source, parsed),
         _ => {}
     }
 }
@@ -962,119 +1341,222 @@ fn collect_binding(node: Node<'_>, source: &str, bindings: &mut Vec<LexicalBindi
             name: text(identifier, source).to_owned(),
             range,
             byte: identifier.start_byte(),
+            import: None,
         });
     }
 }
 
-fn collect_relative_module(node: Node<'_>, source: &str, modules: &mut Vec<ModuleStatement>) {
-    let Some(module) = node
-        .child_by_field_name("source")
-        .map(|source_node| text(source_node, source).trim_matches(['\'', '"']))
-    else {
+fn collect_import(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
+    let Some(module) = static_module(node, source) else {
         return;
     };
-    if module.starts_with("./") || module.starts_with("../") {
-        modules.push(ModuleStatement {
-            module: module.to_owned(),
+    let statement_type_only = has_direct_token(node, "type");
+    let mut bindings = Vec::new();
+    let mut binding_bytes = Vec::new();
+    let mut cursor = node.walk();
+    if let Some(clause) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "import_clause")
+    {
+        let mut clause_cursor = clause.walk();
+        for child in clause.named_children(&mut clause_cursor) {
+            match child.kind() {
+                "identifier" => push_import_binding(
+                    child,
+                    ImportedName::Default,
+                    statement_type_only,
+                    source,
+                    &mut bindings,
+                    &mut binding_bytes,
+                ),
+                "named_imports" => {
+                    let mut imports_cursor = child.walk();
+                    for specifier in child.named_children(&mut imports_cursor) {
+                        let Some(imported) = specifier.child_by_field_name("name") else {
+                            continue;
+                        };
+                        let Some(local) = specifier
+                            .child_by_field_name("alias")
+                            .unwrap_or(imported)
+                            .kind()
+                            .eq("identifier")
+                            .then(|| specifier.child_by_field_name("alias").unwrap_or(imported))
+                        else {
+                            continue;
+                        };
+                        let imported_name = text(imported, source);
+                        push_import_binding(
+                            local,
+                            if imported_name == "default" {
+                                ImportedName::Default
+                            } else {
+                                ImportedName::Named(imported_name.to_owned())
+                            },
+                            statement_type_only || has_direct_token(specifier, "type"),
+                            source,
+                            &mut bindings,
+                            &mut binding_bytes,
+                        );
+                    }
+                }
+                "namespace_import" => {
+                    if let Some(local) = identifiers(child).into_iter().next() {
+                        push_import_binding(
+                            local,
+                            ImportedName::Namespace,
+                            statement_type_only,
+                            source,
+                            &mut bindings,
+                            &mut binding_bytes,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let import = parsed.imports.len();
+    parsed.imports.push(Import {
+        source: containing_definition(node.start_byte(), &parsed.definitions),
+        module: module.to_owned(),
+        bindings,
+        line: line_start(node),
+    });
+    for (binding, byte) in binding_bytes.into_iter().enumerate() {
+        parsed.bindings.push(LexicalBinding {
+            name: parsed.imports[import].bindings[binding].local.clone(),
+            range: module_scope(source),
+            byte,
+            import: Some((import, binding)),
         });
     }
 }
 
-fn collect_import_bindings(node: Node<'_>, source: &str, bindings: &mut Vec<LexicalBinding>) {
-    let module = module_scope(source);
-    let mut pending = vec![node];
-    while let Some(node) = pending.pop() {
-        match node.kind() {
-            "import_specifier" => {
-                let name = node
-                    .child_by_field_name("alias")
-                    .or_else(|| node.child_by_field_name("name"));
-                if let Some(name) = name.filter(|name| name.kind() == "identifier") {
-                    bindings.push(LexicalBinding {
-                        name: text(name, source).to_owned(),
-                        range: module,
-                        byte: name.start_byte(),
-                    });
-                }
-                continue;
-            }
-            "namespace_import" => {
-                if let Some(name) = identifiers(node).into_iter().next() {
-                    bindings.push(LexicalBinding {
-                        name: text(name, source).to_owned(),
-                        range: module,
-                        byte: name.start_byte(),
-                    });
-                }
-                continue;
-            }
-            "identifier"
-                if node
-                    .parent()
-                    .is_some_and(|parent| parent.kind() == "import_clause") =>
-            {
-                bindings.push(LexicalBinding {
-                    name: text(node, source).to_owned(),
-                    range: module,
-                    byte: node.start_byte(),
-                });
-                continue;
-            }
-            "string" | "comment" => continue,
-            _ => {}
-        }
-        let mut cursor = node.walk();
-        pending.extend(node.named_children(&mut cursor));
-    }
+fn push_import_binding(
+    local: Node<'_>,
+    imported: ImportedName,
+    type_only: bool,
+    source: &str,
+    bindings: &mut Vec<ImportBinding>,
+    binding_bytes: &mut Vec<usize>,
+) {
+    bindings.push(ImportBinding {
+        local: text(local, source).to_owned(),
+        imported,
+        type_only,
+    });
+    binding_bytes.push(local.start_byte());
 }
 
-fn collect_exports(node: Node<'_>, source: &str, exports: &mut Vec<String>) {
-    if has_default_token(node) {
-        add_export(exports, "default");
+fn collect_export(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
+    let module = static_module(node, source);
+    let statement_type_only = has_direct_token(node, "type");
+    let mut cursor = node.walk();
+    if let Some(clause) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "export_clause")
+    {
+        let mut clause_cursor = clause.walk();
+        for specifier in clause.named_children(&mut clause_cursor) {
+            let Some(name) = specifier.child_by_field_name("name") else {
+                continue;
+            };
+            let imported = text(name, source);
+            let exported = specifier.child_by_field_name("alias").unwrap_or(name);
+            parsed.exports.push(Export {
+                target: module.map_or_else(
+                    || ExportTarget::Local(imported.to_owned()),
+                    |module| ExportTarget::ReExport {
+                        module: module.to_owned(),
+                        imported: if imported == "default" {
+                            ImportedName::Default
+                        } else {
+                            ImportedName::Named(imported.to_owned())
+                        },
+                    },
+                ),
+                exported: Some(text(exported, source).to_owned()),
+                type_only: statement_type_only || has_direct_token(specifier, "type"),
+                line: line_start(node),
+            });
+        }
         return;
     }
-    let mut pending = vec![node];
-    while let Some(node) = pending.pop() {
-        match node.kind() {
-            "export_specifier" => {
-                if let Some(name) = node
-                    .child_by_field_name("alias")
-                    .or_else(|| node.child_by_field_name("name"))
-                {
-                    add_export(exports, text(name, source));
-                }
-                continue;
-            }
-            "class_declaration"
-            | "function_declaration"
-            | "generator_function_declaration"
-            | "interface_declaration"
-            | "type_alias_declaration"
-            | "enum_declaration"
-            | "internal_module"
-            | "module" => {
-                if let Some(name) = field_text(node, "name", source) {
-                    add_export(exports, name);
-                }
-                continue;
-            }
-            "variable_declarator" => {
-                if let Some(name) = node
-                    .child_by_field_name("name")
-                    .filter(|name| name.kind() == "identifier")
-                {
-                    add_export(exports, text(name, source));
-                }
-                continue;
-            }
-            _ => {}
+
+    let mut cursor = node.walk();
+    if let Some(namespace) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "namespace_export")
+    {
+        let Some(exported) = identifiers(namespace).into_iter().next() else {
+            return;
+        };
+        if let Some(module) = module {
+            parsed.exports.push(Export {
+                target: ExportTarget::ReExport {
+                    module: module.to_owned(),
+                    imported: ImportedName::Namespace,
+                },
+                exported: Some(text(exported, source).to_owned()),
+                type_only: statement_type_only,
+                line: line_start(node),
+            });
         }
-        let mut cursor = node.walk();
-        pending.extend(node.named_children(&mut cursor));
+        return;
+    }
+
+    if let Some(module) = module {
+        parsed.exports.push(Export {
+            target: ExportTarget::Star {
+                module: module.to_owned(),
+            },
+            exported: None,
+            type_only: statement_type_only,
+            line: line_start(node),
+        });
+        return;
+    }
+
+    let default = has_default_token(node);
+    let definitions = parsed
+        .definitions
+        .iter()
+        .enumerate()
+        .filter(|(_, definition)| {
+            definition.parent.is_none()
+                && node.start_byte() <= definition.structure.start
+                && definition.structure.end <= node.end_byte()
+        })
+        .map(|(definition, _)| definition)
+        .collect::<Vec<_>>();
+    if !definitions.is_empty() {
+        for definition in definitions {
+            parsed.exports.push(Export {
+                target: ExportTarget::Definition(definition),
+                exported: Some(if default {
+                    "default".to_owned()
+                } else {
+                    parsed.definitions[definition].name.clone()
+                }),
+                type_only: statement_type_only,
+                line: line_start(node),
+            });
+        }
+    } else if default
+        && let Some(value) = node
+            .child_by_field_name("value")
+            .filter(|value| value.kind() == "identifier")
+    {
+        parsed.exports.push(Export {
+            target: ExportTarget::Local(text(value, source).to_owned()),
+            exported: Some("default".to_owned()),
+            type_only: false,
+            line: line_start(node),
+        });
     }
 }
 
-fn collect_assignment_export(node: Node<'_>, source: &str, exports: &mut Vec<String>) {
+fn collect_assignment_export(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
     let Some(left) = node.child_by_field_name("left") else {
         return;
     };
@@ -1085,23 +1567,45 @@ fn collect_assignment_export(node: Node<'_>, source: &str, exports: &mut Vec<Str
             if let Some(property) =
                 property.filter(|property| property.kind() == "property_identifier")
             {
-                add_export(exports, text(property, source));
+                add_local_export(parsed, text(property, source), line_start(node));
             }
         } else if object.is_some_and(|object| text(object, source) == "module.exports")
             && let Some(property) =
                 property.filter(|property| property.kind() == "property_identifier")
         {
-            add_export(exports, text(property, source));
+            add_local_export(parsed, text(property, source), line_start(node));
         }
     } else if text(left, source) == "module.exports" {
-        add_export(exports, "default");
+        add_local_export(parsed, "default", line_start(node));
     }
 }
 
-fn add_export(exports: &mut Vec<String>, name: &str) {
-    if !name.is_empty() && !exports.iter().any(|export| export == name) {
-        exports.push(name.to_owned());
-    }
+fn add_local_export(parsed: &mut ParsedFile, name: &str, line: usize) {
+    parsed.exports.push(Export {
+        target: ExportTarget::Local(name.to_owned()),
+        exported: Some(name.to_owned()),
+        type_only: false,
+        line,
+    });
+}
+
+fn static_module<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    node.child_by_field_name("source")
+        .map(|module| text(module, source).trim_matches(['\'', '"']))
+}
+
+fn has_direct_token(node: Node<'_>, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| child.kind() == kind)
+}
+
+fn containing_definition(byte: usize, definitions: &[Definition]) -> Option<usize> {
+    definitions
+        .iter()
+        .enumerate()
+        .filter(|(_, definition)| definition.body.start <= byte && byte < definition.body.end)
+        .min_by_key(|(_, definition)| definition.body.end - definition.body.start)
+        .map(|(definition, _)| definition)
 }
 
 fn collect_definition_bindings(definitions: &[Definition], bindings: &mut Vec<LexicalBinding>) {
@@ -1113,12 +1617,14 @@ fn collect_definition_bindings(definitions: &[Definition], bindings: &mut Vec<Le
             name: definition.name.clone(),
             range: parent,
             byte: definition.range.start,
+            import: None,
         });
         if parent.start != definition.body.start || parent.end != definition.body.end {
             bindings.push(LexicalBinding {
                 name: definition.name.clone(),
                 range: definition.body,
                 byte: definition.range.start,
+                import: None,
             });
         }
     }
@@ -1347,9 +1853,9 @@ impl ParsedFile {
     }
 
     fn relative_modules(&self) -> Vec<&str> {
-        self.modules
+        self.imports
             .iter()
-            .map(|module| module.module.as_str())
+            .map(|import| import.module.as_str())
             .collect()
     }
 
@@ -1364,7 +1870,10 @@ impl ParsedFile {
     }
 
     fn export_names(&self) -> Vec<&str> {
-        self.exports.iter().map(String::as_str).collect()
+        self.exports
+            .iter()
+            .filter_map(|export| export.exported.as_deref())
+            .collect()
     }
 
     fn test_names(&self) -> Vec<&str> {
@@ -1396,6 +1905,42 @@ mod tests {
     #[test]
     fn analyzes_javascript_typescript_and_tsx() {
         let mut parsers = ScriptParsers::default();
+
+        assert_eq!(module_aliases("src/core.ts").unwrap(), ["src/core"]);
+        assert_eq!(
+            module_aliases("src/core/index.tsx").unwrap(),
+            ["src/core/index", "src/core"]
+        );
+        assert_eq!(module_aliases("src/types.d.ts").unwrap(), ["src/types"]);
+        assert!(module_aliases("../src/core.ts").is_err());
+        assert!(module_aliases("/src/core.ts").is_err());
+        assert_eq!(
+            relative_module("src/client.ts", "./core.js")
+                .unwrap()
+                .as_deref(),
+            Some("src/core")
+        );
+        assert_eq!(
+            relative_module("tests/client.spec.ts", "../src/core")
+                .unwrap()
+                .as_deref(),
+            Some("src/core")
+        );
+        for rejected in [
+            "react",
+            "@/core",
+            "/src/core",
+            "./core?raw",
+            "./core#fragment",
+            ".\\core",
+            "../../outside",
+        ] {
+            assert_eq!(
+                relative_module("src/client.ts", rejected).unwrap(),
+                None,
+                "{rejected}"
+            );
+        }
 
         let javascript = parsers
             .parse(
