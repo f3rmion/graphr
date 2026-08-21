@@ -273,6 +273,7 @@ struct ByteRange {
 
 #[derive(Clone, Copy)]
 enum DefinitionKind {
+    Class,
     Type { runtime_value: bool },
     Function,
     Method,
@@ -431,7 +432,8 @@ pub(crate) fn add_file(
 
 fn definition_keys(definition: &Definition, path: &str, stem: &str, exported: bool) -> Vec<String> {
     let mut keys = match definition.kind {
-        DefinitionKind::Type {
+        DefinitionKind::Class
+        | DefinitionKind::Type {
             runtime_value: true,
         } => vec![local_type_key(stem, path), local_value_key(stem, path)],
         DefinitionKind::Type {
@@ -449,7 +451,8 @@ fn definition_keys(definition: &Definition, path: &str, stem: &str, exported: bo
     };
     if exported {
         match definition.kind {
-            DefinitionKind::Type {
+            DefinitionKind::Class
+            | DefinitionKind::Type {
                 runtime_value: true,
             } => {
                 keys.push(export_type_key(stem, &definition.name));
@@ -475,14 +478,7 @@ fn call_keys(call: &Call, parsed: &ParsedFile, paths: &[String], stem: &str) -> 
             .and_then(|owner| paths.get(owner))
             .map(|owner| method_key(stem, owner, name)),
         CallTarget::Member { object, property } => visible_value_definition(call, object, parsed)
-            .filter(|target| {
-                matches!(
-                    parsed.definitions[*target].kind,
-                    DefinitionKind::Type {
-                        runtime_value: true
-                    }
-                )
-            })
+            .filter(|target| matches!(parsed.definitions[*target].kind, DefinitionKind::Class))
             .and_then(|owner| paths.get(owner))
             .map(|owner| method_key(stem, owner, property)),
         CallTarget::Jsx(name) => {
@@ -573,7 +569,8 @@ fn visible_value_definition(call: &Call, name: &str, parsed: &ParsedFile) -> Opt
 fn is_runtime_value(kind: DefinitionKind) -> bool {
     matches!(
         kind,
-        DefinitionKind::Function
+        DefinitionKind::Class
+            | DefinitionKind::Function
             | DefinitionKind::Type {
                 runtime_value: true
             }
@@ -584,12 +581,7 @@ fn containing_class(source: Option<usize>, definitions: &[Definition]) -> Option
     let mut current = source;
     while let Some(index) = current {
         let definition = definitions.get(index)?;
-        if matches!(
-            definition.kind,
-            DefinitionKind::Type {
-                runtime_value: true
-            }
-        ) {
+        if matches!(definition.kind, DefinitionKind::Class) {
             return Some(index);
         }
         current = definition.parent;
@@ -680,7 +672,7 @@ fn method_key(stem: &str, owner_path: &str, name: &str) -> String {
 
 fn node_kind(kind: DefinitionKind) -> NodeKind {
     match kind {
-        DefinitionKind::Type { .. } => NodeKind::Type,
+        DefinitionKind::Class | DefinitionKind::Type { .. } => NodeKind::Type,
         DefinitionKind::Function | DefinitionKind::Method => NodeKind::Function,
         DefinitionKind::Test => NodeKind::Test,
     }
@@ -710,9 +702,7 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
     } else {
         match node.kind() {
             "class_declaration" | "abstract_class_declaration" => (
-                DefinitionKind::Type {
-                    runtime_value: true,
-                },
+                DefinitionKind::Class,
                 field_text(node, "name", source)
                     .map(str::to_owned)
                     .or_else(|| default_export(node).then(|| "default".to_owned()))?,
@@ -846,9 +836,7 @@ fn stable_initializer(
 
 fn definition_kind(node: Node<'_>) -> DefinitionKind {
     if node.kind() == "class" {
-        DefinitionKind::Type {
-            runtime_value: true,
-        }
+        DefinitionKind::Class
     } else {
         DefinitionKind::Function
     }
@@ -1484,6 +1472,13 @@ mod tests {
                 export function run(config: Config) { return helper(config); }
                 function helper(config: Config) { return config.value; }
                 export function shadow(run: () => void) { run(); }
+                export namespace Tools {
+                    export function execute() { return work(); }
+                    function work() {}
+                }
+                export function useNamespace() { return Tools.execute(); }
+                export enum State { Ready }
+                export function useEnum() { return State.Ready(); }
             "#
             .to_owned(),
         };
@@ -1508,6 +1503,21 @@ mod tests {
         ));
         assert!(has_ref(&graph, "run", "script:value:src/service::helper"));
         assert!(!has_ref(&graph, "shadow", "script:value:src/service::run"));
+        assert!(has_ref(
+            &graph,
+            "execute",
+            "script:value:src/service::Tools::work"
+        ));
+        assert!(!has_ref(
+            &graph,
+            "useNamespace",
+            "script:method:src/service::Tools::execute"
+        ));
+        assert!(!has_ref(
+            &graph,
+            "useEnum",
+            "script:method:src/service::State::Ready"
+        ));
         assert!(
             add_file(
                 &mut Graph::default(),
