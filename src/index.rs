@@ -449,7 +449,8 @@ impl Engine {
                 ));
             }
         };
-        let text = Store::open_reader(&snapshot.graph_path)
+        let text = snapshot
+            .open_graph()
             .and_then(|mut store| store.search(snapshot_id, query, kind, limit))
             .map_err(query_operation_error)?;
         Ok(query_output(&snapshot, text))
@@ -463,7 +464,8 @@ impl Engine {
         max_nodes: u32,
     ) -> Result<QueryOutput, OperationError> {
         let snapshot = self.catalog.get(snapshot_id)?;
-        let text = Store::open_reader(&snapshot.graph_path)
+        let text = snapshot
+            .open_graph()
             .and_then(|mut store| store.view(snapshot_id, node_ref, depth, max_nodes))
             .map_err(query_operation_error)?;
         Ok(query_output(&snapshot, text))
@@ -507,7 +509,8 @@ impl Engine {
         let review = match review {
             Some(review) => review,
             None => {
-                let graph = Store::open_reader(&snapshot.graph_path)
+                let graph = snapshot
+                    .open_graph()
                     .and_then(|mut store| {
                         store.changes(
                             snapshot_id,
@@ -3243,6 +3246,84 @@ mod tests {
             fresh.get(&original.snapshot_id).unwrap_err().code,
             ErrorCode::CacheCorrupt
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_queries_share_the_pinned_graph_after_filename_replacement() {
+        let root = snapshot_repository("pinned-concurrent");
+        let base = test_git_line(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("src/a.rs"), "fn original() {}\n").unwrap();
+        test_git(&root, &["commit", "--quiet", "-am", "original"]);
+        let head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        let original = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &head),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let node_ref = engine
+            .search(&original.snapshot_id, "original", Some("function"), 8)
+            .unwrap()
+            .text
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned();
+        let replacement = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &base),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let graphs = root.join(".git/graphr/v6/graphs");
+        let pinned = graphs.join(format!("{}.db", original.graph_image_id));
+        fs::rename(&pinned, pinned.with_extension("validated")).unwrap();
+        fs::copy(
+            graphs.join(format!("{}.db", replacement.graph_image_id)),
+            &pinned,
+        )
+        .unwrap();
+
+        // Every reader opens the same pinned description through the override,
+        // so this fails if SQLite ever read through a shared file offset.
+        let answers = std::thread::scope(|scope| {
+            let readers = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut seen = Vec::new();
+                        for _ in 0..4 {
+                            seen.push(
+                                engine
+                                    .search(&original.snapshot_id, "original", Some("function"), 8)
+                                    .unwrap()
+                                    .text,
+                            );
+                            seen.push(
+                                engine
+                                    .view(&original.snapshot_id, &node_ref, 1, 30)
+                                    .unwrap()
+                                    .text,
+                            );
+                        }
+                        seen
+                    })
+                })
+                .collect::<Vec<_>>();
+            readers
+                .into_iter()
+                .flat_map(|reader| reader.join().expect("reader thread"))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(answers.len(), 8 * 4 * 2);
+        for answer in &answers {
+            assert!(answer.contains("original"), "{answer}");
+            assert!(!answer.contains("replacement"), "{answer}");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
