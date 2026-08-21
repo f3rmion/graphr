@@ -1,11 +1,19 @@
 #![allow(dead_code)]
 
-use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator};
+use std::collections::HashSet;
+
+use tree_sitter::{
+    Language as TreeSitterLanguage, Node, Parser, Query, QueryCursor, StreamingIterator,
+};
+
+use crate::git::{Language, Source};
+use crate::store::{Graph, NodeInput, NodeKind, RefInput, RefKind};
 
 const ECMASCRIPT_QUERY: &str = include_str!("../queries/ecmascript.scm");
 const TYPESCRIPT_QUERY: &str = include_str!("../queries/typescript.scm");
 const JSX_QUERY: &str = include_str!("../queries/jsx.scm");
 const SIGNATURE_LIMIT: usize = 200;
+const QUALIFIED_PATH_LIMIT: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScriptDialect {
@@ -34,6 +42,17 @@ impl ScriptDialect {
             Self::Tsx => "tsx",
         }
     }
+
+    const fn language(self) -> Language {
+        match self {
+            Self::JavaScript => Language::JavaScript,
+            Self::TypeScript | Self::Tsx => Language::TypeScript,
+        }
+    }
+}
+
+pub(crate) fn parse_context(path: &str) -> Option<&'static str> {
+    ScriptDialect::for_path(path).map(ScriptDialect::parse_context)
 }
 
 fn query_source(dialect: ScriptDialect) -> String {
@@ -52,7 +71,7 @@ struct ScriptParser {
 
 impl ScriptParser {
     fn new(dialect: ScriptDialect) -> Result<Self, String> {
-        let language: Language = match dialect {
+        let language: TreeSitterLanguage = match dialect {
             ScriptDialect::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             ScriptDialect::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             ScriptDialect::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
@@ -252,6 +271,7 @@ struct ByteRange {
     end: usize,
 }
 
+#[derive(Clone, Copy)]
 enum DefinitionKind {
     Type { runtime_value: bool },
     Function,
@@ -303,6 +323,380 @@ struct ParsedFile {
     bindings: Vec<LexicalBinding>,
     calls: Vec<Call>,
     exports: Vec<String>,
+}
+
+pub(crate) fn add_file(
+    graph: &mut Graph,
+    source: &Source,
+    language: Language,
+    parsers: &mut ScriptParsers,
+) -> Result<(), String> {
+    let dialect = ScriptDialect::for_path(&source.path)
+        .ok_or_else(|| "unsupported script path".to_owned())?;
+    if dialect.language() != language {
+        return Err(format!(
+            "{} path requires stored language {}",
+            dialect.parse_context(),
+            dialect.language().as_str()
+        ));
+    }
+    let stem = module_stem(&source.path)?;
+    let parsed = parsers.parse(&source.path, &source.text)?;
+    let file_key = identity(language, &source.path, "file", &source.path, 0, 0);
+    graph.nodes.push(NodeInput {
+        key: file_key.clone(),
+        file_key: source.path.clone(),
+        kind: NodeKind::File,
+        name: source.path.clone(),
+        qualified_name: file_key.clone(),
+        parent_key: None,
+        owner_key: None,
+        line_start: 1,
+        line_end: to_u32(source.text.lines().count().max(1))?,
+        signature: String::new(),
+        keys: vec![module_key(&stem)],
+    });
+
+    let mut paths = Vec::with_capacity(parsed.definitions.len());
+    let mut node_keys = Vec::with_capacity(parsed.definitions.len());
+    for (ordinal, definition) in parsed.definitions.iter().enumerate() {
+        let parent = definition
+            .parent
+            .and_then(|parent| paths.get(parent))
+            .map_or("", String::as_str);
+        let path = checked_lexical_path(&stem, parent, &definition.name)?;
+        let kind = node_kind(definition.kind);
+        node_keys.push(identity(
+            language,
+            &source.path,
+            kind_name(kind),
+            &path,
+            definition.line_start,
+            ordinal,
+        ));
+        paths.push(path);
+    }
+
+    let exports = parsed
+        .exports
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    for (local, definition) in parsed.definitions.iter().enumerate() {
+        let key = node_keys[local].clone();
+        graph.nodes.push(NodeInput {
+            key: key.clone(),
+            file_key: source.path.clone(),
+            kind: node_kind(definition.kind),
+            name: definition.name.clone(),
+            qualified_name: key,
+            parent_key: Some(
+                definition
+                    .parent
+                    .and_then(|parent| node_keys.get(parent).cloned())
+                    .unwrap_or_else(|| file_key.clone()),
+            ),
+            owner_key: None,
+            line_start: to_u32(definition.line_start)?,
+            line_end: to_u32(definition.line_end)?,
+            signature: definition.signature.clone(),
+            keys: definition_keys(
+                definition,
+                &paths[local],
+                &stem,
+                definition.parent.is_none() && exports.contains(definition.name.as_str()),
+            ),
+        });
+    }
+
+    for call in &parsed.calls {
+        let keys = call_keys(call, &parsed, &paths, &stem);
+        if keys.is_empty() {
+            continue;
+        }
+        graph.refs.push(RefInput {
+            source_key: call
+                .source
+                .and_then(|source| node_keys.get(source).cloned())
+                .unwrap_or_else(|| file_key.clone()),
+            kind: RefKind::Calls,
+            line: to_u32(call.line)?,
+            keys,
+            alias_key: None,
+            resolved_target_key: None,
+        });
+    }
+    Ok(())
+}
+
+fn definition_keys(definition: &Definition, path: &str, stem: &str, exported: bool) -> Vec<String> {
+    let mut keys = match definition.kind {
+        DefinitionKind::Type {
+            runtime_value: true,
+        } => vec![local_type_key(stem, path), local_value_key(stem, path)],
+        DefinitionKind::Type {
+            runtime_value: false,
+        } => vec![local_type_key(stem, path)],
+        DefinitionKind::Method => definition.parent.map_or_else(
+            || vec![local_value_key(stem, path)],
+            |_| {
+                let (owner, _) = path.rsplit_once("::").unwrap_or(("", path));
+                vec![method_key(stem, owner, &definition.name)]
+            },
+        ),
+        DefinitionKind::Function => vec![local_value_key(stem, path)],
+        DefinitionKind::Test => Vec::new(),
+    };
+    if exported {
+        match definition.kind {
+            DefinitionKind::Type {
+                runtime_value: true,
+            } => {
+                keys.push(export_type_key(stem, &definition.name));
+                keys.push(export_value_key(stem, &definition.name));
+            }
+            DefinitionKind::Type {
+                runtime_value: false,
+            } => keys.push(export_type_key(stem, &definition.name)),
+            DefinitionKind::Function => {
+                keys.push(export_value_key(stem, &definition.name));
+            }
+            DefinitionKind::Method | DefinitionKind::Test => {}
+        }
+    }
+    keys
+}
+
+fn call_keys(call: &Call, parsed: &ParsedFile, paths: &[String], stem: &str) -> Vec<String> {
+    let key = match &call.target {
+        CallTarget::Identifier(name) => visible_value_definition(call, name, parsed)
+            .map(|target| local_value_key(stem, paths.get(target).map_or(name, String::as_str))),
+        CallTarget::ThisMethod(name) => containing_class(call.source, &parsed.definitions)
+            .and_then(|owner| paths.get(owner))
+            .map(|owner| method_key(stem, owner, name)),
+        CallTarget::Member { object, property } => visible_value_definition(call, object, parsed)
+            .filter(|target| {
+                matches!(
+                    parsed.definitions[*target].kind,
+                    DefinitionKind::Type {
+                        runtime_value: true
+                    }
+                )
+            })
+            .and_then(|owner| paths.get(owner))
+            .map(|owner| method_key(stem, owner, property)),
+        CallTarget::Jsx(name) => {
+            let root = name.split('.').next().unwrap_or(name);
+            visible_value_definition(call, root, parsed)
+                .map(|target| local_value_key(stem, paths.get(target).map_or(root, String::as_str)))
+        }
+    };
+    key.into_iter().collect()
+}
+
+fn visible_value_definition(call: &Call, name: &str, parsed: &ParsedFile) -> Option<usize> {
+    let bindings = parsed
+        .bindings
+        .iter()
+        .filter(|binding| {
+            binding.name == name
+                && binding.range.start <= call.byte
+                && call.byte < binding.range.end
+        })
+        .collect::<Vec<_>>();
+    if let Some(width) = bindings
+        .iter()
+        .map(|binding| binding.range.end - binding.range.start)
+        .min()
+    {
+        let mut target = None;
+        for binding in bindings
+            .into_iter()
+            .filter(|binding| binding.range.end - binding.range.start == width)
+        {
+            let candidate =
+                parsed
+                    .definitions
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, definition)| {
+                        (definition.name == name
+                            && definition.range.start == binding.byte
+                            && is_runtime_value(definition.kind))
+                        .then_some(index)
+                    })?;
+            if target
+                .replace(candidate)
+                .is_some_and(|current| current != candidate)
+            {
+                return None;
+            }
+        }
+        return target;
+    }
+
+    let mut owner = call.source;
+    loop {
+        let mut candidates = parsed
+            .definitions
+            .iter()
+            .enumerate()
+            .filter(|(_, definition)| {
+                definition.parent == owner
+                    && definition.name == name
+                    && is_runtime_value(definition.kind)
+            });
+        let candidate = candidates.next().map(|(index, _)| index);
+        if candidate.is_some() && candidates.next().is_none() {
+            return candidate;
+        }
+        if candidate.is_some() {
+            return None;
+        }
+        owner = owner.and_then(|scope| parsed.definitions.get(scope)?.parent);
+        if owner.is_none() {
+            let mut top_level = parsed
+                .definitions
+                .iter()
+                .enumerate()
+                .filter(|(_, definition)| {
+                    definition.parent.is_none()
+                        && definition.name == name
+                        && is_runtime_value(definition.kind)
+                });
+            let candidate = top_level.next().map(|(index, _)| index);
+            return candidate.filter(|_| top_level.next().is_none());
+        }
+    }
+}
+
+fn is_runtime_value(kind: DefinitionKind) -> bool {
+    matches!(
+        kind,
+        DefinitionKind::Function
+            | DefinitionKind::Type {
+                runtime_value: true
+            }
+    )
+}
+
+fn containing_class(source: Option<usize>, definitions: &[Definition]) -> Option<usize> {
+    let mut current = source;
+    while let Some(index) = current {
+        let definition = definitions.get(index)?;
+        if matches!(
+            definition.kind,
+            DefinitionKind::Type {
+                runtime_value: true
+            }
+        ) {
+            return Some(index);
+        }
+        current = definition.parent;
+    }
+    None
+}
+
+fn module_stem(path: &str) -> Result<String, String> {
+    let stem = path.strip_suffix(".d.ts").or_else(|| {
+        ScriptDialect::for_path(path).and_then(|_| path.rsplit_once('.').map(|(stem, _)| stem))
+    });
+    let stem = stem
+        .filter(|stem| !stem.is_empty())
+        .ok_or_else(|| "script module path is invalid".to_owned())?;
+    if stem.len() > QUALIFIED_PATH_LIMIT {
+        return Err("Script qualified path exceeds 1024 bytes".to_owned());
+    }
+    Ok(stem.to_owned())
+}
+
+fn checked_lexical_path(stem: &str, parent: &str, name: &str) -> Result<String, String> {
+    let path = join_path(parent, name);
+    checked_join_path(stem, &path)?;
+    Ok(path)
+}
+
+fn checked_join_path(left: &str, right: &str) -> Result<String, String> {
+    let separator = usize::from(!left.is_empty() && !right.is_empty()) * 2;
+    left.len()
+        .checked_add(separator)
+        .and_then(|length| length.checked_add(right.len()))
+        .filter(|length| *length <= QUALIFIED_PATH_LIMIT)
+        .ok_or_else(|| "Script qualified path exceeds 1024 bytes".to_owned())?;
+    Ok(join_path(left, right))
+}
+
+fn join_path(left: &str, right: &str) -> String {
+    if left.is_empty() {
+        right.to_owned()
+    } else if right.is_empty() {
+        left.to_owned()
+    } else {
+        format!("{left}::{right}")
+    }
+}
+
+fn identity(
+    language: Language,
+    path: &str,
+    kind: &str,
+    scope: &str,
+    line: usize,
+    ordinal: usize,
+) -> String {
+    let language = language.as_str();
+    format!(
+        "script-node:{}#{language}:{}#{path}:{}#{kind}:{}#{scope}:{line}:{ordinal}",
+        language.len(),
+        path.len(),
+        kind.len(),
+        scope.len(),
+    )
+}
+
+fn module_key(stem: &str) -> String {
+    format!("script:module:{stem}")
+}
+
+fn local_value_key(stem: &str, lexical_path: &str) -> String {
+    format!("script:value:{stem}::{lexical_path}")
+}
+
+fn local_type_key(stem: &str, lexical_path: &str) -> String {
+    format!("script:type:{stem}::{lexical_path}")
+}
+
+fn export_value_key(stem: &str, name: &str) -> String {
+    format!("script:export-value:{stem}::{name}")
+}
+
+fn export_type_key(stem: &str, name: &str) -> String {
+    format!("script:export-type:{stem}::{name}")
+}
+
+fn method_key(stem: &str, owner_path: &str, name: &str) -> String {
+    format!("script:method:{stem}::{owner_path}::{name}")
+}
+
+fn node_kind(kind: DefinitionKind) -> NodeKind {
+    match kind {
+        DefinitionKind::Type { .. } => NodeKind::Type,
+        DefinitionKind::Function | DefinitionKind::Method => NodeKind::Function,
+        DefinitionKind::Test => NodeKind::Test,
+    }
+}
+
+fn kind_name(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::File => "file",
+        NodeKind::Type => "type",
+        NodeKind::Function => "function",
+        NodeKind::Test => "test",
+    }
+}
+
+fn to_u32(value: usize) -> Result<u32, String> {
+    u32::try_from(value).map_err(|_| "source line exceeds supported range".to_owned())
 }
 
 fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
@@ -1008,6 +1402,8 @@ impl ParsedFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::{Language as StoredLanguage, Source};
+    use crate::store::{Graph, NodeKind};
 
     #[test]
     fn analyzes_javascript_typescript_and_tsx() {
@@ -1062,6 +1458,82 @@ mod tests {
             .unwrap();
         assert_eq!(tsx.definition_names(), ["Panel"]);
         assert_eq!(tsx.jsx_component_names(), ["View"]);
+
+        for (path, context) in [
+            ("a.js", "javascript"),
+            ("a.jsx", "javascript"),
+            ("a.mjs", "javascript"),
+            ("a.cjs", "javascript"),
+            ("a.ts", "typescript"),
+            ("a.d.ts", "typescript"),
+            ("a.mts", "typescript"),
+            ("a.cts", "typescript"),
+            ("a.tsx", "tsx"),
+        ] {
+            assert_eq!(parse_context(path), Some(context), "{path}");
+        }
+
+        let source = Source {
+            path: "src/service.ts".to_owned(),
+            text: r#"
+                export interface Config { value: string }
+                export class Service {
+                    dispatch(config: Config) { return this.finish(config); }
+                    finish(config: Config) { return run(config); }
+                }
+                export function run(config: Config) { return helper(config); }
+                function helper(config: Config) { return config.value; }
+                export function shadow(run: () => void) { run(); }
+            "#
+            .to_owned(),
+        };
+        let mut graph = Graph::default();
+        add_file(
+            &mut graph,
+            &source,
+            StoredLanguage::TypeScript,
+            &mut ScriptParsers::default(),
+        )
+        .unwrap();
+
+        assert!(has_node(&graph, NodeKind::Type, "Config"));
+        assert!(has_node(&graph, NodeKind::Type, "Service"));
+        assert!(has_node(&graph, NodeKind::Function, "run"));
+        assert!(has_node(&graph, NodeKind::Function, "helper"));
+        assert!(has_node(&graph, NodeKind::Function, "dispatch"));
+        assert!(has_ref(
+            &graph,
+            "dispatch",
+            "script:method:src/service::Service::finish"
+        ));
+        assert!(has_ref(&graph, "run", "script:value:src/service::helper"));
+        assert!(!has_ref(&graph, "shadow", "script:value:src/service::run"));
+        assert!(
+            add_file(
+                &mut Graph::default(),
+                &source,
+                StoredLanguage::JavaScript,
+                &mut ScriptParsers::default(),
+            )
+            .is_err()
+        );
+    }
+
+    fn has_node(graph: &Graph, kind: NodeKind, name: &str) -> bool {
+        graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == kind && node.name == name)
+    }
+
+    fn has_ref(graph: &Graph, source: &str, key: &str) -> bool {
+        graph.refs.iter().any(|reference| {
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.key == reference.source_key && node.name == source)
+                && reference.keys.iter().any(|candidate| candidate == key)
+        })
     }
 
     #[test]

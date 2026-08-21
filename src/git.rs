@@ -50,6 +50,8 @@ pub struct Source {
 pub enum Language {
     Rust,
     Python,
+    JavaScript,
+    TypeScript,
 }
 
 #[derive(
@@ -90,6 +92,8 @@ impl Language {
         match self {
             Self::Rust => "rust",
             Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
         }
     }
 
@@ -97,6 +101,8 @@ impl Language {
         match value {
             "rust" => Some(Self::Rust),
             "python" => Some(Self::Python),
+            "javascript" => Some(Self::JavaScript),
+            "typescript" => Some(Self::TypeScript),
             _ => None,
         }
     }
@@ -3552,6 +3558,16 @@ fn language_for_path(path: &str) -> Option<Language> {
         Some(Language::Rust)
     } else if path.ends_with(".py") {
         Some(Language::Python)
+    } else if [".js", ".jsx", ".mjs", ".cjs"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+    {
+        Some(Language::JavaScript)
+    } else if [".ts", ".tsx", ".mts", ".cts"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+    {
+        Some(Language::TypeScript)
     } else {
         None
     }
