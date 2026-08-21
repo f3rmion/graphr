@@ -73,9 +73,12 @@ Added:
 - Do not write a custom SQLite VFS. SQLite's own cut-down reference VFS is
   ~800 lines of C; a Rust equivalent is several hundred lines of
   `unsafe extern "C"` in the one component being hardened.
-- Do not hook SQLite's `xSetSystemCall` / `aSyscall["open"]` table. It is
-  reachable through `rusqlite::ffi` and would work, but it is process-global
-  mutable state installed to avoid a problem this design removes by other means.
+- Do hook SQLite's `xSetSystemCall` / `aSyscall["open"]` table. This reverses
+  an earlier decision in this document, on review. It was rejected as
+  process-global mutable state installed to avoid a problem solved by other
+  means; that was written before it was clear three existing tests depend on
+  the descriptor-pinning invariant, and that no other mechanism preserves it.
+  Scope and soundness are recorded in section 5.
 - Do not use `AT_SYMLINK_NOFOLLOW_ANY`, `AT_RESOLVE_BENEATH`, or `AT_UNIQUE`.
   macOS-only and absent from `libc 0.2.189`.
 - No change to the on-disk cache layout, the `graphr/v6` namespace, manifest
@@ -220,16 +223,35 @@ With no `/proc` paths in the system, this predicate and its siblings
 (`is_process_descriptor_directory`, `has_process_descriptor_boundary`) become
 dead code and are removed rather than left as no-ops.
 
-### 5. SQLite — the one place a path remains
+### 5. SQLite — pinned through the VFS syscall table
 
 There is no descriptor-based open. `sqlite3_open_v2` takes a filename only; URI
 parameters recognise `vfs`, `cache`, and `mode` and nothing descriptor-shaped;
 no built-in VFS accepts a descriptor; `rusqlite 0.40.1` exposes only
 `AsRef<Path>` variants and has no VFS registration API at all.
 
-`Store::open_reader` and `validate_image` therefore keep taking a real path
-under the pinned, exclusively-created, 0700 cache directory. Three checks that
-are **currently disabled because of `/proc`** become unconditional:
+What the unix VFS does expose is a replaceable syscall table. `src/pinned.rs`
+captures the table's `open` once and installs an override. `pin(path, file)`
+then scopes a diversion to the calling thread and one exact path: while the
+guard is live, a read-only `open` of that path returns `F_DUPFD_CLOEXEC` of the
+validated descriptor and resolves nothing. Every other path, thread, access
+mode, and syscall reaches the captured original unchanged.
+
+Three properties make the duplicate sound:
+
+- SQLite reads with `pread`. `sqlite3.c` defines `HAVE_PREAD` / `HAVE_PWRITE`
+  for `__APPLE__` and `__linux__`, so `seekAndRead` never consults the file
+  offset a duplicate shares with its original.
+- The diversion is restricted to read-only opens, and rejects
+  `O_CREAT`/`O_TRUNC`/`O_EXCL`, so the pinned read-only descriptor always
+  satisfies the access mode SQLite asked for. A writer keeps normal resolution
+  and meets the image's 0444 mode.
+- The duplicate clears `SQLITE_MINIMUM_FILE_DESCRIPTOR`, which SQLite requires
+  of any database descriptor.
+
+`Store::open_reader` and `validate_pinned_image` are therefore reached through
+a pin rather than through a bare path. Three checks that are **currently
+disabled because of `/proc`** become unconditional:
 
 - `O_NOFOLLOW` in `open_regular` (:1459-1462), suppressed today only because
   `/proc/self/fd/N` is a symlink that must be followed.
@@ -238,13 +260,10 @@ are **currently disabled because of `/proc`** become unconditional:
   `/proc/self/fd/5-wal` — a path that can never exist, so the check silently
   enforces nothing.
 
-Post-open identity verification is added: `fstatat` the name before open, and
-compare device and inode against the opened handle afterwards.
-
 ## Security Analysis
 
 Presented as three separable claims, because their strengths differ and a
-single "equivalent security" assertion would hide the one real regression.
+single "equivalent security" assertion would hide where each one comes from.
 
 **Link publication — strictly stronger.** `linkat` with two directory
 descriptors resolves exactly one component from each pinned directory. The
@@ -253,37 +272,38 @@ name. Atomicity and `EEXIST` are POSIX guarantees, not properties of `/proc`.
 
 **Hashing and metadata validation — strictly stronger.** `read_at` and
 `fstat` on the pinned `File` resolve zero path components, against four today.
+Seed copies read the entry's descriptor directly (`copy_descriptor`), and
+catalog enumeration runs on `fdopendir` of an `openat(".")` rather than on a
+rebuilt directory path.
 
-**SQLite open — one genuine regression, bounded and named.** Today a
-`SnapshotEntry` retains a `/proc/self/fd/N` string kept live by a held `File`,
-so every later `open_reader` re-resolves to the exact inode validated at
-snapshot time, even after a rename or unlink-and-recreate. A real path does not
-reproduce that. The residual window is between the pre-open `fstatat` and
-SQLite's own independent `open()`, and it is a final-component rename swap.
-`SQLITE_OPEN_NOFOLLOW` closes the symlink half; it does not close the rename
-half.
+**SQLite open — preserved, by a different mechanism.** Today a `SnapshotEntry`
+retains a `/proc/self/fd/N` string kept live by a held `File`, so every later
+`open_reader` re-resolves to the exact inode validated at snapshot time, even
+after a rename or unlink-and-recreate. The syscall-table pin reproduces that
+property without `/proc`: the diverted open returns a duplicate of the
+validated descriptor, so a final-component rename between validation and open
+cannot redirect the read. This is the invariant
+`seed_copy_uses_validated_graph_after_candidate_replacement`,
+`snapshot_queries_keep_the_validated_graph_after_filename_replacement`, and
+`exact_reuse_does_not_publish_a_replaced_graph_name` assert, and they are
+unchanged by this milestone.
 
-Four mitigations bound the consequence:
+The cost is a process-global override, bounded four ways:
 
-1. The window is same-user only. The cache lives under `.git/graphr/v6/` in a
-   0700 directory reached through a device/inode-verified handle. An attacker
-   who can rename entries there can already write the user's `.git`, at which
-   point the cache is not the interesting target. `/proc/self/fd` was never
-   defending against a same-uid attacker; it was defending against path-prefix
-   races, which this design eliminates entirely elsewhere.
-2. Graph names are content-addressed. A substituted file either has different
-   content and fails the checksum, or is byte-identical and the substitution is
-   inert.
-3. `validate_entry_graph` (:1517) recomputes the checksum and re-runs
-   `validate_published_image` on *every* use, and a failure quarantines rather
-   than proceeds. The worst outcome degrades to a forced rebuild, not a poisoned
-   graph.
-4. Post-open device/inode comparison catches the swap in the overwhelming
-   majority of cases; it is a detection layer, not the primary defence.
+1. One syscall (`open`) on one VFS, installed once, forwarding everything it
+   does not divert.
+2. A diversion requires a live pin, and a pin covers one exact path on one
+   thread. Concurrent readers on other threads are unaffected, which
+   `a_pin_is_confined_to_the_thread_that_took_it` and
+   `concurrent_pinned_readers_each_see_the_pinned_image` assert.
+3. Read-only opens only; a writable open is never diverted
+   (`a_pin_never_diverts_a_writable_open`).
+4. Nesting restores the enclosing pin rather than clearing it
+   (`nested_pins_restore_the_enclosing_pin`).
 
-Net posture improves: one narrow, same-uid, DoS-bounded window is introduced in
-exchange for eliminating path resolution from the link and hash paths and
-enabling three checks that are presently inert.
+Net posture improves on every axis: path resolution leaves the link, hash, and
+enumeration paths, three presently-inert checks become real, and the SQLite
+invariant that `/proc` provided is retained rather than traded away.
 
 Device/inode comparison is used here as an assertion over an already-safe
 resolution, never as the mechanism that makes resolution safe — the same

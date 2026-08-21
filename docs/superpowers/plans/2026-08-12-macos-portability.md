@@ -177,7 +177,7 @@ fn link_at(
 
 ---
 
-### Task 3: Hash and validate through the open descriptor
+### Task 3: Hash and validate through the open descriptor — COMPLETE
 
 **Problem:** `hash_file` (`src/workspace.rs:1479`) takes a `&Path` and reopens it via `open_regular` (`:1420`). Every caller — `:618`, `:829`, `:1038`, `:1529` — already holds the `File` and converts it to a `/proc` path solely to satisfy that signature. `validate_published_image` (`:1501`) branches on `is_process_descriptor_path` at `:1503` to choose `fs::metadata` over `fs::symlink_metadata`, purely because `/proc/self/fd/N` is a symlink on Linux.
 
@@ -209,7 +209,7 @@ fn hash_file(file: &File, cancelled: &AtomicBool) -> Result<String, OperationErr
 
 ---
 
-### Task 4: Enumerate the catalog through `fdopendir`
+### Task 4: Enumerate the catalog through `fdopendir` — COMPLETE
 
 **Problem:** The catalog scan at `src/workspace.rs:517` calls `fs::read_dir(stable_directory_path(directory))`. This is the last `stable_directory_path` consumer that genuinely needs enumeration; `CacheDirectory::child` (`:1113`) already carries a real `path` field.
 
@@ -248,7 +248,7 @@ struct DirStream(*mut libc::DIR);
 
 ---
 
-### Task 5: Delete the `/proc` predicates and enable the three suppressed checks
+### Task 5: Delete the `/proc` predicates and enable the three suppressed checks — COMPLETE (SQLite decision reversed)
 
 **Problem:** With no `/proc` paths remaining, `is_process_descriptor_path` (`src/workspace.rs:1437`), `is_process_descriptor_directory` (`src/store.rs:836`), and `has_process_descriptor_boundary` (`src/store.rs:855`) are dead. Three trust-boundary checks are currently disabled *because* of `/proc` and become unconditional. This is the task that makes `cargo test` pass on macOS.
 
@@ -273,9 +273,36 @@ struct DirStream(*mut libc::DIR);
 
 ---
 
+### Execution note: the SQLite open is pinned, not traded away
+
+Recorded during execution, after review. Task 5 planned to accept one bounded
+regression: with `/proc` gone, `Store::open_reader` would resolve a real path,
+so a final-component rename between validation and open could substitute a
+different inode. Detection would replace prevention — checksum mismatch,
+quarantine, rebuild.
+
+Three existing tests assert prevention, not detection:
+`seed_copy_uses_validated_graph_after_candidate_replacement`,
+`snapshot_queries_keep_the_validated_graph_after_filename_replacement`, and
+`exact_reuse_does_not_publish_a_replaced_graph_name`. Relaxing them was put to
+review and declined, so the invariant is preserved instead:
+
+- `src/pinned.rs` replaces the unix VFS `open` syscall. A live pin diverts a
+  read-only open of one exact path, on one thread, to a duplicate of the
+  validated descriptor. Everything else forwards to the captured original.
+- `copy_descriptor` reads a seed from the entry's descriptor rather than
+  reopening `graph_path`, which is what the seed-copy test exercises.
+- `read_dir_at` and `remove_tree_at` enumerate and unlink through descriptors,
+  so Task 4's guarantee extends to private-job teardown.
+
+The three tests are unchanged. The design's Security Analysis is updated to
+drop the regression claim it no longer describes.
+
+---
+
 ### Task 6: Release 0.6.1 and make macOS a required check
 
-**Problem:** The macOS CI job added in `.github/workflows/ci.yml` is red by design until Task 5 lands. Turning it green is the completion signal for this milestone.
+**Problem:** The macOS CI job added in `.github/workflows/ci.yml` was red by design until Task 5 landed. Turning it green is the completion signal for this milestone.
 
 **Files:**
 - Modify: `Cargo.toml:3`
