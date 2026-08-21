@@ -378,6 +378,23 @@ const CORE: &str = r#"
     export function misuseType() { return Config(); }
     export function shadow(run: () => void) { run(); }
 "#;
+const EDITED_CORE: &str = r#"
+    import type { Config } from "./types.js";
+    function helper(config: Config) { return config.value; }
+    export { helper as exposedHelper };
+    export function run(config: Config) {
+        helper(config);
+        return helper(config);
+    }
+    export class Service {
+        static create() { return new Service(); }
+        dispatch(config: Config) { return this.finish(config); }
+        finish(config: Config) { return run(config); }
+    }
+    export function makeService() { return Service.create(); }
+    export function misuseType() { return Config(); }
+    export function shadow(run: () => void) { run(); }
+"#;
 const BRIDGE: &str = r#"
     export { run as execute } from "./core.js";
     export { default as ForwardedService } from "./services";
@@ -893,6 +910,122 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
         named_edge_count(&incremental.path, "unresolved", "duplicate"),
         0
     );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(root.join("src/core.ts"), EDITED_CORE).unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_support_count(
+            &incremental.path,
+            "src/core.ts",
+            "run",
+            "src/core.ts",
+            "helper",
+            "CALLS",
+        ),
+        2
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(
+            root.join("src/future.ts"),
+            "export function future() { return undefined; }\n",
+        )
+        .unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/future.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        1
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::rename(root.join("src/future.ts"), root.join("src/moved.ts")).unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/moved.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        0
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::rename(root.join("src/moved.ts"), root.join("src/future.ts")).unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/future.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        1
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::remove_file(root.join("src/future.ts")).unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/future.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        0
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(
+            root.join("src/future.ts"),
+            "export function future() { return undefined; }\n",
+        )
+        .unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/future.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        1
+    );
+
+    let mut client = Client::start(&incremental.path);
+    let search = client.search("Service", Some("type"));
+    let search_text = response_text(&search);
+    let node_ref = search_text.split_whitespace().next().unwrap();
+    let view = client.view(node_ref, 2, 30);
+    assert!(view.contains("dispatch"), "{view}");
+    assert!(view.contains("finish"), "{view}");
+    let changes = client.changes(1, 50, None);
+    assert!(changes.contains("future"), "{changes}");
+    assert!(changes.contains("run"), "{changes}");
+    client.close();
 }
 
 #[test]
@@ -4496,6 +4629,16 @@ fn assert_immutable_graphs_match(incremental: &Path, oracle: &Path) {
     assert_eq!(semantic_graph(incremental), semantic_graph(oracle));
 }
 
+fn assert_script_graph_matches_fresh(incremental: &Path, oracle: &Path) {
+    index_repository(incremental);
+    let oracle_cache = oracle.join(".git/graphr");
+    if oracle_cache.exists() {
+        fs::remove_dir_all(&oracle_cache).unwrap();
+    }
+    index_repository(oracle);
+    assert_eq!(semantic_graph(incremental), semantic_graph(oracle));
+}
+
 fn graph_path(path: &Path) -> PathBuf {
     latest_graphs()
         .lock()
@@ -4598,6 +4741,30 @@ fn named_edge_kind_count(
         .unwrap()
         .query_row(
             "SELECT count(*) FROM edges edge
+               JOIN nodes source ON source.id=edge.source_id
+               JOIN files source_file ON source_file.id=source.file_id
+               JOIN nodes target ON target.id=edge.target_id
+               JOIN files target_file ON target_file.id=target.file_id
+              WHERE source_file.path=?1 AND source.name=?2
+                AND target_file.path=?3 AND target.name=?4 AND edge.kind=?5",
+            [source_path, source, target_path, target, kind],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn named_edge_support_count(
+    path: &Path,
+    source_path: &str,
+    source: &str,
+    target_path: &str,
+    target: &str,
+    kind: &str,
+) -> i64 {
+    Connection::open(graph_path(path))
+        .unwrap()
+        .query_row(
+            "SELECT edge.support_count FROM edges edge
                JOIN nodes source ON source.id=edge.source_id
                JOIN files source_file ON source_file.id=source.file_id
                JOIN nodes target ON target.id=edge.target_id

@@ -29,14 +29,13 @@ const FLOW_QUERY_LIMIT: usize = 5_000;
 const TRUNCATED: &str = "[truncated]\n";
 const BUSY_LIMIT: Duration = Duration::from_secs(5);
 const BUSY_POLL: Duration = Duration::from_millis(5);
-// ponytail: stable rowid order stops at the output budget; add BM25 only if
-// measured relevance warrants ranking every match.
+// ponytail: native FTS rank preserves relevance without a temporary sort.
 const SEARCH_SQL: &str = "SELECT n.id, n.kind, n.name, f.path, n.line_start
        FROM nodes_fts
        JOIN nodes n ON n.id=nodes_fts.rowid
        JOIN files f ON f.id=n.file_id
       WHERE nodes_fts MATCH ?1 AND (?2 IS NULL OR n.kind=?2)
-      ORDER BY nodes_fts.rowid
+      ORDER BY rank
       LIMIT ?3";
 const SECURITY_KEYWORDS: [&str; 25] = [
     "auth",
