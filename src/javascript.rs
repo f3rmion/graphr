@@ -1416,6 +1416,7 @@ fn collect_module(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
 fn collect_binding(node: Node<'_>, source: &str, bindings: &mut Vec<LexicalBinding>) {
     let target = match node.kind() {
         "formal_parameters" => node,
+        "arrow_function" => node.child_by_field_name("parameter").unwrap_or(node),
         "variable_declarator" => node.child_by_field_name("name").unwrap_or(node),
         "catch_clause" => node.child_by_field_name("parameter").unwrap_or(node),
         _ => return,
@@ -1434,6 +1435,10 @@ fn collect_binding(node: Node<'_>, source: &str, bindings: &mut Vec<LexicalBindi
 fn lexical_scope(node: Node<'_>, source: &str) -> ByteRange {
     match node.kind() {
         "formal_parameters" => function_scope(node, source),
+        "arrow_function" => node
+            .child_by_field_name("body")
+            .map(range)
+            .unwrap_or_else(|| range(node)),
         "variable_declarator" if is_var(node) => function_scope(node, source),
         "variable_declarator" => block_scope(node, source),
         "catch_clause" => node
@@ -1460,7 +1465,7 @@ fn collect_import(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
         push_import_binding(
             local,
             ImportedName::CommonJsModule,
-            false,
+            statement_type_only,
             source,
             &mut bindings,
             &mut binding_bytes,
@@ -2413,6 +2418,27 @@ mod tests {
         );
         assert_eq!(guarded.export_names(), ["named", "renamed"]);
 
+        let arrow_shadow = parsers
+            .parse(
+                "src/arrow-shadow.cjs",
+                r#"
+                    require("./outer");
+                    exports.outerExports = value;
+                    module.exports.outerModule = value;
+                    const shadowRequire = require => require("./inner");
+                    const shadowModule = module => module.exports.innerModule = value;
+                    const shadowExports = exports => exports.innerExports = value;
+                    const value = () => {};
+                    module.exports = { value };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(arrow_shadow.relative_modules(), ["./outer"]);
+        assert_eq!(
+            arrow_shadow.export_names(),
+            ["outerExports", "outerModule", "value"]
+        );
+
         let mut graph = Graph::default();
         add_file(
             &mut graph,
@@ -2420,7 +2446,9 @@ mod tests {
                 path: "src/common.cjs".to_owned(),
                 text: r#"
                     const { run: execute } = require("./core");
+                    const core = require("./core");
                     const invoke = () => execute();
+                    const invokeDefault = () => core();
                     module.exports = { invoke };
                     exports.direct = execute;
                 "#
@@ -2434,6 +2462,11 @@ mod tests {
             &graph,
             "invoke",
             "script:export-value:src/core::run"
+        ));
+        assert!(has_ref(
+            &graph,
+            "invokeDefault",
+            "script:export-value:src/core::default"
         ));
         assert!(graph.nodes.iter().any(|node| {
             node.name == "invoke"
@@ -2474,6 +2507,32 @@ mod tests {
                     .iter()
                     .any(|key| key == "script:export-value:src/consumer::default")
         }));
+
+        add_file(
+            &mut graph,
+            &Source {
+                path: "src/type-only.cts".to_owned(),
+                text: r#"
+                    import type core = require("./common.cjs");
+                    const callCore = () => core();
+                    const callMember = () => core.invoke();
+                "#
+                .to_owned(),
+            },
+            StoredLanguage::TypeScript,
+            &mut ScriptParsers::default(),
+        )
+        .unwrap();
+        assert!(!has_ref(
+            &graph,
+            "callCore",
+            "script:export-value:src/common::default"
+        ));
+        assert!(!has_ref(
+            &graph,
+            "callMember",
+            "script:export-value:src/common::invoke"
+        ));
 
         let typescript = parsers
             .parse(

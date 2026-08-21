@@ -25,3 +25,6 @@
   (variable_declarator)
   (catch_clause)
 ] @binding
+
+(arrow_function
+  parameter: (identifier)) @binding
