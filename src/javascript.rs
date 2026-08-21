@@ -315,7 +315,7 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
                 },
                 field_text(node, "name", source)
                     .map(str::to_owned)
-                    .or_else(|| default_export(node, source).then(|| "default".to_owned()))?,
+                    .or_else(|| default_export(node).then(|| "default".to_owned()))?,
                 definition_start(node),
             ),
             "interface_declaration" | "type_alias_declaration" => (
@@ -336,7 +336,7 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
                 DefinitionKind::Function,
                 field_text(node, "name", source)
                     .map(str::to_owned)
-                    .or_else(|| default_export(node, source).then(|| "default".to_owned()))?,
+                    .or_else(|| default_export(node).then(|| "default".to_owned()))?,
                 definition_start(node),
             ),
             "method_definition" | "method_signature" | "abstract_method_signature" => (
@@ -353,8 +353,9 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
     let body = node.child_by_field_name("body");
     let signature_end = body.map_or(node.end_byte(), |body| body.start_byte());
     let body = body.unwrap_or(node);
+    let binding = definition_binding(node, &kind, &name, source);
     Some(Definition {
-        binding: (!matches!(kind, DefinitionKind::Test)).then(|| definition_scope(node, source)),
+        binding,
         kind,
         name,
         parent: None,
@@ -385,7 +386,7 @@ fn stable_initializer(node: Node<'_>, source: &str) -> Option<(DefinitionKind, S
         return Some((
             definition_kind(node),
             field_text(parent, "name", source)?.to_owned(),
-            definition_start(parent),
+            declaration_start(parent),
         ));
     }
     if matches!(
@@ -417,7 +418,7 @@ fn stable_initializer(node: Node<'_>, source: &str) -> Option<(DefinitionKind, S
             definition_start(parent),
         ));
     }
-    if default_export(node, source) {
+    if default_export(node) {
         return Some((
             definition_kind(node),
             "default".to_owned(),
@@ -462,10 +463,51 @@ fn definition_start(node: Node<'_>) -> usize {
     start
 }
 
-fn default_export(node: Node<'_>, source: &str) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "export_statement" && text(parent, source).starts_with("export default")
-    })
+fn declaration_start(node: Node<'_>) -> usize {
+    let declaration = node.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "lexical_declaration" | "variable_declaration"
+        )
+    });
+    definition_start(declaration.unwrap_or(node))
+}
+
+fn default_export(node: Node<'_>) -> bool {
+    export_statement(node).is_some_and(has_default_token)
+}
+
+fn export_statement(node: Node<'_>) -> Option<Node<'_>> {
+    node.parent()
+        .filter(|parent| parent.kind() == "export_statement")
+}
+
+fn has_default_token(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| child.kind() == "default")
+}
+
+fn definition_binding(
+    node: Node<'_>,
+    kind: &DefinitionKind,
+    name: &str,
+    source: &str,
+) -> Option<ByteRange> {
+    if name == "default" || matches!(kind, DefinitionKind::Method | DefinitionKind::Test) {
+        return None;
+    }
+    matches!(
+        node.kind(),
+        "class_declaration"
+            | "abstract_class_declaration"
+            | "function_declaration"
+            | "generator_function_declaration"
+            | "enum_declaration"
+            | "internal_module"
+            | "module"
+    )
+    .then(|| definition_scope(node, source))
 }
 
 fn collect_module(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
@@ -572,8 +614,7 @@ fn collect_import_bindings(node: Node<'_>, source: &str, bindings: &mut Vec<Lexi
 }
 
 fn collect_exports(node: Node<'_>, source: &str, exports: &mut Vec<String>) {
-    let raw = text(node, source);
-    if raw.starts_with("export default") {
+    if has_default_token(node) {
         add_export(exports, "default");
         return;
     }
@@ -780,7 +821,7 @@ fn test_name(node: Node<'_>, path: &str, source: &str) -> Option<String> {
 }
 
 fn is_test_path(path: &str) -> bool {
-    path.contains("/__tests__/")
+    path.split('/').any(|component| component == "__tests__")
         || [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"]
             .iter()
             .any(|extension| {
@@ -1058,10 +1099,74 @@ const panel = <View />;
         }
     }
 
+    #[test]
+    fn keeps_declaration_coverage_structural_defaults_and_runtime_bindings() {
+        let source = r#"
+export /* legal comment */ default
+function () {}
+export const helper = () => {};
+function run() { run(); }
+class Service { method() {} }
+enum State { Ready }
+namespace API {}
+interface Config {}
+type Alias = string;
+assigned = () => {};
+"#;
+        let parsed = ScriptParsers::default()
+            .parse("src/contracts.ts", source)
+            .unwrap();
+
+        assert_eq!(parsed.export_names(), ["default", "helper"]);
+        let helper = parsed
+            .definitions
+            .iter()
+            .find(|definition| definition.name == "helper")
+            .unwrap();
+        assert!(helper.signature.starts_with("export const helper"));
+        assert!(source[helper.range.start..].starts_with("export const helper"));
+        assert_runtime_binding(&parsed, "run");
+        assert_runtime_binding(&parsed, "Service");
+        assert_runtime_binding(&parsed, "State");
+        assert_runtime_binding(&parsed, "API");
+        assert_eq!(binding_count(&parsed, "helper"), 1);
+        assert_eq!(binding_count(&parsed, "assigned"), 0);
+        assert_eq!(binding_count(&parsed, "method"), 0);
+        assert_eq!(binding_count(&parsed, "Config"), 0);
+        assert_eq!(binding_count(&parsed, "Alias"), 0);
+
+        assert_eq!(
+            ScriptParsers::default()
+                .parse("__tests__/root.ts", "test('root', () => {});")
+                .unwrap()
+                .test_names(),
+            ["root"]
+        );
+        assert!(
+            ScriptParsers::default()
+                .parse("src/not__tests__/root.ts", "test('root', () => {});")
+                .unwrap()
+                .test_names()
+                .is_empty()
+        );
+    }
+
     fn binding_contains(parsed: &ParsedFile, source: &str, name: &str, text: &str) -> bool {
         let offset = source.find(text).unwrap();
         parsed.bindings.iter().any(|binding| {
             binding.name == name && binding.range.start <= offset && offset < binding.range.end
         })
+    }
+
+    fn binding_count(parsed: &ParsedFile, name: &str) -> usize {
+        parsed
+            .bindings
+            .iter()
+            .filter(|binding| binding.name == name)
+            .count()
+    }
+
+    fn assert_runtime_binding(parsed: &ParsedFile, name: &str) {
+        assert!(binding_count(parsed, name) >= 2, "{name}");
     }
 }
