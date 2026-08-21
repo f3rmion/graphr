@@ -19,5 +19,7 @@ rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["macros", "rt", "sync"] }
 tree-sitter = "0.26.11"
+tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
