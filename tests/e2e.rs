@@ -4239,7 +4239,7 @@ fn linked_worktrees(label: &str) -> LinkedWorktrees {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
+    let root = temp_root().join(format!(
         "graphr-e2e-linked-{label}-{}-{unique}",
         std::process::id()
     ));
@@ -4771,10 +4771,18 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("graphr-e2e-{}-{unique}", std::process::id()));
+        let path = temp_root().join(format!("graphr-e2e-{}-{unique}", std::process::id()));
         fs::create_dir(&path).unwrap();
         Self { path }
     }
+}
+
+/// macOS resolves `TMPDIR` under `/var`, a symlink to `/private/var`, and the
+/// server reports canonical roots. Canonicalising here keeps a fixture root
+/// comparable with what the server answers.
+fn temp_root() -> PathBuf {
+    let base = std::env::temp_dir();
+    fs::canonicalize(&base).unwrap_or(base)
 }
 
 impl Drop for Fixture {
