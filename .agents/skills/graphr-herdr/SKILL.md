@@ -9,7 +9,7 @@ description: Use when the user explicitly asks to coordinate Graphr-assisted imp
 
 ## Core contract
 
-Coordinate in the primary checkout. One worker alone writes its linked worktree; Herdr owns topology/lifecycle and Graphr immutable analysis/review. Never edit worker files, integrate, push, delete, close, or clean up without new explicit human approval.
+Coordinate in the primary checkout. One worker alone writes its linked worktree; Herdr owns topology/lifecycle and Graphr immutable analysis/review. Never edit worker files. Without a new explicit human request, never integrate or merge, rebase, push, open a pull request, delete a branch, remove a worktree, close or clean resources, or stop Herdr.
 
 ## Preflight
 
@@ -30,7 +30,7 @@ herdr pane current --current
 herdr agent get "$HERDR_PANE_ID"
 ```
 
-Require equal Git dirs, named branch, empty status, caller identity, both skills, and `inspect_root` canonical root equal to `repo_root`. Any failure stops before creation; report it—never stash, commit, widen `--allow-root`, or choose another root.
+Require equal Git dirs, named branch, empty status, caller identity, both skills, and `inspect_root` canonical root equal to `repo_root`. Require `herdr pane current --current` workspace/tab/pane IDs equal to `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, and `HERDR_PANE_ID`, and `herdr agent get` to bind that pane to the invoking coordinator. Any failure or mismatch stops before creation; report it—never stash, commit, widen `--allow-root`, or choose another root.
 
 ## Choose work
 
