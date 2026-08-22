@@ -186,6 +186,12 @@ impl Store {
             return Err("database directory is not a regular directory".into());
         }
 
+        // `SQLITE_OPEN_NOFOLLOW` rejects a symlinked *ancestor*, not just a
+        // symlinked final component, and every database here is reached
+        // through the cache. Sending it unconditionally is therefore safe only
+        // because `workspace::cache_paths` refuses a `common_git_dir` that is
+        // not already its own canonicalisation. Relax that clause and every
+        // open below starts failing on any symlinked path.
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
