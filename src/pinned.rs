@@ -21,7 +21,7 @@
 //! to read-only opens, so the pinned read-only descriptor always satisfies the
 //! access mode SQLite asked for.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, c_char, c_int};
 use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
@@ -39,6 +39,10 @@ struct Pinned {
     token: Rc<()>,
     path: Box<[u8]>,
     file: File,
+    /// Set when the override answers an open for `path`. A pin that SQLite
+    /// never asked for means the open resolved a name instead, which is the
+    /// defect this module exists to remove.
+    used: Cell<bool>,
 }
 
 thread_local! {
@@ -71,6 +75,36 @@ impl Drop for Pin {
     }
 }
 
+impl Pin {
+    /// Fails unless the override actually answered an open for the pinned path.
+    ///
+    /// SQLite normalises a filename through `unixFullPathname` before the VFS
+    /// sees it — `.` and `..` are collapsed and symlinks resolved — so a path
+    /// shape that does not survive that round trip would miss the pin, fall
+    /// through to the captured original, and resolve by name. That is the
+    /// pre-`0.6.1` behaviour, and it is silent: the caller still receives a
+    /// working database. Callers must ask, so the failure is loud instead.
+    pub(crate) fn require_used(&self) -> Result<(), String> {
+        let used = PINNED
+            .try_with(|pins| {
+                let pins = pins.try_borrow().ok()?;
+                pins.iter()
+                    .rfind(|pinned| Rc::ptr_eq(&pinned.token, &self.token))
+                    .map(|pinned| (pinned.used.get(), pinned.path.clone()))
+            })
+            .ok()
+            .flatten();
+        match used {
+            Some((true, _)) => Ok(()),
+            Some((false, path)) => Err(format!(
+                "SQLite resolved {} by name instead of the pinned descriptor",
+                String::from_utf8_lossy(&path)
+            )),
+            None => Err("pinned descriptor was released before its open".to_owned()),
+        }
+    }
+}
+
 /// Diverts SQLite's `open` of `path` to `file` for the duration of the returned
 /// guard, on this thread only.
 pub(crate) fn pin(path: &Path, file: &File) -> Result<Pin, String> {
@@ -82,6 +116,7 @@ pub(crate) fn pin(path: &Path, file: &File) -> Result<Pin, String> {
         file: file
             .try_clone()
             .map_err(|error| format!("cannot duplicate pinned descriptor: {error}"))?,
+        used: Cell::new(false),
     };
     PINNED.with(|pins| pins.borrow_mut().push(pinned));
     Ok(Pin { token })
@@ -121,7 +156,10 @@ fn diverted_descriptor(path: *const c_char, flags: c_int) -> Option<RawFd> {
         .try_with(|pins| {
             let pins = pins.try_borrow().ok()?;
             let pinned = pins.last()?;
-            (requested == pinned.path.as_ref()).then(|| pinned.file.as_raw_fd())
+            (requested == pinned.path.as_ref()).then(|| {
+                pinned.used.set(true);
+                pinned.file.as_raw_fd()
+            })
         })
         .ok()
         .flatten()
@@ -218,6 +256,43 @@ mod tests {
 
         assert_eq!(marker(&other_path), "other");
         assert_eq!(marker(&pinned_path), "validated");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_pin_that_answered_an_open_reports_that_it_was_used() {
+        let directory = temporary_directory("used");
+        let pinned_path = directory.join("pinned.db");
+        let file = write_marked_database(&pinned_path, "validated");
+
+        let pin = pin(&pinned_path, &file).unwrap();
+        assert_eq!(marker(&pinned_path), "validated");
+
+        pin.require_used().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A pin SQLite never asks for is the silent failure this module exists to
+    /// remove: the caller still gets a working database, opened by name. The
+    /// path here differs only in a `.` component, which `unixFullPathname`
+    /// collapses before the VFS sees it — the same shape a future caller could
+    /// reach by accident.
+    #[test]
+    fn a_pin_sqlite_never_asked_for_is_an_error() {
+        let directory = temporary_directory("unused");
+        let pinned_path = directory.join("pinned.db");
+        let file = write_marked_database(&pinned_path, "validated");
+        let uncollapsed = directory.join(".").join("pinned.db");
+
+        let pin = pin(&uncollapsed, &file).unwrap();
+        let observed = marker(&pinned_path);
+        let error = pin.require_used().unwrap_err();
+
+        assert_eq!(observed, "validated");
+        assert!(
+            error.contains("by name instead of the pinned descriptor"),
+            "{error}"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

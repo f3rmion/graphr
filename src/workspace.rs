@@ -274,8 +274,10 @@ impl SnapshotEntry {
     /// time: renaming `graph_path` afterwards cannot redirect the read to
     /// another inode.
     pub(crate) fn open_graph(&self) -> std::result::Result<store::Store, String> {
-        let _pin = crate::pinned::pin(&self.graph_path, &self.graph_file)?;
-        store::Store::open_reader(&self.graph_path)
+        let pin = crate::pinned::pin(&self.graph_path, &self.graph_file)?;
+        let store = store::Store::open_reader(&self.graph_path)?;
+        pin.require_used()?;
+        Ok(store)
     }
 }
 
@@ -1717,8 +1719,10 @@ fn validate_pinned_image(file: &File, path: &Path) -> Result<crate::store::State
     if !metadata.is_file() || metadata.permissions().mode() & 0o222 != 0 {
         return Err(cache_corrupt("published graph image is not read-only"));
     }
-    let _pin = crate::pinned::pin(path, file).map_err(cache_corrupt)?;
-    store::validate_image(path).map_err(cache_corrupt)
+    let pin = crate::pinned::pin(path, file).map_err(cache_corrupt)?;
+    let state = store::validate_image(path).map_err(cache_corrupt)?;
+    pin.require_used().map_err(cache_corrupt)?;
+    Ok(state)
 }
 
 fn same_file(left: &File, right: &File) -> Result<bool, OperationError> {
