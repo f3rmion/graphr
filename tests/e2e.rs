@@ -515,7 +515,7 @@ fn evidence_pagination_is_independent_bounded_and_exhaustive() {
     let report_bytes = rmcp::serde_json::to_vec(&report).unwrap();
     fs::write(fixture.path.join("coverage.json"), &report_bytes).unwrap();
     let run_label = "é".repeat(90);
-    let missing_test = "missing_test_".repeat(15);
+    let missing_test = format!("{}\"test\\name", "missing_test_".repeat(12));
     fs::write(
         fixture.path.join("evidence.json"),
         rmcp::serde_json::to_vec(&rmcp::serde_json::json!({
@@ -604,6 +604,21 @@ fn evidence_pagination_is_independent_bounded_and_exhaustive() {
     );
     let evidence = change_section_text(&changes, "evidence");
     assert!(evidence.contains(&run_label), "{evidence}");
+    assert!(
+        evidence.lines().any(|line| {
+            line.starts_with("claim kind=changed-execution")
+                && line.contains("status=partial result=unknown")
+                && line.contains(&format!(" test={missing_test:?}"))
+        }),
+        "{evidence}"
+    );
+    assert!(
+        evidence.lines().any(|line| {
+            line.starts_with("gap category=coverage reason=missing-test-context")
+                && line.contains(&format!(" target={missing_test:?}"))
+        }),
+        "{evidence}"
+    );
     assert_eq!(
         evidence
             .lines()

@@ -210,3 +210,64 @@ exit 0; six expected modified tracked files:
 ```
 
 The report is force-added because `.superpowers/sdd` reports are intentionally ignored. A post-commit `git status --short` is also recorded in the handoff to prove the tracked worktree is clean.
+
+## Post-Task-6 final-review correction
+
+The final reviewer identified two remaining public-evidence defects at clean HEAD `67914e781ed48222f06e78a5237e1c0071bacf45`.
+
+### Additive owner/range gap relevance
+
+Root cause: `CoverageScope::gap_relevant` short-circuited on any non-null `source_id`. A generated node outside `scope.nodes` therefore returned false even when changing a declared input had expanded the exact provenance scope to an overlapping output range.
+
+Mutation caught: restoring owner precedence instead of owner OR range relevance.
+
+```text
+cargo test store::tests::provenance_expanded_range_keeps_an_owned_gap_relevant -- --exact --nocapture
+RED: exit 101; 0 passed, 1 failed, 288 filtered. The output contained the complete schema.proto -> target/out.rs:1-5 provenance chain but omitted its owned line-3 generated gap.
+GREEN: exit 0; 1 passed, 0 failed, 288 filtered.
+```
+
+Minimal change: preserve the explicit whole-file fast path, then accept either an exact scoped owner or an overlapping scoped range. No owner is inserted merely to make rendering pass.
+
+### Coverage mapping-gap identity
+
+Root cause: the coverage-gap query sorted by `gap.target_hint` but did not select it. Consequently the renderer could not distinguish unresolved contexts or echo a manifest test name on either the synthetic partial claim or its gap record.
+
+Mutations caught: removing `target_hint` from the SELECT/tuple, omitting `test=` from the partial mapping claim, omitting `target=` from the gap, or failing to escape quotes/backslashes through bounded pagination.
+
+```text
+cargo test store::tests::coverage_gap_rendering_preserves_distinct_escaped_test_contexts -- --exact --nocapture
+RED: exit 101; 0 passed, 1 failed, 288 filtered. test_a and test_\"b produced indistinguishable partial claims and gaps.
+GREEN: exit 0; 1 passed, 0 failed, 288 filtered.
+
+cargo test --test e2e evidence_pagination_is_independent_bounded_and_exhaustive -- --exact --nocapture
+RED: exit 101; 0 passed, 1 failed, 47 filtered. The paginated LLVM missing-test claim/gap omitted the escaped manifest test identity.
+GREEN: exit 0; 1 passed, 0 failed, 47 filtered.
+
+cargo test store::tests::coverage_mapping_renders_relevant_pathless_manifest_test_gap_reasons -- --exact --nocapture
+GREEN contract update: exit 0; 1 passed, 0 failed, 288 filtered.
+```
+
+Minimal change: select the already validated stored hint, render it with Rust's escaped debug form as `test=` only for missing/ambiguous test-context partial claims, and render it as `target=` on the corresponding coverage gap. Aggregate run-level observations remain run-level and are not relabeled as verified named-test evidence.
+
+Affected files: `src/store.rs`, `tests/e2e.rs`, this report, and the progress ledger. Storage meaning and cache identity are unchanged; no schema bump, migration, dependency, compatibility path, or design-spec amendment is required.
+
+### Follow-up serial gate
+
+```text
+cargo fmt --check
+exit 0; no output
+cargo clippy --all-targets -- -D warnings
+exit 0; Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.41s
+cargo test
+exit 0; unit: 289 passed, 0 failed; CLI: 5 passed, 0 failed; E2E: 48 passed, 0 failed (342 passed total)
+cargo build --locked --release
+exit 0; Finished `release` profile [optimized] target(s) in 11.67s
+git diff --check
+exit 0; no output
+git status --short
+exit 0; three expected modified tracked files:
+ M .superpowers/sdd/2026-08-22-dynamic-evidence-graph/task-6-report.md
+ M src/store.rs
+ M tests/e2e.rs
+```

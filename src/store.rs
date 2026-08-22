@@ -3449,13 +3449,11 @@ impl CoverageScope {
         if path.is_some_and(|path| self.whole_file(path)) {
             return true;
         }
-        if let Some(source_id) = source_id {
-            return self.nodes.contains(&source_id);
-        }
-        path.is_some_and(|path| match start {
-            Some(start) => self.relevant(path, start, end.unwrap_or(start)),
-            None => false,
-        })
+        source_id.is_some_and(|source_id| self.nodes.contains(&source_id))
+            || path.is_some_and(|path| match start {
+                Some(start) => self.relevant(path, start, end.unwrap_or(start)),
+                None => false,
+            })
     }
 
     fn relevant(&self, path: &str, start: u32, end: u32) -> bool {
@@ -4077,8 +4075,8 @@ fn render_coverage_observations(
     let mut gaps = connection
         .prepare(
             "SELECT run.run_label, run.format, gap.reason, gap.path,
-                    gap.line_start, gap.line_end, gap.occurrences
-                    , run.id
+                    gap.line_start, gap.line_end, gap.occurrences,
+                    gap.target_hint, run.id
                FROM graph_gaps gap JOIN coverage_runs run ON run.id=gap.run_id
               WHERE gap.category='coverage'
               ORDER BY run.run_label, gap.path, gap.line_start, gap.line_end,
@@ -4095,12 +4093,14 @@ fn render_coverage_observations(
                 row.get::<_, Option<u32>>(4)?,
                 row.get::<_, Option<u32>>(5)?,
                 row.get::<_, u32>(6)?,
-                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })
         .map_err(db_error)?;
     for row in rows {
-        let (run, format, reason, path, start, end, occurrences, run_id) = row.map_err(db_error)?;
+        let (run, format, reason, path, start, end, occurrences, target, run_id) =
+            row.map_err(db_error)?;
         if let Some(scope) = scope {
             let relevant = match path.as_deref() {
                 Some(path) => scope.relevant(path, start.unwrap_or(1), end.unwrap_or(u32::MAX)),
@@ -4127,9 +4127,17 @@ fn render_coverage_observations(
             ));
         }
         text.push_str(&format!(
-            " status=partial result=unknown basis={} run={run:?}\n",
+            " status=partial result=unknown basis={} run={run:?}",
             coverage_basis(&format)?
         ));
+        if matches!(
+            reason.as_str(),
+            "missing-test-context" | "ambiguous-test-context"
+        ) && let Some(test) = &target
+        {
+            text.push_str(&format!(" test={test:?}"));
+        }
+        text.push('\n');
         text.push_str(&format!(
             "gap category=coverage reason={reason} run={run:?}"
         ));
@@ -4141,6 +4149,9 @@ fn render_coverage_observations(
                 " line={}",
                 line_range(start, end.unwrap_or(start))
             ));
+        }
+        if let Some(target) = target {
+            text.push_str(&format!(" target={target:?}"));
         }
         text.push_str(&format!(" occurrences={occurrences}\n"));
     }
@@ -9079,6 +9090,68 @@ mod tests {
     }
 
     #[test]
+    fn coverage_gap_rendering_preserves_distinct_escaped_test_contexts() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((single_node_graph("changed"), ()))
+            })
+            .unwrap();
+        let contexts = ["test_a", "test_\"b"];
+        let evidence = EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                imported("report", "coverage.json", ArtifactRole::CoverageReport, 2),
+            ],
+            runs: vec![CoverageRunInput {
+                key: "run".into(),
+                format: CoverageFormat::CoveragePy,
+                report_key: "report".into(),
+                run_label: "python".into(),
+                test_name: None,
+            }],
+            regions: contexts
+                .iter()
+                .map(|context| coverage_region("run", "src/lib.rs", 1, 1, 1, Some(context)))
+                .collect(),
+            ..EvidenceInput::default()
+        };
+        store
+            .replace_evidence(Graph::default(), &evidence, &cancelled)
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                1,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        for context in contexts {
+            assert!(
+                review.evidence.contains(&format!(
+                    "claim kind=changed-execution path=\"src/lib.rs\" lines=1 status=partial result=unknown basis=coverage-py-json run=\"python\" test={context:?}"
+                )),
+                "{}",
+                review.evidence
+            );
+            assert!(
+                review.evidence.contains(&format!(
+                    "gap category=coverage reason=missing-test-context run=\"python\" path=\"src/lib.rs\" line=1 target={context:?} occurrences=1"
+                )),
+                "{}",
+                review.evidence
+            );
+        }
+    }
+
+    #[test]
     fn coverage_mapping_duplicate_format_run_and_report_digest_rolls_back() {
         let cancelled = AtomicBool::new(false);
         let mut store = Store {
@@ -9298,7 +9371,14 @@ mod tests {
                 .unwrap();
             assert!(
                 review.evidence.contains(&format!(
-                    "gap category=coverage reason={reason} run=\"run\" occurrences=1"
+                    "claim kind=changed-execution status=partial result=unknown basis=llvm-coverage-json run=\"run\" test={test_name:?}"
+                )),
+                "{}",
+                review.evidence
+            );
+            assert!(
+                review.evidence.contains(&format!(
+                    "gap category=coverage reason={reason} run=\"run\" target={test_name:?} occurrences=1"
                 )),
                 "{}",
                 review.evidence
@@ -10338,6 +10418,79 @@ mod tests {
         assert!(
             review.evidence.contains(
                 "claim kind=changed-execution path=\"target/out.rs\" lines=1 status=complete result=observed basis=llvm-coverage-json run=\"generated-run\""
+            ),
+            "{}",
+            review.evidence
+        );
+    }
+
+    #[test]
+    fn provenance_expanded_range_keeps_an_owned_gap_relevant() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = provenance_source_store(None);
+        let mut evidence = provenance_evidence();
+        evidence.provenance[0].output_lines = EvidenceLineSpan { start: 1, end: 5 };
+        let mut generated = generated_output_graph();
+        generated.nodes.push(NodeInput {
+            key: "generated".into(),
+            file_key: "target/out.rs".into(),
+            kind: NodeKind::Function,
+            name: "generated".into(),
+            qualified_name: "generated".into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: 3,
+            line_end: 3,
+            signature: String::new(),
+            keys: Vec::new(),
+        });
+        generated.gaps.push(GapInput {
+            file_key: Some("target/out.rs".into()),
+            source_key: Some("generated".into()),
+            run_key: None,
+            path: Some("target/out.rs".into()),
+            line_start: Some(3),
+            line_end: Some(3),
+            category: GapCategory::Generated,
+            reason: GapReason::GeneratedOutputUnobserved,
+            target_hint: Some("nested.rs".into()),
+            occurrences: 1,
+            relation_site: false,
+        });
+        store
+            .replace_evidence(generated, &evidence, &cancelled)
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &WorktreeChanges {
+                    files: Vec::new(),
+                    records: Vec::new(),
+                    paths: vec![crate::git::ChangedPath {
+                        status: crate::git::ChangeStatus::Modified,
+                        old_path: None,
+                        old_language: None,
+                        path: "schema.proto".into(),
+                        language: None,
+                        additions: Some(1),
+                        deletions: Some(1),
+                        layers: vec![crate::git::ChangeLayer::Unstaged],
+                    }],
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+
+        assert!(
+            review.evidence.contains(
+                "gap category=generated reason=generated-output-unobserved path=\"target/out.rs\" line=3 target=\"nested.rs\" occurrences=1"
             ),
             "{}",
             review.evidence
