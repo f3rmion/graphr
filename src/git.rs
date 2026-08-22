@@ -554,10 +554,6 @@ impl ArtifactReview {
             .iter()
             .all(|file| file.diff_complete && file.analysis_complete)
     }
-
-    pub fn analysis_complete(&self) -> bool {
-        self.files.iter().all(|file| file.analysis_complete)
-    }
 }
 
 pub fn change_content_complete(

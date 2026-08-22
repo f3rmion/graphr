@@ -78,10 +78,11 @@ Call `changes` once without a cursor. Every continuation is a standalone
 `name=value` line: split on the first `=`, pass the complete remaining value
 verbatim with the same snapshot, depth, and max-nodes, and continue until all
 `files_next_cursor`, `diff_next_cursor`, `artifacts_next_cursor`, and
-`graph_next_cursor` values are exhausted. `max_nodes` changes graph page size,
-not snapshot coverage. `analysis_complete` is analyzer-local;
-`review_complete_when_pages_exhausted=true` is the terminal completeness
-predicate after every cursor and named graph remediation is exhausted.
+`graph_next_cursor` and `evidence_next_cursor` values are exhausted. `max_nodes`
+changes graph page size, not snapshot coverage. Every initial and continuation
+page repeats three independent terminal facts:
+`content_complete_when_pages_exhausted`, `static_evidence_status`, and
+`dynamic_evidence_status`.
 
 `inspect_root` may also receive a `snapshot_id`. If it reports
 `snapshot_matches_worktree=false`, the old snapshot and its cursors remain
@@ -120,6 +121,78 @@ analysis but keep distinct workspace and snapshot identities. Published
 snapshots are immutable. Graphr 0.6.0 performs no automatic cache garbage
 collection.
 
+## External execution evidence
+
+First run `index` without evidence and retain its source-only `snapshot_id`.
+Run generators, tests, and coverage tools outside Graphr, write their outputs
+under the authorized worktree, then create a manifest bound to that source
+snapshot. Finally run the same `index` selection with
+`"evidence_manifest":"evidence.json"`. Graphr validates and imports the files
+into a new immutable evidence-bearing snapshot; it never executes a producer.
+
+The closed v1 manifest is:
+
+```json
+{
+  "format_version": 1,
+  "source_snapshot_id": "<64 lowercase hex>",
+  "generated": [
+    {
+      "input": {
+        "path": "proto/message.proto",
+        "blake3": "<64 lowercase hex>",
+        "line_start": 18,
+        "line_end": 18
+      },
+      "generator": {
+        "path": "src/generator.rs",
+        "line_start": 70,
+        "line_end": 78
+      },
+      "output": {
+        "path": "target/debug/build/example/out/message.rs",
+        "blake3": "<64 lowercase hex>",
+        "line_start": 42,
+        "line_end": 67
+      }
+    }
+  ],
+  "coverage": [
+    {
+      "format": "llvm",
+      "path": "target/graphr/strict-roundtrip.json",
+      "blake3": "<64 lowercase hex>",
+      "run_label": "strict-roundtrip",
+      "test_name": "strict_roundtrip"
+    }
+  ]
+}
+```
+
+V1 accepts LLVM coverage-export JSON major versions 2 and 3 (`format: "llvm"`)
+and Coverage.py JSON with `meta.format=3` (`format: "coverage_py"`). The fixed
+bounds are 64 KiB for the manifest, 2 MiB per input or generated artifact,
+64 MiB per coverage report, 64 generated mappings, eight coverage reports,
+128 MiB of unique evidence bytes total, and 200 line-safe bytes per `run_label`
+or `test_name`; paths retain the existing repository-path bound.
+
+Generated Rust enters the static graph only when its verified output has one
+unique lexical `include!(concat!(env!("OUT_DIR"), "/file.rs"))` site. The
+manifest is a producer attestation: Graphr verifies its source snapshot, paths,
+spans, digests, generated syntax, and coverage contents, but not that a declared
+process caused an output.
+
+An `observed` result means a positive count in one declared run;
+`not-observed` means a mapped executable region had zero count in that run;
+`unknown` means the imported evidence cannot answer. Static heuristic test
+paths use `basis=resolved-static-call-graph`; they are possible source paths,
+not execution observations. Manifest provenance uses
+`basis=verified-generated-manifest`, not causal build proof.
+
+This milestone has no process execution, causal build trace, runtime call
+ordering, mutation proof, JavaScript runtime coverage, before/after trust query,
+or normative citation mapping.
+
 ## Review output
 
 Graphr detects Rust, Python, JavaScript/JSX, and TypeScript/TSX sources
@@ -145,7 +218,7 @@ Artifact text and semantics belong to the immutable snapshot. Non-symbol source
 ranges map to their indexed file node and are reported as `file-mapped`;
 targeted `search` or `view` remediation is named for unresolved graph coverage.
 Binary, oversized, unsafe, non-regular, type-changed, unmerged, and other
-explicit artifact omissions keep `review_complete_when_pages_exhausted=false`.
+explicit artifact omissions keep `content_complete_when_pages_exhausted=false`.
 This is complete artifact coverage for every supported source language.
 
 JavaScript and TypeScript use the existing incremental indexing and rename

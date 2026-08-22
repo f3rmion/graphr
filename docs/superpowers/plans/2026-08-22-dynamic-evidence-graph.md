@@ -1472,7 +1472,7 @@ git commit -m "feat: review dynamic evidence paths"
 
 **Steps:**
 
-- [ ] **Step 1: Document the producer/consumer workflow**
+- [x] **Step 1: Document the producer/consumer workflow**
 
 Update `README.md` with:
 
@@ -1490,7 +1490,7 @@ Update `README.md` with:
 
 Do not describe the manifest as proof that a process caused an output.
 
-- [ ] **Step 2: Audit the implementation against the approved design**
+- [x] **Step 2: Audit the implementation against the approved design**
 
 Run these searches and resolve every hit intentionally:
 
@@ -1512,7 +1512,7 @@ Expected results:
 Compare each spec verification bullet to a named unit/E2E test. If behavior
 deviated, either fix it or amend the spec only after explicit user approval.
 
-- [ ] **Step 3: Run the complete serial gate with fresh evidence**
+- [x] **Step 3: Run the complete serial gate with fresh evidence**
 
 Run every command from the repository root and retain exit status/output:
 
@@ -1527,6 +1527,12 @@ git status --short
 
 If a command fails, use `superpowers:systematic-debugging`, repair the root
 cause, and restart the gate from `cargo fmt --check`.
+
+Controller-approved process ownership: the mandatory final whole-branch review
+will satisfy Step 4's review requirement once, with this documentation
+included. This task commits the documentation after the serial gate without a
+duplicate review. The controller also owns Step 5 and branch handoff; this task
+does not invoke the branch-finishing workflow or integrate the branch.
 
 - [ ] **Step 4: Request review and commit documentation**
 

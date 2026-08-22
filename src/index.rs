@@ -1436,11 +1436,10 @@ fn artifact_text(review: &ArtifactReview) -> String {
     let mut output = String::new();
     for file in &review.files {
         output.push_str(&format!(
-            "artifact path={:?} analyzer={} diff_complete={} analysis_complete={}",
+            "artifact path={:?} analyzer={} diff_complete={}",
             file.path,
             file.analyzer.as_str(),
             file.diff_complete,
-            file.analysis_complete,
         ));
         if let Some(reason) = file.omission {
             output.push_str(" reason=");
@@ -1602,7 +1601,7 @@ fn render_section_page(
             let records = record_coverage(&snapshot.artifact_record_ranges, &page);
             let hunks = record_coverage(&snapshot.artifact_hunk_ranges, &page);
             output.push_str(&format!(
-                "artifacts emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_files={} partial_files={} total_files={} prior_files={} remaining_files={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} emitted_hunks={} partial_hunks={} total_hunks={} prior_hunks={} remaining_hunks={} {} analysis_complete={} page_complete={}\n",
+                "artifacts emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_files={} partial_files={} total_files={} prior_files={} remaining_files={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} emitted_hunks={} partial_hunks={} total_hunks={} prior_hunks={} remaining_hunks={} {} page_complete={}\n",
                 emitted_bytes,
                 value.len(),
                 page.start,
@@ -1628,7 +1627,6 @@ fn render_section_page(
                 hunks.prior,
                 hunks.remaining,
                 snapshot.artifact_patch_totals,
-                snapshot.changes.artifacts.analysis_complete(),
                 !more,
             ));
         }
@@ -5309,7 +5307,7 @@ fn run() {
         );
 
         let expected = format!(
-            "artifact path=\"README.md\" analyzer=markdown diff_complete=true analysis_complete=true\n{}{}",
+            "artifact path=\"README.md\" analyzer=markdown diff_complete=true\n{}{}",
             snapshot.changes.artifacts.analysis, artifact_patch
         );
         let mut reconstructed = String::new();
@@ -5322,6 +5320,7 @@ fn run() {
                 SECTION_OVERHEAD + 257,
             )
             .unwrap();
+            assert!(!page.contains("analysis_complete="), "{page}");
             let metadata = page.lines().nth(1).unwrap();
             let emitted = metadata
                 .split_ascii_whitespace()
