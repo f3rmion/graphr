@@ -66,6 +66,17 @@ const SECURITY_KEYWORDS: [&str; 25] = [
     "privilege",
 ];
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_REFERENCE_CANDIDATE_PASS_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_after_reference_candidate_pass_hook(hook: impl FnOnce() + 'static) {
+    AFTER_REFERENCE_CANDIDATE_PASS_HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
+}
+
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -462,7 +473,7 @@ impl Store {
             return Err("database has uncommitted work".into());
         }
         let state = read_state_cancelled(&self.connection, cancelled)?;
-        require_graph_invariants(&self.connection)?;
+        require_graph_invariants(&self.connection, cancelled)?;
         let (busy, _, _): (i64, i64, i64) = retry_sqlite(cancelled, || {
             self.connection
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
@@ -544,7 +555,7 @@ impl Store {
         } else {
             apply_incremental(&tx, &graph, &existing, cancelled)?
         };
-        require_graph_invariants(&tx)?;
+        require_graph_invariants(&tx, cancelled)?;
         if full || changed != 0 {
             tx.execute(
                 "UPDATE state SET generation=generation+1 WHERE singleton=1",
@@ -1060,7 +1071,7 @@ pub fn validate_image(path: &Path) -> Result<State> {
     }
     let state = read_state(&connection)?;
     require_integrity(&connection)?;
-    require_graph_invariants(&connection)?;
+    require_graph_invariants(&connection, &AtomicBool::new(false))?;
     require_no_sidecars(path)?;
     Ok(state)
 }
@@ -1087,7 +1098,8 @@ fn require_integrity(connection: &Connection) -> Result<()> {
     }
 }
 
-fn require_graph_invariants(connection: &Connection) -> Result<()> {
+fn require_graph_invariants(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
+    check_cancelled(cancelled)?;
     for state in distinct_text(connection, "SELECT DISTINCT resolution_state FROM refs")? {
         ResolutionState::parse(&state)
             .ok_or_else(|| "database reference resolution is invalid".to_owned())?;
@@ -1124,33 +1136,42 @@ fn require_graph_invariants(connection: &Connection) -> Result<()> {
     if invalid != 0 {
         return Err("database reference resolution is invalid".into());
     }
-    require_reference_candidates(connection)?;
+    require_reference_candidates(connection, cancelled)?;
+    check_cancelled(cancelled)?;
     let invalid_edges: bool = connection
         .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM (
-                     SELECT r.source_id, r.resolved_target_id AS target_id,
-                            CASE
-                                WHEN r.kind='IMPORTS' THEN 'IMPORTS'
-                                WHEN n.kind='test' THEN 'TEST_CALLS'
-                                ELSE 'CALLS'
-                            END AS kind,
-                            count(*) AS support_count
-                      FROM refs r JOIN nodes n ON n.id=r.source_id
-                      WHERE r.resolution_state='resolved'
-                      GROUP BY r.source_id, r.resolved_target_id,
-                               CASE
-                                   WHEN r.kind='IMPORTS' THEN 'IMPORTS'
-                                   WHEN n.kind='test' THEN 'TEST_CALLS'
-                                   ELSE 'CALLS'
-                               END
-                 ) expected
+            "WITH expected AS (
+                 SELECT r.source_id, r.resolved_target_id AS target_id,
+                        CASE
+                            WHEN r.kind='IMPORTS' THEN 'IMPORTS'
+                            WHEN n.kind='test' THEN 'TEST_CALLS'
+                            ELSE 'CALLS'
+                        END AS kind,
+                        count(*) AS support_count
+                   FROM refs r JOIN nodes n ON n.id=r.source_id
+                  WHERE r.resolution_state='resolved'
+                  GROUP BY r.source_id, r.resolved_target_id,
+                           CASE
+                               WHEN r.kind='IMPORTS' THEN 'IMPORTS'
+                               WHEN n.kind='test' THEN 'TEST_CALLS'
+                               ELSE 'CALLS'
+                           END
+             )
+             SELECT EXISTS(
+                 SELECT 1 FROM expected
                  LEFT JOIN edges e
                    ON e.source_id=expected.source_id
                   AND e.target_id=expected.target_id
                   AND e.kind=expected.kind
                 WHERE e.support_count IS NULL
                    OR e.support_count!=expected.support_count
+                 UNION ALL
+                 SELECT 1 FROM edges e
+                 LEFT JOIN expected
+                   ON expected.source_id=e.source_id
+                  AND expected.target_id=e.target_id
+                  AND expected.kind=e.kind
+                WHERE expected.source_id IS NULL
              )",
             [],
             |row| row.get(0),
@@ -1159,6 +1180,7 @@ fn require_graph_invariants(connection: &Connection) -> Result<()> {
     if invalid_edges {
         return Err("database reference edges do not match resolved references".into());
     }
+    check_cancelled(cancelled)?;
     let mismatch = connection
         .query_row(
             "SELECT f.path FROM files f
@@ -1176,21 +1198,21 @@ fn require_graph_invariants(connection: &Connection) -> Result<()> {
         .optional()
         .map_err(db_error)?;
     if let Some(path) = mismatch {
-        Err(format!(
+        return Err(format!(
             "observed relation-site accounting mismatch for {path}"
-        ))
-    } else {
-        Ok(())
+        ));
     }
+    check_cancelled(cancelled)
 }
 
-fn require_reference_candidates(connection: &Connection) -> Result<()> {
-    let references = connection
+fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
+    let mut load_references = connection
         .prepare(
             "SELECT id, alias_key, resolved_target_id, resolution_state
                FROM refs ORDER BY id",
         )
-        .map_err(db_error)?
+        .map_err(db_error)?;
+    let rows = load_references
         .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -1199,9 +1221,12 @@ fn require_reference_candidates(connection: &Connection) -> Result<()> {
                 row.get::<_, String>(3)?,
             ))
         })
-        .map_err(db_error)?
-        .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(db_error)?;
+    let mut references = Vec::new();
+    for row in rows {
+        check_cancelled(cancelled)?;
+        references.push(row.map_err(db_error)?);
+    }
     let mut load_keys = connection
         .prepare("SELECT key FROM ref_keys WHERE ref_id=?1 ORDER BY rank")
         .map_err(db_error)?;
@@ -1211,12 +1236,16 @@ fn require_reference_candidates(connection: &Connection) -> Result<()> {
     let mut loaded = Vec::with_capacity(references.len());
     let mut aliases = HashMap::new();
     for (id, alias, target, state) in references {
-        let keys = load_keys
+        check_cancelled(cancelled)?;
+        let rows = load_keys
             .query_map([id], |row| row.get::<_, String>(0))
-            .map_err(db_error)?
-            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)?;
-        let direct = expected_reference_candidate(&keys, &mut candidates, None)?;
+        let mut keys = Vec::new();
+        for row in rows {
+            check_cancelled(cancelled)?;
+            keys.push(row.map_err(db_error)?);
+        }
+        let direct = expected_reference_candidate(&keys, &mut candidates, None, cancelled)?;
         if let Some(alias) = &alias {
             aliases
                 .entry(alias.clone())
@@ -1238,11 +1267,20 @@ fn require_reference_candidates(connection: &Connection) -> Result<()> {
         loaded.push((alias, target, state, keys, direct));
     }
 
+    #[cfg(test)]
+    AFTER_REFERENCE_CANDIDATE_PASS_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+    check_cancelled(cancelled)?;
+
     for (alias, actual_target, actual_state, keys, direct) in loaded {
+        check_cancelled(cancelled)?;
         let expected = if alias.is_some() {
             direct
         } else {
-            expected_reference_candidate(&keys, &mut candidates, Some(&aliases))?
+            expected_reference_candidate(&keys, &mut candidates, Some(&aliases), cancelled)?
         };
         let (expected_target, expected_state) = match expected {
             DbCandidate::Unique(target) => (Some(target), ResolutionState::Resolved),
@@ -1260,8 +1298,10 @@ fn expected_reference_candidate(
     keys: &[String],
     candidates: &mut rusqlite::Statement<'_>,
     aliases: Option<&HashMap<String, DbCandidate>>,
+    cancelled: &AtomicBool,
 ) -> Result<DbCandidate> {
     for key in keys {
+        check_cancelled(cancelled)?;
         let direct = candidate(candidates, key)?;
         let alias = aliases
             .and_then(|aliases| aliases.get(key))
@@ -4557,6 +4597,47 @@ mod tests {
     }
 
     #[test]
+    fn seal_and_image_validation_reject_surplus_unowned_edges() {
+        let insert_surplus = "INSERT INTO edges(source_id, target_id, kind, support_count)
+                              SELECT source_id, resolved_target_id, 'IMPORTS', 1 FROM refs";
+        let seal_error = sealed_resolution_corruption("surplus-edge", |connection| {
+            connection.execute(insert_surplus, []).unwrap();
+        });
+        assert_eq!(
+            seal_error,
+            "database reference edges do not match resolved references"
+        );
+
+        let image_error = sealed_image_corruption("surplus-edge", |connection| {
+            connection.execute(insert_surplus, []).unwrap();
+        });
+        assert_eq!(
+            image_error,
+            "database reference edges do not match resolved references"
+        );
+    }
+
+    #[test]
+    fn reference_candidate_validation_observes_midpass_cancellation() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&AtomicBool::new(false), |_full, _existing| {
+                Ok((resolution_graph(1), ()))
+            })
+            .unwrap();
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = cancelled.clone();
+        set_after_reference_candidate_pass_hook(move || cancel.store(true, Ordering::Relaxed));
+
+        assert_eq!(
+            require_graph_invariants(&store.connection, &cancelled).unwrap_err(),
+            "index cancelled"
+        );
+    }
+
+    #[test]
     fn relation_site_accounting_mismatch_rolls_back_publication() {
         let mut graph = single_node_graph("unaccounted");
         graph.files[0].observed_relation_sites = 1;
@@ -4887,7 +4968,7 @@ mod tests {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
         };
-        let graph = Graph {
+        let mut graph = Graph {
             files: vec![FileInput {
                 path: "src/lib.rs".into(),
                 language: Language::Rust,
@@ -4934,6 +5015,7 @@ mod tests {
             }],
             ..Graph::default()
         };
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         let (state, _, ()) = store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -4967,6 +5049,7 @@ mod tests {
                 support_count: 1,
             });
         }
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         let (state, _, ()) = store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -5051,7 +5134,7 @@ mod tests {
             NodeKind::Function,
             NodeKind::Type,
         ];
-        let graph = Graph {
+        let mut graph = Graph {
             files: vec![FileInput {
                 path: "src/lib.rs".into(),
                 language: Language::Rust,
@@ -5117,6 +5200,7 @@ mod tests {
             ],
             ..Graph::default()
         };
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -5345,6 +5429,7 @@ mod tests {
                 support_count: 1,
             });
         }
+        own_graph_edges(&mut graph);
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
         };
@@ -5757,6 +5842,7 @@ mod tests {
                 support_count: 1,
             });
         }
+        own_graph_edges(&mut graph);
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
         };
@@ -6111,6 +6197,7 @@ mod tests {
                 support_count: 1,
             },
         ]);
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -6192,6 +6279,7 @@ mod tests {
             kind: EdgeKind::Calls,
             support_count: 1,
         });
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -6298,6 +6386,7 @@ mod tests {
             kind: EdgeKind::Calls,
             support_count: 1,
         });
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -6349,6 +6438,7 @@ mod tests {
                 support_count: 1,
             });
         }
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -6581,6 +6671,70 @@ mod tests {
         }
     }
 
+    fn own_graph_edges(graph: &mut Graph) {
+        let edges = graph
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(index, edge)| {
+                (
+                    index,
+                    edge.source_key.clone(),
+                    edge.target_key.clone(),
+                    edge.kind,
+                    edge.support_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, source_key, target_key, kind, support_count) in edges {
+            let source = graph
+                .nodes
+                .iter()
+                .find(|node| node.key == source_key)
+                .unwrap();
+            let source_kind = source.kind;
+            let source_file = source.file_key.clone();
+            let line = source.line_start;
+            match kind {
+                EdgeKind::TestCalls => assert_eq!(source_kind, NodeKind::Test),
+                EdgeKind::Calls => assert_ne!(source_kind, NodeKind::Test),
+                EdgeKind::Imports => {}
+            }
+            let candidate = format!("test:owned-edge:{index}");
+            graph
+                .nodes
+                .iter_mut()
+                .find(|node| node.key == target_key)
+                .unwrap()
+                .keys
+                .push(candidate.clone());
+            for _ in 0..support_count {
+                graph.refs.push(RefInput {
+                    source_key: source_key.clone(),
+                    kind: if kind == EdgeKind::Imports {
+                        RefKind::Imports
+                    } else {
+                        RefKind::Calls
+                    },
+                    line,
+                    keys: vec![candidate.clone()],
+                    alias_key: None,
+                    resolved_target_key: Some(target_key.clone()),
+                    resolution: ResolutionState::Resolved,
+                });
+            }
+            let file = graph
+                .files
+                .iter_mut()
+                .find(|file| file.path == source_file)
+                .unwrap();
+            file.observed_relation_sites = file
+                .observed_relation_sites
+                .checked_add(support_count)
+                .unwrap();
+        }
+    }
+
     fn sealed_resolution_corruption(label: &str, corrupt: impl FnOnce(&Connection)) -> String {
         let root = std::env::temp_dir().join(format!(
             "graphr-seal-{label}-{}-{}",
@@ -6600,6 +6754,32 @@ mod tests {
         corrupt(&store.connection);
 
         let error = store.seal(&cancelled).unwrap_err();
+        fs::remove_dir_all(root).unwrap();
+        error
+    }
+
+    fn sealed_image_corruption(label: &str, corrupt: impl FnOnce(&Connection)) -> String {
+        let root = std::env::temp_dir().join(format!(
+            "graphr-image-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((resolution_graph(1), ())))
+            .unwrap();
+        store.seal(&cancelled).unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        corrupt(&connection);
+        connection.close().unwrap();
+        let error = validate_image(&path).unwrap_err();
         fs::remove_dir_all(root).unwrap();
         error
     }
