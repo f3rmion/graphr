@@ -37,10 +37,10 @@ use crate::workspace::{
 
 const QUALIFIED_PATH_LIMIT: usize = 1024;
 const REVIEW_CONTEXT_BUDGET: usize = 8192;
-const INITIAL_FILES_BUDGET: usize = 1792;
-const INITIAL_DIFF_BUDGET: usize = 2432;
-const INITIAL_ARTIFACTS_BUDGET: usize = 1920;
-const INITIAL_GRAPH_BUDGET: usize = 1920;
+const INITIAL_FILES_BUDGET: usize = 1200;
+const INITIAL_DIFF_BUDGET: usize = 1800;
+const INITIAL_ARTIFACTS_BUDGET: usize = 1200;
+const INITIAL_GRAPH_BUDGET: usize = 1600;
 const INITIAL_EVIDENCE_BUDGET: usize = 1400;
 const SECTION_OVERHEAD: usize = 704;
 
@@ -1463,35 +1463,22 @@ struct Page<'a> {
 }
 
 fn review_context(snapshot: &ReviewSnapshot) -> Result<String, String> {
-    let with_evidence = !snapshot.evidence.is_empty();
-    let budgets = if with_evidence {
-        (1200, 1800, 1200, 1600)
-    } else {
-        (
-            INITIAL_FILES_BUDGET,
-            INITIAL_DIFF_BUDGET,
-            INITIAL_ARTIFACTS_BUDGET,
-            INITIAL_GRAPH_BUDGET,
-        )
-    };
-    let (files, files_more) = render_section_page(snapshot, ReviewSection::Files, 0, budgets.0)?;
-    let (diff, diff_more) = render_section_page(snapshot, ReviewSection::Diff, 0, budgets.1)?;
-    let (artifacts, artifacts_more) =
-        render_section_page(snapshot, ReviewSection::Artifacts, 0, budgets.2)?;
-    let (graph_page, graph_more) =
-        render_section_page(snapshot, ReviewSection::Graph, 0, budgets.3)?;
-    let (evidence, evidence_more) = if with_evidence {
-        render_section_page(
-            snapshot,
-            ReviewSection::Evidence,
-            0,
-            INITIAL_EVIDENCE_BUDGET,
-        )?
-    } else {
-        (String::new(), false)
-    };
-    let _all_initial_pages_complete =
-        !files_more && !diff_more && !artifacts_more && !graph_more && !evidence_more;
+    let (files, _) = render_section_page(snapshot, ReviewSection::Files, 0, INITIAL_FILES_BUDGET)?;
+    let (diff, _) = render_section_page(snapshot, ReviewSection::Diff, 0, INITIAL_DIFF_BUDGET)?;
+    let (artifacts, _) = render_section_page(
+        snapshot,
+        ReviewSection::Artifacts,
+        0,
+        INITIAL_ARTIFACTS_BUDGET,
+    )?;
+    let (graph_page, _) =
+        render_section_page(snapshot, ReviewSection::Graph, 0, INITIAL_GRAPH_BUDGET)?;
+    let (evidence, _) = render_section_page(
+        snapshot,
+        ReviewSection::Evidence,
+        0,
+        INITIAL_EVIDENCE_BUDGET,
+    )?;
     let output = format!(
         "{files}{diff}{artifacts}{graph_page}{evidence}{}",
         terminal_status(snapshot),
@@ -5576,6 +5563,234 @@ fn run() {
             .unwrap_err(),
             "invalid changes cursor"
         );
+    }
+
+    #[test]
+    fn evidence_page_initializes_all_five_independent_sections_without_a_manifest() {
+        let snapshot = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            1,
+            DependencyMode::Boundary,
+            WorktreeChanges {
+                files: Vec::new(),
+                records: Vec::new(),
+                paths: Vec::new(),
+                source_patch: String::new(),
+                artifacts: Default::default(),
+                skipped_paths: 0,
+            },
+            complete_review(
+                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n"
+                    .into(),
+            ),
+        );
+
+        let output = review_context(&snapshot).unwrap();
+
+        for header in ["files", "diff", "artifacts", "graph", "evidence"] {
+            assert!(
+                output.lines().any(|line| line == header),
+                "missing {header} section: {output}"
+            );
+        }
+        assert_eq!(
+            output
+                .lines()
+                .find(|line| line.starts_with("evidence emitted_bytes="))
+                .unwrap(),
+            "evidence emitted_bytes=0 total_bytes=0 prior_bytes=0 remaining_bytes=0 byte_range=0..0 starts_mid_line=false ends_mid_line=false framing_suffix_bytes=0 emitted_records=0 partial_records=0 total_records=0 prior_records=0 remaining_records=0 page_complete=true"
+        );
+        assert!(output.len() <= REVIEW_CONTEXT_BUDGET, "{}", output.len());
+        assert!(output.contains("dynamic_evidence_status=not-applicable"));
+    }
+
+    #[test]
+    fn evidence_page_reconstructs_ordered_unicode_records_with_exact_accounting() {
+        let evidence = format!(
+            "claim named-test={}\nclaim run-level=second\nclaim kind=static-test-paths status=partial basis=resolved-static-call-graph\n",
+            "é".repeat(5_000)
+        );
+        let snapshot = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            1,
+            DependencyMode::Boundary,
+            WorktreeChanges {
+                files: Vec::new(),
+                records: Vec::new(),
+                paths: Vec::new(),
+                source_patch: String::new(),
+                artifacts: Default::default(),
+                skipped_paths: 0,
+            },
+            ChangeReview {
+                graph: "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n".into(),
+                evidence: evidence.clone(),
+                static_status: CompletenessStatus::Partial,
+                dynamic_status: CompletenessStatus::Partial,
+            },
+        );
+        let initial = review_context(&snapshot).unwrap();
+        assert!(initial.contains("evidence_next_cursor="), "{initial}");
+        assert_eq!(
+            initial.lines().filter(|line| line == &"files").count(),
+            1,
+            "{initial}"
+        );
+        assert!(initial.contains("page_record_limit=1"), "{initial}");
+
+        let mut reconstructed = String::new();
+        let mut offset = 0;
+        let mut saw_mid_line_continuation = false;
+        loop {
+            let (rendered, more) = render_section_page(
+                &snapshot,
+                ReviewSection::Evidence,
+                offset,
+                SECTION_OVERHEAD + 257,
+            )
+            .unwrap();
+            let metadata = rendered.lines().nth(1).unwrap();
+            let field = |name: &str| {
+                metadata
+                    .split_ascii_whitespace()
+                    .find_map(|field| field.strip_prefix(&format!("{name}=")))
+                    .unwrap()
+            };
+            let emitted = field("emitted_bytes").parse::<usize>().unwrap();
+            let prior = field("prior_bytes").parse::<usize>().unwrap();
+            let remaining = field("remaining_bytes").parse::<usize>().unwrap();
+            let total = field("total_bytes").parse::<usize>().unwrap();
+            let emitted_records = field("emitted_records").parse::<usize>().unwrap();
+            let partial_records = field("partial_records").parse::<usize>().unwrap();
+            let prior_records = field("prior_records").parse::<usize>().unwrap();
+            let remaining_records = field("remaining_records").parse::<usize>().unwrap();
+            let total_records = field("total_records").parse::<usize>().unwrap();
+            assert_eq!(prior, offset, "{rendered}");
+            assert_eq!(prior + emitted + remaining, total, "{rendered}");
+            if offset == 0 {
+                assert_eq!(field("starts_mid_line"), "false", "{rendered}");
+                assert_eq!(field("ends_mid_line"), "true", "{rendered}");
+                assert_eq!(field("framing_suffix_bytes"), "1", "{rendered}");
+            } else if field("starts_mid_line") == "true" {
+                saw_mid_line_continuation = true;
+            }
+            assert_eq!(
+                prior_records + emitted_records + partial_records + remaining_records,
+                total_records,
+                "{rendered}"
+            );
+            let content_start = rendered.match_indices('\n').nth(1).unwrap().0 + 1;
+            let content_end = content_start + emitted;
+            assert!(rendered.is_char_boundary(content_end), "{rendered}");
+            reconstructed.push_str(&rendered[content_start..content_end]);
+            offset += emitted;
+            assert_eq!(more, offset < evidence.len(), "{rendered}");
+            if !more {
+                assert!(field("page_complete") == "true", "{rendered}");
+                break;
+            }
+        }
+        assert_eq!(reconstructed, evidence);
+        assert!(saw_mid_line_continuation);
+        let named = reconstructed.find("claim named-test=").unwrap();
+        let run = reconstructed.find("claim run-level=second").unwrap();
+        let static_paths = reconstructed.find("claim kind=static-test-paths").unwrap();
+        assert!(named < run && run < static_paths);
+    }
+
+    #[test]
+    fn evidence_page_cursor_binds_snapshot_parameters_and_evidence_checksum() {
+        let review = |suffix: &str| {
+            ChangeReview {
+            graph: "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n".into(),
+            evidence: format!("{}sentinel-{suffix}\n", "evidence-record\n".repeat(600)),
+            static_status: CompletenessStatus::Complete,
+            dynamic_status: CompletenessStatus::Partial,
+        }
+        };
+        let changes = WorktreeChanges {
+            files: Vec::new(),
+            records: Vec::new(),
+            paths: Vec::new(),
+            source_patch: String::new(),
+            artifacts: Default::default(),
+            skipped_paths: 0,
+        };
+        let snapshot = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            1,
+            DependencyMode::Boundary,
+            changes.clone(),
+            review("original"),
+        );
+        let initial = review_context(&snapshot).unwrap();
+        let cursor = next_cursor(&initial, "evidence_next_cursor").unwrap();
+
+        assert_eq!(
+            parse_review_cursor(&cursor, &"b".repeat(64), 6, 1)
+                .err()
+                .unwrap(),
+            "cursor_snapshot_mismatch"
+        );
+        assert_eq!(
+            parse_review_cursor(&cursor, REVIEW_SNAPSHOT_ID, 5, 1)
+                .err()
+                .unwrap(),
+            "cursor_parameters_mismatch"
+        );
+        assert_eq!(
+            parse_review_cursor(&cursor, REVIEW_SNAPSHOT_ID, 6, 2)
+                .err()
+                .unwrap(),
+            "cursor_parameters_mismatch"
+        );
+        let mut tampered = cursor.clone();
+        let replacement = if tampered.ends_with('0') { "1" } else { "0" };
+        tampered.replace_range(tampered.len() - 1.., replacement);
+        assert_eq!(
+            render_section(
+                &snapshot,
+                &parse_review_cursor(&tampered, REVIEW_SNAPSHOT_ID, 6, 1).unwrap(),
+            )
+            .unwrap_err(),
+            "invalid changes cursor"
+        );
+        let changed = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            1,
+            DependencyMode::Boundary,
+            changes,
+            review("changed"),
+        );
+        assert_eq!(
+            render_section(
+                &changed,
+                &parse_review_cursor(&cursor, REVIEW_SNAPSHOT_ID, 6, 1).unwrap(),
+            )
+            .unwrap_err(),
+            "invalid changes cursor"
+        );
+
+        let mut output = initial;
+        let mut cursor = next_cursor(&output, "evidence_next_cursor");
+        while let Some(token) = cursor {
+            output = render_section(
+                &snapshot,
+                &parse_review_cursor(&token, REVIEW_SNAPSHOT_ID, 6, 1).unwrap(),
+            )
+            .unwrap();
+            assert!(output.starts_with("evidence\n"), "{output}");
+            assert!(output.contains("content_complete_when_pages_exhausted=true"));
+            assert!(output.contains("static_evidence_status=complete"));
+            assert!(output.contains("dynamic_evidence_status=partial"));
+            cursor = next_cursor(&output, "evidence_next_cursor");
+        }
+        assert!(output.contains("sentinel-original"), "{output}");
+        assert!(output.contains("page_complete=true"), "{output}");
     }
 
     #[test]

@@ -471,6 +471,535 @@ fn coverage_evidence_imports_python_contexts_with_run_scoped_arcs() {
 }
 
 #[test]
+fn evidence_pagination_is_independent_bounded_and_exhaustive() {
+    let fixture = Fixture::new();
+    let segment = "long-evidence-path-segment-".repeat(4);
+    let source_path = format!("src/{segment}/{segment}/{segment}/covered.rs");
+    fs::create_dir_all(fixture.path.join(Path::new(&source_path).parent().unwrap())).unwrap();
+    let source = |value: bool| {
+        (1..=48)
+            .map(|line| format!("pub fn changed_{line:02}() -> bool {{ {value} }}\n"))
+            .collect::<String>()
+    };
+    fs::write(fixture.path.join(&source_path), source(false)).unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", &source_path]);
+    git_commit(&fixture.path, "coverage pagination baseline");
+    fs::write(fixture.path.join(&source_path), source(true)).unwrap();
+    git(&fixture.path, &["add", "--", &source_path]);
+    git_commit(&fixture.path, "coverage pagination change");
+    let source_snapshot = index_repository_request(&fixture.path, "HEAD~1", "HEAD");
+    let report = rmcp::serde_json::json!({
+        "type": "llvm.coverage.json.export",
+        "version": "2.0.1",
+        "data": [{
+            "functions": (1..=48).map(|line| rmcp::serde_json::json!({
+                "name": format!("changed_{line:02}"),
+                "filenames": [&source_path],
+                "regions": [[line, 1, line, 36, 1, 0, 0, 0]]
+            })).collect::<Vec<_>>(),
+            "files": [{"filename": &source_path, "branches": []}]
+        }]
+    });
+    let report_bytes = rmcp::serde_json::to_vec(&report).unwrap();
+    fs::write(fixture.path.join("coverage.json"), &report_bytes).unwrap();
+    let run_label = "é".repeat(90);
+    let missing_test = "missing_test_".repeat(15);
+    fs::write(
+        fixture.path.join("evidence.json"),
+        rmcp::serde_json::to_vec(&rmcp::serde_json::json!({
+            "format_version": 1,
+            "source_snapshot_id": source_snapshot["snapshot_id"],
+            "generated": [],
+            "coverage": [{
+                "format": "llvm",
+                "path": "coverage.json",
+                "blake3": blake3::hash(&report_bytes).to_hex().to_string(),
+                "run_label": &run_label,
+                "test_name": &missing_test
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = cli_index_with_evidence_request(
+        &fixture.path,
+        "evidence.json",
+        "HEAD~1",
+        "HEAD",
+        "worktree",
+        true,
+        "boundary",
+    );
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let completion: rmcp::serde_json::Value =
+        rmcp::serde_json::from_slice(output.stdout.trim_ascii()).unwrap();
+    remember_graph(&fixture.path, &completion);
+
+    let mut client = Client::start_unindexed(&fixture.path);
+    client.snapshot_id = Some(completion["snapshot_id"].as_str().unwrap().into());
+    let snapshot_id = client.snapshot_id().to_owned();
+    let inspection = client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({
+            "worktree_root": &fixture.path,
+            "snapshot_id": &snapshot_id,
+        }),
+    );
+    assert!(!tool_failed(&inspection), "{inspection}");
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 1);
+    for section in ["files", "diff", "artifacts", "graph", "evidence"] {
+        assert!(
+            changes.initial.text.lines().any(|line| line == section),
+            "missing {section}: {}",
+            changes.initial.text
+        );
+    }
+    assert_eq!(
+        terminal_status(&changes.initial.text),
+        (true, "complete".into(), "partial".into())
+    );
+    assert!(
+        !changes.pages["evidence"].is_empty(),
+        "evidence unexpectedly fit the initial page: {}",
+        changes.initial.text
+    );
+    let mut pages = vec![&changes.initial];
+    pages.extend(changes.pages["evidence"].iter().map(|(_, page)| page));
+    let totals = pages
+        .iter()
+        .map(|page| {
+            assert!(page.text.len() <= 8192, "{}", page.text.len());
+            assert_page_accounting(
+                &page.text,
+                "evidence",
+                [
+                    "emitted_records",
+                    "partial_records",
+                    "total_records",
+                    "prior_records",
+                    "remaining_records",
+                ],
+                "evidence_next_cursor",
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(totals.len(), 1, "evidence totals changed between pages");
+    assert!(
+        pages
+            .iter()
+            .any(|page| page_metric(&page.text, "evidence", "emitted_records") > 1),
+        "max_nodes leaked into evidence pages"
+    );
+    let evidence = change_section_text(&changes, "evidence");
+    assert!(evidence.contains(&run_label), "{evidence}");
+    assert_eq!(
+        evidence
+            .lines()
+            .filter(|line| line.starts_with("observed run="))
+            .count(),
+        48,
+        "{evidence}"
+    );
+    let observation = evidence.find("observed run=").unwrap();
+    let gap = evidence
+        .find("gap category=coverage reason=missing-test-context")
+        .unwrap();
+    let static_paths = evidence.find("claim kind=static-test-paths").unwrap();
+    assert!(observation < gap && gap < static_paths, "{evidence}");
+
+    let first_cursor = changes.pages["evidence"][0].0.clone();
+    let repeated_a = capture_query(&client.call(
+        "changes",
+        rmcp::serde_json::json!({
+            "snapshot_id": &snapshot_id,
+            "depth": 6,
+            "max_nodes": 1,
+            "cursor": &first_cursor
+        }),
+    ));
+    let repeated_b = capture_query(&client.call(
+        "changes",
+        rmcp::serde_json::json!({
+            "snapshot_id": &snapshot_id,
+            "depth": 6,
+            "max_nodes": 1,
+            "cursor": &first_cursor
+        }),
+    ));
+    assert_eq!(repeated_a, repeated_b);
+    for (depth, max_nodes) in [(5, 1), (6, 2)] {
+        let response = client.call(
+            "changes",
+            rmcp::serde_json::json!({
+                "snapshot_id": &snapshot_id,
+                "depth": depth,
+                "max_nodes": max_nodes,
+                "cursor": &first_cursor
+            }),
+        );
+        assert!(
+            response.contains("cursor_parameters_mismatch"),
+            "{response}"
+        );
+    }
+    let mut tampered = first_cursor.clone();
+    let replacement = if tampered.ends_with('0') { "1" } else { "0" };
+    tampered.replace_range(tampered.len() - 1.., replacement);
+    let response = client.call(
+        "changes",
+        rmcp::serde_json::json!({
+            "snapshot_id": &snapshot_id,
+            "depth": 6,
+            "max_nodes": 1,
+            "cursor": tampered
+        }),
+    );
+    assert!(response.contains("invalid changes cursor"), "{response}");
+
+    fs::write(
+        fixture.path.join(&source_path),
+        format!("{}// new snapshot\n", source(true)),
+    )
+    .unwrap();
+    client.index_and_wait("boundary");
+    let response = client.changes(6, 1, Some(&first_cursor));
+    assert!(response.contains("cursor_snapshot_mismatch"), "{response}");
+    client.close();
+}
+
+#[test]
+fn evidence_pagination_without_a_manifest_is_empty_and_not_applicable() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(fixture.path.join("src/lib.rs"), "pub fn unchanged() {}\n").unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "src/lib.rs"]);
+    git_commit(&fixture.path, "no evidence manifest");
+    fs::write(fixture.path.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+
+    let mut client = Client::start(&fixture.path);
+    let snapshot_id = client.snapshot_id().to_owned();
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+
+    assert_eq!(terminal_status(&changes.initial.text).2, "not-applicable");
+    assert!(changes.pages["evidence"].is_empty());
+    assert_eq!(
+        page_metadata_line(&changes.initial.text, "evidence"),
+        "evidence emitted_bytes=0 total_bytes=0 prior_bytes=0 remaining_bytes=0 byte_range=0..0 starts_mid_line=false ends_mid_line=false framing_suffix_bytes=0 emitted_records=0 partial_records=0 total_records=0 prior_records=0 remaining_records=0 page_complete=true"
+    );
+    client.close();
+}
+
+#[test]
+fn generated_evidence_chain_joins_provenance_static_calls_and_named_coverage() {
+    let evidence = generated_acceptance_fixture(GeneratedAcceptanceOptions::default());
+    let completion = successful_generated_acceptance_index(&evidence);
+    let mut client = client_for_completion(&evidence.fixture.path, &completion);
+    let snapshot_id = client.snapshot_id().to_owned();
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    let artifacts = change_section_text(&changes, "artifacts");
+    let graph = change_section_text(&changes, "graph");
+    let observations = change_section_text(&changes, "evidence");
+
+    assert!(
+        artifacts.contains("+  optional bool strict = 1;"),
+        "{artifacts}"
+    );
+    for expected in [
+        "Function encode target/debug/build/graphr-fixture/out/message.rs:1",
+        "Function decode target/debug/build/graphr-fixture/out/message.rs:2",
+        "Function strict_predicate src/predicate.rs:1",
+    ] {
+        assert!(graph.contains(expected), "missing {expected}: {graph}");
+    }
+    assert_eq!(
+        graph
+            .lines()
+            .filter(|line| {
+                line.contains("caller <-")
+                    && (line.contains("Function encode") || line.contains("Function decode"))
+            })
+            .count(),
+        2,
+        "{graph}"
+    );
+    for expected in [
+        "claim kind=generated-provenance status=complete result=linked basis=verified-generated-manifest output=\"target/debug/build/graphr-fixture/out/message.rs\"",
+        "provenance input=\"proto/message.proto:2-2\" generator=\"src/generator.rs:2-2\" output=\"target/debug/build/graphr-fixture/out/message.rs:1-2\"",
+        "includes source=\"src/lib.rs:6\" output=\"target/debug/build/graphr-fixture/out/message.rs\"",
+        "claim kind=changed-execution path=\"target/debug/build/graphr-fixture/out/message.rs\" lines=1 status=complete result=observed basis=llvm-coverage-json run=\"strict-run\" test=\"strict_roundtrip\"",
+        "claim kind=changed-execution path=\"target/debug/build/graphr-fixture/out/message.rs\" lines=2 status=complete result=observed basis=llvm-coverage-json run=\"strict-run\" test=\"strict_roundtrip\"",
+        "observed-branch run=\"strict-run\" test=\"strict_roundtrip\" path=\"src/predicate.rs\" line=2 arm=true count=1",
+    ] {
+        assert!(
+            observations.contains(expected),
+            "missing {expected}: {observations}"
+        );
+    }
+    assert_eq!(
+        terminal_status(&changes.initial.text),
+        (true, "complete".into(), "complete".into())
+    );
+
+    for (name, line) in [("encode", 1), ("decode", 2)] {
+        let search = response_text(&client.search(name, Some("function")));
+        let node_ref = search
+            .lines()
+            .find(|line| line.contains(&format!("Function {name} ")))
+            .and_then(|line| line.split_ascii_whitespace().next())
+            .unwrap_or_else(|| panic!("missing generated {name}: {search}"));
+        let view = response_text(&client.view(node_ref, 1, 20));
+        assert!(view.contains("basis=verified-generated-manifest"), "{view}");
+        assert!(
+            view.contains("provenance input=\"proto/message.proto:2-2\""),
+            "{view}"
+        );
+        assert!(
+            view.contains(&format!(
+                "path=\"target/debug/build/graphr-fixture/out/message.rs\" lines={line} status=complete result=observed"
+            )),
+            "{view}"
+        );
+    }
+    client.close();
+}
+
+#[test]
+fn generated_evidence_negative_missing_decode_static_path_changes_the_chain() {
+    let positive = generated_acceptance_fixture(GeneratedAcceptanceOptions::default());
+    let positive_completion = successful_generated_acceptance_index(&positive);
+    let mut positive_client = client_for_completion(&positive.fixture.path, &positive_completion);
+    let positive_snapshot = positive_client.snapshot_id().to_owned();
+    let positive_changes = capture_changes(&mut positive_client, &positive_snapshot, 6, 50);
+    let positive_graph = change_section_text(&positive_changes, "graph");
+    positive_client.close();
+
+    let negative = generated_acceptance_fixture(GeneratedAcceptanceOptions {
+        decode_calls_predicate: false,
+        ..GeneratedAcceptanceOptions::default()
+    });
+    let negative_completion = successful_generated_acceptance_index(&negative);
+    let mut negative_client = client_for_completion(&negative.fixture.path, &negative_completion);
+    let negative_snapshot = negative_client.snapshot_id().to_owned();
+    let negative_changes = capture_changes(&mut negative_client, &negative_snapshot, 6, 50);
+    let negative_graph = change_section_text(&negative_changes, "graph");
+
+    assert_eq!(
+        positive_graph
+            .lines()
+            .filter(|line| {
+                line.contains("caller <-")
+                    && (line.contains("Function encode") || line.contains("Function decode"))
+            })
+            .count(),
+        2,
+        "{positive_graph}"
+    );
+    assert_eq!(
+        negative_graph
+            .lines()
+            .filter(|line| {
+                line.contains("caller <-")
+                    && (line.contains("Function encode") || line.contains("Function decode"))
+            })
+            .count(),
+        1,
+        "{negative_graph}"
+    );
+    let search = response_text(&negative_client.search("decode", Some("function")));
+    let decode = search.split_ascii_whitespace().next().unwrap();
+    let view = response_text(&negative_client.view(decode, 1, 20));
+    assert!(!view.contains("call ->"), "{view}");
+    assert_ne!(positive_graph, negative_graph);
+    negative_client.close();
+}
+
+#[test]
+fn generated_evidence_negative_corrupt_digest_publishes_nothing() {
+    let evidence = generated_acceptance_fixture(GeneratedAcceptanceOptions {
+        corrupt_output_digest: true,
+        ..GeneratedAcceptanceOptions::default()
+    });
+    let before = published_snapshots(&evidence.fixture.path);
+
+    let output = cli_index_with_evidence_request(
+        &evidence.fixture.path,
+        evidence
+            .manifest
+            .strip_prefix(&evidence.fixture.path)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "HEAD",
+        "HEAD",
+        "worktree",
+        true,
+        "boundary",
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("generated artifact digest does not match"),
+        "{:?}",
+        output.stderr
+    );
+    assert_eq!(published_snapshots(&evidence.fixture.path), before);
+}
+
+#[test]
+fn generated_evidence_negative_omitted_test_name_stays_run_level() {
+    let evidence = generated_acceptance_fixture(GeneratedAcceptanceOptions {
+        include_test_name: false,
+        ..GeneratedAcceptanceOptions::default()
+    });
+    let completion = successful_generated_acceptance_index(&evidence);
+    let mut client = client_for_completion(&evidence.fixture.path, &completion);
+    let snapshot_id = client.snapshot_id().to_owned();
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    let observations = change_section_text(&changes, "evidence");
+    let run_level = "claim kind=changed-execution path=\"target/debug/build/graphr-fixture/out/message.rs\" lines=1 status=complete result=observed basis=llvm-coverage-json run=\"strict-run\"";
+    let named = format!("{run_level} test=\"strict_roundtrip\"");
+
+    assert!(observations.contains(run_level), "{observations}");
+    assert!(!observations.contains(&named), "{observations}");
+    assert!(
+        !observations
+            .lines()
+            .any(|line| line.contains("test=\"strict_roundtrip\"")
+                && line.contains("result=observed")),
+        "run-level coverage must not be promoted into a named-test observation: {observations}"
+    );
+    assert!(
+        observations.contains(
+            "claim kind=static-test-paths status=complete basis=resolved-static-call-graph"
+        ),
+        "{observations}"
+    );
+    client.close();
+}
+
+#[test]
+fn generated_evidence_negative_zero_required_branch_is_not_observed() {
+    let evidence = generated_acceptance_fixture(GeneratedAcceptanceOptions {
+        predicate_true_count: 0,
+        ..GeneratedAcceptanceOptions::default()
+    });
+    let completion = successful_generated_acceptance_index(&evidence);
+    let mut client = client_for_completion(&evidence.fixture.path, &completion);
+    let snapshot_id = client.snapshot_id().to_owned();
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    let observations = change_section_text(&changes, "evidence");
+    let exact = "not-observed-branch run=\"strict-run\" test=\"strict_roundtrip\" path=\"src/predicate.rs\" line=2 arm=true count=0";
+
+    assert!(observations.contains(exact), "{observations}");
+    assert!(
+        !observations.lines().any(|line| {
+            line.starts_with("observed-branch run=\"strict-run\"")
+                && line.contains("path=\"src/predicate.rs\"")
+                && line.contains("arm=true")
+        }),
+        "{observations}"
+    );
+    client.close();
+}
+
+#[test]
+fn mixed_evidence_gaps_keep_completed_transport_distinct_from_partial_static_evidence() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::create_dir_all(fixture.path.join("tests")).unwrap();
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn ambiguous() {}\npub fn resolved() {}\npub fn changed() { resolved(); }\n",
+    )
+    .unwrap();
+    fs::write(fixture.path.join("src/broken.rs"), "pub fn valid() {}\n").unwrap();
+    fs::write(
+        fixture.path.join("tests/registration.test.js"),
+        "export function jsTarget() { return false; }\nexport function jsCaller() { return jsTarget(); }\ntest(\"exercise\", () => jsCaller());\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git_commit(&fixture.path, "mixed gap baseline");
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn ambiguous() {}\npub fn ambiguous() {}\npub trait Runner { fn run(&self); }\npub fn resolved() {}\npub fn changed(value: &dyn Runner) {\n    resolved();\n    ambiguous();\n    value.run();\n    println!(\"macro boundary\");\n}\n",
+    )
+    .unwrap();
+    fs::write(fixture.path.join("src/broken.rs"), "pub fn broken( {\n").unwrap();
+    fs::write(
+        fixture.path.join("tests/registration.test.js"),
+        "export function jsTarget() { return true; }\nexport function jsCaller() { return jsTarget(); }\ntest(\"exercise\", () => jsCaller());\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/skipped.rs"),
+        vec![b'x'; 2 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+
+    let mut client = Client::start(&fixture.path);
+    let snapshot_id = client.snapshot_id().to_owned();
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    let graph = change_section_text(&changes, "graph");
+
+    assert_eq!(
+        terminal_status(&changes.initial.text),
+        (false, "partial".into(), "not-applicable".into())
+    );
+    for query in changes.queries() {
+        assert!(query.text.len() <= 8192, "{}", query.text.len());
+    }
+    for (section, cursor) in [
+        ("files", "files_next_cursor"),
+        ("diff", "diff_next_cursor"),
+        ("artifacts", "artifacts_next_cursor"),
+        ("graph", "graph_next_cursor"),
+        ("evidence", "evidence_next_cursor"),
+    ] {
+        let terminal = changes.pages[section]
+            .last()
+            .map_or(&changes.initial, |(_, page)| page);
+        assert!(
+            page_cursor(&terminal.text, cursor).is_none(),
+            "{}",
+            terminal.text
+        );
+    }
+    for expected in [
+        "Function resolved src/lib.rs:4",
+        "references missing=0 ambiguous=1",
+        "gaps total=4 relevant=4 by_reason=oversized:1,parser-error:1,dynamic-or-unsupported-dispatch:1,macro-expansion-unavailable:1",
+        "completeness content_capture=partial source_capture=partial syntax_parse=partial site_classification=complete static_model=partial evidence_capture=not-applicable provenance_model=not-applicable execution_mapping=not-applicable traversal=complete",
+        "Test exercise tests/registration.test.js:3",
+    ] {
+        assert!(graph.contains(expected), "missing {expected}: {graph}");
+    }
+    let callers = graph
+        .find("claim kind=affected-callers status=partial basis=resolved-static-call-graph")
+        .unwrap();
+    let flows = graph
+        .find("claim kind=affected-flows status=partial basis=resolved-static-call-graph")
+        .unwrap();
+    let tests = graph
+        .find("claim kind=static-test-paths status=partial basis=resolved-static-call-graph")
+        .unwrap();
+    assert!(callers < flows && flows < tests, "{graph}");
+    assert!(graph.contains("resolved@src/lib.rs:4"), "{graph}");
+    assert!(
+        graph.contains("jsTarget@tests/registration.test.js:1")
+            && graph
+                .lines()
+                .any(|line| line.contains("test <-") && line.contains("Test exercise")),
+        "{graph}"
+    );
+    client.close();
+}
+
+#[test]
 fn completeness_reports_direct_static_calls_without_legacy_fields() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
@@ -490,6 +1019,7 @@ fn completeness_reports_direct_static_calls_without_legacy_fields() {
 
     let mut client = Client::start(&fixture.path);
     let output = response_text(&client.changes(6, 50, None));
+    let output = complete_graph_pages(&mut client, output, 6, 50);
 
     for expected in [
         "languages=rust,python,javascript,typescript",
@@ -533,6 +1063,7 @@ fn completeness_keeps_finished_traversal_partial_for_macro_gap() {
 
     let mut client = Client::start(&fixture.path);
     let output = response_text(&client.changes(6, 50, None));
+    let output = complete_graph_pages(&mut client, output, 6, 50);
 
     assert!(output.contains("traversal_complete=true"), "{output}");
     assert!(
@@ -2196,7 +2727,7 @@ fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
 
     let mut client = Client::start(&fixture.path);
     let boundary = response_text(&client.changes(1, 10, None));
-    let boundary = complete_graph_pages(&mut client, boundary, 1, 10);
+    let boundary = complete_review_pages(&mut client, boundary, 1, 10);
     for expected in [
         "dependency_mode=boundary",
         "dependency-boundary root=.cargo/vendor packages=2 files=5 path_digest=",
@@ -2236,7 +2767,7 @@ fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
 
     client.index_and_wait("full");
     let full = response_text(&client.changes(0, 10, None));
-    let full = complete_graph_pages(&mut client, full, 0, 10);
+    let full = complete_review_pages(&mut client, full, 0, 10);
     for expected in [
         "dependency_mode=full",
         "changed source rust .cargo/vendor/sha2/src/lib.rs status=modified",
@@ -3108,16 +3639,17 @@ fn capture_changes(
             ("diff", "diff_next_cursor"),
             ("artifacts", "artifacts_next_cursor"),
             ("graph", "graph_next_cursor"),
+            ("evidence", "evidence_next_cursor"),
         ],
     )
 }
 
-fn capture_changes_in_order(
+fn capture_changes_in_order<const N: usize>(
     client: &mut Client,
     snapshot_id: &str,
     depth: u32,
     max_nodes: u32,
-    sections: [(&'static str, &'static str); 4],
+    sections: [(&'static str, &'static str); N],
 ) -> ChangesCapture {
     let initial = capture_query(&client.call(
         "changes",
@@ -3209,7 +3741,8 @@ fn change_section_text(changes: &ChangesCapture, section: &str) -> String {
         "files" => "diff",
         "diff" => "artifacts",
         "artifacts" => "graph",
-        "graph" => "content_complete_when_pages_exhausted=",
+        "graph" => "evidence",
+        "evidence" => "content_complete_when_pages_exhausted=",
         _ => unreachable!(),
     };
     let header = format!("{section}\n");
@@ -3684,9 +4217,8 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         "changed source rust src/lib.rs",
         "changed artifact text README.md analyzer=markdown",
         "changed artifact text settings.toml analyzer=generic",
-        "untracked artifact text tests/fixtures/alias-registry.v1.tsv analyzer=tsv",
         "untracked artifact omitted image.bin analyzer=generic reason=binary",
-        "markdown path=\"README.md\"",
+        "files_next_cursor=",
         "artifacts_next_cursor=",
         "content_complete_when_pages_exhausted=false",
         "static_evidence_status=partial",
@@ -3697,7 +4229,14 @@ fn changes_pages_complete_inventory_diff_and_flows() {
     ] {
         assert!(initial.contains(expected), "missing {expected}: {initial}");
     }
-    assert!(!initial.contains("ignored.txt"), "{initial}");
+    let file_pages =
+        complete_section_pages(&mut client, initial.clone(), 6, 50, "files_next_cursor");
+    assert!(
+        file_pages
+            .contains("untracked artifact text tests/fixtures/alias-registry.v1.tsv analyzer=tsv"),
+        "{file_pages}"
+    );
+    assert!(!file_pages.contains("ignored.txt"), "{file_pages}");
     assert!(!initial.contains("[truncated]"), "{initial}");
     assert!(initial.len() <= 8192, "{}", initial.len());
     let diff_totals = assert_page_accounting(
@@ -3823,6 +4362,7 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         artifact_pages.push_str(&page);
     }
     assert!(artifact_pages.contains("key_basis=first-column"));
+    assert!(artifact_pages.contains("markdown path=\"README.md\""));
     assert!(artifact_pages.contains("LAST_ARTIFACT_SENTINEL"));
     assert!(artifact_pages.contains("diff --git a/README.md b/README.md"));
     assert!(artifact_pages.contains("diff --git a/settings.toml b/settings.toml"));
@@ -3988,11 +4528,38 @@ fn complete_graph_pages(
     depth: u32,
     max_nodes: u32,
 ) -> String {
-    let mut output = initial;
-    let mut cursor = page_cursor(&output, "graph_next_cursor");
+    complete_section_pages(client, initial, depth, max_nodes, "graph_next_cursor")
+}
+
+fn complete_review_pages(
+    client: &mut Client,
+    mut output: String,
+    depth: u32,
+    max_nodes: u32,
+) -> String {
+    for cursor in [
+        "files_next_cursor",
+        "diff_next_cursor",
+        "artifacts_next_cursor",
+        "graph_next_cursor",
+        "evidence_next_cursor",
+    ] {
+        output = complete_section_pages(client, output, depth, max_nodes, cursor);
+    }
+    output
+}
+
+fn complete_section_pages(
+    client: &mut Client,
+    mut output: String,
+    depth: u32,
+    max_nodes: u32,
+    cursor_label: &str,
+) -> String {
+    let mut cursor = page_cursor(&output, cursor_label);
     while let Some(token) = cursor {
         let page = response_text(&client.changes(depth, max_nodes, Some(&token)));
-        cursor = page_cursor(&page, "graph_next_cursor");
+        cursor = page_cursor(&page, cursor_label);
         output.push_str(&page);
     }
     output
@@ -4051,7 +4618,7 @@ fn page_metadata_line<'a>(output: &'a str, section: &str) -> &'a str {
         .find(|line| {
             line.split_ascii_whitespace().next() == Some(section) && line.contains("emitted_bytes=")
         })
-        .unwrap()
+        .unwrap_or_else(|| panic!("missing {section} page metadata: {output}"))
 }
 
 fn page_field<'a>(line: &'a str, key: &str) -> &'a str {
@@ -4783,6 +5350,7 @@ fn two_linked_worktrees_index_concurrently_without_cross_contamination() {
             ("artifacts", "artifacts_next_cursor"),
             ("diff", "diff_next_cursor"),
             ("files", "files_next_cursor"),
+            ("evidence", "evidence_next_cursor"),
         ],
     );
     assert_change_manifest(
@@ -5030,6 +5598,7 @@ fn long_indexing_keeps_status_inspect_and_existing_snapshot_queries_responsive()
             ("graph", "graph_next_cursor"),
             ("files", "files_next_cursor"),
             ("diff", "diff_next_cursor"),
+            ("evidence", "evidence_next_cursor"),
         ],
     );
     assert_eq!(blocked_search, old_search);
@@ -5299,6 +5868,7 @@ fn linked_feature_with_ten_commits_and_twelve_files_returns_replay_symbols() {
             ("files", "files_next_cursor"),
             ("graph", "graph_next_cursor"),
             ("artifacts", "artifacts_next_cursor"),
+            ("evidence", "evidence_next_cursor"),
         ],
     );
     assert_eq!(reused_changes, first_changes);
@@ -5378,6 +5948,220 @@ fn queued_jobs_ignore_request_cancellation_and_eof_closes_them() {
 struct GeneratedEvidenceFixture {
     fixture: Fixture,
     manifest: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct GeneratedAcceptanceOptions {
+    decode_calls_predicate: bool,
+    corrupt_output_digest: bool,
+    include_test_name: bool,
+    predicate_true_count: u64,
+}
+
+impl Default for GeneratedAcceptanceOptions {
+    fn default() -> Self {
+        Self {
+            decode_calls_predicate: true,
+            corrupt_output_digest: false,
+            include_test_name: true,
+            predicate_true_count: 1,
+        }
+    }
+}
+
+fn generated_acceptance_fixture(options: GeneratedAcceptanceOptions) -> GeneratedEvidenceFixture {
+    const GENERATED_PATH: &str = "target/debug/build/graphr-fixture/out/message.rs";
+    const COVERAGE_PATH: &str = "target/graphr/strict.json";
+    const MANIFEST_PATH: &str = "target/graphr/evidence.json";
+
+    let fixture = Fixture::new();
+    for directory in [
+        "proto",
+        "src",
+        "target/debug/build/graphr-fixture/out",
+        "target/graphr",
+    ] {
+        fs::create_dir_all(fixture.path.join(directory)).unwrap();
+    }
+    fs::write(fixture.path.join(".gitignore"), "target/\n").unwrap();
+    fs::write(
+        fixture.path.join("proto/message.proto"),
+        "message Message {\n  optional bool loose = 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/generator.rs"),
+        "pub fn emit(strict: bool) -> &'static str {\n    if strict { \"strict-code\" } else { \"loose-code\" }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "mod predicate;\nmod generator;\n#[cfg(test)]\nmod tests;\npub mod message {\n    include!(concat!(env!(\"OUT_DIR\"), \"/message.rs\"));\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/predicate.rs"),
+        "pub fn strict_predicate(value: u8) -> bool {\n    if value >= 0 { true } else { false }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/tests.rs"),
+        "#[test]\nfn strict_roundtrip() {\n    crate::message::encode(1);\n    crate::message::decode(1);\n}\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git_commit(&fixture.path, "generated acceptance baseline");
+    fs::write(
+        fixture.path.join("proto/message.proto"),
+        "message Message {\n  optional bool strict = 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/predicate.rs"),
+        "pub fn strict_predicate(value: u8) -> bool {\n    if value > 0 { true } else { false }\n}\n",
+    )
+    .unwrap();
+    let source = index_repository(&fixture.path);
+
+    let decode = if options.decode_calls_predicate {
+        "pub fn decode(value: u8) -> bool { crate::predicate::strict_predicate(value) }\n"
+    } else {
+        "pub fn decode(value: u8) -> bool { value > 0 }\n"
+    };
+    let generated = format!(
+        "pub fn encode(value: u8) -> bool {{ crate::predicate::strict_predicate(value) }}\n{decode}"
+    );
+    fs::write(fixture.path.join(GENERATED_PATH), generated).unwrap();
+    let coverage = rmcp::serde_json::json!({
+        "type": "llvm.coverage.json.export",
+        "version": "2.0.1",
+        "data": [{
+            "functions": [
+                {
+                    "name": "encode",
+                    "filenames": [GENERATED_PATH],
+                    "regions": [[1, 1, 1, 82, 1, 0, 0, 0]]
+                },
+                {
+                    "name": "decode",
+                    "filenames": [GENERATED_PATH],
+                    "regions": [[2, 1, 2, 82, 1, 0, 0, 0]]
+                },
+                {
+                    "name": "strict_predicate",
+                    "filenames": ["src/predicate.rs"],
+                    "regions": [[1, 1, 3, 2, 1, 0, 0, 0]]
+                }
+            ],
+            "files": [
+                {"filename": GENERATED_PATH, "branches": []},
+                {
+                    "filename": "src/predicate.rs",
+                    "branches": [[2, 5, 2, 18, options.predicate_true_count, 0, 0, 0, 4]]
+                }
+            ]
+        }]
+    });
+    let coverage_bytes = rmcp::serde_json::to_vec(&coverage).unwrap();
+    fs::write(fixture.path.join(COVERAGE_PATH), &coverage_bytes).unwrap();
+    let generated_bytes = fs::read(fixture.path.join(GENERATED_PATH)).unwrap();
+    let input_bytes = fs::read(fixture.path.join("proto/message.proto")).unwrap();
+    let mut coverage_declaration = rmcp::serde_json::json!({
+        "format": "llvm",
+        "path": COVERAGE_PATH,
+        "blake3": blake3::hash(&coverage_bytes).to_hex().to_string(),
+        "run_label": "strict-run"
+    });
+    if options.include_test_name {
+        coverage_declaration["test_name"] = "strict_roundtrip".into();
+    }
+    let output_digest = if options.corrupt_output_digest {
+        "0".repeat(64)
+    } else {
+        blake3::hash(&generated_bytes).to_hex().to_string()
+    };
+    let manifest = fixture.path.join(MANIFEST_PATH);
+    fs::write(
+        &manifest,
+        rmcp::serde_json::to_vec(&rmcp::serde_json::json!({
+            "format_version": 1,
+            "source_snapshot_id": source["snapshot_id"],
+            "generated": [{
+                "input": {
+                    "path": "proto/message.proto",
+                    "blake3": blake3::hash(&input_bytes).to_hex().to_string(),
+                    "line_start": 2,
+                    "line_end": 2
+                },
+                "generator": {
+                    "path": "src/generator.rs",
+                    "line_start": 2,
+                    "line_end": 2
+                },
+                "output": {
+                    "path": GENERATED_PATH,
+                    "blake3": output_digest,
+                    "line_start": 1,
+                    "line_end": 2
+                }
+            }],
+            "coverage": [coverage_declaration]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    GeneratedEvidenceFixture { fixture, manifest }
+}
+
+fn successful_generated_acceptance_index(
+    evidence: &GeneratedEvidenceFixture,
+) -> rmcp::serde_json::Value {
+    let manifest = evidence
+        .manifest
+        .strip_prefix(&evidence.fixture.path)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let output = cli_index_with_evidence_request(
+        &evidence.fixture.path,
+        manifest,
+        "HEAD",
+        "HEAD",
+        "worktree",
+        true,
+        "boundary",
+    );
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let completion = rmcp::serde_json::from_slice(output.stdout.trim_ascii()).unwrap();
+    remember_graph(&evidence.fixture.path, &completion);
+    completion
+}
+
+fn client_for_completion(path: &PathBuf, completion: &rmcp::serde_json::Value) -> Client {
+    let mut client = Client::start_unindexed(path);
+    client.snapshot_id = Some(completion["snapshot_id"].as_str().unwrap().into());
+    let snapshot_id = client.snapshot_id().to_owned();
+    let inspection = client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({
+            "worktree_root": path,
+            "snapshot_id": snapshot_id,
+        }),
+    );
+    assert!(!tool_failed(&inspection), "{inspection}");
+    client
+}
+
+fn published_snapshots(path: &Path) -> BTreeSet<String> {
+    let snapshots = path.join(".git/graphr/v6/snapshots");
+    if !snapshots.exists() {
+        return BTreeSet::new();
+    }
+    fs::read_dir(snapshots)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
 }
 
 fn generated_evidence_fixture() -> GeneratedEvidenceFixture {
