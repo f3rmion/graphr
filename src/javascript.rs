@@ -873,18 +873,28 @@ fn shadows_test_callee(
     name: &str,
     byte: usize,
 ) -> bool {
-    bindings.iter().any(|binding| {
-        binding.name == name
-            && binding.range.start <= byte
-            && byte < binding.range.end
-            && match binding.import {
-                None => true,
-                Some((import, imported)) => imports
-                    .get(import)
-                    .and_then(|import| import.bindings.get(imported))
-                    .is_none_or(|binding| binding.type_only),
-            }
-    })
+    let visible = |binding: &&LexicalBinding| {
+        binding.name == name && binding.range.start <= byte && byte < binding.range.end
+    };
+    let Some(width) = bindings
+        .iter()
+        .filter(visible)
+        .map(|binding| binding.range.end - binding.range.start)
+        .min()
+    else {
+        return false;
+    };
+    bindings
+        .iter()
+        .filter(visible)
+        .filter(|binding| binding.range.end - binding.range.start == width)
+        .any(|binding| match binding.import {
+            None => true,
+            Some((import, imported)) => imports
+                .get(import)
+                .and_then(|import| import.bindings.get(imported))
+                .is_none_or(|binding| binding.type_only),
+        })
 }
 
 fn visible_import(parsed: &ParsedFile, name: &str, byte: usize) -> Option<(usize, usize)> {
@@ -3014,6 +3024,21 @@ const panel = <View />;
             )
             .unwrap();
         assert_eq!(commonjs.test_names(), ["common"]);
+
+        let nested_import = ScriptParsers::default()
+            .parse(
+                "tests/nested-import.test.cjs",
+                r#"
+                    const test = register;
+                    {
+                        const { test } = require("./framework");
+                        test("nested import", () => nested());
+                    }
+                "#,
+            )
+            .unwrap();
+        assert_eq!(nested_import.test_names(), ["nested import"]);
+        assert!(!nested_import.call_names().contains(&"test"));
 
         let type_only = ScriptParsers::default()
             .parse(
