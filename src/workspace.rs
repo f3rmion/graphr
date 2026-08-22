@@ -1168,7 +1168,7 @@ impl CacheDirectory {
 // exactly these functions and nothing else: `openat` maps to `NtCreateFile`
 // with `OBJECT_ATTRIBUTES.RootDirectory`, `linkat` to `NtSetInformationFile`
 // with `FILE_LINK_INFORMATION`, `renameat` to `SetFileInformationByHandle` with
-// `FILE_RENAME_INFO`. See docs/superpowers/specs/2026-08-12-macos-portability-design.md.
+// `FILE_RENAME_INFO`.
 //
 // Do not add a path-taking helper here, and do not reconstruct a path from a
 // descriptor. That is what tied the cache to Linux `/proc/self/fd`.
