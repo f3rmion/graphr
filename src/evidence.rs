@@ -214,6 +214,26 @@ impl EvidenceManifest {
                 },
             });
         }
+        let mut coverage = Vec::with_capacity(self.coverage.len());
+        for declaration in self.coverage {
+            let bytes = capture_evidence_file(root, &declaration.path, COVERAGE_LIMIT, cancelled)?;
+            let content_hash = *blake3::hash(&bytes).as_bytes();
+            if content_hash != parse_digest(&declaration.blake3)? {
+                return Err(invalid("coverage report digest does not match"));
+            }
+            let report = CapturedArtifact {
+                path: declaration.path,
+                content_hash,
+                bytes,
+            };
+            record_unique(&mut unique, &report)?;
+            coverage.push(CapturedCoverage {
+                format: declaration.format,
+                report,
+                run_label: declaration.run_label,
+                test_name: declaration.test_name,
+            });
+        }
         let total = unique
             .values()
             .try_fold(0_u64, |total, (_, size)| total.checked_add(*size))
@@ -225,7 +245,7 @@ impl EvidenceManifest {
             source_snapshot_id: self.source_snapshot_id,
             manifest: self.manifest,
             generated,
-            coverage: Vec::new(),
+            coverage,
         })
     }
 }
@@ -276,15 +296,10 @@ pub(crate) fn capture_manifest(
     if value
         .coverage
         .iter()
-        .any(|coverage| !runs.insert((&coverage.run_label, &coverage.test_name)))
+        .any(|coverage| !runs.insert((coverage.format, &coverage.run_label, &coverage.blake3)))
     {
         return Err(invalid(
             "evidence manifest contains a duplicate coverage run",
-        ));
-    }
-    if !value.coverage.is_empty() {
-        return Err(invalid(
-            "coverage evidence is unsupported by this graph format",
         ));
     }
     Ok(EvidenceManifest {
@@ -474,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_validation_rejects_unknown_version_coverage_and_unsafe_paths() {
+    fn manifest_validation_rejects_unknown_version_and_unsafe_paths() {
         let root = fixture("invalid-manifest");
         for value in [
             format!(
@@ -484,11 +499,6 @@ mod tests {
             format!(
                 "{{\"format_version\":1,\"source_snapshot_id\":\"{}\",\"generated\":[],\"coverage\":[],\"unknown\":true}}",
                 "a".repeat(64)
-            ),
-            format!(
-                "{{\"format_version\":1,\"source_snapshot_id\":\"{}\",\"generated\":[],\"coverage\":[{{\"format\":\"llvm\",\"path\":\"report.json\",\"blake3\":\"{}\",\"run_label\":\"run\"}}]}}",
-                "a".repeat(64),
-                "b".repeat(64)
             ),
         ] {
             write_manifest(&root, &value);
@@ -504,6 +514,52 @@ mod tests {
         ] {
             assert!(capture_manifest(&root, Path::new(path), &AtomicBool::new(false)).is_err());
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_validation_captures_coverage_and_uses_digest_run_identity() {
+        let root = fixture("coverage");
+        let first = br#"{"meta":{"format":3,"version":"7.0"},"files":{}}"#.to_vec();
+        let second = br#"{"meta":{"format":3,"version":"8.0"},"files":{}}"#.to_vec();
+        fs::write(root.join("first.json"), &first).unwrap();
+        fs::write(root.join("second.json"), &second).unwrap();
+        let manifest = |second_digest: blake3::Hash| {
+            rmcp::serde_json::json!({
+                "format_version": 1,
+                "source_snapshot_id": "a".repeat(64),
+                "generated": [],
+                "coverage": [
+                    {
+                        "format": "coverage_py",
+                        "path": "first.json",
+                        "blake3": blake3::hash(&first).to_hex().to_string(),
+                        "run_label": "same",
+                    },
+                    {
+                        "format": "coverage_py",
+                        "path": "second.json",
+                        "blake3": second_digest.to_hex().to_string(),
+                        "run_label": "same",
+                        "test_name": "named",
+                    }
+                ]
+            })
+        };
+        write_manifest(&root, &manifest(blake3::hash(&second)).to_string());
+
+        let captured = capture_manifest(&root, Path::new("evidence.json"), &AtomicBool::new(false))
+            .unwrap()
+            .capture(&root, &BTreeMap::new(), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(captured.coverage.len(), 2);
+        assert_eq!(captured.coverage[0].report.bytes, first);
+        assert_eq!(captured.coverage[1].report.bytes, second);
+
+        write_manifest(&root, &manifest(blake3::hash(&first)).to_string());
+        assert!(
+            capture_manifest(&root, Path::new("evidence.json"), &AtomicBool::new(false)).is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -189,6 +189,274 @@ fn generated_provenance_links_generated_calls_and_renders_verified_chain() {
 }
 
 #[test]
+fn coverage_evidence_imports_scoped_rust_observations_without_dynamic_edges() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn changed() -> bool { false }\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "src/lib.rs"]);
+    git_commit(&fixture.path, "coverage baseline");
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn changed() -> bool { true }\n\n#[test]\nfn named() { changed(); }\n",
+    )
+    .unwrap();
+    git(&fixture.path, &["add", "--", "src/lib.rs"]);
+    git_commit(&fixture.path, "coverage change");
+    let source = index_repository_request(&fixture.path, "HEAD~1", "HEAD");
+    let report = rmcp::serde_json::json!({
+        "type": "llvm.coverage.json.export",
+        "version": "2.0.1",
+        "data": [{
+            "functions": [{
+                "name": "ignored",
+                "filenames": ["src/lib.rs"],
+                "regions": [
+                    [1, 1, 1, 35, 1, 0, 0, 0],
+                    [4, 1, 4, 36, 0, 0, 0, 0]
+                ]
+            }],
+            "files": [{
+                "filename": "src/lib.rs",
+                "branches": [[1, 1, 1, 35, 1, 0, 0, 0, 4]]
+            }]
+        }]
+    });
+    let report_bytes = rmcp::serde_json::to_vec(&report).unwrap();
+    fs::write(fixture.path.join("coverage.json"), &report_bytes).unwrap();
+    fs::write(
+        fixture.path.join("evidence.json"),
+        rmcp::serde_json::to_vec(&rmcp::serde_json::json!({
+            "format_version": 1,
+            "source_snapshot_id": source["snapshot_id"],
+            "generated": [],
+            "coverage": [{
+                "format": "llvm",
+                "path": "coverage.json",
+                "blake3": blake3::hash(&report_bytes).to_hex().to_string(),
+                "run_label": "rust-run",
+                "test_name": "named"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = cli_index_with_evidence_request(
+        &fixture.path,
+        "evidence.json",
+        "HEAD~1",
+        "HEAD",
+        "worktree",
+        true,
+        "boundary",
+    );
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let completion: rmcp::serde_json::Value =
+        rmcp::serde_json::from_slice(output.stdout.trim_ascii()).unwrap();
+    remember_graph(&fixture.path, &completion);
+    let connection = Connection::open(graph_path(&fixture.path)).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM coverage_regions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM coverage_branches", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM edges WHERE kind NOT IN ('CALLS','TEST_CALLS','CONTAINS','IMPLEMENTS','IMPLEMENTS_TRAIT')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM edges e JOIN nodes source ON source.id=e.source_id
+                  JOIN nodes target ON target.id=e.target_id
+                 WHERE e.kind='TEST_CALLS' AND source.name='named' AND target.name='changed'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+
+    let mut client = Client::start_unindexed(&fixture.path);
+    client.snapshot_id = Some(completion["snapshot_id"].as_str().unwrap().into());
+    let snapshot_id = client.snapshot_id().to_owned();
+    let inspection = client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({
+            "worktree_root": &fixture.path,
+            "snapshot_id": snapshot_id,
+        }),
+    );
+    assert!(!tool_failed(&inspection), "{inspection}");
+    let mut changes = response_text(&client.changes(6, 50, None));
+    let mut cursor = page_cursor(&changes, "evidence_next_cursor");
+    while let Some(token) = cursor {
+        let page = changes_page(&mut client, &token);
+        cursor = page_cursor(&page, "evidence_next_cursor");
+        changes.push_str(&page);
+    }
+    for expected in [
+        "execution_mapping=complete",
+        "dynamic_evidence_status=complete",
+        "result=observed basis=llvm-coverage-json run=\"rust-run\" test=\"named\"",
+        "result=not-observed basis=llvm-coverage-json run=\"rust-run\" test=\"named\"",
+        "observed-branch run=\"rust-run\" test=\"named\" path=\"src/lib.rs\" line=1 arm=true count=1",
+        "not-observed-branch run=\"rust-run\" test=\"named\" path=\"src/lib.rs\" line=1 arm=false count=0",
+    ] {
+        assert!(changes.contains(expected), "missing {expected}: {changes}");
+    }
+    let search = response_text(&client.search("changed", Some("function")));
+    let node_ref = search.split_whitespace().next().unwrap();
+    let view = response_text(&client.view(node_ref, 0, 1));
+    assert!(view.contains("path=\"src/lib.rs\" lines=1"), "{view}");
+    assert!(!view.contains("path=\"src/lib.rs\" lines=4"), "{view}");
+    client.close();
+}
+
+#[test]
+fn coverage_evidence_imports_python_contexts_with_run_scoped_arcs() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/lib.py"),
+        "def changed_py():\n    return False\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "src/lib.py"]);
+    git_commit(&fixture.path, "python coverage baseline");
+    fs::write(
+        fixture.path.join("src/lib.py"),
+        "def changed_py():\n    return True\n\ndef test_named_py():\n    changed_py()\n",
+    )
+    .unwrap();
+    git(&fixture.path, &["add", "--", "src/lib.py"]);
+    git_commit(&fixture.path, "python coverage change");
+    let source = index_repository_request(&fixture.path, "HEAD~1", "HEAD");
+    let report = rmcp::serde_json::json!({
+        "meta": {"format": 3, "version": "7.10.7"},
+        "files": {
+            "src/lib.py": {
+                "executed_lines": [1, 2, 4, 5],
+                "missing_lines": [],
+                "contexts": {"1": ["test_named_py"]},
+                "executed_branches": [[1, 2]],
+                "missing_branches": []
+            }
+        }
+    });
+    let report_bytes = rmcp::serde_json::to_vec(&report).unwrap();
+    fs::write(fixture.path.join("coverage-python.json"), &report_bytes).unwrap();
+    fs::write(
+        fixture.path.join("evidence.json"),
+        rmcp::serde_json::to_vec(&rmcp::serde_json::json!({
+            "format_version": 1,
+            "source_snapshot_id": source["snapshot_id"],
+            "generated": [],
+            "coverage": [{
+                "format": "coverage_py",
+                "path": "coverage-python.json",
+                "blake3": blake3::hash(&report_bytes).to_hex().to_string(),
+                "run_label": "python-run"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = cli_index_with_evidence_request(
+        &fixture.path,
+        "evidence.json",
+        "HEAD~1",
+        "HEAD",
+        "worktree",
+        true,
+        "boundary",
+    );
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let completion: rmcp::serde_json::Value =
+        rmcp::serde_json::from_slice(output.stdout.trim_ascii()).unwrap();
+    remember_graph(&fixture.path, &completion);
+    let connection = Connection::open(graph_path(&fixture.path)).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM coverage_regions WHERE test_id IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM coverage_branches WHERE test_id IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    drop(connection);
+
+    let mut client = Client::start_unindexed(&fixture.path);
+    client.snapshot_id = Some(completion["snapshot_id"].as_str().unwrap().into());
+    let snapshot_id = client.snapshot_id().to_owned();
+    let inspection = client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({
+            "worktree_root": &fixture.path,
+            "snapshot_id": snapshot_id,
+        }),
+    );
+    assert!(!tool_failed(&inspection), "{inspection}");
+    let mut changes = response_text(&client.changes(6, 50, None));
+    let mut cursor = page_cursor(&changes, "evidence_next_cursor");
+    while let Some(token) = cursor {
+        let page = changes_page(&mut client, &token);
+        cursor = page_cursor(&page, "evidence_next_cursor");
+        changes.push_str(&page);
+    }
+    assert!(
+        changes.contains("basis=coverage-py-json run=\"python-run\" test=\"test_named_py\""),
+        "{changes}"
+    );
+    assert!(
+        changes.contains(
+            "observed-branch run=\"python-run\" path=\"src/lib.py\" line=1 arm=target:2 count=1"
+        ),
+        "{changes}"
+    );
+    assert!(
+        !changes.contains("observed-branch run=\"python-run\" test="),
+        "{changes}"
+    );
+    client.close();
+}
+
+#[test]
 fn completeness_reports_direct_static_calls_without_legacy_fields() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
@@ -5190,15 +5458,19 @@ fn crate_graph_is_valid(path: &Path) {
 }
 
 fn index_repository(path: &Path) -> rmcp::serde_json::Value {
+    index_repository_request(path, "HEAD", "HEAD")
+}
+
+fn index_repository_request(path: &Path, base: &str, head: &str) -> rmcp::serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_graphr"))
         .args([
             "index",
             "--worktree-root",
             path.to_str().unwrap(),
             "--base",
-            "HEAD",
+            base,
             "--head",
-            "HEAD",
+            head,
             "--target",
             "worktree",
             "--include-untracked",

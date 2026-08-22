@@ -10,6 +10,7 @@ use std::sync::{
 };
 use std::thread;
 
+use crate::coverage::{BranchObservationKind, parse_coverage};
 use crate::evidence::{CapturedArtifact, CapturedEvidence, capture_manifest};
 use crate::git::{
     ArtifactReview, CapturedSource, ChangeStatus, ChangedPath, DependencyMode, Language,
@@ -20,10 +21,11 @@ use crate::javascript::ScriptParsers;
 use crate::parse::{DefinitionKind, ParsedFile, RustParser};
 use crate::python::PythonParser;
 use crate::store::{
-    ArtifactRole, ChangeReview, CompletenessStatus, EdgeInput, EdgeKind, EvidenceInput,
-    EvidenceLineSpan, FileInput, GapCategory, GapInput, GapReason, Graph, ImportedArtifactInput,
-    MappingStatus, ModeledSiteInput, ModeledSiteKind, NodeInput, NodeKind, ProvenanceInput,
-    RefInput, RefKind, ResolutionState, Store, TraitImplementationInput,
+    ArtifactRole, ChangeReview, CompletenessStatus, CoverageBranchInput, CoverageBranchKind,
+    CoverageRegionInput, CoverageRunInput, EdgeInput, EdgeKind, EvidenceInput, EvidenceLineSpan,
+    FileInput, GapCategory, GapInput, GapReason, Graph, ImportedArtifactInput, MappingStatus,
+    ModeledSiteInput, ModeledSiteKind, NodeInput, NodeKind, ProvenanceInput, RefInput, RefKind,
+    ResolutionState, Store, TraitImplementationInput,
 };
 use crate::workspace::{
     BuildProgress, BuildStage, CACHE_FORMAT_VERSION, ErrorCode, GRAPH_ANALYZER_VERSION,
@@ -380,6 +382,7 @@ impl Engine {
                     artifacts
                         .take()
                         .expect("captured evidence always has artifact identity"),
+                    &request.root.worktree_root,
                     cancelled,
                 )
                 .map_err(index_operation_error)?;
@@ -878,6 +881,7 @@ fn build_generated_evidence(
     store: &Store,
     captured: &CapturedEvidence,
     artifacts: Vec<ImportedArtifactInput>,
+    worktree_root: &Path,
     cancelled: &AtomicBool,
 ) -> Result<(Graph, EvidenceInput), String> {
     let mut graph = Graph::default();
@@ -983,14 +987,84 @@ fn build_generated_evidence(
             }),
         }
     }
+    let mut runs = Vec::with_capacity(captured.coverage.len());
+    let mut regions = Vec::new();
+    let mut branches = Vec::new();
+    for coverage in &captured.coverage {
+        check_cancelled(cancelled)?;
+        let report_digest = blake3::Hash::from_bytes(coverage.report.content_hash).to_hex();
+        let run_key = format!(
+            "coverage:{}:{}:{report_digest}",
+            coverage.format.db(),
+            coverage.run_label
+        );
+        let parsed = parse_coverage(coverage.format, &coverage.report.bytes, worktree_root)?;
+        runs.push(CoverageRunInput {
+            key: run_key.clone(),
+            format: parsed.format,
+            report_key: captured_artifact_key(ArtifactRole::CoverageReport, &coverage.report),
+            run_label: coverage.run_label.clone(),
+            test_name: coverage.test_name.clone(),
+        });
+        regions.extend(
+            parsed
+                .regions
+                .into_iter()
+                .map(|region| CoverageRegionInput {
+                    run_key: run_key.clone(),
+                    path: region.path,
+                    start_line: region.start_line,
+                    start_column: region.start_column,
+                    end_line: region.end_line,
+                    end_column: region.end_column,
+                    execution_count: region.execution_count,
+                    context: region.context,
+                }),
+        );
+        branches.extend(
+            parsed
+                .branches
+                .into_iter()
+                .map(|branch| CoverageBranchInput {
+                    run_key: run_key.clone(),
+                    path: branch.path,
+                    start_line: branch.start_line,
+                    start_column: branch.start_column,
+                    end_line: branch.end_line,
+                    end_column: branch.end_column,
+                    target_line: branch.target_line,
+                    kind: match branch.kind {
+                        BranchObservationKind::TrueOutcome => CoverageBranchKind::TrueOutcome,
+                        BranchObservationKind::FalseOutcome => CoverageBranchKind::FalseOutcome,
+                        BranchObservationKind::Arc => CoverageBranchKind::Arc,
+                    },
+                    execution_count: branch.execution_count,
+                }),
+        );
+        if parsed.external_paths > 0 {
+            gaps.push(GapInput {
+                file_key: None,
+                source_key: None,
+                run_key: Some(run_key),
+                path: None,
+                line_start: None,
+                line_end: None,
+                category: GapCategory::Coverage,
+                reason: GapReason::CoverageUnmappedFile,
+                target_hint: None,
+                occurrences: parsed.external_paths,
+                relation_site: false,
+            });
+        }
+    }
     Ok((
         graph,
         EvidenceInput {
             artifacts,
             provenance,
-            runs: Vec::new(),
-            regions: Vec::new(),
-            branches: Vec::new(),
+            runs,
+            regions,
+            branches,
             gaps,
         },
     ))
@@ -3923,7 +3997,7 @@ mod tests {
         let artifacts = evidence_artifacts(&evidence).unwrap();
 
         let (generated, input) =
-            build_generated_evidence(&store, &evidence, artifacts, &cancelled).unwrap();
+            build_generated_evidence(&store, &evidence, artifacts, &fixture, &cancelled).unwrap();
         assert_eq!(generated.files[0].path, "target/out.rs");
         assert!(generated.refs.iter().any(|reference| {
             reference
@@ -4027,7 +4101,8 @@ mod tests {
             };
             let artifacts = evidence_artifacts(&captured).unwrap();
             let (graph, evidence) =
-                build_generated_evidence(&store, &captured, artifacts, &cancelled).unwrap();
+                build_generated_evidence(&store, &captured, artifacts, &fixture, &cancelled)
+                    .unwrap();
 
             assert!(graph.files.is_empty());
             assert_eq!(evidence.provenance.len(), provenance_count);

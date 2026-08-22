@@ -1,4 +1,5 @@
 mod artifact;
+mod coverage;
 mod evidence;
 mod git;
 mod index;
