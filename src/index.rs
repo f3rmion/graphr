@@ -2111,7 +2111,25 @@ fn add_rust_file(
     }
     for import in &parsed.imports {
         let import_module = lexical_module(import.module, module, &module_paths);
+        let source_key = import
+            .source
+            .and_then(|source| node_keys.get(source).cloned())
+            .unwrap_or_else(|| file_key.clone());
         let Some(path) = normalize_use(&import.path, import_module, &target.root) else {
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(source_key),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(import.line)?),
+                line_end: Some(to_u32(import.line)?),
+                category: GapCategory::Relation,
+                reason: GapReason::DynamicOrUnsupportedDispatch,
+                target_hint: Some(import.path.clone()),
+                occurrences: 1,
+                relation_site: true,
+            });
+            observed_relation_sites += 1;
             continue;
         };
         let alias_key = import
@@ -2120,10 +2138,7 @@ fn add_rust_file(
             .flatten()
             .map(|(alias, _)| item_key(&join_path(import_module, &alias)));
         graph.refs.push(RefInput {
-            source_key: import
-                .source
-                .and_then(|source| node_keys.get(source).cloned())
-                .unwrap_or_else(|| file_key.clone()),
+            source_key,
             kind: RefKind::Imports,
             line: to_u32(import.line)?,
             keys: vec![item_key(&path)],
@@ -2783,10 +2798,27 @@ fn supported_rust_call_target(raw: &str) -> bool {
 }
 
 fn generated_include_basename(raw: &str) -> Option<String> {
-    let compact = raw
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect::<Vec<_>>();
+    let mut compact = Vec::with_capacity(raw.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for byte in raw.bytes() {
+        if quoted {
+            compact.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else if !byte.is_ascii_whitespace() {
+            compact.push(byte);
+            quoted = byte == b'"';
+        }
+    }
+    if quoted {
+        return None;
+    }
     let compact = std::str::from_utf8(&compact).ok()?;
     let suffix = compact
         .strip_prefix("include!(concat!(env!(\"OUT_DIR\"),\"/")?
@@ -3384,7 +3416,8 @@ mod tests {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     use crate::artifact::AnalyzerKind;
     use crate::git::{
-        ArtifactFile, ArtifactOmission, ArtifactReview, CapturedSource, ChangeLayer, SourceOmission,
+        ArtifactFile, ArtifactOmission, ArtifactReview, CapturedSource, ChangeLayer, PathRecord,
+        SourceOmission,
     };
     use crate::workspace::{
         AllowedRoots, ErrorCode, IndexRequest, SnapshotCatalog, SnapshotTarget, resolve_request,
@@ -3511,6 +3544,62 @@ mod tests {
     }
 
     #[test]
+    fn incremental_source_omissions_replace_global_gaps() {
+        let root = snapshot_repository("incremental-source-omissions");
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let graph_path = root.join("incremental-source-omissions.db");
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store::open_private_image(&graph_path, &cancelled).unwrap();
+
+        for (reason, expected) in [
+            (Some(SourceOmissionReason::UnsafePath), "unsafe-path:1"),
+            (Some(SourceOmissionReason::Oversized), "oversized:1"),
+            (None, "none"),
+        ] {
+            let snapshot = SourceSnapshot {
+                capture_root: root.clone(),
+                files: Vec::new(),
+                omissions: reason
+                    .map(|reason| SourceOmission {
+                        path: Some("src/omitted.rs".into()),
+                        reason,
+                        occurrences: 1,
+                    })
+                    .into_iter()
+                    .collect(),
+            };
+            let graph = build_snapshot_for_test(&repository, &snapshot, &cancelled).unwrap();
+            store
+                .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+                .unwrap();
+            let review = store
+                .changes(
+                    REVIEW_SNAPSHOT_ID,
+                    &WorktreeChanges {
+                        files: Vec::new(),
+                        records: vec![PathRecord::Deleted("README.md".into())],
+                        paths: Vec::new(),
+                        source_patch: String::new(),
+                        artifacts: ArtifactReview::default(),
+                        skipped_paths: 0,
+                    },
+                    0,
+                    1,
+                    DependencyMode::Boundary,
+                    &cancelled,
+                )
+                .unwrap();
+            assert!(
+                review.graph.contains(&format!("by_reason={expected}")),
+                "{}",
+                review.graph
+            );
+        }
+        fs::remove_file(graph_path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn concurrent_source_digest_mismatch_is_fatal() {
         let root = snapshot_repository("source-digest-mismatch");
         let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
@@ -3573,6 +3662,55 @@ fn run() {
         assert_eq!(
             graph.modeled_sites[0].target_hint.as_deref(),
             Some("generated.rs")
+        );
+    }
+
+    #[test]
+    fn rust_wildcard_import_is_an_accounted_relation_gap() {
+        let graph = build_graph(
+            &[Source {
+                path: "src/lib.rs".into(),
+                text: "mod tests { use super::*; }".into(),
+            }],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(graph.files[0].observed_relation_sites, 1);
+        assert!(graph.refs.is_empty());
+        assert_eq!(
+            graph
+                .gaps
+                .iter()
+                .filter(|gap| gap.relation_site)
+                .map(|gap| (
+                    gap.category,
+                    gap.reason,
+                    gap.target_hint.as_deref(),
+                    gap.occurrences
+                ))
+                .collect::<Vec<_>>(),
+            [(
+                GapCategory::Relation,
+                GapReason::DynamicOrUnsupportedDispatch,
+                Some("super::*"),
+                1
+            )]
+        );
+    }
+
+    #[test]
+    fn generated_include_matches_out_dir_lexically() {
+        assert_eq!(
+            generated_include_basename(
+                r#"include! ( concat! ( env! ( "OUT_DIR" ) , "/generated.rs" ) )"#
+            )
+            .as_deref(),
+            Some("generated.rs")
+        );
+        assert_eq!(
+            generated_include_basename(r#"include!(concat!(env!("OUT_ DIR"), "/generated.rs"))"#),
+            None
         );
     }
 

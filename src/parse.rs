@@ -1022,9 +1022,9 @@ mod tests {
             parsed
                 .imports
                 .iter()
-                .map(|import| (import.path.as_str(), import.block_local))
+                .map(|import| (import.path.as_str(), import.line, import.block_local))
                 .collect::<Vec<_>>(),
-            [("super::*", false), ("crate::support::*", true)]
+            [("super::*", 3, false), ("crate::support::*", 5, true)]
         );
     }
 

@@ -2741,10 +2741,8 @@ it("works", () => direct());
                 "{path}"
             );
             assert_eq!(
-                graph.files[0].observed_relation_sites as usize,
-                graph.refs.len()
-                    + graph.modeled_sites.len()
-                    + graph.gaps.iter().filter(|gap| gap.relation_site).count(),
+                graph.files[0].observed_relation_sites,
+                if jsx { 19 } else { 17 },
                 "{path}"
             );
             if jsx {

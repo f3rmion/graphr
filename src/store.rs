@@ -1124,6 +1124,41 @@ fn require_graph_invariants(connection: &Connection) -> Result<()> {
     if invalid != 0 {
         return Err("database reference resolution is invalid".into());
     }
+    require_reference_candidates(connection)?;
+    let invalid_edges: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM (
+                     SELECT r.source_id, r.resolved_target_id AS target_id,
+                            CASE
+                                WHEN r.kind='IMPORTS' THEN 'IMPORTS'
+                                WHEN n.kind='test' THEN 'TEST_CALLS'
+                                ELSE 'CALLS'
+                            END AS kind,
+                            count(*) AS support_count
+                      FROM refs r JOIN nodes n ON n.id=r.source_id
+                      WHERE r.resolution_state='resolved'
+                      GROUP BY r.source_id, r.resolved_target_id,
+                               CASE
+                                   WHEN r.kind='IMPORTS' THEN 'IMPORTS'
+                                   WHEN n.kind='test' THEN 'TEST_CALLS'
+                                   ELSE 'CALLS'
+                               END
+                 ) expected
+                 LEFT JOIN edges e
+                   ON e.source_id=expected.source_id
+                  AND e.target_id=expected.target_id
+                  AND e.kind=expected.kind
+                WHERE e.support_count IS NULL
+                   OR e.support_count!=expected.support_count
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if invalid_edges {
+        return Err("database reference edges do not match resolved references".into());
+    }
     let mismatch = connection
         .query_row(
             "SELECT f.path FROM files f
@@ -1147,6 +1182,98 @@ fn require_graph_invariants(connection: &Connection) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn require_reference_candidates(connection: &Connection) -> Result<()> {
+    let references = connection
+        .prepare(
+            "SELECT id, alias_key, resolved_target_id, resolution_state
+               FROM refs ORDER BY id",
+        )
+        .map_err(db_error)?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?;
+    let mut load_keys = connection
+        .prepare("SELECT key FROM ref_keys WHERE ref_id=?1 ORDER BY rank")
+        .map_err(db_error)?;
+    let mut candidates = connection
+        .prepare("SELECT node_id FROM node_keys WHERE key=?1 ORDER BY node_id LIMIT 2")
+        .map_err(db_error)?;
+    let mut loaded = Vec::with_capacity(references.len());
+    let mut aliases = HashMap::new();
+    for (id, alias, target, state) in references {
+        let keys = load_keys
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        let direct = expected_reference_candidate(&keys, &mut candidates, None)?;
+        if let Some(alias) = &alias {
+            aliases
+                .entry(alias.clone())
+                .and_modify(|candidate| {
+                    *candidate = match (*candidate, direct) {
+                        (DbCandidate::Unique(left), DbCandidate::Unique(right))
+                            if left == right =>
+                        {
+                            DbCandidate::Unique(left)
+                        }
+                        _ => DbCandidate::Ambiguous,
+                    };
+                })
+                .or_insert(match direct {
+                    DbCandidate::Unique(target) => DbCandidate::Unique(target),
+                    DbCandidate::Missing | DbCandidate::Ambiguous => DbCandidate::Ambiguous,
+                });
+        }
+        loaded.push((alias, target, state, keys, direct));
+    }
+
+    for (alias, actual_target, actual_state, keys, direct) in loaded {
+        let expected = if alias.is_some() {
+            direct
+        } else {
+            expected_reference_candidate(&keys, &mut candidates, Some(&aliases))?
+        };
+        let (expected_target, expected_state) = match expected {
+            DbCandidate::Unique(target) => (Some(target), ResolutionState::Resolved),
+            DbCandidate::Missing => (None, ResolutionState::Missing),
+            DbCandidate::Ambiguous => (None, ResolutionState::Ambiguous),
+        };
+        if actual_target != expected_target || actual_state != expected_state.db() {
+            return Err("database reference resolution does not match candidates".into());
+        }
+    }
+    Ok(())
+}
+
+fn expected_reference_candidate(
+    keys: &[String],
+    candidates: &mut rusqlite::Statement<'_>,
+    aliases: Option<&HashMap<String, DbCandidate>>,
+) -> Result<DbCandidate> {
+    for key in keys {
+        let direct = candidate(candidates, key)?;
+        let alias = aliases
+            .and_then(|aliases| aliases.get(key))
+            .copied()
+            .unwrap_or(DbCandidate::Missing);
+        match merge_candidates(direct, alias) {
+            DbCandidate::Unique(target) => return Ok(DbCandidate::Unique(target)),
+            DbCandidate::Ambiguous => return Ok(DbCandidate::Ambiguous),
+            DbCandidate::Missing => {}
+        }
+    }
+    Ok(DbCandidate::Missing)
 }
 
 fn distinct_text(connection: &Connection, sql: &str) -> Result<Vec<String>> {
@@ -2647,18 +2774,31 @@ fn apply_incremental(
         .map(|(_, file)| file.id)
         .collect::<Vec<_>>();
     removed.sort_unstable();
+    let stored_global_gaps = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM graph_gaps
+                  WHERE file_id IS NULL AND source_id IS NULL AND run_id IS NULL
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(db_error)?;
+    let current_global_gaps = graph.gaps.iter().any(global_gap);
+    let replace_global_gaps = stored_global_gaps || current_global_gaps;
     let changed = removed.len()
         + graph
             .files
             .iter()
             .filter(|file| file.replace && !existing.contains_key(&file.path))
-            .count();
+            .count()
+        + usize::from(replace_global_gaps);
     if changed == 0
         && (!graph.nodes.is_empty()
             || !graph.refs.is_empty()
             || !graph.trait_implementations.is_empty()
             || !graph.modeled_sites.is_empty()
-            || !graph.gaps.is_empty())
+            || graph.gaps.iter().any(|gap| !global_gap(gap)))
     {
         return Err("no-op incremental graph contains parsed rows".into());
     }
@@ -2842,6 +2982,15 @@ fn apply_incremental(
         }
     }
 
+    if replace_global_gaps {
+        tx.execute(
+            "DELETE FROM graph_gaps
+              WHERE file_id IS NULL AND source_id IS NULL AND run_id IS NULL",
+            [],
+        )
+        .map_err(db_error)?;
+    }
+
     let (new_refs, new_implementations) = insert_graph(tx, graph, cancelled, true)?;
     affected_refs.extend(new_refs);
     affected_refs.extend(
@@ -2858,6 +3007,10 @@ fn apply_incremental(
     resolve_trait_implementations(tx, affected_implementations, cancelled)?;
     reparent_methods(tx, affected_owners, cancelled)?;
     Ok(changed)
+}
+
+fn global_gap(gap: &GapInput) -> bool {
+    gap.file_key.is_none() && gap.source_key.is_none() && gap.run_key.is_none()
 }
 
 fn refresh_script_export_methods(tx: &Transaction<'_>, cancelled: &AtomicBool) -> Result<()> {
@@ -4295,6 +4448,31 @@ mod tests {
     }
 
     #[test]
+    fn incremental_global_gaps_replace_the_complete_inventory() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((global_gap_graph(GapReason::UnsafePath, 2), ()))
+            })
+            .unwrap();
+
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((global_gap_graph(GapReason::Oversized, 1), ()))
+            })
+            .unwrap();
+        assert_eq!(stored_global_gaps(&store), [("oversized".into(), 1)]);
+
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((Graph::default(), ())))
+            .unwrap();
+        assert!(stored_global_gaps(&store).is_empty());
+    }
+
+    #[test]
     fn resolution_state_constraints_and_seal_reject_invalid_rows() {
         let root = std::env::temp_dir().join(format!(
             "graphr-resolution-state-{}-{}",
@@ -4342,6 +4520,40 @@ mod tests {
             "database contains pending references"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seal_recomputes_reference_candidate_resolution() {
+        let error = sealed_resolution_corruption("candidate", |connection| {
+            connection
+                .execute(
+                    "UPDATE refs SET resolved_target_id=NULL, resolution_state='missing'",
+                    [],
+                )
+                .unwrap();
+        });
+
+        assert_eq!(
+            error,
+            "database reference resolution does not match candidates"
+        );
+    }
+
+    #[test]
+    fn seal_verifies_resolved_reference_edge_ownership_and_support() {
+        for (label, sql) in [
+            ("missing-edge", "DELETE FROM edges"),
+            ("wrong-support", "UPDATE edges SET support_count=2"),
+            ("wrong-owner", "UPDATE edges SET kind='IMPORTS'"),
+        ] {
+            let error = sealed_resolution_corruption(label, |connection| {
+                connection.execute(sql, []).unwrap();
+            });
+            assert_eq!(
+                error, "database reference edges do not match resolved references",
+                "{label}"
+            );
+        }
     }
 
     #[test]
@@ -6369,6 +6581,29 @@ mod tests {
         }
     }
 
+    fn sealed_resolution_corruption(label: &str, corrupt: impl FnOnce(&Connection)) -> String {
+        let root = std::env::temp_dir().join(format!(
+            "graphr-seal-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((resolution_graph(1), ())))
+            .unwrap();
+        corrupt(&store.connection);
+
+        let error = store.seal(&cancelled).unwrap_err();
+        fs::remove_dir_all(root).unwrap();
+        error
+    }
+
     fn changed_lib() -> WorktreeChanges {
         WorktreeChanges {
             files: vec![ChangedFile {
@@ -6476,6 +6711,40 @@ mod tests {
             });
         }
         graph
+    }
+
+    fn global_gap_graph(reason: GapReason, occurrences: u32) -> Graph {
+        Graph {
+            gaps: vec![GapInput {
+                file_key: None,
+                source_key: None,
+                run_key: None,
+                path: Some("omitted.rs".into()),
+                line_start: None,
+                line_end: None,
+                category: GapCategory::Source,
+                reason,
+                target_hint: None,
+                occurrences,
+                relation_site: false,
+            }],
+            ..Graph::default()
+        }
+    }
+
+    fn stored_global_gaps(store: &Store) -> Vec<(String, i64)> {
+        store
+            .connection
+            .prepare(
+                "SELECT reason, occurrences FROM graph_gaps
+                  WHERE file_id IS NULL AND source_id IS NULL AND run_id IS NULL
+                  ORDER BY reason",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
     }
 
     fn assert_ref_state(store: &Store, state: &str, edges: i64) {

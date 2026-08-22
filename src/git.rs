@@ -381,7 +381,10 @@ impl ArtifactReview {
     }
 }
 
-pub fn change_content_complete(changes: &WorktreeChanges, dependency_mode: DependencyMode) -> bool {
+pub fn change_content_complete(
+    changes: &WorktreeChanges,
+    _dependency_mode: DependencyMode,
+) -> bool {
     changes.skipped_paths == 0
         && changes
             .artifacts
@@ -389,11 +392,7 @@ pub fn change_content_complete(changes: &WorktreeChanges, dependency_mode: Depen
             .iter()
             .all(|file| file.diff_complete && file.omission.is_none())
         && changes.paths.iter().all(|path| {
-            if dependency_mode == DependencyMode::Boundary
-                && changed_dependency_package(path).is_some()
-            {
-                true
-            } else if path.language.is_none() {
+            if path.language.is_none() {
                 changes
                     .artifacts
                     .file(&path.path)
@@ -5850,6 +5849,32 @@ mod tests {
             capture_error("Git change inventories disagree; retry".into()).code,
             ErrorCode::CaptureChanged
         );
+    }
+
+    #[test]
+    fn boundary_dependency_changes_require_exact_content() {
+        let mut changes = WorktreeChanges {
+            files: Vec::new(),
+            records: Vec::new(),
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: ".cargo/vendor/example/src/lib.rs".into(),
+                language: Some(Language::Rust),
+                additions: None,
+                deletions: None,
+                layers: vec![ChangeLayer::Unstaged],
+            }],
+            source_patch: String::new(),
+            artifacts: ArtifactReview::default(),
+            skipped_paths: 0,
+        };
+
+        assert!(!change_content_complete(&changes, DependencyMode::Boundary));
+        changes.paths[0].additions = Some(1);
+        changes.paths[0].deletions = Some(1);
+        assert!(change_content_complete(&changes, DependencyMode::Boundary));
     }
 
     #[test]
