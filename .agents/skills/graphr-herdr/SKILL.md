@@ -34,11 +34,11 @@ Require equal Git dirs, named branch, empty status, caller identity, both skills
 
 ## Choose work
 
-Search first. Default to one worker; add writers only for separately committable, non-overlapping tasks. Shared files, registries, schemas, generated files, or ordering mean one worker, not serial writers or an invented reviewer. Use Graphr planning only for a meaningful committed range; never manufacture one or index `HEAD..HEAD` as discovery.
+Search first. Default to one worker; add writers only for separately committable, non-overlapping tasks. Shared files, registries, schemas, generated files, or ordering mean one worker, not serial writers or an invented reviewer. When multiple tasks qualify, run the remainder independently per worker without shared IDs, snapshots, or state. Use Graphr planning only for a meaningful committed range; never manufacture one or index `HEAD..HEAD` as discovery.
 
 ## Create and brief the worker
 
-Normalize task slug to lowercase ASCII `[a-z0-9-]`, trim separators, cap at 25, and use `task` if empty so `worker-<slug>` fits 32. Use `agent/<slug>` unless convention wins. Report branch/path/live-agent collisions; never overwrite or guess reuse. Create with `herdr worktree create --cwd "$repo_root" --base "$parent_head" --branch "agent/$task_slug" --label "$task_slug" --no-focus`; require `result.type=worktree_created` and parse `result.workspace.workspace_id`, `result.tab.tab_id`, `result.root_pane.pane_id`, `result.worktree.path`, and `result.worktree.branch`.
+Normalize task slug to lowercase ASCII `[a-z0-9-]`, trim separators, cap at 25, and use `task` if empty so `worker-<slug>` fits 32. Set `worker_branch` to the explicit user/repository convention when present, otherwise `agent/$task_slug`. Collision-check `worker_branch`, path, and live agent; never overwrite or guess reuse. Create with `herdr worktree create --cwd "$repo_root" --base "$parent_head" --branch "$worker_branch" --label "$task_slug" --no-focus`; require `result.type=worktree_created` and parse `result.workspace.workspace_id`, `result.tab.tab_id`, `result.root_pane.pane_id`, `result.worktree.path`, and `result.worktree.branch`.
 
 Choose kind: user request; else caller kind from `herdr agent get "$HERDR_PANE_ID"` if listed by `herdr agent start --help`; else Codex only if `command -v codex` succeeds; otherwise stop. Start `worker-<slug>` in the returned pane, without model/effort arguments or Graphr MCP, then prompt:
 
@@ -71,11 +71,11 @@ Return mismatches to the same worker. On truncation, have it write the handoff u
 
 ## Review and repair
 
-Compute `review_base=$(git -C "$repo_root" merge-base "$parent_branch" "$worker_head")`. Invoke `graphr-review` from `repo_root` with `review_base`, `worker_head`, `target={"kind":"commit"}`; never authorize child, use a live diff, or reuse a snapshot. Findings return to the same worker; every new head needs verification and a fresh complete snapshot. A separate reviewer is only requested or broad/security-sensitive, and read-only in main.
+Compute `review_base=$(git -C "$repo_root" merge-base "$parent_branch" "$worker_head")`. Invoke `graphr-review` from `repo_root` with `review_base`, `worker_head`, `target={"kind":"commit"}`; never authorize child, use a live diff, or reuse a snapshot. The gate cannot run with unresolved actionable findings. A rejected finding needs an evidence-backed disposition; a repair returns to the same worker, and every new head needs verification and a fresh complete snapshot. A separate reviewer is only requested or broad/security-sensitive, and read-only in main.
 
 ## Run the gate
 
-After fresh complete review, create an ordinary no-focus checks tab in the idle worker worktree, parse its root pane, and run this serial per-attempt sentinel:
+After fresh complete review, create an ordinary no-focus checks tab in the idle worker worktree and parse its root pane. In that pane, independently rerun every reported targeted check and record its exact command/exit status before the repository gate; never accept the worker summary as proof. Missing/failing targeted checks return to the same worker; a changed head repeats Git verification and fresh Graphr review. Then run this serial per-attempt sentinel:
 
 ```bash
 herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$worker_path" --label "checks-$task_slug" --no-focus
@@ -86,11 +86,11 @@ herdr pane wait-output "$checks_pane" --match "${gate_token}=" --timeout 1800000
 herdr pane read "$checks_pane" --source recent-unwrapped --lines 200
 ```
 
-First non-zero stops. Return output to the same worker; after repair and fresh review, restart at formatting, not clippy.
+First non-zero stops. If sentinel/readback cannot identify the first failing command, report the gate incomplete/failed with command unknown; never infer success. Return output to the same worker; after repair and fresh review, restart at formatting, not clippy.
 
 ## Report and stop
 
-Retain resources and emit exactly:
+Retain resources and emit this exact block once per worker:
 
 ```text
 Branch: <worker branch>
