@@ -194,7 +194,7 @@ impl Engine {
                 &evidence.source_snapshot_id,
                 manifest_digest,
                 artifacts,
-                3,
+                4,
                 CACHE_FORMAT_VERSION,
                 GRAPH_ANALYZER_VERSION,
                 crate::store::SCHEMA_VERSION,
@@ -974,7 +974,12 @@ fn build_generated_evidence(
             coverage.format.db(),
             coverage.run_label
         );
-        let parsed = parse_coverage(coverage.format, &coverage.report.bytes, worktree_root)?;
+        let parsed = parse_coverage(
+            coverage.format,
+            &coverage.report.bytes,
+            worktree_root,
+            cancelled,
+        )?;
         runs.push(CoverageRunInput {
             key: run_key.clone(),
             format: parsed.format,

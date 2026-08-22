@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::evidence::CoverageFormat;
 use rmcp::serde_json::Value;
+
+const COVERAGE_OBSERVATION_LIMIT: usize = 100_000;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CoverageObservation {
@@ -47,10 +50,12 @@ pub fn parse_coverage(
     format: CoverageFormat,
     bytes: &[u8],
     worktree_root: &Path,
+    cancelled: &AtomicBool,
 ) -> Result<ParsedCoverage, String> {
+    check_cancelled(cancelled)?;
     match format {
-        CoverageFormat::Llvm => parse_llvm(bytes, worktree_root),
-        CoverageFormat::CoveragePy => parse_coverage_py(bytes, worktree_root),
+        CoverageFormat::Llvm => parse_llvm(bytes, worktree_root, cancelled),
+        CoverageFormat::CoveragePy => parse_coverage_py(bytes, worktree_root, cancelled),
     }
 }
 
@@ -66,7 +71,11 @@ type BranchKey = (
     Option<String>,
 );
 
-fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, String> {
+fn parse_llvm(
+    bytes: &[u8],
+    worktree_root: &Path,
+    cancelled: &AtomicBool,
+) -> Result<ParsedCoverage, String> {
     let root: Value = rmcp::serde_json::from_slice(bytes)
         .map_err(|_| "LLVM coverage report is invalid".to_owned())?;
     let object = root
@@ -105,8 +114,10 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
     let mut regions = BTreeMap::<RegionKey, u64>::new();
     let mut branches = BTreeMap::<BranchKey, u64>::new();
     let mut external = BTreeSet::new();
+    let mut observations = 0;
 
     for export in data {
+        check_cancelled(cancelled)?;
         let export = export
             .as_object()
             .ok_or_else(|| "LLVM coverage export block is invalid".to_owned())?;
@@ -115,6 +126,7 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
                 .as_array()
                 .ok_or_else(|| "LLVM coverage functions are invalid".to_owned())?;
             for function in functions {
+                check_cancelled(cancelled)?;
                 let function = function
                     .as_object()
                     .ok_or_else(|| "LLVM coverage function is invalid".to_owned())?;
@@ -135,6 +147,7 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
                     .and_then(Value::as_array)
                     .ok_or_else(|| "LLVM coverage regions are invalid".to_owned())?;
                 for tuple in tuples {
+                    check_cancelled(cancelled)?;
                     let tuple = exact_tuple(tuple, 8, "LLVM coverage region")?;
                     let (start_line, start_column, end_line, end_column) = coordinates(tuple)?;
                     let count = integer(tuple, 4, "LLVM coverage count")?;
@@ -153,6 +166,8 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
                             let path = coverage_path(filename, &normalized_root, &mut external);
                             add_count(
                                 &mut regions,
+                                &mut observations,
+                                cancelled,
                                 (path, start_line, start_column, end_line, end_column, None),
                                 count,
                             )?;
@@ -168,6 +183,7 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
                 .as_array()
                 .ok_or_else(|| "LLVM coverage files are invalid".to_owned())?;
             for file in files {
+                check_cancelled(cancelled)?;
                 let file = file
                     .as_object()
                     .ok_or_else(|| "LLVM coverage file is invalid".to_owned())?;
@@ -182,6 +198,7 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
                     .as_array()
                     .ok_or_else(|| "LLVM coverage branches are invalid".to_owned())?;
                 for tuple in tuples {
+                    check_cancelled(cancelled)?;
                     let tuple = exact_tuple(tuple, 9, "LLVM coverage branch")?;
                     let (start_line, start_column, end_line, end_column) = coordinates(tuple)?;
                     let true_count = integer(tuple, 4, "LLVM coverage true count")?;
@@ -205,6 +222,8 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
                     ] {
                         add_count(
                             &mut branches,
+                            &mut observations,
+                            cancelled,
                             (
                                 path.clone(),
                                 i64::from(start_line),
@@ -276,7 +295,11 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
     })
 }
 
-fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, String> {
+fn parse_coverage_py(
+    bytes: &[u8],
+    worktree_root: &Path,
+    cancelled: &AtomicBool,
+) -> Result<ParsedCoverage, String> {
     let root: Value = rmcp::serde_json::from_slice(bytes)
         .map_err(|_| "Coverage.py report is invalid".to_owned())?;
     let object = root
@@ -303,8 +326,10 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
     let mut regions = BTreeMap::<RegionKey, u64>::new();
     let mut branches = BTreeMap::<BranchKey, u64>::new();
     let mut external = BTreeSet::new();
+    let mut observations = 0;
 
     for (filename, file) in files {
+        check_cancelled(cancelled)?;
         let file = file
             .as_object()
             .ok_or_else(|| "Coverage.py file entry is invalid".to_owned())?;
@@ -315,6 +340,7 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                     .ok_or_else(|| "Coverage.py contexts are invalid".to_owned())?;
                 let mut contexts = BTreeMap::<u32, Vec<Option<String>>>::new();
                 for (line, names) in values {
+                    check_cancelled(cancelled)?;
                     let parsed = line
                         .parse::<u32>()
                         .map_err(|_| "Coverage.py context line is invalid".to_owned())?;
@@ -327,6 +353,7 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                     let mut unique = BTreeSet::new();
                     let mut parsed_names = Vec::with_capacity(names.len());
                     for name in names {
+                        check_cancelled(cancelled)?;
                         let name = name
                             .as_str()
                             .ok_or_else(|| "Coverage.py context is invalid".to_owned())?;
@@ -356,12 +383,16 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                 .as_array()
                 .ok_or_else(|| format!("Coverage.py {field} are invalid"))?;
             for line in lines {
+                check_cancelled(cancelled)?;
                 let line = value_positive_u32(line, "Coverage.py line")?;
                 match contexts.get(&line).filter(|contexts| !contexts.is_empty()) {
                     Some(contexts) => {
                         for context in contexts {
+                            check_cancelled(cancelled)?;
                             insert_coverage_py(
                                 &mut regions,
+                                &mut observations,
+                                cancelled,
                                 (path.clone(), line, 0, line, 0, context.clone()),
                                 count,
                             )?;
@@ -369,6 +400,8 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                     }
                     None => insert_coverage_py(
                         &mut regions,
+                        &mut observations,
+                        cancelled,
                         (path.clone(), line, 0, line, 0, None),
                         count,
                     )?,
@@ -383,11 +416,14 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                 .as_array()
                 .ok_or_else(|| format!("Coverage.py {field} are invalid"))?;
             for arc in arcs {
+                check_cancelled(cancelled)?;
                 let arc = exact_tuple(arc, 2, "Coverage.py branch")?;
                 let start_line = value_nonzero_i64(&arc[0], "Coverage.py branch source")?;
                 let target_line = value_nonzero_i64(&arc[1], "Coverage.py branch target")?;
                 insert_coverage_py(
                     &mut branches,
+                    &mut observations,
+                    cancelled,
                     (
                         path.clone(),
                         start_line,
@@ -519,7 +555,14 @@ fn index(tuple: &[Value], index: usize, kind: &str) -> Result<usize, String> {
     usize::try_from(integer(tuple, index, kind)?).map_err(|_| format!("{kind} exceeds range"))
 }
 
-fn add_count<K: Ord>(values: &mut BTreeMap<K, u64>, key: K, count: u64) -> Result<(), String> {
+fn add_count<K: Ord>(
+    values: &mut BTreeMap<K, u64>,
+    observations: &mut usize,
+    cancelled: &AtomicBool,
+    key: K,
+    count: u64,
+) -> Result<(), String> {
+    charge_observation(observations, cancelled)?;
     let total = values.entry(key).or_default();
     *total = total
         .checked_add(count)
@@ -529,11 +572,31 @@ fn add_count<K: Ord>(values: &mut BTreeMap<K, u64>, key: K, count: u64) -> Resul
 
 fn insert_coverage_py<K: Ord>(
     values: &mut BTreeMap<K, u64>,
+    observations: &mut usize,
+    cancelled: &AtomicBool,
     key: K,
     count: u64,
 ) -> Result<(), String> {
+    charge_observation(observations, cancelled)?;
     if values.insert(key, count).is_some() {
         Err("Coverage.py observation is duplicated or contradictory".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn charge_observation(observations: &mut usize, cancelled: &AtomicBool) -> Result<(), String> {
+    check_cancelled(cancelled)?;
+    if *observations >= COVERAGE_OBSERVATION_LIMIT {
+        return Err("coverage report has too many observations".into());
+    }
+    *observations += 1;
+    Ok(())
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
+    if cancelled.load(Ordering::Relaxed) {
+        Err("coverage parsing cancelled".into())
     } else {
         Ok(())
     }
@@ -603,6 +666,14 @@ mod tests {
 
     use super::*;
 
+    fn parse_report(
+        format: CoverageFormat,
+        bytes: &[u8],
+        worktree_root: &Path,
+    ) -> Result<ParsedCoverage, String> {
+        parse_coverage(format, bytes, worktree_root, &AtomicBool::new(false))
+    }
+
     fn llvm_report(version: &str) -> Value {
         json!({
             "type": "llvm.coverage.json.export",
@@ -661,9 +732,101 @@ mod tests {
     }
 
     #[test]
+    fn coverage_py_rejects_more_than_one_hundred_thousand_observations() {
+        let report = |regions: u32, branches: u32| {
+            let executed_lines = (1..=regions).collect::<Vec<_>>();
+            let executed_branches = (1..=branches)
+                .map(|line| [i64::from(line), i64::from(line) + 1])
+                .collect::<Vec<_>>();
+            json!({
+                "meta": {"format": 3, "version": "7"},
+                "files": {
+                    "src/lib.rs": {
+                        "executed_lines": executed_lines,
+                        "executed_branches": executed_branches
+                    }
+                }
+            })
+            .to_string()
+        };
+
+        assert!(
+            parse_coverage_py(
+                report(50_000, 50_000).as_bytes(),
+                Path::new("/repo"),
+                &AtomicBool::new(false),
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_coverage_py(
+                report(50_000, 50_001).as_bytes(),
+                Path::new("/repo"),
+                &AtomicBool::new(false),
+            )
+            .is_err_and(|error| error == "coverage report has too many observations")
+        );
+    }
+
+    #[test]
+    fn llvm_rejects_more_than_one_hundred_thousand_observations() {
+        let report = |branches: u32| {
+            let branches = (1..=branches)
+                .map(|line| [line, 1, line, 2, 1, 0, 0, 0, 4])
+                .collect::<Vec<_>>();
+            json!({
+                "type": "llvm.coverage.json.export",
+                "version": "2.0.1",
+                "data": [{
+                    "functions": [{
+                        "filenames": ["src/lib.rs"],
+                        "regions": [
+                            [1, 1, 1, 2, 1, 0, 0, 0],
+                            [2, 1, 2, 2, 1, 0, 0, 0]
+                        ]
+                    }],
+                    "files": [{"filename": "src/lib.rs", "branches": branches}]
+                }]
+            })
+            .to_string()
+        };
+
+        assert!(
+            parse_llvm(
+                report(49_999).as_bytes(),
+                Path::new("/repo"),
+                &AtomicBool::new(false),
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_llvm(
+                report(50_000).as_bytes(),
+                Path::new("/repo"),
+                &AtomicBool::new(false),
+            )
+            .is_err_and(|error| error == "coverage report has too many observations")
+        );
+    }
+
+    #[test]
+    fn coverage_decode_honors_preexisting_cancellation() {
+        let report =
+            br#"{"meta":{"format":3,"version":"7"},"files":{"src/lib.rs":{"executed_lines":[1]}}}"#;
+        let error = parse_coverage(
+            CoverageFormat::CoveragePy,
+            report,
+            Path::new("/repo"),
+            &std::sync::atomic::AtomicBool::new(true),
+        )
+        .unwrap_err();
+        assert_eq!(error, "coverage parsing cancelled");
+    }
+
+    #[test]
     fn llvm_v2_v3_decode_regions_branches_paths_and_fold_duplicates() {
         for version in ["2.0.1", "3.0.0"] {
-            let parsed = parse_coverage(
+            let parsed = parse_report(
                 CoverageFormat::Llvm,
                 llvm_report(version).to_string().as_bytes(),
                 Path::new("/repo"),
@@ -790,7 +953,7 @@ mod tests {
 
         for report in cases {
             assert!(
-                parse_coverage(
+                parse_report(
                     CoverageFormat::Llvm,
                     report.to_string().as_bytes(),
                     Path::new("/repo")
@@ -814,7 +977,7 @@ mod tests {
             }),
         ] {
             assert!(
-                parse_coverage(
+                parse_report(
                     CoverageFormat::Llvm,
                     report.to_string().as_bytes(),
                     Path::new("/repo")
@@ -852,7 +1015,7 @@ mod tests {
                 }]
             }]
         });
-        let parsed = parse_coverage(
+        let parsed = parse_report(
             CoverageFormat::Llvm,
             report.to_string().as_bytes(),
             Path::new("/repo"),
@@ -887,7 +1050,7 @@ mod tests {
                 malformed["data"][0]["files"][0]["branches"] = json!([tuple]);
             }
             assert!(
-                parse_coverage(
+                parse_report(
                     CoverageFormat::Llvm,
                     malformed.to_string().as_bytes(),
                     Path::new("/repo"),
@@ -940,7 +1103,7 @@ mod tests {
 
     #[test]
     fn coverage_py_v3_decodes_context_lines_and_run_scoped_arcs() {
-        let parsed = parse_coverage(
+        let parsed = parse_report(
             CoverageFormat::CoveragePy,
             coverage_py_report().to_string().as_bytes(),
             Path::new("/repo"),
@@ -1064,7 +1227,7 @@ mod tests {
                 "contexts": {"8": [""]}
             }}
         });
-        let parsed = parse_coverage(
+        let parsed = parse_report(
             CoverageFormat::CoveragePy,
             report.to_string().as_bytes(),
             Path::new("/repo"),
@@ -1114,7 +1277,7 @@ mod tests {
 
         for report in reports {
             assert!(
-                parse_coverage(
+                parse_report(
                     CoverageFormat::CoveragePy,
                     report.to_string().as_bytes(),
                     Path::new("/repo")
@@ -1165,7 +1328,7 @@ mod tests {
                 "files": {"pkg/a.py": entry}
             });
             assert!(
-                parse_coverage(
+                parse_report(
                     CoverageFormat::CoveragePy,
                     report.to_string().as_bytes(),
                     Path::new("/repo")
@@ -1187,7 +1350,7 @@ mod tests {
             }),
         ] {
             assert!(
-                parse_coverage(
+                parse_report(
                     CoverageFormat::CoveragePy,
                     report.to_string().as_bytes(),
                     Path::new("/repo")

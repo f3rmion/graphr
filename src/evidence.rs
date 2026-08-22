@@ -157,6 +157,8 @@ impl EvidenceManifest {
     ) -> Result<CapturedEvidence, OperationError> {
         let mut unique = BTreeMap::<String, ([u8; 32], u64)>::new();
         record_unique(&mut unique, &self.manifest)?;
+        let mut retained = 0;
+        charge_retained(&mut retained, &self.manifest)?;
         let mut generated = Vec::with_capacity(self.generated.len());
         for declaration in self.generated {
             let expected_input = parse_digest(&declaration.input.blake3)?;
@@ -175,6 +177,7 @@ impl EvidenceManifest {
                 declaration.input.line_end,
             )?;
             record_unique(&mut unique, input)?;
+            charge_retained(&mut retained, input)?;
 
             let bytes =
                 capture_evidence_file(root, &declaration.output.path, ARTIFACT_LIMIT, cancelled)?;
@@ -196,6 +199,7 @@ impl EvidenceManifest {
                 bytes,
             };
             record_unique(&mut unique, &output)?;
+            charge_retained(&mut retained, &output)?;
             generated.push(CapturedGenerated {
                 input: CapturedArtifactSpan {
                     artifact: input.clone(),
@@ -227,19 +231,13 @@ impl EvidenceManifest {
                 bytes,
             };
             record_unique(&mut unique, &report)?;
+            charge_retained(&mut retained, &report)?;
             coverage.push(CapturedCoverage {
                 format: declaration.format,
                 report,
                 run_label: declaration.run_label,
                 test_name: declaration.test_name,
             });
-        }
-        let total = unique
-            .values()
-            .try_fold(0_u64, |total, (_, size)| total.checked_add(*size))
-            .ok_or_else(|| invalid("captured evidence byte total exceeds its limit"))?;
-        if total > EVIDENCE_TOTAL_LIMIT {
-            return Err(invalid("captured evidence byte total exceeds its limit"));
         }
         Ok(CapturedEvidence {
             source_snapshot_id: self.source_snapshot_id,
@@ -433,6 +431,16 @@ fn record_unique(
             Err(invalid("evidence artifact identity conflicts"))
         }
     }
+}
+
+fn charge_retained(total: &mut u64, artifact: &CapturedArtifact) -> Result<(), OperationError> {
+    let size = u64::try_from(artifact.bytes.len())
+        .map_err(|_| invalid("captured artifact size exceeds supported range"))?;
+    *total = total
+        .checked_add(size)
+        .filter(|total| *total <= EVIDENCE_TOTAL_LIMIT)
+        .ok_or_else(|| invalid("captured evidence byte total exceeds its limit"))?;
+    Ok(())
 }
 
 fn invalid(message: &'static str) -> OperationError {
@@ -731,7 +739,7 @@ mod tests {
         let provisional = manifest_value(generated.clone()).to_string();
         let final_output_size = ARTIFACT_LIMIT
             - u64::try_from(provisional.len()).unwrap()
-            - u64::try_from(input.len()).unwrap();
+            - u64::try_from(input.len() * GENERATED_LIMIT).unwrap();
         let final_output = vec![b'x'; final_output_size as usize];
         generated[GENERATED_LIMIT - 1]["output"]["blake3"] =
             blake3::hash(&final_output).to_hex().to_string().into();
@@ -777,6 +785,80 @@ mod tests {
             manifest
                 .capture(&root, &inputs, &AtomicBool::new(false))
                 .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_retained_declaration_amplification() {
+        let root = fixture("retained-amplification");
+        let input = vec![b'i'; 1024 * 1024];
+        let output = vec![b'o'; 1024 * 1024];
+        let report = vec![b'r'; 1024 * 1024];
+        fs::write(root.join("out.rs"), &output).unwrap();
+        fs::write(root.join("report.json"), &report).unwrap();
+
+        let generated = (1..=GENERATED_LIMIT)
+            .map(|line| {
+                rmcp::serde_json::json!({
+                    "input": {
+                        "path": "schema.proto",
+                        "blake3": blake3::hash(&input).to_hex().to_string(),
+                        "line_start": 1,
+                        "line_end": 1
+                    },
+                    "generator": {
+                        "path": "src/generator.rs",
+                        "line_start": line,
+                        "line_end": line
+                    },
+                    "output": {
+                        "path": "out.rs",
+                        "blake3": blake3::hash(&output).to_hex().to_string(),
+                        "line_start": 1,
+                        "line_end": 1
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let coverage = (0..COVERAGE_REPORT_LIMIT)
+            .map(|index| {
+                rmcp::serde_json::json!({
+                    "format": "coverage_py",
+                    "path": "report.json",
+                    "blake3": blake3::hash(&report).to_hex().to_string(),
+                    "run_label": format!("run-{index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        write_manifest(
+            &root,
+            &rmcp::serde_json::json!({
+                "format_version": 1,
+                "source_snapshot_id": "a".repeat(64),
+                "generated": generated,
+                "coverage": coverage
+            })
+            .to_string(),
+        );
+        let inputs = BTreeMap::from([(
+            "schema.proto".to_owned(),
+            CapturedArtifact {
+                path: "schema.proto".into(),
+                content_hash: *blake3::hash(&input).as_bytes(),
+                bytes: input,
+            },
+        )]);
+
+        let result = capture_manifest(&root, Path::new("evidence.json"), &AtomicBool::new(false))
+            .unwrap()
+            .capture(&root, &inputs, &AtomicBool::new(false));
+        let Err(error) = result else {
+            panic!("retained evidence above the aggregate limit was accepted");
+        };
+        assert_eq!(
+            error.message,
+            "captured evidence byte total exceeds its limit"
         );
         fs::remove_dir_all(root).unwrap();
     }
