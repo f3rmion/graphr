@@ -2786,6 +2786,7 @@ struct StaticAccounting {
     total_gaps: u64,
     relevant_gaps: u64,
     gaps_by_reason: BTreeMap<GapReason, u64>,
+    gap_records: String,
     missing: u64,
     ambiguous: u64,
 }
@@ -2822,6 +2823,7 @@ fn static_accounting(
         total_gaps: 0,
         relevant_gaps: 0,
         gaps_by_reason: BTreeMap::new(),
+        gap_records: String::new(),
         missing: 0,
         ambiguous: 0,
     };
@@ -2879,6 +2881,7 @@ fn static_accounting(
             }
         }
     }
+    accounting.gap_records = static_gap_records(connection)?;
     let (missing, ambiguous) = connection
         .query_row(
             "SELECT
@@ -2936,6 +2939,72 @@ fn static_accounting(
         accounting.static_model_complete = false;
     }
     Ok(accounting)
+}
+
+fn static_gap_records(connection: &Connection) -> Result<String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT category, reason, path, line_start, line_end, target_hint,
+                    occurrences, relation_site, id
+               FROM graph_gaps
+              WHERE category NOT IN ('coverage','generated')",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<u32>>(3)?,
+                row.get::<_, Option<u32>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, bool>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut gaps = Vec::new();
+    for row in rows {
+        let (category, reason, path, start, end, target, occurrences, relation_site, id) =
+            row.map_err(db_error)?;
+        gaps.push((
+            GapReason::parse(&reason).ok_or_else(|| "database gap reason is invalid".to_owned())?,
+            path,
+            start,
+            end,
+            GapCategory::parse(&category)
+                .ok_or_else(|| "database gap category is invalid".to_owned())?,
+            target,
+            occurrences,
+            relation_site,
+            id,
+        ));
+    }
+    gaps.sort_unstable();
+
+    let mut text = String::new();
+    for (reason, path, start, end, category, target, occurrences, relation_site, _) in gaps {
+        let line = match (start, end) {
+            (Some(start), Some(end)) => line_range(start, end),
+            (Some(start), None) => start.to_string(),
+            (None, _) => "none".into(),
+        };
+        text.push_str(&format!(
+            "gap category={} reason={} path={:?} line={line}",
+            category.db(),
+            reason.db(),
+            path.unwrap_or_default(),
+        ));
+        if let Some(target) = target {
+            text.push_str(&format!(" target={target:?}"));
+        }
+        text.push_str(&format!(
+            " occurrences={occurrences} relation_site={relation_site}\n"
+        ));
+    }
+    Ok(text)
 }
 
 #[derive(Default)]
@@ -3350,7 +3419,7 @@ fn render_coverage_observations(
                     region.end_line, region.end_column, region.execution_count,
                     CASE WHEN region.test_id IS NOT NULL
                          THEN coalesce(region.context, run.test_name) END,
-                    NOT EXISTS(
+                    (run.test_name IS NOT NULL OR region.context IS NOT NULL) AND NOT EXISTS(
                         SELECT 1 FROM graph_gaps gap
                          WHERE gap.run_id=run.id AND gap.category='coverage' AND (
                             (gap.reason IN ('missing-test-context','ambiguous-test-context')
@@ -3452,7 +3521,7 @@ fn render_coverage_observations(
                     branch.end_line, branch.end_column, branch.target_line,
                     branch.kind, branch.execution_count,
                     CASE WHEN branch.test_id IS NOT NULL THEN run.test_name END,
-                    NOT EXISTS(
+                    run.test_name IS NOT NULL AND NOT EXISTS(
                         SELECT 1 FROM graph_gaps gap
                          WHERE gap.run_id=run.id AND gap.category='coverage' AND (
                             (run.format='llvm'
@@ -3734,6 +3803,7 @@ fn assurance_preamble(
 completeness content_capture={} source_capture={} syntax_parse={} site_classification=complete static_model={} evidence_capture={} provenance_model={} execution_mapping={} traversal={}\n\
 gaps total={} relevant={} by_reason={}\n\
 references missing={} ambiguous={}\n\
+{}\
 claim kind=affected-callers status={static_status} basis=resolved-static-call-graph\n\
 claim kind=affected-flows status={static_status} basis=resolved-static-call-graph\n\
 {static_test_paths}",
@@ -3750,6 +3820,7 @@ claim kind=affected-flows status={static_status} basis=resolved-static-call-grap
         by_reason,
         accounting.missing,
         accounting.ambiguous,
+        accounting.gap_records,
     )
 }
 
@@ -8639,8 +8710,13 @@ mod tests {
             "claim kind=changed-execution path=\"src/lib.rs\" lines=1-3 status=complete result=observed basis=llvm-coverage-json run=\"positive\" test=\"named\""
         ));
         assert!(review.evidence.contains(
-            "claim kind=changed-execution path=\"src/lib.rs\" lines=1-3 status=complete result=not-observed basis=llvm-coverage-json run=\"zero\""
+            "claim kind=changed-execution path=\"src/lib.rs\" lines=1-3 status=partial result=unknown basis=llvm-coverage-json run=\"zero\""
         ));
+        assert!(
+            review
+                .evidence
+                .contains("not-observed run=\"zero\" path=\"src/lib.rs\" lines=1-3 count=0")
+        );
         assert!(review.evidence.contains(
             "observed-branch run=\"positive\" test=\"named\" path=\"src/lib.rs\" line=2 arm=true count=1"
         ));

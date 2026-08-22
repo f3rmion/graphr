@@ -460,13 +460,19 @@ fn coverage_evidence_imports_python_contexts_with_run_scoped_arcs() {
         .unwrap();
     let run_level = changes
         .find(
-            "claim kind=changed-execution path=\"src/lib.py\" lines=2 status=complete result=observed basis=coverage-py-json run=\"python-run\"",
+            "claim kind=changed-execution path=\"src/lib.py\" lines=2 status=partial result=unknown basis=coverage-py-json run=\"python-run\"",
         )
+        .unwrap();
+    let run_observation = changes
+        .find("observed run=\"python-run\" path=\"src/lib.py\" lines=2 count=1")
         .unwrap();
     let heuristic = changes
         .find("claim kind=static-test-paths status=")
         .unwrap_or_else(|| panic!("{changes}"));
-    assert!(named < run_level && run_level < heuristic, "{changes}");
+    assert!(
+        named < run_level && run_level < run_observation && run_observation < heuristic,
+        "{changes}"
+    );
     client.close();
 }
 
@@ -750,17 +756,18 @@ fn generated_evidence_chain_joins_provenance_static_calls_and_named_coverage() {
             .and_then(|line| line.split_ascii_whitespace().next())
             .unwrap_or_else(|| panic!("missing generated {name}: {search}"));
         let view = response_text(&client.view(node_ref, 1, 20));
-        assert!(view.contains("basis=verified-generated-manifest"), "{view}");
-        assert!(
-            view.contains("provenance input=\"proto/message.proto:2-2\""),
-            "{view}"
-        );
-        assert!(
-            view.contains(&format!(
-                "path=\"target/debug/build/graphr-fixture/out/message.rs\" lines={line} status=complete result=observed"
-            )),
-            "{view}"
-        );
+        for expected in [
+            "claim kind=generated-provenance status=complete result=linked basis=verified-generated-manifest output=\"target/debug/build/graphr-fixture/out/message.rs\"".to_owned(),
+            "provenance input=\"proto/message.proto:2-2\" generator=\"src/generator.rs:2-2\" output=\"target/debug/build/graphr-fixture/out/message.rs:1-2\"".to_owned(),
+            "includes source=\"src/lib.rs:6\" output=\"target/debug/build/graphr-fixture/out/message.rs\"".to_owned(),
+            format!("claim kind=changed-execution path=\"target/debug/build/graphr-fixture/out/message.rs\" lines={line} status=complete result=observed basis=llvm-coverage-json run=\"strict-run\" test=\"strict_roundtrip\""),
+            format!("observed run=\"strict-run\" test=\"strict_roundtrip\" path=\"target/debug/build/graphr-fixture/out/message.rs\" lines={line} count=1"),
+        ] {
+            assert!(
+                view.lines().any(|line| line == expected),
+                "missing exact view record {expected}: {view}"
+            );
+        }
     }
     client.close();
 }
@@ -859,11 +866,19 @@ fn generated_evidence_negative_omitted_test_name_stays_run_level() {
     let snapshot_id = client.snapshot_id().to_owned();
     let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
     let observations = change_section_text(&changes, "evidence");
-    let run_level = "claim kind=changed-execution path=\"target/debug/build/graphr-fixture/out/message.rs\" lines=1 status=complete result=observed basis=llvm-coverage-json run=\"strict-run\"";
-    let named = format!("{run_level} test=\"strict_roundtrip\"");
+    let unknown_named = "claim kind=changed-execution path=\"target/debug/build/graphr-fixture/out/message.rs\" lines=1 status=partial result=unknown basis=llvm-coverage-json run=\"strict-run\"";
+    let observed = "observed run=\"strict-run\" path=\"target/debug/build/graphr-fixture/out/message.rs\" lines=1 count=1";
 
-    assert!(observations.contains(run_level), "{observations}");
-    assert!(!observations.contains(&named), "{observations}");
+    for expected in [unknown_named, observed] {
+        assert!(
+            observations.lines().any(|line| line == expected),
+            "missing exact aggregate-coverage record {expected}: {observations}"
+        );
+    }
+    assert!(
+        observations.find(unknown_named).unwrap() < observations.find(observed).unwrap(),
+        "unknown named-test claim must precede its run-level observation: {observations}"
+    );
     assert!(
         !observations
             .lines()
@@ -977,6 +992,23 @@ fn mixed_evidence_gaps_keep_completed_transport_distinct_from_partial_static_evi
         "Test exercise tests/registration.test.js:3",
     ] {
         assert!(graph.contains(expected), "missing {expected}: {graph}");
+    }
+    let exact_gaps = [
+        "gap category=source reason=oversized path=\"src/skipped.rs\" line=none occurrences=1 relation_site=false",
+        "gap category=parse reason=parser-error path=\"src/broken.rs\" line=1 occurrences=1 relation_site=false",
+        "gap category=relation reason=dynamic-or-unsupported-dispatch path=\"src/lib.rs\" line=8 target=\"value.run\" occurrences=1 relation_site=true",
+        "gap category=macro reason=macro-expansion-unavailable path=\"src/lib.rs\" line=9 target=\"println\" occurrences=1 relation_site=true",
+    ];
+    let mut previous = None;
+    for expected in exact_gaps {
+        let position = graph
+            .lines()
+            .position(|line| line == expected)
+            .unwrap_or_else(|| panic!("missing exact gap {expected}: {graph}"));
+        if let Some(previous) = previous {
+            assert!(previous < position, "gap order changed: {graph}");
+        }
+        previous = Some(position);
     }
     let callers = graph
         .find("claim kind=affected-callers status=partial basis=resolved-static-call-graph")
@@ -3966,6 +3998,7 @@ fn is_graph_non_node(line: &str) -> bool {
         "languages=",
         "completeness ",
         "gaps ",
+        "gap ",
         "references ",
         "claim ",
         "file-mapped ",
@@ -4087,6 +4120,13 @@ fn graph_record_parser_accepts_only_complete_node_records() {
         parse_graph_records("  call -> dependency-boundary package=sha2")
             .unwrap()
             .is_empty()
+    );
+    assert!(
+        parse_graph_records(
+            "gap category=parse reason=parser-error path=\"src/lib.rs\" line=2 occurrences=1 relation_site=false"
+        )
+        .unwrap()
+        .is_empty()
     );
 
     for malformed in [
