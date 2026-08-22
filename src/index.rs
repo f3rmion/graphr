@@ -12,15 +12,16 @@ use std::thread;
 
 use crate::git::{
     ArtifactReview, CapturedSource, ChangeStatus, ChangedPath, DependencyMode, Language,
-    Repository, Source, SourceContent, SourceSnapshot, WorktreeChanges, changed_dependency_package,
-    read_captured_source,
+    Repository, Source, SourceContent, SourceOmissionReason, SourceSnapshot, WorktreeChanges,
+    change_content_complete, changed_dependency_package, read_captured_source,
 };
 use crate::javascript::ScriptParsers;
 use crate::parse::{DefinitionKind, ParsedFile, RustParser};
 use crate::python::PythonParser;
 use crate::store::{
-    EdgeInput, EdgeKind, FileInput, Graph, NodeInput, NodeKind, RefInput, RefKind, Store,
-    TraitImplementationInput,
+    ChangeReview, CompletenessStatus, EdgeInput, EdgeKind, FileInput, GapCategory, GapInput,
+    GapReason, Graph, ModeledSiteInput, ModeledSiteKind, NodeInput, NodeKind, RefInput, RefKind,
+    ResolutionState, Store, TraitImplementationInput,
 };
 use crate::workspace::{
     BuildProgress, BuildStage, CACHE_FORMAT_VERSION, ErrorCode, GRAPH_ANALYZER_VERSION,
@@ -113,6 +114,7 @@ impl Engine {
         let graph_image_id = graph_image_key(
             &request.root.repository_id,
             &capture.sources.files,
+            &capture.sources.omissions,
             CACHE_FORMAT_VERSION,
             GRAPH_ANALYZER_VERSION,
             crate::store::SCHEMA_VERSION,
@@ -213,7 +215,7 @@ impl Engine {
                 files_total: total,
                 files_reused: total,
                 files_parsed: 0,
-                files_skipped: capture.sources.skipped,
+                files_skipped: capture.sources.files_skipped(),
             };
             report(
                 BuildStage::Indexing,
@@ -495,7 +497,13 @@ impl Engine {
                 ));
             }
             return Ok(QueryOutput {
-                text: format!("no changes reason={}\n", reason.as_str()),
+                text: format!(
+                    "no changes reason={}\n\
+                     content_complete_when_pages_exhausted=true\n\
+                     static_evidence_status=complete\n\
+                     dynamic_evidence_status=not-applicable\n",
+                    reason.as_str()
+                ),
                 provenance: snapshot.provenance.clone(),
                 no_change_reason: Some(reason),
             });
@@ -861,7 +869,9 @@ struct ReviewSnapshot {
     artifact_patch_totals: String,
     all_path_totals: String,
     all_path_hunks: String,
-    complete_after_pagination: bool,
+    content_complete_when_pages_exhausted: bool,
+    static_status: CompletenessStatus,
+    dynamic_status: CompletenessStatus,
 }
 
 impl ReviewSnapshot {
@@ -871,8 +881,14 @@ impl ReviewSnapshot {
         max_nodes: u32,
         dependency_mode: DependencyMode,
         changes: impl Into<Arc<WorktreeChanges>>,
-        graph: String,
+        review: ChangeReview,
     ) -> Self {
+        let ChangeReview {
+            graph,
+            evidence,
+            static_status,
+            dynamic_status,
+        } = review;
         let changes = changes.into();
         let manifest = change_manifest(&changes, dependency_mode);
         let artifacts = artifact_text(&changes.artifacts);
@@ -881,7 +897,13 @@ impl ReviewSnapshot {
             depth,
             max_nodes,
             dependency_mode,
-            [&manifest, &changes.source_patch, &artifacts, &graph],
+            [
+                &manifest,
+                &changes.source_patch,
+                &artifacts,
+                &graph,
+                &evidence,
+            ],
         );
         let file_ranges = line_ranges(&manifest, None);
         let artifact_file_ranges = line_ranges(&artifacts, Some("artifact "));
@@ -916,8 +938,8 @@ impl ReviewSnapshot {
         );
         let all_path_totals =
             change_totals("all_path", changes.paths.iter(), changes.skipped_paths);
-        let complete_after_pagination =
-            graph_review_complete(&graph) && change_content_complete(&changes, dependency_mode);
+        let content_complete_when_pages_exhausted =
+            change_content_complete(&changes, dependency_mode);
         Self {
             snapshot_id: snapshot_id.into(),
             depth,
@@ -939,7 +961,9 @@ impl ReviewSnapshot {
             artifact_patch_totals,
             all_path_totals,
             all_path_hunks,
-            complete_after_pagination,
+            content_complete_when_pages_exhausted,
+            static_status,
+            dynamic_status,
         }
     }
 
@@ -1005,14 +1029,10 @@ fn review_context(snapshot: &ReviewSnapshot) -> Result<String, String> {
     )?;
     let (graph_page, graph_more) =
         render_section_page(snapshot, ReviewSection::Graph, 0, INITIAL_GRAPH_BUDGET)?;
+    let _all_initial_pages_complete = !files_more && !diff_more && !artifacts_more && !graph_more;
     let output = format!(
-        "{files}{diff}{artifacts}{graph_page}review_complete={} review_complete_when_pages_exhausted={}\n",
-        !files_more
-            && !diff_more
-            && !artifacts_more
-            && !graph_more
-            && snapshot.complete_after_pagination,
-        snapshot.complete_after_pagination,
+        "{files}{diff}{artifacts}{graph_page}{}",
+        terminal_status(snapshot),
     );
     if output.len() > REVIEW_CONTEXT_BUDGET {
         return Err("review context exceeds output budget".into());
@@ -1032,10 +1052,7 @@ fn render_section(snapshot: &ReviewSnapshot, cursor: &ReviewCursor) -> Result<St
     if cursor.checksum != expected {
         return Err("invalid changes cursor".into());
     }
-    let completion = format!(
-        "review_complete_when_pages_exhausted={}\n",
-        snapshot.complete_after_pagination
-    );
+    let completion = terminal_status(snapshot);
     let page_budget = REVIEW_CONTEXT_BUDGET
         .checked_sub(completion.len())
         .ok_or_else(|| "review completion metadata exceeds output budget".to_owned())?;
@@ -1046,6 +1063,15 @@ fn render_section(snapshot: &ReviewSnapshot, cursor: &ReviewCursor) -> Result<St
         return Err("review section exceeds output budget".into());
     }
     Ok(output)
+}
+
+fn terminal_status(snapshot: &ReviewSnapshot) -> String {
+    format!(
+        "content_complete_when_pages_exhausted={}\nstatic_evidence_status={}\ndynamic_evidence_status={}\n",
+        snapshot.content_complete_when_pages_exhausted,
+        snapshot.static_status.as_str(),
+        snapshot.dynamic_status.as_str(),
+    )
 }
 
 fn render_section_page(
@@ -1160,18 +1186,18 @@ fn render_section_page(
         ReviewSection::Graph => {
             let coverage = record_coverage(snapshot.ranges(section), &page);
             let records = record_coverage(&snapshot.graph_record_ranges, &page);
-            let analysis_complete = graph_flow_analysis_complete(&snapshot.graph);
+            let traversal_complete = graph_traversal_complete(&snapshot.graph);
             let neighborhood_complete =
                 graph_summary_value(&snapshot.graph, "neighborhood_omitted") == Some("false");
             let mapping_complete =
                 graph_summary_value(&snapshot.graph, "unmapped_ranges") == Some("0");
-            let flow_total = if analysis_complete {
+            let flow_total = if traversal_complete {
                 coverage.total.to_string()
             } else {
                 "unknown".into()
             };
             output.push_str(&format!(
-                "graph emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} page_record_limit={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} emitted_flows={} partial_flows={} discovered_flows={} total_flows={} prior_flows={} remaining_discovered_flows={} page_complete={} analysis_complete={} neighborhood_complete={} mapping_complete={}\n",
+                "graph emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} page_record_limit={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} emitted_flows={} partial_flows={} discovered_flows={} total_flows={} prior_flows={} remaining_discovered_flows={} page_complete={} traversal_complete={} neighborhood_complete={} mapping_complete={}\n",
                 emitted_bytes,
                 value.len(),
                 page.start,
@@ -1194,7 +1220,7 @@ fn render_section_page(
                 coverage.prior,
                 coverage.remaining,
                 !more,
-                analysis_complete,
+                traversal_complete,
                 neighborhood_complete,
                 mapping_complete,
             ));
@@ -1272,7 +1298,7 @@ fn review_snapshot(
     depth: u32,
     max_nodes: u32,
     dependency_mode: DependencyMode,
-    sections: [&str; 4],
+    sections: [&str; 5],
 ) -> String {
     let depth = depth.to_string();
     let max_nodes = max_nodes.to_string();
@@ -1557,8 +1583,8 @@ fn hunk_ranges(value: &str) -> Vec<Range<usize>> {
     ranges
 }
 
-fn graph_flow_analysis_complete(value: &str) -> bool {
-    graph_summary_value(value, "analysis_complete") == Some("true")
+fn graph_traversal_complete(value: &str) -> bool {
+    graph_summary_value(value, "traversal_complete") == Some("true")
 }
 
 fn graph_summary_value<'a>(value: &'a str, name: &str) -> Option<&'a str> {
@@ -1569,38 +1595,6 @@ fn graph_summary_value<'a>(value: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|field| {
             let (key, value) = field.split_once('=')?;
             (key == name).then_some(value)
-        })
-}
-
-fn graph_review_complete(value: &str) -> bool {
-    graph_flow_analysis_complete(value)
-        && graph_summary_value(value, "changed_symbols_omitted") == Some("0")
-        && graph_summary_value(value, "neighborhood_omitted") == Some("false")
-        && graph_summary_value(value, "unmapped_ranges") == Some("0")
-}
-
-fn change_content_complete(changes: &WorktreeChanges, dependency_mode: DependencyMode) -> bool {
-    changes.skipped_paths == 0
-        && changes.artifacts.is_complete()
-        && changes
-            .artifacts
-            .files
-            .iter()
-            .all(|file| file.omission.is_none())
-        && changes.paths.iter().all(|path| {
-            if dependency_mode == DependencyMode::Boundary
-                && changed_dependency_package(path).is_some()
-            {
-                true
-            } else if path.language.is_none() {
-                changes.artifacts.file(&path.path).is_some_and(|file| {
-                    file.diff_complete && file.analysis_complete && file.omission.is_none()
-                })
-            } else {
-                (path.status != ChangeStatus::Renamed || path.old_language.is_some())
-                    && path.additions.is_some()
-                    && path.deletions.is_some()
-            }
         })
 }
 
@@ -1617,7 +1611,7 @@ fn build_index(
         files_total: total,
         files_reused: 0,
         files_parsed: 0,
-        files_skipped: sources.skipped,
+        files_skipped: sources.files_skipped(),
     };
     progress(0, total, 0);
     let mut outputs = (0..total).map(|_| None).collect::<Vec<Option<Graph>>>();
@@ -1646,6 +1640,7 @@ fn build_index(
                 parse_context: file.parse_context.clone(),
                 byte_size: old.byte_size,
                 replace: false,
+                observed_relation_sites: old.observed_relation_sites,
             });
             outputs[index] = Some(graph);
             stats.files_reused += 1;
@@ -1680,8 +1675,12 @@ fn build_index(
                 &mut blob_reader,
             )? {
                 Some(graph) => {
+                    if graph.files.is_empty() {
+                        stats.files_skipped += 1;
+                    } else {
+                        stats.files_parsed += 1;
+                    }
                     outputs[work.index] = Some(graph);
-                    stats.files_parsed += 1;
                 }
                 None => stats.files_skipped += 1,
             }
@@ -1737,8 +1736,12 @@ fn build_index(
         for (index, part) in parts {
             match part {
                 Some(graph) => {
+                    if graph.files.is_empty() {
+                        stats.files_skipped += 1;
+                    } else {
+                        stats.files_parsed += 1;
+                    }
                     outputs[index] = Some(graph);
-                    stats.files_parsed += 1;
                 }
                 None => stats.files_skipped += 1,
             }
@@ -1746,6 +1749,25 @@ fn build_index(
     }
 
     let mut graph = Graph::default();
+    graph
+        .gaps
+        .extend(sources.omissions.iter().map(|omission| GapInput {
+            file_key: None,
+            source_key: None,
+            run_key: None,
+            path: omission.path.clone(),
+            line_start: None,
+            line_end: None,
+            category: if omission.reason == SourceOmissionReason::LanguageNotIndexed {
+                GapCategory::Language
+            } else {
+                GapCategory::Source
+            },
+            reason: source_gap_reason(omission.reason),
+            target_hint: None,
+            occurrences: omission.occurrences,
+            relation_site: false,
+        }));
     for mut part in outputs.into_iter().flatten() {
         graph.files.append(&mut part.files);
         graph.nodes.append(&mut part.nodes);
@@ -1754,6 +1776,8 @@ fn build_index(
             .trait_implementations
             .append(&mut part.trait_implementations);
         graph.edges.append(&mut part.edges);
+        graph.modeled_sites.append(&mut part.modeled_sites);
+        graph.gaps.append(&mut part.gaps);
     }
     if full {
         resolve(&mut graph, cancelled)?;
@@ -1802,7 +1826,10 @@ fn build_file(
                 .read(oid, cancelled)?;
             let Some(content) = content else {
                 *blob_reader = None;
-                return Ok(None);
+                return Ok(Some(global_source_gap(
+                    &work.file.path,
+                    GapReason::Oversized,
+                )));
             };
             content
         }
@@ -1812,7 +1839,10 @@ fn build_file(
         } => read_captured_source(&sources.capture_root, relative_path, digest, cancelled)?,
     };
     let Ok(text) = String::from_utf8(content) else {
-        return Ok(None);
+        return Ok(Some(global_source_gap(
+            &work.file.path,
+            GapReason::InvalidUtf8,
+        )));
     };
     let source = Source {
         path: work.file.path.clone(),
@@ -1830,6 +1860,7 @@ fn build_file(
         parse_context: work.file.parse_context.clone(),
         byte_size,
         replace: true,
+        observed_relation_sites: 0,
     });
     match work.file.language {
         Language::Rust => {
@@ -1860,6 +1891,37 @@ fn build_file(
     Ok(Some(graph))
 }
 
+fn global_source_gap(path: &str, reason: GapReason) -> Graph {
+    Graph {
+        gaps: vec![GapInput {
+            file_key: None,
+            source_key: None,
+            run_key: None,
+            path: Some(path.to_owned()),
+            line_start: None,
+            line_end: None,
+            category: GapCategory::Source,
+            reason,
+            target_hint: None,
+            occurrences: 1,
+            relation_site: false,
+        }],
+        ..Graph::default()
+    }
+}
+
+fn source_gap_reason(reason: SourceOmissionReason) -> GapReason {
+    match reason {
+        SourceOmissionReason::UnsafePath => GapReason::UnsafePath,
+        SourceOmissionReason::NonRegular => GapReason::NonRegular,
+        SourceOmissionReason::Unmerged => GapReason::Unmerged,
+        SourceOmissionReason::Oversized => GapReason::Oversized,
+        SourceOmissionReason::InvalidUtf8 => GapReason::InvalidUtf8,
+        SourceOmissionReason::MissingDuringRead => GapReason::MissingDuringRead,
+        SourceOmissionReason::LanguageNotIndexed => GapReason::LanguageNotIndexed,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn build_snapshot_for_test(
     repository: &Repository,
@@ -1887,6 +1949,8 @@ fn build_graph(sources: &[Source], cancelled: &AtomicBool) -> Result<Graph, Stri
         refs: Vec::new(),
         trait_implementations: Vec::new(),
         edges: Vec::new(),
+        modeled_sites: Vec::new(),
+        gaps: Vec::new(),
     };
     for source in sources {
         check_cancelled(cancelled)?;
@@ -1900,6 +1964,7 @@ fn build_graph(sources: &[Source], cancelled: &AtomicBool) -> Result<Graph, Stri
             byte_size: u64::try_from(source.text.len())
                 .map_err(|_| "source byte size exceeds supported range".to_owned())?,
             replace: true,
+            observed_relation_sites: 0,
         });
         add_rust_file(&mut graph, source, &target, &mut parser)?;
     }
@@ -1914,6 +1979,7 @@ fn add_rust_file(
     parser: &mut RustParser,
 ) -> Result<(), String> {
     let parsed = parser.parse(&source.text)?;
+    let mut observed_relation_sites = 0_u32;
 
     let file_key = identity(&source.path, "file", &source.path, 0, 0);
     graph.nodes.push(NodeInput {
@@ -1929,6 +1995,25 @@ fn add_rust_file(
         signature: String::new(),
         keys: vec![format!("rust:file:{}", source.path)],
     });
+    for gap in &parsed.parse_gaps {
+        graph.gaps.push(GapInput {
+            file_key: Some(source.path.clone()),
+            source_key: None,
+            run_key: None,
+            path: Some(source.path.clone()),
+            line_start: Some(to_u32(gap.line_start)?),
+            line_end: Some(to_u32(gap.line_end)?),
+            category: GapCategory::Parse,
+            reason: if parsed.parser_no_tree {
+                GapReason::ParserNoTree
+            } else {
+                GapReason::ParserError
+            },
+            target_hint: None,
+            occurrences: 1,
+            relation_site: false,
+        });
+    }
 
     let module = target.module.as_str();
     let module_paths = inline_module_paths(&parsed, module)?;
@@ -2044,32 +2129,106 @@ fn add_rust_file(
             keys: vec![item_key(&path)],
             alias_key,
             resolved_target_key: None,
+            resolution: ResolutionState::Pending,
         });
+        observed_relation_sites += 1;
     }
 
     for call in &parsed.calls {
-        let Some(source_key) = node_keys.get(call.source) else {
-            continue;
+        let source_key = call
+            .source
+            .and_then(|source| node_keys.get(source).cloned())
+            .unwrap_or_else(|| file_key.clone());
+        let keys = if supported_rust_call_target(&call.target) {
+            call_keys(
+                call,
+                &parsed,
+                &absolute_paths,
+                target,
+                &module_paths,
+                &bindings,
+            )
+        } else {
+            Vec::new()
         };
-        let keys = call_keys(
-            call,
-            &parsed,
-            &absolute_paths,
-            target,
-            &module_paths,
-            &bindings,
-        );
         if !keys.is_empty() {
             graph.refs.push(RefInput {
-                source_key: source_key.clone(),
+                source_key,
                 kind: RefKind::Calls,
                 line: to_u32(call.line)?,
                 keys,
                 alias_key: None,
                 resolved_target_key: None,
+                resolution: ResolutionState::Pending,
+            });
+        } else {
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(source_key),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(call.line)?),
+                line_end: Some(to_u32(call.line)?),
+                category: GapCategory::Relation,
+                reason: GapReason::DynamicOrUnsupportedDispatch,
+                target_hint: Some(call.target.clone()),
+                occurrences: 1,
+                relation_site: true,
             });
         }
+        observed_relation_sites += 1;
     }
+    for site in &parsed.macros {
+        let source_key = site
+            .source
+            .and_then(|source| node_keys.get(source).cloned())
+            .unwrap_or_else(|| file_key.clone());
+        if let Some(output) = generated_include_basename(&site.text) {
+            graph.modeled_sites.push(ModeledSiteInput {
+                file_key: source.path.clone(),
+                source_key: Some(source_key),
+                kind: ModeledSiteKind::GeneratedInclusion,
+                line_start: to_u32(site.line)?,
+                line_end: to_u32(site.line_end)?,
+                target_hint: Some(output.clone()),
+                parse_context: Some(target.parse_context()),
+            });
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: None,
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(site.line)?),
+                line_end: Some(to_u32(site.line_end)?),
+                category: GapCategory::Generated,
+                reason: GapReason::GeneratedOutputUnobserved,
+                target_hint: Some(output),
+                occurrences: 1,
+                relation_site: false,
+            });
+        } else {
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(source_key),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(site.line)?),
+                line_end: Some(to_u32(site.line_end)?),
+                category: GapCategory::Macro,
+                reason: GapReason::MacroExpansionUnavailable,
+                target_hint: Some(site.target.clone()),
+                occurrences: 1,
+                relation_site: true,
+            });
+        }
+        observed_relation_sites += 1;
+    }
+    graph
+        .files
+        .iter_mut()
+        .find(|file| file.path == source.path)
+        .ok_or_else(|| "Rust graph file is missing".to_owned())?
+        .observed_relation_sites = observed_relation_sites;
     Ok(())
 }
 
@@ -2101,8 +2260,10 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
         let Some(alias) = reference.alias_key.as_ref() else {
             continue;
         };
-        let target = reference_target(&reference.keys, &candidates, None)
-            .map_or(Candidate::Ambiguous, Candidate::Unique);
+        let target = match reference_target(&reference.keys, &candidates, None) {
+            ReferenceTarget::Resolved(target) => Candidate::Unique(target),
+            ReferenceTarget::Missing | ReferenceTarget::Ambiguous => Candidate::Ambiguous,
+        };
         aliases
             .entry(alias.clone())
             .and_modify(|candidate| {
@@ -2144,8 +2305,19 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
     for (index, reference) in graph.refs.iter_mut().enumerate() {
         check_progress(index, cancelled)?;
         let alias_candidates = reference.alias_key.is_none().then_some(&aliases);
-        let Some(target) = reference_target(&reference.keys, &candidates, alias_candidates) else {
-            continue;
+        let target = match reference_target(&reference.keys, &candidates, alias_candidates) {
+            ReferenceTarget::Resolved(target) => {
+                reference.resolution = ResolutionState::Resolved;
+                target
+            }
+            ReferenceTarget::Missing => {
+                reference.resolution = ResolutionState::Missing;
+                continue;
+            }
+            ReferenceTarget::Ambiguous => {
+                reference.resolution = ResolutionState::Ambiguous;
+                continue;
+            }
         };
         reference.resolved_target_key = Some(graph.nodes[target].key.clone());
         let source = node_by_key
@@ -2191,26 +2363,34 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
     check_cancelled(cancelled)
 }
 
+enum ReferenceTarget {
+    Resolved(usize),
+    Missing,
+    Ambiguous,
+}
+
 fn reference_target(
     keys: &[String],
     candidates: &HashMap<&str, Candidate>,
     aliases: Option<&HashMap<String, Candidate>>,
-) -> Option<usize> {
+) -> ReferenceTarget {
     for key in keys {
         let direct = candidates.get(key.as_str());
         let alias = aliases.and_then(|aliases| aliases.get(key));
         match (direct, alias) {
-            (Some(Candidate::Ambiguous), _) | (_, Some(Candidate::Ambiguous)) => return None,
+            (Some(Candidate::Ambiguous), _) | (_, Some(Candidate::Ambiguous)) => {
+                return ReferenceTarget::Ambiguous;
+            }
             (Some(Candidate::Unique(left)), Some(Candidate::Unique(right))) if left != right => {
-                return None;
+                return ReferenceTarget::Ambiguous;
             }
             (Some(Candidate::Unique(node)), _) | (_, Some(Candidate::Unique(node))) => {
-                return Some(*node);
+                return ReferenceTarget::Resolved(*node);
             }
             (None, None) => {}
         }
     }
-    None
+    ReferenceTarget::Missing
 }
 
 fn definition_path(
@@ -2428,7 +2608,7 @@ fn call_keys(
     bindings: &Bindings,
 ) -> Vec<String> {
     let source = call.source;
-    let definition = parsed.definitions.get(source);
+    let definition = source.and_then(|source| parsed.definitions.get(source));
     let module_index = definition.and_then(|definition| definition.module);
     let module = definition.map_or(target.module.as_str(), |definition| {
         lexical_module(definition.module, &target.module, module_paths)
@@ -2447,8 +2627,10 @@ fn call_keys(
             return Vec::new();
         }
         let owner = if receiver == "self" {
-            source_owner(source, parsed, paths).map(str::to_owned)
-        } else if valid_identifier(receiver) {
+            source.and_then(|source| source_owner(source, parsed, paths).map(str::to_owned))
+        } else if valid_identifier(receiver)
+            && let Some(source) = source
+        {
             bindings
                 .values
                 .get(&source)
@@ -2482,12 +2664,12 @@ fn call_keys(
         // add block ranges only when the lost pre-binding edges matter.
         if bindings
             .values
-            .get(&source)
+            .get(&source.unwrap_or(usize::MAX))
             .is_some_and(|bindings| bindings.contains_key(name))
         {
             return vec![format!("rust:shadowed-value:{name}")];
         }
-        if let Some(binding) = import_binding(&bindings.imports, source, module_index, name) {
+        if let Some(binding) = call_import_binding(&bindings.imports, source, module_index, name) {
             return match binding {
                 Binding::Unique(path) => {
                     vec![format!("rust:function:{path}"), item_key(path)]
@@ -2496,7 +2678,7 @@ fn call_keys(
             };
         }
         let mut keys = Vec::with_capacity(4);
-        if let Some(scope) = source_scope(source, parsed, paths, module) {
+        if let Some(scope) = source.and_then(|source| source_scope(source, parsed, paths, module)) {
             let target = join_path(scope, name);
             keys.push(format!("rust:function:{target}"));
             keys.push(item_key(&target));
@@ -2504,7 +2686,7 @@ fn call_keys(
         let target = join_path(module, name);
         keys.push(format!("rust:function:{target}"));
         keys.push(item_key(&target));
-        if let Some(prefix) = glob_import_binding(&bindings.imports, source, module_index) {
+        if let Some(prefix) = call_glob_import_binding(&bindings.imports, source, module_index) {
             let target = join_path(prefix, name);
             keys.push(format!("rust:function:{target}"));
             keys.push(item_key(&target));
@@ -2515,14 +2697,15 @@ fn call_keys(
     let method = parts[parts.len() - 1];
     let owner = parts[..parts.len() - 1].join("::");
     if owner == "Self" {
-        return source_owner(source, parsed, paths)
+        return source
+            .and_then(|source| source_owner(source, parsed, paths))
             .map(|owner| vec![format!("rust:method:{}", join_path(owner, method))])
             .unwrap_or_default();
     }
 
     let first = parts[0];
     let mut owners = Vec::with_capacity(3);
-    match import_binding(&bindings.imports, source, module_index, first) {
+    match call_import_binding(&bindings.imports, source, module_index, first) {
         Some(Binding::Unique(path)) => owners.push(if parts.len() == 2 {
             path.clone()
         } else {
@@ -2533,8 +2716,9 @@ fn call_keys(
         }
         None => {
             if !matches!(first, "crate" | "self" | "super")
-                && let Some(scope) =
+                && let Some(scope) = source.and_then(|source| {
                     visible_local_type_scope(&owner, source, call.byte, parsed, paths)
+                })
             {
                 owners.push(join_path(scope, &owner));
             }
@@ -2542,7 +2726,8 @@ fn call_keys(
                 owners.push(local);
             }
             if !matches!(first, "crate" | "self" | "super")
-                && let Some(prefix) = glob_import_binding(&bindings.imports, source, module_index)
+                && let Some(prefix) =
+                    call_glob_import_binding(&bindings.imports, source, module_index)
             {
                 owners.push(join_path(prefix, &owner));
             }
@@ -2556,6 +2741,58 @@ fn call_keys(
         keys.push(item_key(&target));
     }
     dedup_keys(keys)
+}
+
+fn call_import_binding<'a>(
+    imports: &'a ImportBindings,
+    source: Option<usize>,
+    module: Option<usize>,
+    alias: &str,
+) -> Option<&'a Binding> {
+    source
+        .and_then(|source| import_binding(imports, source, module, alias))
+        .or_else(|| module_import_binding(imports, module, alias))
+}
+
+fn call_glob_import_binding(
+    imports: &ImportBindings,
+    source: Option<usize>,
+    module: Option<usize>,
+) -> Option<&str> {
+    match call_import_binding(imports, source, module, "*") {
+        Some(Binding::Unique(path)) => Some(path),
+        Some(Binding::Ambiguous) | None => None,
+    }
+}
+
+fn supported_rust_call_target(raw: &str) -> bool {
+    let Some(raw) = strip_generics(raw.trim()) else {
+        return false;
+    };
+    let mut dots = raw.split('.');
+    let left = dots.next().unwrap_or_default();
+    if let Some(method) = dots.next() {
+        return dots.next().is_none()
+            && (matches!(left, "self") || valid_identifier(left))
+            && valid_identifier(method);
+    }
+    !left.is_empty()
+        && left.split("::").all(|part| {
+            matches!(part, "crate" | "self" | "super" | "Self") || valid_identifier(part)
+        })
+}
+
+fn generated_include_basename(raw: &str) -> Option<String> {
+    let compact = raw
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let compact = std::str::from_utf8(&compact).ok()?;
+    let suffix = compact
+        .strip_prefix("include!(concat!(env!(\"OUT_DIR\"),\"/")?
+        .strip_suffix("\"))")?;
+    (!suffix.is_empty() && !suffix.contains(['/', '\\']) && suffix.ends_with(".rs"))
+        .then(|| suffix.to_owned())
 }
 
 fn visible_local_type_scope<'a>(
@@ -2628,17 +2865,6 @@ fn import_binding<'a>(
                 })
                 .and_then(|scope| scope.get(alias))
         })
-}
-
-fn glob_import_binding(
-    imports: &ImportBindings,
-    source: usize,
-    module: Option<usize>,
-) -> Option<&str> {
-    match import_binding(imports, source, module, "*") {
-        Some(Binding::Unique(path)) => Some(path),
-        Some(Binding::Ambiguous) | None => None,
-    }
 }
 
 fn source_scope<'a>(
@@ -3157,7 +3383,9 @@ mod tests {
     const REVIEW_SNAPSHOT_ID: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     use crate::artifact::AnalyzerKind;
-    use crate::git::{ArtifactFile, ArtifactOmission, ArtifactReview, ChangeLayer};
+    use crate::git::{
+        ArtifactFile, ArtifactOmission, ArtifactReview, CapturedSource, ChangeLayer, SourceOmission,
+    };
     use crate::workspace::{
         AllowedRoots, ErrorCode, IndexRequest, SnapshotCatalog, SnapshotTarget, resolve_request,
         set_before_seed_open_hook_for_test,
@@ -3173,6 +3401,69 @@ mod tests {
             analysis_complete: true,
             omission: None,
         }
+    }
+
+    fn complete_review(graph: String) -> ChangeReview {
+        ChangeReview {
+            graph,
+            evidence: String::new(),
+            static_status: CompletenessStatus::Complete,
+            dynamic_status: CompletenessStatus::NotApplicable,
+        }
+    }
+
+    fn partial_review(graph: String) -> ChangeReview {
+        ChangeReview {
+            static_status: CompletenessStatus::Partial,
+            ..complete_review(graph)
+        }
+    }
+
+    #[test]
+    fn review_status_fields_are_typed_and_independent_from_pagination() {
+        let snapshot = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            50,
+            DependencyMode::Boundary,
+            WorktreeChanges {
+                files: vec![],
+                records: vec![],
+                paths: vec![],
+                source_patch: String::new(),
+                artifacts: Default::default(),
+                skipped_paths: 1,
+            },
+            ChangeReview {
+                graph: "risk traversal_complete=true\n".into(),
+                evidence: String::new(),
+                static_status: CompletenessStatus::Complete,
+                dynamic_status: CompletenessStatus::NotApplicable,
+            },
+        );
+
+        let output = review_context(&snapshot).unwrap();
+        assert!(
+            output.contains("content_complete_when_pages_exhausted=false"),
+            "{output}"
+        );
+        assert!(
+            output.contains("static_evidence_status=complete"),
+            "{output}"
+        );
+        assert!(
+            output.contains("dynamic_evidence_status=not-applicable"),
+            "{output}"
+        );
+        assert!(!output.contains("review_complete"), "{output}");
+        assert!(
+            !output
+                .split_once("graph\n")
+                .unwrap()
+                .1
+                .contains("analysis_complete"),
+            "{output}"
+        );
     }
 
     #[test]
@@ -3193,6 +3484,159 @@ mod tests {
         assert_eq!(second.stats.files_reused, 2);
         assert_eq!(second.stats.files_parsed, 0);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_gap_preserves_omission_inventory() {
+        let root = snapshot_repository("source-gap");
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let snapshot = SourceSnapshot {
+            capture_root: root.clone(),
+            files: Vec::new(),
+            omissions: vec![SourceOmission {
+                path: Some("cmd/main.go".into()),
+                reason: SourceOmissionReason::LanguageNotIndexed,
+                occurrences: 1,
+            }],
+        };
+
+        let graph =
+            build_snapshot_for_test(&repository, &snapshot, &AtomicBool::new(false)).unwrap();
+
+        assert_eq!(graph.gaps.len(), 1);
+        assert_eq!(graph.gaps[0].category, GapCategory::Language);
+        assert_eq!(graph.gaps[0].reason, GapReason::LanguageNotIndexed);
+        assert_eq!(graph.gaps[0].path.as_deref(), Some("cmd/main.go"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_source_digest_mismatch_is_fatal() {
+        let root = snapshot_repository("source-digest-mismatch");
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let original = fs::read(root.join("src/a.rs")).unwrap();
+        let digest = *blake3::hash(&original).as_bytes();
+        fs::write(root.join("src/a.rs"), "fn mutated_after_capture() {}\n").unwrap();
+        let mut files = vec![CapturedSource {
+            path: "src/a.rs".into(),
+            language: Language::Rust,
+            git_oid: None,
+            content_key: blake3::Hash::from_bytes(digest).to_hex().to_string(),
+            parse_context: String::new(),
+            content: SourceContent::Captured {
+                relative_path: "src/a.rs".into(),
+                digest,
+            },
+        }];
+        assign_parse_contexts(&mut files, &BTreeSet::new());
+        let snapshot = SourceSnapshot {
+            capture_root: root.clone(),
+            files,
+            omissions: Vec::new(),
+        };
+
+        let error = match build_snapshot_for_test(&repository, &snapshot, &AtomicBool::new(false)) {
+            Ok(_) => panic!("mutated captured source unexpectedly indexed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "captured source digest mismatch");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rust_relation_sites_are_fully_accounted() {
+        let graph = build_graph(
+            &[Source {
+                path: "src/lib.rs".into(),
+                text: r#"fn direct() {}
+fn factory() -> fn() { direct }
+fn run() {
+    direct();
+    factory()();
+    println!("hello");
+    include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+}"#
+                .into(),
+            }],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(graph.files[0].observed_relation_sites, 5);
+        assert_eq!(graph.refs.len(), 2);
+        assert_eq!(graph.modeled_sites.len(), 1);
+        assert_eq!(graph.gaps.iter().filter(|gap| gap.relation_site).count(), 2);
+        assert!(graph.gaps.iter().any(|gap| {
+            gap.reason == GapReason::GeneratedOutputUnobserved && !gap.relation_site
+        }));
+        assert_eq!(
+            graph.modeled_sites[0].target_hint.as_deref(),
+            Some("generated.rs")
+        );
+    }
+
+    #[test]
+    fn python_relation_sites_are_fully_accounted() {
+        let source = Source {
+            path: "pkg/app.py".into(),
+            text: "def local():\n    pass\ndef run(value):\n    local()\n    value.method()\n"
+                .into(),
+        };
+        let mut graph = Graph::default();
+        graph.files.push(FileInput {
+            path: source.path.clone(),
+            language: Language::Python,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: "python".into(),
+            byte_size: source.text.len() as u64,
+            replace: true,
+            observed_relation_sites: 0,
+        });
+        crate::python::add_file(&mut graph, &source, &mut PythonParser::new().unwrap()).unwrap();
+
+        assert_eq!(graph.files[0].observed_relation_sites, 2);
+        assert_eq!(graph.refs.len(), 1);
+        assert_eq!(graph.gaps.iter().filter(|gap| gap.relation_site).count(), 1);
+    }
+
+    #[test]
+    fn script_relation_sites_are_fully_accounted() {
+        let source = Source {
+            path: "src/app.ts".into(),
+            text: "function direct() {}\nfunction run(value: unknown) { direct(); value(); }\n"
+                .into(),
+        };
+        let mut graph = Graph::default();
+        graph.files.push(FileInput {
+            path: source.path.clone(),
+            language: Language::TypeScript,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: "typescript".into(),
+            byte_size: source.text.len() as u64,
+            replace: true,
+            observed_relation_sites: 0,
+        });
+        crate::javascript::add_file(
+            &mut graph,
+            &source,
+            Language::TypeScript,
+            &mut ScriptParsers::default(),
+        )
+        .unwrap();
+
+        let accounted = graph.refs.len()
+            + graph.modeled_sites.len()
+            + graph
+                .gaps
+                .iter()
+                .filter(|gap| gap.relation_site)
+                .map(|gap| gap.occurrences as usize)
+                .sum::<usize>();
+        assert_eq!(graph.files[0].observed_relation_sites as usize, accounted);
+        assert!(accounted > 0);
     }
 
     #[test]
@@ -3885,20 +4329,21 @@ mod tests {
             },
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n";
         let snapshot = ReviewSnapshot::new(
             REVIEW_SNAPSHOT_ID,
             6,
             50,
             DependencyMode::Boundary,
             changes,
-            graph.into(),
+            complete_review(graph.into()),
         );
 
         let initial = review_context(&snapshot).unwrap();
         assert!(initial.contains("\nartifacts\n"), "{initial}");
         assert!(initial.contains("artifacts_next_cursor="), "{initial}");
-        assert!(initial.contains("review_complete_when_pages_exhausted=true"));
+        assert!(initial.contains("content_complete_when_pages_exhausted=true"));
+        assert!(initial.contains("static_evidence_status=complete"));
         let mut stale = next_cursor(&initial, "artifacts_next_cursor").unwrap();
         let replacement = if stale.ends_with('0') { "1" } else { "0" };
         stale.replace_range(stale.len() - 1.., replacement);
@@ -3996,6 +4441,39 @@ mod tests {
     }
 
     #[test]
+    fn exact_changed_content_is_independent_from_artifact_semantics() {
+        let changes = WorktreeChanges {
+            files: vec![],
+            records: vec![],
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: "README.md".into(),
+                language: None,
+                additions: Some(1),
+                deletions: Some(1),
+                layers: Vec::new(),
+            }],
+            source_patch: String::new(),
+            artifacts: ArtifactReview {
+                files: vec![ArtifactFile {
+                    path: "README.md".into(),
+                    analyzer: AnalyzerKind::Markdown,
+                    diff_complete: true,
+                    analysis_complete: false,
+                    omission: None,
+                }],
+                analysis: String::new(),
+                patch: "diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            },
+            skipped_paths: 0,
+        };
+
+        assert!(change_content_complete(&changes, DependencyMode::Boundary));
+    }
+
+    #[test]
     fn source_looking_nonregular_path_is_not_source_complete() {
         let changes = WorktreeChanges {
             files: vec![],
@@ -4039,7 +4517,7 @@ mod tests {
             "@@ -1 +1 @@\n-é old\n+é changed\n".repeat(400)
         );
         let graph = format!(
-            "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=300 static_test_path_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
+            "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=300 static_test_path_gaps=1 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
             (0..300)
                 .map(|index| format!(
                     "flow 0.1000 entry_{index}@src/lib.rs:1 -> changed@src/lib.rs:2\n"
@@ -4069,7 +4547,7 @@ mod tests {
             50,
             DependencyMode::Boundary,
             changes,
-            graph,
+            complete_review(graph),
         );
         let initial = review_context(&snapshot).unwrap();
         assert!(initial.len() <= REVIEW_CONTEXT_BUDGET);
@@ -4077,9 +4555,9 @@ mod tests {
         assert!(initial.contains("rename_detection=within-source-and-artifact"));
         assert!(initial.contains("total_hunks=400"));
         assert!(initial.contains("total_flows=300"));
-        assert!(
-            initial.contains("review_complete=false review_complete_when_pages_exhausted=true")
-        );
+        assert!(initial.contains("content_complete_when_pages_exhausted=true"));
+        assert!(initial.contains("static_evidence_status=complete"));
+        assert!(!initial.contains("review_complete"));
         assert!(!initial.contains("[truncated]"));
 
         let mut pages = initial.clone();
@@ -4105,7 +4583,9 @@ mod tests {
                 assert!(output.len() <= REVIEW_CONTEXT_BUDGET);
                 assert!(output.is_char_boundary(output.len()));
                 assert!(!output.contains("[truncated]"));
-                assert!(output.contains("review_complete_when_pages_exhausted=true"));
+                assert!(output.contains("content_complete_when_pages_exhausted=true"));
+                assert!(output.contains("static_evidence_status=complete"));
+                assert!(output.contains("dynamic_evidence_status=not-applicable"));
                 cursor = next_cursor(&output, label);
                 pages.push_str(&output);
             }
@@ -4142,7 +4622,7 @@ mod tests {
     #[test]
     fn max_nodes_limits_each_graph_page_not_the_snapshot() {
         let graph = format!(
-            "risk overall=0.3000 changed_symbols_total=6 changed_symbols_analyzed=6 changed_symbols_emitted=6 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=6 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
+            "risk overall=0.3000 changed_symbols_total=6 changed_symbols_analyzed=6 changed_symbols_emitted=6 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=6 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
             (0..6)
                 .map(|index| format!("  risk 0.3000 node-{index}\n"))
                 .collect::<String>()
@@ -4170,7 +4650,7 @@ mod tests {
                 artifacts: Default::default(),
                 skipped_paths: 0,
             },
-            graph,
+            complete_review(graph),
         );
         let initial = review_context(&snapshot).unwrap();
         assert!(
@@ -4221,7 +4701,7 @@ mod tests {
                 artifacts: Default::default(),
                 skipped_paths: 0,
             },
-            String::new(),
+            complete_review(String::new()),
         );
         let cursor = cursor_token(&snapshot, ReviewSection::Files, 0);
 
@@ -4264,7 +4744,7 @@ mod tests {
     }
 
     #[test]
-    fn review_complete_rejects_omitted_changed_symbols() {
+    fn typed_static_status_reports_omitted_changed_symbols() {
         let changes = WorktreeChanges {
             files: vec![],
             records: vec![],
@@ -4282,7 +4762,7 @@ mod tests {
             artifacts: Default::default(),
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             REVIEW_SNAPSHOT_ID,
@@ -4290,15 +4770,19 @@ mod tests {
             50,
             DependencyMode::Boundary,
             changes,
-            graph.into(),
+            partial_review(graph.into()),
         );
         let output = review_context(&snapshot).unwrap();
 
-        assert!(output.contains("review_complete=false"), "{output}");
         assert!(
-            output.contains("review_complete_when_pages_exhausted=false"),
+            output.contains("content_complete_when_pages_exhausted=true"),
             "{output}"
         );
+        assert!(
+            output.contains("static_evidence_status=partial"),
+            "{output}"
+        );
+        assert!(!output.contains("review_complete"), "{output}");
     }
 
     #[test]
@@ -4330,7 +4814,7 @@ mod tests {
             },
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             REVIEW_SNAPSHOT_ID,
@@ -4338,7 +4822,7 @@ mod tests {
             50,
             DependencyMode::Boundary,
             changes,
-            graph.into(),
+            complete_review(graph.into()),
         );
         let output = review_context(&snapshot).unwrap();
 
@@ -4346,18 +4830,21 @@ mod tests {
             output.contains("renamed artifact omitted src/old.rs -> tests/fixture.tsv analyzer=tsv reason=type-changed"),
             "{output}"
         );
-        assert!(output.contains("review_complete=false"), "{output}");
         assert!(
-            output.contains("review_complete_when_pages_exhausted=false"),
+            output.contains("content_complete_when_pages_exhausted=false"),
             "{output}"
         );
+        assert!(
+            output.contains("static_evidence_status=complete"),
+            "{output}"
+        );
+        assert!(!output.contains("review_complete"), "{output}");
     }
 
     #[test]
-    fn graph_completeness_reads_only_the_summary() {
-        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n  risk 0.0000 node src/analysis_complete=false.rs:1\n";
-        assert!(graph_flow_analysis_complete(graph));
-        assert!(graph_review_complete(graph));
+    fn graph_traversal_reads_only_the_summary() {
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n  risk 0.0000 node src/traversal_complete=false.rs:1\n";
+        assert!(graph_traversal_complete(graph));
     }
 
     #[test]
@@ -4396,7 +4883,7 @@ mod tests {
             },
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             REVIEW_SNAPSHOT_ID,
@@ -4404,7 +4891,7 @@ mod tests {
             50,
             DependencyMode::Boundary,
             changes,
-            graph.into(),
+            complete_review(graph.into()),
         );
         let output = review_context(&snapshot).unwrap();
 
@@ -4476,14 +4963,14 @@ mod tests {
             artifacts: Default::default(),
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=1 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
         let output = review_context(&ReviewSnapshot::new(
             REVIEW_SNAPSHOT_ID,
             0,
             1,
             DependencyMode::Boundary,
             changes,
-            graph.into(),
+            complete_review(graph.into()),
         ))
         .unwrap();
 
@@ -4494,9 +4981,14 @@ mod tests {
         );
         assert!(output.contains("all_path_hunks=1"), "{output}");
         assert!(
-            output.contains("review_complete=true review_complete_when_pages_exhausted=true"),
+            output.contains("content_complete_when_pages_exhausted=true"),
             "{output}"
         );
+        assert!(
+            output.contains("static_evidence_status=complete"),
+            "{output}"
+        );
+        assert!(!output.contains("review_complete"), "{output}");
     }
 
     #[test]
@@ -4629,7 +5121,7 @@ mod tests {
             1,
             DependencyMode::Boundary,
             Arc::clone(&changes),
-            String::new(),
+            complete_review(String::new()),
         );
 
         assert!(Arc::ptr_eq(&snapshot.changes, &changes));
@@ -4660,7 +5152,7 @@ mod tests {
                 artifacts: Default::default(),
                 skipped_paths: 0,
             },
-            "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n".into(),
+            complete_review("risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n".into()),
         );
         let mut offset = 0;
         let mut reconstructed = String::new();

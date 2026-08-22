@@ -14,6 +14,83 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension};
 
 #[test]
+fn completeness_reports_direct_static_calls_without_legacy_fields() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn target() -> u32 { 1 }\npub fn changed() -> u32 { target() }\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git_commit(&fixture.path, "baseline");
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn target() -> u32 { 2 }\npub fn changed() -> u32 { target() }\n",
+    )
+    .unwrap();
+
+    let mut client = Client::start(&fixture.path);
+    let output = response_text(&client.changes(6, 50, None));
+
+    for expected in [
+        "languages=rust,python,javascript,typescript",
+        "completeness content_capture=complete source_capture=complete syntax_parse=complete site_classification=complete static_model=complete evidence_capture=not-applicable provenance_model=not-applicable execution_mapping=not-applicable traversal=complete",
+        "claim kind=affected-callers status=complete basis=resolved-static-call-graph",
+        "claim kind=affected-flows status=complete basis=resolved-static-call-graph",
+        "claim kind=static-test-paths status=complete basis=resolved-static-call-graph",
+        "references missing=0 ambiguous=0",
+        "content_complete_when_pages_exhausted=true",
+        "static_evidence_status=complete",
+        "dynamic_evidence_status=not-applicable",
+        "traversal_complete=true",
+    ] {
+        assert!(output.contains(expected), "missing {expected}: {output}");
+    }
+    assert!(!output.contains("review_complete"), "{output}");
+    assert!(
+        !output
+            .split_once("graph\n")
+            .unwrap()
+            .1
+            .contains("analysis_complete"),
+        "{output}"
+    );
+    client.close();
+}
+
+#[test]
+fn completeness_keeps_finished_traversal_partial_for_macro_gap() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(fixture.path.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git_commit(&fixture.path, "baseline");
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn changed() { println!(\"changed\"); }\n",
+    )
+    .unwrap();
+
+    let mut client = Client::start(&fixture.path);
+    let output = response_text(&client.changes(6, 50, None));
+
+    assert!(output.contains("traversal_complete=true"), "{output}");
+    assert!(
+        output.contains("static_evidence_status=partial"),
+        "{output}"
+    );
+    assert!(output.contains("macro-expansion-unavailable:1"), "{output}");
+    assert!(
+        output
+            .contains("claim kind=affected-flows status=partial basis=resolved-static-call-graph")
+    );
+    client.close();
+}
+
+#[test]
 fn binary_only_crate_resolves_crate_paths() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
@@ -67,7 +144,7 @@ fn rust_attribute_only_changes_map_to_declarations() {
 
     let mut client = Client::start(&fixture.path);
     let changes = client.changes(0, 20, None);
-    let text = response_text(&changes);
+    let text = complete_graph_pages(&mut client, response_text(&changes), 0, 20);
     for name in ["Item", "free_function", "method", "test_function"] {
         assert!(text.contains(name), "missing {name}: {changes}");
     }
@@ -356,8 +433,9 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
     assert!(view.contains("member ->"), "{view}");
     assert!(view.contains("dispatch"), "{view}");
     let changes = client.changes(1, 50, None);
-    assert!(changes.contains("dispatch"), "{changes}");
-    assert!(changes.contains("decorated"), "{changes}");
+    let text = complete_graph_pages(&mut client, response_text(&changes), 1, 50);
+    assert!(text.contains("dispatch"), "{changes}");
+    assert!(text.contains("decorated"), "{changes}");
     client.close();
 }
 
@@ -1565,13 +1643,12 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
         text.contains("+pub fn first_untracked() { second_untracked(); }"),
         "{changed}"
     );
-    let graph = text.split_once("graph\n").unwrap().1;
+    let graph = complete.split_once("graph\n").unwrap().1;
     assert!(graph.contains("file-mapped src/lib.rs"), "{changed}");
     assert!(graph.contains("unmapped_ranges=0"), "{changed}");
     assert!(!graph.contains("removed_symbol"), "{changed}");
     assert!(!graph.contains("ignored_symbol"), "{changed}");
     assert!(text.len() <= 8192, "{}", text.len());
-    assert!(text.contains(&format!(":{generation}:")), "{changed}");
     assert_eq!(database_generation(&graph_path(&fixture.path)), generation);
     let repeated = client.changes(6, 50, None);
     assert_eq!(response_text(&repeated), text);
@@ -1662,6 +1739,7 @@ fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
 
     let mut client = Client::start(&fixture.path);
     let boundary = response_text(&client.changes(1, 10, None));
+    let boundary = complete_graph_pages(&mut client, boundary, 1, 10);
     for expected in [
         "dependency_mode=boundary",
         "dependency-boundary root=.cargo/vendor packages=2 files=5 path_digest=",
@@ -1701,6 +1779,7 @@ fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
 
     client.index_and_wait("full");
     let full = response_text(&client.changes(0, 10, None));
+    let full = complete_graph_pages(&mut client, full, 0, 10);
     for expected in [
         "dependency_mode=full",
         "changed source rust .cargo/vendor/sha2/src/lib.rs status=modified",
@@ -1756,7 +1835,7 @@ fn commit_index_and_worktree_targets_preserve_status_layers_and_artifacts() {
         2,
         &["committed"],
     );
-    assert_review_completion(&commit_changes, true);
+    assert_content_completion(&commit_changes, true);
     assert_change_manifest(
         &commit_changes,
         &[
@@ -1795,7 +1874,7 @@ fn commit_index_and_worktree_targets_preserve_status_layers_and_artifacts() {
         5,
         &["committed", "staged"],
     );
-    assert_review_completion(&index_changes, false);
+    assert_content_completion(&index_changes, true);
     assert_change_manifest(
         &index_changes,
         &[
@@ -1850,7 +1929,7 @@ fn commit_index_and_worktree_targets_preserve_status_layers_and_artifacts() {
         9,
         &["committed", "staged", "unstaged", "untracked"],
     );
-    assert_review_completion(&worktree_changes, false);
+    assert_content_completion(&worktree_changes, true);
     assert_change_manifest(
         &worktree_changes,
         &[
@@ -2592,7 +2671,7 @@ fn capture_changes_in_order(
         }),
     ));
     assert_eq!(initial.provenance["snapshot_id"], snapshot_id);
-    let review_complete = review_complete_when_pages_exhausted(&initial.text);
+    let status = terminal_status(&initial.text);
     let mut pages = BTreeMap::new();
     for (section, cursor_label) in sections {
         let mut section_pages = Vec::new();
@@ -2619,8 +2698,9 @@ fn capture_changes_in_order(
                 "{}",
                 page.text
             );
-            assert!(
-                review_complete_when_pages_exhausted(&page.text) == review_complete,
+            assert_eq!(
+                terminal_status(&page.text),
+                status,
                 "completion changed between pages: {}",
                 page.text,
             );
@@ -2639,30 +2719,31 @@ fn capture_changes_in_order(
     ChangesCapture { initial, pages }
 }
 
-fn review_complete_when_pages_exhausted(output: &str) -> bool {
-    output
-        .lines()
-        .flat_map(str::split_ascii_whitespace)
-        .find_map(|field| field.strip_prefix("review_complete_when_pages_exhausted="))
-        .unwrap()
-        .parse()
-        .unwrap()
+fn terminal_status(output: &str) -> (bool, String, String) {
+    let field = |name: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap()
+    };
+    (
+        field("content_complete_when_pages_exhausted=")
+            .parse()
+            .unwrap(),
+        field("static_evidence_status=").to_owned(),
+        field("dynamic_evidence_status=").to_owned(),
+    )
 }
 
-fn assert_review_completion(changes: &ChangesCapture, expected: bool) {
+fn assert_content_completion(changes: &ChangesCapture, expected: bool) {
     assert_eq!(
-        review_complete_when_pages_exhausted(&changes.initial.text),
+        terminal_status(&changes.initial.text).0,
         expected,
         "{}",
         changes.initial.text
     );
     for (_, page) in changes.cursor_queries() {
-        assert_eq!(
-            review_complete_when_pages_exhausted(&page.text),
-            expected,
-            "{}",
-            page.text
-        );
+        assert_eq!(terminal_status(&page.text).0, expected, "{}", page.text);
     }
 }
 
@@ -2671,7 +2752,7 @@ fn change_section_text(changes: &ChangesCapture, section: &str) -> String {
         "files" => "diff",
         "diff" => "artifacts",
         "artifacts" => "graph",
-        "graph" => "review_complete=",
+        "graph" => "content_complete_when_pages_exhausted=",
         _ => unreachable!(),
     };
     let header = format!("{section}\n");
@@ -2892,13 +2973,16 @@ fn is_graph_non_node(line: &str) -> bool {
     if [
         "graph emitted_bytes=",
         "risk overall=",
-        "coverage category=",
+        "languages=",
+        "completeness ",
+        "gaps ",
+        "references ",
+        "claim ",
         "file-mapped ",
         "unmapped ",
     ]
     .iter()
     .any(|prefix| line.starts_with(prefix) && line.len() > prefix.len())
-        || line == "coverage status=complete remediation=none"
     {
         return true;
     }
@@ -2911,8 +2995,14 @@ fn is_graph_non_node(line: &str) -> bool {
         .is_some_and(|cursor| !cursor.is_empty() && !cursor.contains(char::is_whitespace))
         || matches!(
             line,
-            "review_complete_when_pages_exhausted=true"
-                | "review_complete_when_pages_exhausted=false"
+            "content_complete_when_pages_exhausted=true"
+                | "content_complete_when_pages_exhausted=false"
+                | "static_evidence_status=complete"
+                | "static_evidence_status=partial"
+                | "static_evidence_status=not-applicable"
+                | "dynamic_evidence_status=complete"
+                | "dynamic_evidence_status=partial"
+                | "dynamic_evidence_status=not-applicable"
         )
 }
 
@@ -3141,11 +3231,12 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         "untracked artifact omitted image.bin analyzer=generic reason=binary",
         "markdown path=\"README.md\"",
         "artifacts_next_cursor=",
-        "review_complete_when_pages_exhausted=false",
+        "content_complete_when_pages_exhausted=false",
+        "static_evidence_status=partial",
+        "dynamic_evidence_status=not-applicable",
         "total_hunks=14",
         "changed_symbols_total=14",
         "flows_total=3",
-        "review_complete=false",
     ] {
         assert!(initial.contains(expected), "missing {expected}: {initial}");
     }
@@ -3253,7 +3344,7 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         assert!(page.len() <= 8192, "{}", page.len());
         assert!(page.starts_with("artifacts\n"), "{page}");
         assert!(
-            page.contains("review_complete_when_pages_exhausted=false"),
+            page.contains("content_complete_when_pages_exhausted=false"),
             "{page}"
         );
         assert_eq!(
@@ -3366,6 +3457,7 @@ fn changes_file_maps_non_symbol_ranges_in_a_mixed_rust_hunk() {
 
     let mut client = Client::start(&fixture.path);
     let changes = response_text(&client.changes(0, 50, None));
+    let changes = complete_graph_pages(&mut client, changes, 0, 50);
 
     for expected in [
         "changed_symbols_total=2",
@@ -3381,10 +3473,13 @@ fn changes_file_maps_non_symbol_ranges_in_a_mixed_rust_hunk() {
     assert!(changes.contains("mapping_complete=true"), "{changes}");
     assert!(changes.contains("neighborhood_complete=true"), "{changes}");
     assert!(
-        changes.contains("review_complete_when_pages_exhausted=true"),
+        changes.contains("content_complete_when_pages_exhausted=true"),
         "{changes}"
     );
-    assert!(changes.contains("coverage status=complete"), "{changes}");
+    assert!(
+        changes.contains("static_evidence_status=partial"),
+        "{changes}"
+    );
     assert!(!changes.contains("file-mapped src/lib.rs:1-7"), "{changes}");
     client.close();
 }
@@ -3428,6 +3523,22 @@ fn page_cursor(output: &str, label: &str) -> Option<String> {
 
 fn changes_page(client: &mut Client, cursor: &str) -> String {
     response_text(&client.changes(6, 50, Some(cursor)))
+}
+
+fn complete_graph_pages(
+    client: &mut Client,
+    initial: String,
+    depth: u32,
+    max_nodes: u32,
+) -> String {
+    let mut output = initial;
+    let mut cursor = page_cursor(&output, "graph_next_cursor");
+    while let Some(token) = cursor {
+        let page = response_text(&client.changes(depth, max_nodes, Some(&token)));
+        cursor = page_cursor(&page, "graph_next_cursor");
+        output.push_str(&page);
+    }
+    output
 }
 
 fn assert_page_accounting(
@@ -4345,7 +4456,10 @@ fn identical_clean_oids_return_explained_no_changes() {
 
     assert_eq!(
         response_text(&changes),
-        "no changes reason=identical_commit_oids\n"
+        "no changes reason=identical_commit_oids\n\
+         content_complete_when_pages_exhausted=true\n\
+         static_evidence_status=complete\n\
+         dynamic_evidence_status=not-applicable\n"
     );
     assert_eq!(
         structured["result"]["structuredContent"]["no_change_reason"],

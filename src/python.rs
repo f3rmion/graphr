@@ -3,7 +3,11 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::git::Source;
-use crate::store::{Graph, NodeInput, NodeKind, RefInput, RefKind};
+use crate::parse::{ParseGap, parser_no_tree_gaps, syntax_gaps};
+use crate::store::{
+    GapCategory, GapInput, GapReason, Graph, NodeInput, NodeKind, RefInput, RefKind,
+    ResolutionState,
+};
 
 const PYTHON_QUERY: &str = include_str!("../queries/python.scm");
 const PATH_LIMIT: usize = 1024;
@@ -34,8 +38,9 @@ struct Import {
 }
 
 struct Call {
-    source: usize,
+    source: Option<usize>,
     target: String,
+    bare: bool,
     line: usize,
 }
 
@@ -50,6 +55,8 @@ struct ParsedFile {
     imports: Vec<Import>,
     bindings: Vec<ValueBinding>,
     calls: Vec<Call>,
+    parse_gaps: Vec<ParseGap>,
+    parser_no_tree: bool,
 }
 
 struct Scope {
@@ -97,9 +104,16 @@ impl PythonParser {
 
     fn parse(&mut self, source: &str) -> Result<ParsedFile, String> {
         let Some(tree) = self.parser.parse(source, None) else {
-            return Ok(ParsedFile::default());
+            return Ok(ParsedFile {
+                parse_gaps: parser_no_tree_gaps(source.lines().count().max(1)),
+                parser_no_tree: true,
+                ..ParsedFile::default()
+            });
         };
-        let mut parsed = ParsedFile::default();
+        let mut parsed = ParsedFile {
+            parse_gaps: syntax_gaps(tree.root_node()),
+            ..ParsedFile::default()
+        };
         let mut scopes = Vec::<Scope>::new();
         let mut captures = self
             .cursor
@@ -160,11 +174,12 @@ impl PythonParser {
             } else if capture.index == self.captures.binding {
                 collect_bindings(node, source, parent, &mut parsed.bindings);
             } else if capture.index == self.captures.call
-                && let Some(source_definition) = parent
+                && let Some(function) = node.child_by_field_name("function")
             {
                 parsed.calls.push(Call {
-                    source: source_definition,
-                    target: text(node, source).to_owned(),
+                    source: parent,
+                    target: text(function, source).to_owned(),
+                    bare: function.kind() == "identifier",
                     line: line_start(node),
                 });
             }
@@ -217,6 +232,7 @@ pub fn add_file(
     let target = PythonTarget::for_path(&source.path)
         .ok_or_else(|| "Python source path is invalid".to_owned())?;
     let parsed = parser.parse(&source.text)?;
+    let mut observed_relation_sites = 0_u32;
     let file_key = identity(&source.path, "file", &source.path, 0, 0);
     graph.nodes.push(NodeInput {
         key: file_key.clone(),
@@ -231,6 +247,25 @@ pub fn add_file(
         signature: String::new(),
         keys: vec![item_key(&target.module)],
     });
+    for gap in &parsed.parse_gaps {
+        graph.gaps.push(GapInput {
+            file_key: Some(source.path.clone()),
+            source_key: None,
+            run_key: None,
+            path: Some(source.path.clone()),
+            line_start: Some(to_u32(gap.line_start)?),
+            line_end: Some(to_u32(gap.line_end)?),
+            category: GapCategory::Parse,
+            reason: if parsed.parser_no_tree {
+                GapReason::ParserNoTree
+            } else {
+                GapReason::ParserError
+            },
+            target_hint: None,
+            occurrences: 1,
+            relation_site: false,
+        });
+    }
 
     let mut paths = Vec::with_capacity(parsed.definitions.len());
     let mut node_keys = Vec::with_capacity(parsed.definitions.len());
@@ -288,44 +323,105 @@ pub fn add_file(
         values,
     };
     for import in &parsed.imports {
+        let source_key = import
+            .source
+            .and_then(|source| node_keys.get(source).cloned())
+            .unwrap_or_else(|| file_key.clone());
+        if external_import(import, &target) {
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(source_key),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(import.line)?),
+                line_end: Some(to_u32(import.line)?),
+                category: GapCategory::Boundary,
+                reason: GapReason::ExternalDependency,
+                target_hint: Some(import.module.clone()),
+                occurrences: 1,
+                relation_site: true,
+            });
+            observed_relation_sites += 1;
+            continue;
+        }
         let Some(path) = import_path(import, &target)? else {
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(source_key),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(import.line)?),
+                line_end: Some(to_u32(import.line)?),
+                category: GapCategory::Relation,
+                reason: GapReason::DynamicOrUnsupportedDispatch,
+                target_hint: Some(import.module.clone()),
+                occurrences: 1,
+                relation_site: true,
+            });
+            observed_relation_sites += 1;
             continue;
         };
         graph.refs.push(RefInput {
-            source_key: import
-                .source
-                .and_then(|source| node_keys.get(source).cloned())
-                .unwrap_or_else(|| file_key.clone()),
+            source_key,
             kind: RefKind::Imports,
             line: to_u32(import.line)?,
             keys: vec![item_key(&path)],
             alias_key: export_key(import, &target),
             resolved_target_key: None,
+            resolution: ResolutionState::Pending,
         });
+        observed_relation_sites += 1;
     }
     for call in &parsed.calls {
-        let Some(source_key) = node_keys.get(call.source) else {
-            continue;
+        let source_key = call
+            .source
+            .and_then(|source| node_keys.get(source).cloned())
+            .unwrap_or_else(|| file_key.clone());
+        let keys = if call.bare {
+            call_keys(
+                call,
+                &parsed.definitions,
+                &paths,
+                &target,
+                &bindings,
+                &available,
+            )
+        } else {
+            Vec::new()
         };
-        let keys = call_keys(
-            call,
-            &parsed.definitions,
-            &paths,
-            &target,
-            &bindings,
-            &available,
-        );
         if !keys.is_empty() {
             graph.refs.push(RefInput {
-                source_key: source_key.clone(),
+                source_key,
                 kind: RefKind::Calls,
                 line: to_u32(call.line)?,
                 keys,
                 alias_key: None,
                 resolved_target_key: None,
+                resolution: ResolutionState::Pending,
+            });
+        } else {
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(source_key),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(call.line)?),
+                line_end: Some(to_u32(call.line)?),
+                category: GapCategory::Relation,
+                reason: GapReason::DynamicOrUnsupportedDispatch,
+                target_hint: Some(call.target.clone()),
+                occurrences: 1,
+                relation_site: true,
             });
         }
+        observed_relation_sites += 1;
     }
+    graph
+        .files
+        .iter_mut()
+        .find(|file| file.path == source.path)
+        .ok_or_else(|| "Python graph file is missing".to_owned())?
+        .observed_relation_sites = observed_relation_sites;
     Ok(())
 }
 
@@ -385,7 +481,11 @@ fn call_keys(
     // ponytail: bare calls cover the measured Python corpus; add attribute
     // resolution only when static receiver evidence can keep it precise.
     let name = call.target.as_str();
-    for scope in lexical_scopes(call.source, definitions) {
+    for scope in call
+        .source
+        .into_iter()
+        .flat_map(|source| lexical_scopes(source, definitions))
+    {
         if bindings
             .values
             .get(&Some(scope))
@@ -443,7 +543,16 @@ fn call_keys(
         };
         return vec![item_key(path)];
     }
-    Vec::new()
+    vec![item_key(&join(&target.module, name))]
+}
+
+fn external_import(import: &Import, target: &PythonTarget) -> bool {
+    if import.module.starts_with('.') {
+        return false;
+    }
+    let imported = import.module.split(['.', ':']).next().unwrap_or_default();
+    let local = target.module.split("::").next().unwrap_or_default();
+    !imported.is_empty() && imported != local
 }
 
 fn lexical_scopes(source: usize, definitions: &[Definition]) -> impl Iterator<Item = usize> + '_ {
@@ -705,6 +814,64 @@ fn to_u32(value: usize) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_every_python_relation_site() {
+        let source = Source {
+            path: "pkg/app.py".into(),
+            text: r#"import os
+from .worker import run
+from ...outside import impossible
+
+def dispatch(value):
+    run()
+    value.method()
+    value[0]()
+"#
+            .into(),
+        };
+        let mut graph = Graph::default();
+        graph.files.push(crate::store::FileInput {
+            path: source.path.clone(),
+            language: crate::git::Language::Python,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: "python".into(),
+            byte_size: source.text.len() as u64,
+            replace: true,
+            observed_relation_sites: 0,
+        });
+
+        add_file(&mut graph, &source, &mut PythonParser::new().unwrap()).unwrap();
+
+        assert_eq!(graph.refs.len(), 2, "one local import and one bare call");
+        assert_eq!(
+            graph
+                .gaps
+                .iter()
+                .filter(|gap| gap.relation_site)
+                .map(|gap| gap.reason)
+                .collect::<Vec<_>>(),
+            [
+                crate::store::GapReason::ExternalDependency,
+                crate::store::GapReason::DynamicOrUnsupportedDispatch,
+                crate::store::GapReason::DynamicOrUnsupportedDispatch,
+                crate::store::GapReason::DynamicOrUnsupportedDispatch,
+            ]
+        );
+        assert_eq!(graph.files[0].observed_relation_sites, 6);
+    }
+
+    #[test]
+    fn reports_parse_gaps_for_malformed_python() {
+        let parsed = PythonParser::new()
+            .unwrap()
+            .parse("def first(:\n  pass\ndef second():\n  value =\n")
+            .unwrap();
+
+        assert!(!parsed.parse_gaps.is_empty());
+        assert!(parsed.parse_gaps.windows(2).all(|pair| pair[0] < pair[1]));
+    }
 
     #[test]
     fn extracts_python_graph_evidence_from_incomplete_source() {

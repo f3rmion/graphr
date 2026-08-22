@@ -7,7 +7,11 @@ use tree_sitter::{
 };
 
 use crate::git::{Language, Source};
-use crate::store::{Graph, NodeInput, NodeKind, RefInput, RefKind};
+use crate::parse::{ParseGap, parser_no_tree_gaps, syntax_gaps};
+use crate::store::{
+    GapCategory, GapInput, GapReason, Graph, ModeledSiteInput, ModeledSiteKind, NodeInput,
+    NodeKind, RefInput, RefKind, ResolutionState,
+};
 
 const ECMASCRIPT_QUERY: &str = include_str!("../queries/ecmascript.scm");
 const TYPESCRIPT_QUERY: &str = include_str!("../queries/typescript.scm");
@@ -106,12 +110,13 @@ impl ScriptParser {
         path: &str,
         source: &str,
     ) -> Result<ParsedFile, String> {
-        let tree = self.parser.parse(source, None).ok_or_else(|| {
-            format!(
-                "{} parser did not return a syntax tree",
-                dialect.parse_context()
-            )
-        })?;
+        let Some(tree) = self.parser.parse(source, None) else {
+            return Ok(ParsedFile {
+                parse_gaps: parser_no_tree_gaps(source.lines().count()),
+                parser_no_tree: true,
+                ..ParsedFile::default()
+            });
+        };
         let mut captured = Vec::new();
         let mut matches = self
             .cursor
@@ -149,7 +154,10 @@ impl ScriptParser {
             )
         });
 
-        let mut parsed = ParsedFile::default();
+        let mut parsed = ParsedFile {
+            parse_gaps: syntax_gaps(tree.root_node()),
+            ..ParsedFile::default()
+        };
         for capture in &captured {
             match capture.name.as_str() {
                 "definition" | "typescript_definition" => {
@@ -174,7 +182,7 @@ impl ScriptParser {
         }
         for capture in &captured {
             if capture.name == "call" && capture.node.kind() == "call_expression" {
-                collect_require(capture.node, path, source, &mut parsed);
+                collect_require(capture.node, source, &mut parsed);
             }
         }
         let bindings = &parsed.bindings;
@@ -223,6 +231,12 @@ impl ScriptParser {
         });
         for capture in &captured {
             if capture.name == "call" {
+                let static_require = capture.node.kind() == "call_expression"
+                    && static_require(capture.node, source).is_some()
+                    && !is_lexically_bound(&parsed, "require", capture.node.start_byte());
+                if static_require {
+                    continue;
+                }
                 let registration =
                     test_parts(capture.node, path, source).is_some_and(|(callee, _, _)| {
                         !shadows_test_callee(
@@ -232,19 +246,35 @@ impl ScriptParser {
                             capture.node.start_byte(),
                         )
                     });
-                if !registration && let Some(call) = call(capture.node, source) {
-                    parsed.calls.push(call);
+                if !registration {
+                    if let Some(call) = call(capture.node, source) {
+                        parsed.calls.push(call);
+                    } else {
+                        parsed.unsupported.push(UnsupportedRelation {
+                            source: None,
+                            byte: capture.node.start_byte(),
+                            target_hint: relation_target_hint(capture.node, source),
+                            line: line_start(capture.node),
+                        });
+                    }
                 }
             }
-            if capture.name == "jsx"
-                && let Some(target) = jsx_target(capture.node, source.as_bytes())
-            {
-                parsed.calls.push(Call {
-                    source: None,
-                    byte: capture.node.start_byte(),
-                    target,
-                    line: line_start(capture.node),
-                });
+            if capture.name == "jsx" {
+                if let Some(target) = jsx_target(capture.node, source.as_bytes()) {
+                    parsed.calls.push(Call {
+                        source: None,
+                        byte: capture.node.start_byte(),
+                        target,
+                        line: line_start(capture.node),
+                    });
+                } else {
+                    parsed.unsupported.push(UnsupportedRelation {
+                        source: None,
+                        byte: capture.node.start_byte(),
+                        target_hint: relation_target_hint(capture.node, source),
+                        line: line_start(capture.node),
+                    });
+                }
             }
         }
         parsed.calls.sort_unstable_by_key(|call| call.byte);
@@ -258,6 +288,12 @@ impl ScriptParser {
                 })
                 .min_by_key(|(_, definition)| definition.body.end - definition.body.start)
                 .map(|(index, _)| index);
+        }
+        parsed
+            .unsupported
+            .sort_unstable_by_key(|relation| relation.byte);
+        for relation in &mut parsed.unsupported {
+            relation.source = containing_definition(relation.byte, &parsed.definitions);
         }
         Ok(parsed)
     }
@@ -413,13 +449,23 @@ struct Call {
     line: usize,
 }
 
+struct UnsupportedRelation {
+    source: Option<usize>,
+    byte: usize,
+    target_hint: String,
+    line: usize,
+}
+
 #[derive(Default)]
 struct ParsedFile {
     definitions: Vec<Definition>,
     imports: Vec<Import>,
     bindings: Vec<LexicalBinding>,
     calls: Vec<Call>,
+    unsupported: Vec<UnsupportedRelation>,
     exports: Vec<Export>,
+    parse_gaps: Vec<ParseGap>,
+    parser_no_tree: bool,
 }
 
 pub(crate) fn add_file(
@@ -440,6 +486,7 @@ pub(crate) fn add_file(
     let aliases = module_aliases(&source.path)?;
     let stem = &aliases[0];
     let parsed = parsers.parse(&source.path, &source.text)?;
+    let mut observed_relation_sites = 0_u32;
     let file_key = identity(language, &source.path, "file", &source.path, 0, 0);
     graph.nodes.push(NodeInput {
         key: file_key.clone(),
@@ -454,6 +501,25 @@ pub(crate) fn add_file(
         signature: String::new(),
         keys: aliases.iter().map(|alias| module_key(alias)).collect(),
     });
+    for gap in &parsed.parse_gaps {
+        graph.gaps.push(GapInput {
+            file_key: Some(source.path.clone()),
+            source_key: None,
+            run_key: None,
+            path: Some(source.path.clone()),
+            line_start: Some(to_u32(gap.line_start)?),
+            line_end: Some(to_u32(gap.line_end)?),
+            category: GapCategory::Parse,
+            reason: if parsed.parser_no_tree {
+                GapReason::ParserNoTree
+            } else {
+                GapReason::ParserError
+            },
+            target_hint: None,
+            occurrences: 1,
+            relation_site: false,
+        });
+    }
 
     let mut paths = Vec::with_capacity(parsed.definitions.len());
     let mut node_keys = Vec::with_capacity(parsed.definitions.len());
@@ -503,6 +569,18 @@ pub(crate) fn add_file(
                 }),
             ),
         });
+        if matches!(definition.kind, DefinitionKind::Test(_)) {
+            graph.modeled_sites.push(ModeledSiteInput {
+                file_key: source.path.clone(),
+                source_key: Some(node_keys[local].clone()),
+                kind: ModeledSiteKind::TestRegistration,
+                line_start: to_u32(definition.line_start)?,
+                line_end: to_u32(definition.line_end)?,
+                target_hint: Some(definition.name.clone()),
+                parse_context: Some(dialect.parse_context().to_owned()),
+            });
+            observed_relation_sites += 1;
+        }
     }
 
     for export in &parsed.exports {
@@ -528,6 +606,16 @@ pub(crate) fn add_file(
                 keys.push(key);
             }
         }
+        graph.modeled_sites.push(ModeledSiteInput {
+            file_key: source.path.clone(),
+            source_key: Some(node_keys[local].clone()),
+            kind: ModeledSiteKind::StaticExport,
+            line_start: to_u32(export.line)?,
+            line_end: to_u32(export.line)?,
+            target_hint: Some(exported.to_owned()),
+            parse_context: Some(dialect.parse_context().to_owned()),
+        });
+        observed_relation_sites += 1;
     }
 
     let import_modules = parsed
@@ -536,21 +624,39 @@ pub(crate) fn add_file(
         .map(|import| relative_module(&source.path, &import.module))
         .collect::<Result<Vec<_>, _>>()?;
     for (import, module) in parsed.imports.iter().zip(&import_modules) {
+        let source_key = import
+            .source
+            .and_then(|source| node_keys.get(source).cloned())
+            .unwrap_or_else(|| file_key.clone());
         let Some(module) = module.as_deref() else {
+            let occurrences = to_u32(import.bindings.len().max(1))?;
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(source_key),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(import.line)?),
+                line_end: Some(to_u32(import.line)?),
+                category: GapCategory::Boundary,
+                reason: GapReason::ExternalDependency,
+                target_hint: Some(import.module.clone()),
+                occurrences,
+                relation_site: true,
+            });
+            observed_relation_sites += occurrences;
             continue;
         };
         if import.bindings.is_empty() {
             graph.refs.push(RefInput {
-                source_key: import
-                    .source
-                    .and_then(|source| node_keys.get(source).cloned())
-                    .unwrap_or_else(|| file_key.clone()),
+                source_key: source_key.clone(),
                 kind: RefKind::Imports,
                 line: to_u32(import.line)?,
                 keys: vec![module_key(module)],
                 alias_key: None,
                 resolved_target_key: None,
+                resolution: ResolutionState::Pending,
             });
+            observed_relation_sites += 1;
         }
         for binding in &import.bindings {
             let key = match &binding.imported {
@@ -561,16 +667,15 @@ pub(crate) fn add_file(
                 ImportedName::Named(name) => export_value_key(module, name),
             };
             graph.refs.push(RefInput {
-                source_key: import
-                    .source
-                    .and_then(|source| node_keys.get(source).cloned())
-                    .unwrap_or_else(|| file_key.clone()),
+                source_key: source_key.clone(),
                 kind: RefKind::Imports,
                 line: to_u32(import.line)?,
                 keys: vec![key],
                 alias_key: None,
                 resolved_target_key: None,
+                resolution: ResolutionState::Pending,
             });
+            observed_relation_sites += 1;
         }
     }
 
@@ -581,13 +686,29 @@ pub(crate) fn add_file(
         let Some(exported) = export.exported.as_deref() else {
             continue;
         };
-        if export.type_only || unique_top_level_definition(&parsed, local).is_some() {
+        if unique_top_level_definition(&parsed, local).is_some() {
             continue;
         }
-        let Some((import, binding)) = visible_import(&parsed, local, export.byte) else {
-            continue;
-        };
-        let Some(key) = import_value_key(&parsed, &import_modules, import, binding, None) else {
+        let key = visible_import(&parsed, local, export.byte).and_then(|(import, binding)| {
+            (!export.type_only)
+                .then(|| import_value_key(&parsed, &import_modules, import, binding, None))
+                .flatten()
+        });
+        let Some(key) = key else {
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(file_key.clone()),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(export.line)?),
+                line_end: Some(to_u32(export.line)?),
+                category: GapCategory::Relation,
+                reason: GapReason::DynamicOrUnsupportedDispatch,
+                target_hint: Some(local.clone()),
+                occurrences: 1,
+                relation_site: true,
+            });
+            observed_relation_sites += 1;
             continue;
         };
         for alias in &aliases {
@@ -598,7 +719,9 @@ pub(crate) fn add_file(
                 keys: vec![key.clone()],
                 alias_key: Some(export_value_key(alias, exported)),
                 resolved_target_key: None,
+                resolution: ResolutionState::Pending,
             });
+            observed_relation_sites += 1;
         }
     }
 
@@ -608,7 +731,22 @@ pub(crate) fn add_file(
             ExportTarget::Star { module } => (module, None),
             ExportTarget::Definition(_) | ExportTarget::Local(_) => continue,
         };
+        let raw_module = module;
         let Some(module) = relative_module(&source.path, module)? else {
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(file_key.clone()),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(export.line)?),
+                line_end: Some(to_u32(export.line)?),
+                category: GapCategory::Boundary,
+                reason: GapReason::ExternalDependency,
+                target_hint: Some(raw_module.clone()),
+                occurrences: 1,
+                relation_site: true,
+            });
+            observed_relation_sites += 1;
             continue;
         };
         let (key, alias_keys) = match imported {
@@ -678,7 +816,9 @@ pub(crate) fn add_file(
                 keys: vec![key],
                 alias_key: None,
                 resolved_target_key: None,
+                resolution: ResolutionState::Pending,
             });
+            observed_relation_sites += 1;
         } else {
             for alias_key in alias_keys {
                 graph.refs.push(RefInput {
@@ -688,7 +828,9 @@ pub(crate) fn add_file(
                     keys: vec![key.clone()],
                     alias_key: Some(alias_key),
                     resolved_target_key: None,
+                    resolution: ResolutionState::Pending,
                 });
+                observed_relation_sites += 1;
             }
         }
     }
@@ -696,19 +838,62 @@ pub(crate) fn add_file(
     for call in &parsed.calls {
         let keys = call_keys(call, &parsed, &paths, stem, &import_modules);
         if keys.is_empty() {
-            continue;
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(
+                    call.source
+                        .and_then(|source| node_keys.get(source).cloned())
+                        .unwrap_or_else(|| file_key.clone()),
+                ),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(call.line)?),
+                line_end: Some(to_u32(call.line)?),
+                category: GapCategory::Relation,
+                reason: GapReason::DynamicOrUnsupportedDispatch,
+                target_hint: Some(call_target_hint(&call.target)),
+                occurrences: 1,
+                relation_site: true,
+            });
+        } else {
+            graph.refs.push(RefInput {
+                source_key: call
+                    .source
+                    .and_then(|source| node_keys.get(source).cloned())
+                    .unwrap_or_else(|| file_key.clone()),
+                kind: RefKind::Calls,
+                line: to_u32(call.line)?,
+                keys,
+                alias_key: None,
+                resolved_target_key: None,
+                resolution: ResolutionState::Pending,
+            });
         }
-        graph.refs.push(RefInput {
-            source_key: call
-                .source
-                .and_then(|source| node_keys.get(source).cloned())
-                .unwrap_or_else(|| file_key.clone()),
-            kind: RefKind::Calls,
-            line: to_u32(call.line)?,
-            keys,
-            alias_key: None,
-            resolved_target_key: None,
+        observed_relation_sites += 1;
+    }
+    for relation in &parsed.unsupported {
+        graph.gaps.push(GapInput {
+            file_key: Some(source.path.clone()),
+            source_key: Some(
+                relation
+                    .source
+                    .and_then(|source| node_keys.get(source).cloned())
+                    .unwrap_or_else(|| file_key.clone()),
+            ),
+            run_key: None,
+            path: Some(source.path.clone()),
+            line_start: Some(to_u32(relation.line)?),
+            line_end: Some(to_u32(relation.line)?),
+            category: GapCategory::Relation,
+            reason: GapReason::DynamicOrUnsupportedDispatch,
+            target_hint: Some(relation.target_hint.clone()),
+            occurrences: 1,
+            relation_site: true,
         });
+        observed_relation_sites += 1;
+    }
+    if let Some(file) = graph.files.iter_mut().find(|file| file.path == source.path) {
+        file.observed_relation_sites = observed_relation_sites;
     }
     Ok(())
 }
@@ -1636,13 +1821,11 @@ fn collect_import(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
     );
 }
 
-fn collect_require(node: Node<'_>, path: &str, source: &str, parsed: &mut ParsedFile) {
+fn collect_require(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
     let Some(module) = static_require(node, source) else {
         return;
     };
-    if !matches!(relative_module(path, module), Ok(Some(_)))
-        || is_lexically_bound(parsed, "require", node.start_byte())
-    {
+    if is_lexically_bound(parsed, "require", node.start_byte()) {
         return;
     }
 
@@ -2293,6 +2476,24 @@ fn call(node: Node<'_>, source: &str) -> Option<Call> {
     })
 }
 
+fn relation_target_hint(node: Node<'_>, source: &str) -> String {
+    let target = if node.kind() == "new_expression" {
+        node.child_by_field_name("constructor")
+    } else {
+        node.child_by_field_name("function")
+    }
+    .unwrap_or(node);
+    signature(target.start_byte(), target.end_byte(), source)
+}
+
+fn call_target_hint(target: &CallTarget) -> String {
+    match target {
+        CallTarget::Identifier(name) => name.clone(),
+        CallTarget::Member { object, property } => format!("{object}.{property}"),
+        CallTarget::ThisMethod { name, .. } => format!("this.{name}"),
+    }
+}
+
 fn this_resolution(node: Node<'_>) -> Option<MethodResolution> {
     let mut current = node;
     while let Some(parent) = current.parent() {
@@ -2460,6 +2661,136 @@ impl ParsedFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_all_relation_sites() {
+        for path in [
+            "src/app.test.js",
+            "src/app.test.jsx",
+            "src/app.test.ts",
+            "src/app.test.tsx",
+        ] {
+            let jsx = path.ends_with(".jsx") || path.ends_with(".tsx");
+            let source = Source {
+                path: path.into(),
+                text: format!(
+                    r#"import {{ helper }} from "./dep";
+	import "external-package";
+	export {{ helper as exported }};
+	export function exportedLocal() {{}}
+	export * from "./dep";
+const required = require("./dep");
+class Widget {{ method() {{ this.method(); }} }}
+function direct() {{}}
+function run(obj, key, factory) {{
+  direct(); new Widget(); obj.method(); factory()(); obj[key]();
+}}
+it("works", () => direct());
+{{ const it = direct; it("shadowed", () => direct()); }}
+{}"#,
+                    if jsx {
+                        "const view = <Widget />; const intrinsic = <div />;"
+                    } else {
+                        ""
+                    }
+                ),
+            };
+            let language = ScriptDialect::for_path(path).unwrap().language();
+            let mut graph = Graph::default();
+            graph.files.push(crate::store::FileInput {
+                path: source.path.clone(),
+                language,
+                git_oid: None,
+                content_hash: [0; 32],
+                parse_context: ScriptDialect::for_path(path)
+                    .unwrap()
+                    .parse_context()
+                    .into(),
+                byte_size: source.text.len() as u64,
+                replace: true,
+                observed_relation_sites: 0,
+            });
+
+            add_file(&mut graph, &source, language, &mut ScriptParsers::default()).unwrap();
+
+            assert!(
+                graph
+                    .modeled_sites
+                    .iter()
+                    .any(|site| { site.kind == crate::store::ModeledSiteKind::TestRegistration }),
+                "{path}"
+            );
+            assert!(
+                graph
+                    .modeled_sites
+                    .iter()
+                    .any(|site| { site.kind == crate::store::ModeledSiteKind::StaticExport }),
+                "{path}"
+            );
+            assert!(
+                graph
+                    .gaps
+                    .iter()
+                    .any(|gap| { gap.reason == crate::store::GapReason::ExternalDependency }),
+                "{path}"
+            );
+            assert!(
+                graph.gaps.iter().any(|gap| {
+                    gap.reason == crate::store::GapReason::DynamicOrUnsupportedDispatch
+                }),
+                "{path}"
+            );
+            assert_eq!(
+                graph.files[0].observed_relation_sites as usize,
+                graph.refs.len()
+                    + graph.modeled_sites.len()
+                    + graph.gaps.iter().filter(|gap| gap.relation_site).count(),
+                "{path}"
+            );
+            if jsx {
+                assert!(
+                    graph.refs.iter().any(|reference| {
+                        reference.keys.iter().any(|key| key.contains("Widget"))
+                    })
+                );
+                assert!(
+                    graph.gaps.iter().any(|gap| {
+                        gap.target_hint.as_deref() == Some("div") && gap.relation_site
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reports_parse_gaps() {
+        let source = Source {
+            path: "src/broken.ts".into(),
+            text: "function first( {\nconst value = ;\n".into(),
+        };
+        let mut graph = Graph::default();
+        graph.files.push(crate::store::FileInput {
+            path: source.path.clone(),
+            language: Language::TypeScript,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: "typescript".into(),
+            byte_size: source.text.len() as u64,
+            replace: true,
+            observed_relation_sites: 0,
+        });
+        add_file(
+            &mut graph,
+            &source,
+            Language::TypeScript,
+            &mut ScriptParsers::default(),
+        )
+        .unwrap();
+
+        assert!(graph.gaps.iter().any(|gap| {
+            gap.reason == crate::store::GapReason::ParserError && !gap.relation_site
+        }));
+    }
     use crate::git::{Language as StoredLanguage, Source};
     use crate::store::{Graph, NodeKind};
 

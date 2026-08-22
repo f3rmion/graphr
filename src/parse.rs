@@ -39,10 +39,25 @@ pub struct Import {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Call {
-    pub source: usize,
+    pub source: Option<usize>,
     pub target: String,
     pub line: usize,
     pub byte: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct MacroCall {
+    pub source: Option<usize>,
+    pub target: String,
+    pub text: String,
+    pub line: usize,
+    pub line_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ParseGap {
+    pub line_start: usize,
+    pub line_end: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -62,6 +77,9 @@ pub struct ParsedFile {
     pub imports: Vec<Import>,
     pub bindings: Vec<ValueBinding>,
     pub calls: Vec<Call>,
+    pub macros: Vec<MacroCall>,
+    pub parse_gaps: Vec<ParseGap>,
+    pub parser_no_tree: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -123,6 +141,7 @@ struct Captures {
     import: u32,
     binding: u32,
     call: u32,
+    macro_: u32,
 }
 
 impl RustParser {
@@ -142,6 +161,7 @@ impl RustParser {
             import: capture(&query, "import")?,
             binding: capture(&query, "binding")?,
             call: capture(&query, "call")?,
+            macro_: capture(&query, "macro")?,
         };
         Ok(Self {
             parser,
@@ -153,10 +173,17 @@ impl RustParser {
 
     pub fn parse(&mut self, source: &str) -> Result<ParsedFile, String> {
         let Some(tree) = self.parser.parse(source, None) else {
-            return Ok(ParsedFile::default());
+            return Ok(ParsedFile {
+                parse_gaps: parser_no_tree_gaps(source.lines().count().max(1)),
+                parser_no_tree: true,
+                ..ParsedFile::default()
+            });
         };
 
-        let mut parsed = ParsedFile::default();
+        let mut parsed = ParsedFile {
+            parse_gaps: syntax_gaps(tree.root_node()),
+            ..ParsedFile::default()
+        };
         let mut pending_parents = Vec::new();
         let mut type_parents = HashMap::new();
         let mut scopes = Vec::<Scope<'_>>::new();
@@ -382,14 +409,24 @@ impl RustParser {
                 if let Some(source_definition) = current_parent {
                     collect_binding_names(node, source, source_definition, &mut parsed.bindings);
                 }
-            } else if capture.index == self.captures.call
-                && let Some(source_definition) = current_parent
+            } else if capture.index == self.captures.call {
+                if let Some(function) = node.child_by_field_name("function") {
+                    parsed.calls.push(Call {
+                        source: current_parent,
+                        target: text(function, source).to_owned(),
+                        line: line_start(node),
+                        byte: node.start_byte(),
+                    });
+                }
+            } else if capture.index == self.captures.macro_
+                && let Some(target) = node.child_by_field_name("macro")
             {
-                parsed.calls.push(Call {
-                    source: source_definition,
-                    target: text(node, source).to_owned(),
+                parsed.macros.push(MacroCall {
+                    source: current_parent,
+                    target: text(target, source).trim_end_matches('!').to_owned(),
+                    text: text(node, source).to_owned(),
                     line: line_start(node),
-                    byte: node.start_byte(),
+                    line_end: line_end(node),
                 });
             }
         }
@@ -404,6 +441,43 @@ impl RustParser {
             }
         }
         Ok(parsed)
+    }
+}
+
+pub(crate) fn syntax_gaps(root: Node<'_>) -> Vec<ParseGap> {
+    let mut gaps = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.is_error() {
+            gaps.push(parse_gap(node));
+            continue;
+        }
+        if node.is_missing() {
+            gaps.push(parse_gap(node));
+        }
+        let mut cursor = node.walk();
+        let mut children = node.children(&mut cursor).collect::<Vec<_>>();
+        children.reverse();
+        pending.extend(children);
+    }
+    gaps.sort_unstable();
+    gaps.dedup();
+    gaps
+}
+
+pub(crate) fn parser_no_tree_gaps(line_end: usize) -> Vec<ParseGap> {
+    vec![ParseGap {
+        line_start: 1,
+        line_end: line_end.max(1),
+    }]
+}
+
+fn parse_gap(node: Node<'_>) -> ParseGap {
+    let line_start = node.start_position().row + 1;
+    let end = node.end_position();
+    ParseGap {
+        line_start,
+        line_end: (end.row + usize::from(end.column > 0)).max(line_start),
     }
 }
 
@@ -636,6 +710,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn classifies_every_rust_call_and_macro_shape() {
+        let parsed = RustParser::new()
+            .unwrap()
+            .parse(
+                r#"fn run(receiver: Worker, closure: fn()) {
+    direct();
+    crate::scoped();
+    self.method();
+    receiver.method();
+    factory()();
+    closure();
+    println!("hello");
+    include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+}"#,
+            )
+            .unwrap();
+
+        let targets = parsed
+            .calls
+            .iter()
+            .map(|call| call.target.as_str())
+            .collect::<Vec<_>>();
+        for target in [
+            "direct",
+            "crate::scoped",
+            "self.method",
+            "receiver.method",
+            "factory()",
+            "factory",
+            "closure",
+        ] {
+            assert!(targets.contains(&target), "missing {target}: {targets:?}");
+        }
+        assert_eq!(
+            parsed
+                .macros
+                .iter()
+                .map(|site| site.target.as_str())
+                .collect::<Vec<_>>(),
+            ["println", "include"]
+        );
+    }
+
+    #[test]
+    fn reports_parse_gaps_as_outermost_sorted_ranges() {
+        let parsed = RustParser::new()
+            .unwrap()
+            .parse("fn first( {\n  broken!();\n}\nfn second() { let value = ; }\n")
+            .unwrap();
+
+        assert!(!parsed.parse_gaps.is_empty());
+        assert!(
+            parsed.parse_gaps.windows(2).all(|pair| pair[0] < pair[1]),
+            "{:?}",
+            parsed.parse_gaps
+        );
+        assert_eq!(
+            parser_no_tree_gaps(4),
+            [ParseGap {
+                line_start: 1,
+                line_end: 4,
+            }]
+        );
+    }
+
+    #[test]
     fn extracts_rust_graph_evidence() {
         let parsed = RustParser::new()
             .unwrap()
@@ -700,10 +840,10 @@ fn register_dispatches() {
                 .map(|call| (call.source, call.target.as_str()))
                 .collect::<Vec<_>>(),
             [
-                (1, "Client::connect"),
-                (1, "self.flush"),
-                (2, "Mailer::dispatch"),
-                (3, "register"),
+                (Some(1), "Client::connect"),
+                (Some(1), "self.flush"),
+                (Some(2), "Mailer::dispatch"),
+                (Some(3), "register"),
             ]
         );
     }
@@ -778,9 +918,9 @@ fn detached() {}
                 .collect::<Vec<_>>(),
             [1, 3, 5, 10, 13, 18]
         );
-        assert_eq!(first.calls[0].source, 2);
+        assert_eq!(first.calls[0].source, Some(2));
         assert_eq!(second.definitions[0].kind, DefinitionKind::Function);
-        assert_eq!(second.calls[0].source, 0);
+        assert_eq!(second.calls[0].source, Some(0));
     }
 
     #[test]
@@ -889,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn captures_only_receiver_calls_with_supported_shapes() {
+    fn captures_supported_and_computed_receiver_calls() {
         let parsed = RustParser::new()
             .unwrap()
             .parse(
@@ -908,6 +1048,7 @@ mod tests {
                 "Item::make::<u8>",
                 "self.work::<u8>",
                 "other.work",
+                "Item::make().work",
                 "Item::make"
             ]
         );

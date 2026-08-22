@@ -128,7 +128,48 @@ pub struct CapturedSource {
 pub struct SourceSnapshot {
     pub capture_root: PathBuf,
     pub files: Vec<CapturedSource>,
-    pub skipped: usize,
+    pub omissions: Vec<SourceOmission>,
+}
+
+impl SourceSnapshot {
+    pub fn files_skipped(&self) -> usize {
+        self.omissions
+            .iter()
+            .map(|omission| omission.occurrences as usize)
+            .sum()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SourceOmissionReason {
+    UnsafePath,
+    NonRegular,
+    Unmerged,
+    Oversized,
+    InvalidUtf8,
+    MissingDuringRead,
+    LanguageNotIndexed,
+}
+
+impl SourceOmissionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsafePath => "unsafe-path",
+            Self::NonRegular => "non-regular",
+            Self::Unmerged => "unmerged",
+            Self::Oversized => "oversized",
+            Self::InvalidUtf8 => "invalid-utf8",
+            Self::MissingDuringRead => "missing-during-read",
+            Self::LanguageNotIndexed => "language-not-indexed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceOmission {
+    pub path: Option<String>,
+    pub reason: SourceOmissionReason,
+    pub occurrences: u32,
 }
 
 #[allow(dead_code)] // Task 4 consumes the review/provenance fields during publication.
@@ -159,7 +200,7 @@ struct TargetInventory {
     sources: BTreeMap<String, (Language, InventoryContent)>,
     cargo_manifests: BTreeSet<String>,
     unmerged_paths: BTreeSet<String>,
-    skipped: usize,
+    omissions: Vec<SourceOmission>,
 }
 
 enum InventoryContent {
@@ -173,6 +214,7 @@ enum InventoryContent {
 #[derive(Clone, Copy)]
 enum InventoryKind {
     Source(Language),
+    UnindexedLanguage,
     CargoManifest,
 }
 
@@ -337,6 +379,31 @@ impl ArtifactReview {
     pub fn analysis_complete(&self) -> bool {
         self.files.iter().all(|file| file.analysis_complete)
     }
+}
+
+pub fn change_content_complete(changes: &WorktreeChanges, dependency_mode: DependencyMode) -> bool {
+    changes.skipped_paths == 0
+        && changes
+            .artifacts
+            .files
+            .iter()
+            .all(|file| file.diff_complete && file.omission.is_none())
+        && changes.paths.iter().all(|path| {
+            if dependency_mode == DependencyMode::Boundary
+                && changed_dependency_package(path).is_some()
+            {
+                true
+            } else if path.language.is_none() {
+                changes
+                    .artifacts
+                    .file(&path.path)
+                    .is_some_and(|file| file.diff_complete && file.omission.is_none())
+            } else {
+                (path.status != ChangeStatus::Renamed || path.old_language.is_some())
+                    && path.additions.is_some()
+                    && path.deletions.is_some()
+            }
+        })
 }
 
 #[derive(Default)]
@@ -814,8 +881,13 @@ impl Repository {
 }
 
 fn source_snapshot(inventory: TargetInventory, capture_root: &Path) -> SourceSnapshot {
-    let mut files = inventory
-        .sources
+    let TargetInventory {
+        sources,
+        cargo_manifests,
+        unmerged_paths: _,
+        mut omissions,
+    } = inventory;
+    let mut files = sources
         .into_iter()
         .map(|(path, (language, content))| {
             let (git_oid, content_key, content) = match content {
@@ -844,13 +916,48 @@ fn source_snapshot(inventory: TargetInventory, capture_root: &Path) -> SourceSna
             }
         })
         .collect::<Vec<_>>();
-    crate::index::assign_parse_contexts(&mut files, &inventory.cargo_manifests);
+    crate::index::assign_parse_contexts(&mut files, &cargo_manifests);
     debug_assert!(files.windows(2).all(|pair| pair[0].path < pair[1].path));
+    fold_source_omissions(&mut omissions);
     SourceSnapshot {
         capture_root: capture_root.to_owned(),
         files,
-        skipped: inventory.skipped,
+        omissions,
     }
+}
+
+fn fold_source_omissions(omissions: &mut Vec<SourceOmission>) {
+    omissions.sort_unstable_by(|left, right| {
+        (&left.path, left.reason).cmp(&(&right.path, right.reason))
+    });
+    let mut folded = Vec::<SourceOmission>::with_capacity(omissions.len());
+    for omission in omissions.drain(..) {
+        if let Some(previous) = folded.last_mut()
+            && previous.path == omission.path
+            && previous.reason == omission.reason
+        {
+            previous.occurrences = previous.occurrences.saturating_add(omission.occurrences);
+        } else {
+            folded.push(omission);
+        }
+    }
+    *omissions = folded;
+}
+
+fn omit(inventory: &mut TargetInventory, path: Option<String>, reason: SourceOmissionReason) {
+    if path.is_some()
+        && inventory
+            .omissions
+            .iter()
+            .any(|omission| omission.path == path && omission.reason == reason)
+    {
+        return;
+    }
+    inventory.omissions.push(SourceOmission {
+        path,
+        reason,
+        occurrences: 1,
+    });
 }
 
 impl BlobReader {
@@ -1147,10 +1254,10 @@ fn overlay_worktree(
         cancelled,
     )
     .map_err(capture_error)?;
-    let (dirty, dirty_skipped) = parse_inventory_paths(&dirty).map_err(capture_error)?;
-    inventory.skipped += dirty_skipped;
+    let (dirty, dirty_omissions) = parse_inventory_paths(&dirty).map_err(capture_error)?;
+    inventory.omissions.extend(dirty_omissions);
     let untracked = if include_untracked {
-        let (paths, skipped) = parse_inventory_paths(
+        let (paths, omissions) = parse_inventory_paths(
             &run_with_index(
                 &repository.root,
                 &["ls-files", "--others", "--exclude-standard", "-z"],
@@ -1160,7 +1267,7 @@ fn overlay_worktree(
             .map_err(capture_error)?,
         )
         .map_err(capture_error)?;
-        inventory.skipped += skipped;
+        inventory.omissions.extend(omissions);
         paths
     } else {
         BTreeSet::new()
@@ -1198,10 +1305,8 @@ fn overlay_worktree(
             }
             InventoryKind::Source(language) => {
                 inventory.sources.remove(path);
-                match read_regular_file(&repository.root, path, SOURCE_LIMIT, cancelled)
-                    .map_err(capture_error)?
-                {
-                    Some(content) => {
+                match read_source_file(&repository.root, path, cancelled).map_err(capture_error)? {
+                    SourceRead::Content(content) => {
                         let digest = *blake3::hash(&content).as_bytes();
                         let relative_path =
                             PathBuf::from("sources").join(format!("{ordinal:016x}"));
@@ -1218,13 +1323,14 @@ fn overlay_worktree(
                             ),
                         );
                     }
-                    None => {
-                        if fs::symlink_metadata(repository.root.join(path)).is_ok() {
-                            inventory.skipped += 1;
-                        }
-                    }
+                    SourceRead::Omitted(reason) => omit(inventory, Some(path.clone()), reason),
                 }
             }
+            InventoryKind::UnindexedLanguage => omit(
+                inventory,
+                Some(path.clone()),
+                SourceOmissionReason::LanguageNotIndexed,
+            ),
         }
     }
 
@@ -1786,6 +1892,44 @@ fn hash_field(hash: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
     hash.update(label);
     hash.update(&(value.len() as u64).to_le_bytes());
     hash.update(value);
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SourceRead {
+    Content(Vec<u8>),
+    Omitted(SourceOmissionReason),
+}
+
+fn read_source_file(root: &Path, path: &str, cancelled: &AtomicBool) -> Result<SourceRead, String> {
+    let metadata = match fs::symlink_metadata(root.join(path)) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SourceRead::Omitted(SourceOmissionReason::MissingDuringRead));
+        }
+        Err(_) => return Ok(SourceRead::Omitted(SourceOmissionReason::NonRegular)),
+    };
+    if !metadata.is_file() {
+        return Ok(SourceRead::Omitted(SourceOmissionReason::NonRegular));
+    }
+    if metadata.len() > SOURCE_LIMIT {
+        return Ok(SourceRead::Omitted(SourceOmissionReason::Oversized));
+    }
+    let Some(content) = read_regular_file(root, path, SOURCE_LIMIT, cancelled)? else {
+        return Ok(SourceRead::Omitted(
+            match fs::symlink_metadata(root.join(path)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    SourceOmissionReason::MissingDuringRead
+                }
+                Ok(metadata) if metadata.len() > SOURCE_LIMIT => SourceOmissionReason::Oversized,
+                _ => SourceOmissionReason::NonRegular,
+            },
+        ));
+    };
+    if std::str::from_utf8(&content).is_err() {
+        Ok(SourceRead::Omitted(SourceOmissionReason::InvalidUtf8))
+    } else {
+        Ok(SourceRead::Content(content))
+    }
 }
 
 fn read_regular_file(
@@ -3389,7 +3533,7 @@ fn parse_tree_inventory(output: &[u8]) -> Result<TargetInventory, String> {
         sources: BTreeMap::new(),
         cargo_manifests: BTreeSet::new(),
         unmerged_paths: BTreeSet::new(),
-        skipped: 0,
+        omissions: Vec::new(),
     };
     for record in nul_records(output) {
         let tab = record
@@ -3408,7 +3552,8 @@ fn parse_tree_inventory(output: &[u8]) -> Result<TargetInventory, String> {
         {
             return Err("Git returned malformed tree metadata".into());
         }
-        let Some((path, kind)) = parse_inventory_path(&record[tab + 1..], &mut inventory.skipped)?
+        let Some((path, kind)) =
+            parse_inventory_path(&record[tab + 1..], &mut inventory.omissions)?
         else {
             continue;
         };
@@ -3426,20 +3571,28 @@ fn parse_tree_inventory(output: &[u8]) -> Result<TargetInventory, String> {
                     return Err("Git returned duplicate tree paths".into());
                 }
             }
-            InventoryKind::Source(_) => inventory.skipped += 1,
+            InventoryKind::Source(_) => {
+                omit(&mut inventory, Some(path), SourceOmissionReason::NonRegular)
+            }
+            InventoryKind::UnindexedLanguage => omit(
+                &mut inventory,
+                Some(path),
+                SourceOmissionReason::LanguageNotIndexed,
+            ),
             InventoryKind::CargoManifest if regular => {
                 inventory.cargo_manifests.insert(path);
             }
             InventoryKind::CargoManifest => {}
         }
     }
+    fold_source_omissions(&mut inventory.omissions);
     Ok(inventory)
 }
 
 fn parse_index_inventory(output: &[u8]) -> Result<TargetInventory, String> {
     validate_nul_inventory(output)?;
     let mut entries = BTreeMap::<String, (InventoryKind, Vec<(u8, Vec<u8>, String)>)>::new();
-    let mut skipped = 0;
+    let mut omissions = Vec::new();
     for record in nul_records(output) {
         let tab = record
             .iter()
@@ -3457,7 +3610,7 @@ fn parse_index_inventory(output: &[u8]) -> Result<TargetInventory, String> {
         {
             return Err("Git returned malformed index metadata".into());
         }
-        let Some((path, kind)) = parse_inventory_path(&record[tab + 1..], &mut skipped)? else {
+        let Some((path, kind)) = parse_inventory_path(&record[tab + 1..], &mut omissions)? else {
             continue;
         };
         let stage = fields[2][0] - b'0';
@@ -3475,7 +3628,7 @@ fn parse_index_inventory(output: &[u8]) -> Result<TargetInventory, String> {
         sources: BTreeMap::new(),
         cargo_manifests: BTreeSet::new(),
         unmerged_paths: BTreeSet::new(),
-        skipped,
+        omissions,
     };
     for (path, (kind, entries)) in entries {
         let Some((_, mode, oid)) = entries
@@ -3483,8 +3636,18 @@ fn parse_index_inventory(output: &[u8]) -> Result<TargetInventory, String> {
             .first()
             .filter(|(stage, _, _)| entries.len() == 1 && *stage == 0)
         else {
-            if matches!(kind, InventoryKind::Source(_)) {
-                inventory.skipped += 1;
+            match kind {
+                InventoryKind::Source(_) => omit(
+                    &mut inventory,
+                    Some(path.clone()),
+                    SourceOmissionReason::Unmerged,
+                ),
+                InventoryKind::UnindexedLanguage => omit(
+                    &mut inventory,
+                    Some(path.clone()),
+                    SourceOmissionReason::LanguageNotIndexed,
+                ),
+                InventoryKind::CargoManifest => {}
             }
             inventory.unmerged_paths.insert(path);
             continue;
@@ -3496,31 +3659,40 @@ fn parse_index_inventory(output: &[u8]) -> Result<TargetInventory, String> {
                     .sources
                     .insert(path, (language, InventoryContent::GitBlob(oid.clone())));
             }
-            InventoryKind::Source(_) => inventory.skipped += 1,
+            InventoryKind::Source(_) => {
+                omit(&mut inventory, Some(path), SourceOmissionReason::NonRegular)
+            }
+            InventoryKind::UnindexedLanguage => omit(
+                &mut inventory,
+                Some(path),
+                SourceOmissionReason::LanguageNotIndexed,
+            ),
             InventoryKind::CargoManifest if regular => {
                 inventory.cargo_manifests.insert(path);
             }
             InventoryKind::CargoManifest => {}
         }
     }
+    fold_source_omissions(&mut inventory.omissions);
     Ok(inventory)
 }
 
-fn parse_inventory_paths(output: &[u8]) -> Result<(BTreeSet<String>, usize), String> {
+fn parse_inventory_paths(output: &[u8]) -> Result<(BTreeSet<String>, Vec<SourceOmission>), String> {
     validate_nul_inventory(output)?;
     let mut paths = BTreeSet::new();
-    let mut skipped = 0;
+    let mut omissions = Vec::new();
     for record in nul_records(output) {
-        if let Some((path, _)) = parse_inventory_path(record, &mut skipped)? {
+        if let Some((path, _)) = parse_inventory_path(record, &mut omissions)? {
             paths.insert(path);
         }
     }
-    Ok((paths, skipped))
+    fold_source_omissions(&mut omissions);
+    Ok((paths, omissions))
 }
 
 fn parse_inventory_path(
     raw_path: &[u8],
-    skipped: &mut usize,
+    omissions: &mut Vec<SourceOmission>,
 ) -> Result<Option<(String, InventoryKind)>, String> {
     let supported_source_suffix = [
         b".rs".as_slice(),
@@ -3534,18 +3706,27 @@ fn parse_inventory_path(
         b".mts",
         b".cts",
         b".d.ts",
+        b".go",
     ]
     .iter()
     .any(|suffix| raw_path.ends_with(suffix));
     let Ok(path) = std::str::from_utf8(raw_path) else {
         if supported_source_suffix {
-            *skipped += 1;
+            omissions.push(SourceOmission {
+                path: None,
+                reason: SourceOmissionReason::UnsafePath,
+                occurrences: 1,
+            });
         }
         return Ok(None);
     };
     let Some(path) = parse_change_path(path.as_bytes())? else {
         if supported_source_suffix {
-            *skipped += 1;
+            omissions.push(SourceOmission {
+                path: None,
+                reason: SourceOmissionReason::UnsafePath,
+                occurrences: 1,
+            });
         }
         return Ok(None);
     };
@@ -3555,6 +3736,10 @@ fn parse_inventory_path(
 fn inventory_kind(path: &str) -> Option<InventoryKind> {
     language_for_path(path)
         .map(InventoryKind::Source)
+        .or_else(|| {
+            path.ends_with(".go")
+                .then_some(InventoryKind::UnindexedLanguage)
+        })
         .or_else(|| {
             (path == "Cargo.toml" || path.ends_with("/Cargo.toml"))
                 .then_some(InventoryKind::CargoManifest)
@@ -4657,7 +4842,84 @@ mod tests {
         let inventory = parse_index_inventory(output.as_bytes()).unwrap();
 
         assert!(inventory.sources.is_empty());
-        assert_eq!(inventory.skipped, 1);
+        assert_eq!(inventory.omissions.len(), 1);
+    }
+
+    #[test]
+    fn source_omission_inventory_retains_safe_reasons_and_folds_unsafe_paths() {
+        let tree = [
+            format!("120000 blob {OID}\tlinked.rs\0").into_bytes(),
+            format!("100644 blob {OID}\tcmd/main.go\0").into_bytes(),
+            format!("100644 blob {OID}\tREADME.txt\0").into_bytes(),
+            {
+                let mut value = format!("100644 blob {OID}\t").into_bytes();
+                value.extend_from_slice(b"bad-\xff.rs\0");
+                value
+            },
+            {
+                let mut value = format!("100644 blob {OID}\t").into_bytes();
+                value.extend_from_slice(b"other-\xfe.rs\0");
+                value
+            },
+        ]
+        .concat();
+        let inventory = parse_tree_inventory(&tree).unwrap();
+        assert_eq!(
+            inventory.omissions,
+            [
+                SourceOmission {
+                    path: None,
+                    reason: SourceOmissionReason::UnsafePath,
+                    occurrences: 2,
+                },
+                SourceOmission {
+                    path: Some("cmd/main.go".into()),
+                    reason: SourceOmissionReason::LanguageNotIndexed,
+                    occurrences: 1,
+                },
+                SourceOmission {
+                    path: Some("linked.rs".into()),
+                    reason: SourceOmissionReason::NonRegular,
+                    occurrences: 1,
+                },
+            ]
+        );
+
+        let index = format!(
+            "100644 {OID} 1\tconflict.py\0\
+             100644 {OID} 2\tconflict.py\0\
+             100644 {OID} 3\tconflict.py\0"
+        );
+        assert_eq!(
+            parse_index_inventory(index.as_bytes()).unwrap().omissions,
+            [SourceOmission {
+                path: Some("conflict.py".into()),
+                reason: SourceOmissionReason::Unmerged,
+                occurrences: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn source_omission_read_classifies_expected_safe_failures() {
+        let root = private_dir("source-omission-read");
+        fs::write(root.join("large.rs"), vec![b'x'; SOURCE_LIMIT as usize + 1]).unwrap();
+        fs::write(root.join("invalid.py"), [0xff]).unwrap();
+        fs::create_dir(root.join("directory.ts")).unwrap();
+
+        for (path, reason) in [
+            ("large.rs", SourceOmissionReason::Oversized),
+            ("invalid.py", SourceOmissionReason::InvalidUtf8),
+            ("directory.ts", SourceOmissionReason::NonRegular),
+            ("gone.js", SourceOmissionReason::MissingDuringRead),
+        ] {
+            assert_eq!(
+                read_source_file(&root, path, &AtomicBool::new(false)).unwrap(),
+                SourceRead::Omitted(reason),
+                "{path}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4693,7 +4955,7 @@ mod tests {
             .unwrap();
 
         assert!(snapshot.files.is_empty());
-        assert_eq!(snapshot.skipped, 1);
+        assert_eq!(snapshot.files_skipped(), 1);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(capture_root).unwrap();
     }
@@ -4709,7 +4971,7 @@ mod tests {
 
         assert_eq!(inventory.sources.len(), 1);
         assert!(inventory.sources.contains_key("src/lib.rs"));
-        assert_eq!(inventory.skipped, 0);
+        assert!(inventory.omissions.is_empty());
     }
 
     #[test]
@@ -4819,32 +5081,32 @@ mod tests {
         ] {
             let mut invalid = vec![0xff];
             invalid.extend_from_slice(suffix);
-            let mut skipped = 0;
+            let mut omissions = Vec::new();
             assert!(
-                parse_inventory_path(&invalid, &mut skipped)
+                parse_inventory_path(&invalid, &mut omissions)
                     .unwrap()
                     .is_none()
             );
-            assert_eq!(skipped, 1);
+            assert_eq!(omissions.len(), 1);
 
-            let mut skipped = 0;
+            let mut omissions = Vec::new();
             let control = format!("src/a\n{}", String::from_utf8_lossy(suffix));
             assert!(
-                parse_inventory_path(control.as_bytes(), &mut skipped)
+                parse_inventory_path(control.as_bytes(), &mut omissions)
                     .unwrap()
                     .is_none()
             );
-            assert_eq!(skipped, 1);
+            assert_eq!(omissions.len(), 1);
         }
         for path in ["/tmp/a.js", "../a.ts"] {
-            let mut skipped = 0;
+            let mut omissions = Vec::new();
             assert_eq!(
-                parse_inventory_path(path.as_bytes(), &mut skipped)
+                parse_inventory_path(path.as_bytes(), &mut omissions)
                     .err()
                     .unwrap(),
                 "Git returned an unsafe changed path"
             );
-            assert_eq!(skipped, 0);
+            assert!(omissions.is_empty());
         }
 
         fs::remove_dir_all(capture_root).unwrap();

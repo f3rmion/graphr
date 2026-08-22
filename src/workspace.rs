@@ -12,16 +12,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::git::{
-    CapturedSource, ChangeLayer, DependencyMode, Repository, WorktreeChanges, resolve_commit,
+    CapturedSource, ChangeLayer, DependencyMode, Repository, SourceOmission, WorktreeChanges,
+    resolve_commit,
 };
 use crate::index::IndexStats;
 use crate::store;
 
 pub use crate::index::Engine;
 
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 6;
-pub(crate) const GRAPH_ANALYZER_VERSION: u32 = 2;
-pub(crate) const REVIEW_FORMAT_VERSION: u32 = 2;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 7;
+pub(crate) const GRAPH_ANALYZER_VERSION: u32 = 3;
+pub(crate) const REVIEW_FORMAT_VERSION: u32 = 3;
 const MANIFEST_SIZE_LIMIT: u64 = 64 * 1024;
 const REVIEW_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 static PRIVATE_ID: AtomicU64 = AtomicU64::new(0);
@@ -1985,6 +1986,7 @@ fn identity(repository: Repository) -> RootIdentity {
 pub(crate) fn graph_image_key(
     repository_id: &str,
     files: &[CapturedSource],
+    omissions: &[SourceOmission],
     cache_format_version: u32,
     analyzer_version: u32,
     schema_version: i64,
@@ -2001,6 +2003,18 @@ pub(crate) fn graph_image_key(
         file.language.as_str().as_bytes().hash_field(&mut hasher);
         file.content_key.as_bytes().hash_field(&mut hasher);
         file.parse_context.as_bytes().hash_field(&mut hasher);
+    }
+    (omissions.len() as u64).hash_field(&mut hasher);
+    for omission in omissions {
+        u32::from(omission.path.is_some()).hash_field(&mut hasher);
+        omission
+            .path
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes()
+            .hash_field(&mut hasher);
+        omission.reason.as_str().as_bytes().hash_field(&mut hasher);
+        omission.occurrences.hash_field(&mut hasher);
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -2108,7 +2122,10 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
-    use crate::git::{CapturedSource, DependencyMode, Language, SourceContent};
+    use crate::git::{
+        CapturedSource, DependencyMode, Language, SourceContent, SourceOmission,
+        SourceOmissionReason,
+    };
     use crate::index::Engine;
     use crate::store;
 
@@ -2191,13 +2208,14 @@ mod tests {
         }
 
         let files = vec![source("src/lib.rs", "a", Language::Rust, "crate")];
-        let key = graph_image_key("repository", &files, 6, 1, 4);
-        assert_ne!(key, graph_image_key("other", &files, 6, 1, 4));
+        let key = graph_image_key("repository", &files, &[], 6, 1, 4);
+        assert_ne!(key, graph_image_key("other", &files, &[], 6, 1, 4));
         assert_ne!(
             key,
             graph_image_key(
                 "repository",
                 &[source("src/lib.rs", "b", Language::Rust, "crate")],
+                &[],
                 6,
                 1,
                 4,
@@ -2208,6 +2226,7 @@ mod tests {
             graph_image_key(
                 "repository",
                 &[source("src/lib.rs", "a", Language::Python, "crate")],
+                &[],
                 6,
                 1,
                 4,
@@ -2218,14 +2237,28 @@ mod tests {
             graph_image_key(
                 "repository",
                 &[source("src/lib.rs", "a", Language::Rust, "other")],
+                &[],
                 6,
                 1,
                 4,
             )
         );
-        assert_ne!(key, graph_image_key("repository", &files, 7, 1, 4));
-        assert_ne!(key, graph_image_key("repository", &files, 6, 2, 4));
-        assert_ne!(key, graph_image_key("repository", &files, 6, 1, 5));
+        assert_ne!(key, graph_image_key("repository", &files, &[], 7, 1, 4));
+        assert_ne!(key, graph_image_key("repository", &files, &[], 6, 2, 4));
+        assert_ne!(key, graph_image_key("repository", &files, &[], 6, 1, 5));
+    }
+
+    #[test]
+    fn graph_image_key_changes_with_source_omissions() {
+        let omissions = [SourceOmission {
+            path: Some("src/large.rs".into()),
+            reason: SourceOmissionReason::Oversized,
+            occurrences: 1,
+        }];
+        assert_ne!(
+            graph_image_key("repository", &[], &[], 7, 3, 5),
+            graph_image_key("repository", &[], &omissions, 7, 3, 5)
+        );
     }
 
     #[test]

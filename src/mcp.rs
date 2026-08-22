@@ -251,7 +251,7 @@ impl ServerHandler for Graphr {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("graphr", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Graphr indexes Rust, Python, JavaScript/JSX, and TypeScript/TSX. Use inspect_root with the explicitly selected worktree_root. Use index with that worktree_root plus base, head, typed target (including include_untracked for a worktree target), and dependency_mode; verify the resolved root and OIDs. Poll index_status until completed and retain its snapshot_id; failed or cancelled is terminal. Call changes for that snapshot_id once without a cursor at depth 6 and max_nodes 50, then pass every files, diff, artifacts, and graph cursor verbatim with the same parameters until terminal completeness. Use search or view with the same snapshot_id only for named graph remediation. Stop on any structured root, job, snapshot, cursor, provenance, or completeness failure. Never fall back to another root, the default checkout, a live diff, or an older snapshot.",
+                "Graphr indexes Rust, Python, JavaScript/JSX, and TypeScript/TSX. Use inspect_root with the explicitly selected worktree_root. Use index with that worktree_root plus base, head, typed target (including include_untracked for a worktree target), and dependency_mode; verify the resolved root and OIDs. Poll index_status until completed and retain its snapshot_id; failed or cancelled is terminal. Call changes for that snapshot_id once without a cursor at depth 6 and max_nodes 50, then pass every files, diff, artifacts, and graph cursor verbatim with the same parameters until all pages are exhausted. Every changes response repeats content_complete_when_pages_exhausted, static_evidence_status, and dynamic_evidence_status; treat changed-content capture, static evidence, and dynamic evidence as independent facts. Use search or view with the same snapshot_id only for named graph remediation. Stop on any structured root, job, snapshot, cursor, provenance, or completeness failure. Never fall back to another root, the default checkout, a live diff, or an older snapshot.",
             )
     }
 }
@@ -545,6 +545,10 @@ mod tests {
             "once without a cursor",
             "files, diff, artifacts, and graph",
             "verbatim",
+            "content_complete_when_pages_exhausted",
+            "static_evidence_status",
+            "dynamic_evidence_status",
+            "independent facts",
             "search or view",
             "Stop on any structured root, job, snapshot, cursor, provenance, or completeness failure",
             "Never fall back",

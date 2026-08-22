@@ -28,19 +28,5 @@
   (static_item name: (identifier) @binding)
 ]
 
-(call_expression
-  function: [
-    (identifier)
-    (scoped_identifier)
-    (field_expression
-      value: [(self) (identifier)]
-      field: (field_identifier))
-    (generic_function
-      function: [
-        (identifier)
-        (scoped_identifier)
-        (field_expression
-          value: [(self) (identifier)]
-          field: (field_identifier))
-      ])
-  ] @call)
+(call_expression) @call
+(macro_invocation) @macro
