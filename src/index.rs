@@ -15,6 +15,7 @@ use crate::git::{
     Repository, Source, SourceContent, SourceSnapshot, WorktreeChanges, changed_dependency_package,
     read_captured_source,
 };
+use crate::javascript::ScriptParsers;
 use crate::parse::{DefinitionKind, ParsedFile, RustParser};
 use crate::python::PythonParser;
 use crate::store::{
@@ -1666,6 +1667,7 @@ fn build_index(
     if workers == 1 {
         let mut rust_parser = None;
         let mut python_parser = None;
+        let mut script_parsers = ScriptParsers::default();
         let mut blob_reader = None;
         let mut completed = stats.files_reused;
         for work in &pending {
@@ -1674,8 +1676,7 @@ fn build_index(
                 sources,
                 cancelled,
                 work,
-                &mut rust_parser,
-                &mut python_parser,
+                (&mut rust_parser, &mut python_parser, &mut script_parsers),
                 &mut blob_reader,
             )? {
                 Some(graph) => {
@@ -1697,6 +1698,7 @@ fn build_index(
                     scope.spawn(|| {
                         let mut rust_parser = None;
                         let mut python_parser = None;
+                        let mut script_parsers = ScriptParsers::default();
                         let mut blob_reader = None;
                         let mut parts = Vec::new();
                         while let Some(work) = pending.get(next.fetch_add(1, Ordering::Relaxed)) {
@@ -1705,8 +1707,7 @@ fn build_index(
                                 sources,
                                 cancelled,
                                 work,
-                                &mut rust_parser,
-                                &mut python_parser,
+                                (&mut rust_parser, &mut python_parser, &mut script_parsers),
                                 &mut blob_reader,
                             )?;
                             parts.push((work.index, part));
@@ -1779,10 +1780,14 @@ fn build_file(
     sources: &SourceSnapshot,
     cancelled: &AtomicBool,
     work: &FileWork<'_>,
-    rust_parser: &mut Option<RustParser>,
-    python_parser: &mut Option<PythonParser>,
+    parsers: (
+        &mut Option<RustParser>,
+        &mut Option<PythonParser>,
+        &mut ScriptParsers,
+    ),
     blob_reader: &mut Option<crate::git::BlobReader>,
 ) -> Result<Option<Graph>, String> {
+    let (rust_parser, python_parser, script_parsers) = parsers;
     let content = match &work.file.content {
         SourceContent::GitBlob(oid) => {
             if work.file.git_oid.as_deref() != Some(oid) || work.file.content_key != *oid {
@@ -1847,6 +1852,9 @@ fn build_file(
                 &source,
                 python_parser.as_mut().expect("initialized above"),
             )?;
+        }
+        Language::JavaScript | Language::TypeScript => {
+            crate::javascript::add_file(&mut graph, &source, work.file.language, script_parsers)?;
         }
     }
     Ok(Some(graph))
@@ -2881,6 +2889,11 @@ pub(crate) fn assign_parse_contexts(
         file.parse_context = match file.language {
             Language::Rust => targets.for_path(&file.path).parse_context(),
             Language::Python => String::new(),
+            Language::JavaScript | Language::TypeScript => {
+                crate::javascript::parse_context(&file.path)
+                    .expect("script language requires a supported path")
+                    .to_owned()
+            }
         };
     }
 }

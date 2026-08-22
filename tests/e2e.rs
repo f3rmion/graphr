@@ -361,6 +361,946 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
     client.close();
 }
 
+const TYPES: &str = r#"
+    export interface Config { value: string }
+"#;
+const CORE: &str = r#"
+    import type { Config } from "./types.js";
+    function helper(config: Config) { return config.value; }
+    export { helper as exposedHelper };
+    export function run(config: Config) { return helper(config); }
+    export class Service {
+        static create() { return new Service(); }
+        dispatch(config: Config) { return this.finish(config); }
+        finish(config: Config) { return run(config); }
+    }
+    export function makeService() { return Service.create(); }
+    export function misuseType() { return Config(); }
+    export function shadow(run: () => void) { run(); }
+"#;
+const EDITED_CORE: &str = r#"
+    import type { Config } from "./types.js";
+    function helper(config: Config) { return config.value; }
+    export { helper as exposedHelper };
+    export function run(config: Config) {
+        helper(config);
+        return helper(config);
+    }
+    export class Service {
+        static create() { return new Service(); }
+        dispatch(config: Config) { return this.finish(config); }
+        finish(config: Config) { return run(config); }
+    }
+    export function makeService() { return Service.create(); }
+    export function misuseType() { return Config(); }
+    export function shadow(run: () => void) { run(); }
+"#;
+const BRIDGE: &str = r#"
+    export { run as execute } from "./core.js";
+    export { default as ForwardedService } from "./services";
+    export { Factory as ForwardedFactory } from "./not-a-class";
+    export * as widgets from "./widget";
+    export * from "./types.js";
+"#;
+const WIDGET: &str = r#"
+    export default function DefaultWidget() { return <section />; }
+    export function Widget() { return <div />; }
+    export function div() { return null; }
+"#;
+const UI: &str = r#"
+    import DefaultWidget, { Widget, div } from "./widget";
+    import * as UI from "./widget";
+    export const Panel = () =>
+        <><DefaultWidget /><Widget /><UI.Widget /><div /></>;
+"#;
+const SCRIPT_TESTS: &str = r#"
+    import { execute } from "../src/bridge";
+    import { Service } from "../src/core";
+    import { Panel } from "../src/ui";
+    import { future } from "../src/future";
+
+    test.only("runs", () => execute?.({ value: "test" }));
+    describe("nested", () => {
+        it.skip("constructs", () => new Service());
+    });
+    test("static factory", () => Service.create());
+    test("renders", () => Panel());
+    test("future", () => future());
+"#;
+const MODERN: &str = r#"
+    import { execute } from "./bridge";
+    import { exposedHelper } from "./core";
+    export function invoke() { return execute({ value: "mts" }); }
+    export function invokeLocalExport() {
+        return exposedHelper({ value: "local" });
+    }
+"#;
+const COMMON: &str = r#"
+    const { run } = require("./core");
+    const invokeCommon = () => run({ value: "cjs" });
+    module.exports = { invokeCommon };
+"#;
+const CONSUMER: &str = r#"
+    import common = require("./common.cjs");
+    const consume = () => common.invokeCommon();
+    export = consume;
+"#;
+const ENTRY: &str = r#"
+    import "./bridge";
+    import { duplicate } from "./collision";
+    import { indexed } from "./directory";
+    function bootstrap() { return true; }
+    bootstrap();
+    export function unresolved() { return duplicate(); }
+    export function fromIndex() { return indexed(); }
+"#;
+const SERVICES: &str = r#"
+    class DefaultService {
+        static defaultCreate() { return new DefaultService(); }
+    }
+    class LocalService {
+        static renamedCreate() { return new LocalService(); }
+    }
+    export default DefaultService;
+    export { LocalService as RenamedService };
+"#;
+const CLASS_USER: &str = r#"
+    import DirectoryDefault, {
+        RenamedService as DirectoryRenamed,
+    } from "./services";
+    import IndexDefault, {
+        RenamedService as IndexRenamed,
+    } from "./services/index";
+    import { ForwardedService } from "./bridge";
+    import { AmbiguousService } from "./ambiguous-service";
+    import { ForwardedFactory } from "./bridge";
+    export function useDirectoryDefault() {
+        return DirectoryDefault.defaultCreate();
+    }
+    export function useDirectoryRenamed() {
+        return DirectoryRenamed.renamedCreate();
+    }
+    export function useIndexDefault() {
+        return IndexDefault.defaultCreate();
+    }
+    export function useIndexRenamed() {
+        return IndexRenamed.renamedCreate();
+    }
+    export function useForwarded() {
+        return ForwardedService.defaultCreate();
+    }
+    export function useAmbiguousFileMethod() {
+        return AmbiguousService.fileOnly();
+    }
+    export function useAmbiguousIndexMethod() {
+        return AmbiguousService.indexOnly();
+    }
+    export function useForwardedFactory() {
+        return ForwardedFactory.fakeCreate();
+    }
+"#;
+const AMBIGUOUS_SERVICE_FILE: &str = r#"
+    export class AmbiguousService {
+        static fileOnly() { return 1; }
+    }
+"#;
+const AMBIGUOUS_SERVICE_INDEX: &str = r#"
+    export class AmbiguousService {
+        static indexOnly() { return 2; }
+    }
+"#;
+const NOT_A_CLASS: &str = r#"
+    export function Factory() {
+        return {
+            fakeCreate() { return 3; }
+        };
+    }
+"#;
+
+fn write_script_fixture(root: &Path) {
+    fs::create_dir_all(root.join("src/collision")).unwrap();
+    fs::create_dir_all(root.join("src/directory")).unwrap();
+    fs::create_dir_all(root.join("src/services")).unwrap();
+    fs::create_dir_all(root.join("src/ambiguous-service")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(root.join("src/types.d.ts"), TYPES).unwrap();
+    fs::write(root.join("src/core.ts"), CORE).unwrap();
+    fs::write(root.join("src/bridge.js"), BRIDGE).unwrap();
+    fs::write(root.join("src/widget.jsx"), WIDGET).unwrap();
+    fs::write(root.join("src/ui.tsx"), UI).unwrap();
+    fs::write(root.join("src/modern.mts"), MODERN).unwrap();
+    fs::write(root.join("src/common.cjs"), COMMON).unwrap();
+    fs::write(root.join("src/consumer.cts"), CONSUMER).unwrap();
+    fs::write(root.join("src/entry.mjs"), ENTRY).unwrap();
+    fs::write(root.join("src/services/index.ts"), SERVICES).unwrap();
+    fs::write(root.join("src/class-user.ts"), CLASS_USER).unwrap();
+    fs::write(
+        root.join("src/ambiguous-service.ts"),
+        AMBIGUOUS_SERVICE_FILE,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/ambiguous-service/index.ts"),
+        AMBIGUOUS_SERVICE_INDEX,
+    )
+    .unwrap();
+    fs::write(root.join("src/not-a-class.ts"), NOT_A_CLASS).unwrap();
+    fs::write(root.join("tests/core.test.ts"), SCRIPT_TESTS).unwrap();
+    fs::write(
+        root.join("src/collision.js"),
+        "export function duplicate() { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/collision/index.ts"),
+        "export function duplicate() { return 2; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/directory/index.ts"),
+        "export function indexed() { return 3; }\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
+    let incremental = Fixture::new();
+    let oracle = Fixture::new();
+    for root in [&incremental.path, &oracle.path] {
+        write_script_fixture(root);
+        init_git(root);
+        git(root, &["add", "--", "."]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Graphr Test",
+                "-c",
+                "user.email=graphr@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+    }
+
+    index_repository(&incremental.path);
+    assert_eq!(language_file_count(&incremental.path, "javascript"), 5);
+    assert_eq!(language_file_count(&incremental.path, "typescript"), 13);
+    for (path, language, context) in [
+        ("src/bridge.js", "javascript", "javascript"),
+        ("src/widget.jsx", "javascript", "javascript"),
+        ("src/entry.mjs", "javascript", "javascript"),
+        ("src/common.cjs", "javascript", "javascript"),
+        ("src/core.ts", "typescript", "typescript"),
+        ("src/types.d.ts", "typescript", "typescript"),
+        ("src/modern.mts", "typescript", "typescript"),
+        ("src/consumer.cts", "typescript", "typescript"),
+        ("src/ui.tsx", "typescript", "tsx"),
+        ("tests/core.test.ts", "typescript", "typescript"),
+    ] {
+        assert_eq!(
+            stored_file_language_and_context(&incremental.path, path),
+            (language.to_owned(), context.to_owned()),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "runs",
+            "src/core.ts",
+            "run",
+            "TEST_CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "static factory",
+            "src/core.ts",
+            "create",
+            "TEST_CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "constructs",
+            "src/core.ts",
+            "Service",
+            "TEST_CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "renders",
+            "src/ui.tsx",
+            "Panel",
+            "TEST_CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/ui.tsx",
+            "Panel",
+            "src/widget.jsx",
+            "Widget",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/ui.tsx",
+            "Panel",
+            "src/widget.jsx",
+            "DefaultWidget",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(named_edge_count(&incremental.path, "Panel", "div"), 0);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/future.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        0
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/core.ts",
+            "run",
+            "src/core.ts",
+            "helper",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        [
+            named_edge_kind_count(
+                &incremental.path,
+                "src/class-user.ts",
+                "useAmbiguousFileMethod",
+                "src/ambiguous-service.ts",
+                "fileOnly",
+                "CALLS",
+            ),
+            named_edge_kind_count(
+                &incremental.path,
+                "src/class-user.ts",
+                "useAmbiguousIndexMethod",
+                "src/ambiguous-service/index.ts",
+                "indexOnly",
+                "CALLS",
+            ),
+            named_edge_kind_count(
+                &incremental.path,
+                "src/class-user.ts",
+                "useForwardedFactory",
+                "src/not-a-class.ts",
+                "fakeCreate",
+                "CALLS",
+            ),
+        ],
+        [0, 0, 0]
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/class-user.ts",
+            "useDirectoryDefault",
+            "src/services/index.ts",
+            "defaultCreate",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/class-user.ts",
+            "useDirectoryRenamed",
+            "src/services/index.ts",
+            "renamedCreate",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/class-user.ts",
+            "useIndexDefault",
+            "src/services/index.ts",
+            "defaultCreate",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/class-user.ts",
+            "useIndexRenamed",
+            "src/services/index.ts",
+            "renamedCreate",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/class-user.ts",
+            "useForwarded",
+            "src/services/index.ts",
+            "defaultCreate",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/entry.mjs",
+            "fromIndex",
+            "src/directory/index.ts",
+            "indexed",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/entry.mjs",
+            "src/entry.mjs",
+            "src/entry.mjs",
+            "bootstrap",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/core.ts",
+            "makeService",
+            "src/core.ts",
+            "create",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/modern.mts",
+            "invoke",
+            "src/core.ts",
+            "run",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/common.cjs",
+            "invokeCommon",
+            "src/core.ts",
+            "run",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/consumer.cts",
+            "consume",
+            "src/common.cjs",
+            "invokeCommon",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/modern.mts",
+            "invokeLocalExport",
+            "src/core.ts",
+            "helper",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/entry.mjs",
+            "src/entry.mjs",
+            "src/bridge.js",
+            "src/bridge.js",
+            "IMPORTS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/bridge.js",
+            "src/bridge.js",
+            "src/types.d.ts",
+            "src/types.d.ts",
+            "IMPORTS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/bridge.js",
+            "src/bridge.js",
+            "src/widget.jsx",
+            "src/widget.jsx",
+            "IMPORTS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "src/core.ts",
+            "src/core.ts",
+            "src/types.d.ts",
+            "Config",
+            "IMPORTS",
+        ),
+        1
+    );
+    assert_eq!(named_edge_count(&incremental.path, "shadow", "run"), 0);
+    assert_eq!(
+        named_edge_count(&incremental.path, "misuseType", "Config"),
+        0
+    );
+    assert_eq!(
+        named_edge_count(&incremental.path, "unresolved", "duplicate"),
+        0
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(root.join("src/core.ts"), EDITED_CORE).unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_support_count(
+            &incremental.path,
+            "src/core.ts",
+            "run",
+            "src/core.ts",
+            "helper",
+            "CALLS",
+        ),
+        2
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(
+            root.join("src/future.ts"),
+            "export function future() { return undefined; }\n",
+        )
+        .unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/future.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        1
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::rename(root.join("src/future.ts"), root.join("src/moved.ts")).unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/moved.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        0
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::rename(root.join("src/moved.ts"), root.join("src/future.ts")).unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/future.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        1
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::remove_file(root.join("src/future.ts")).unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/future.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        0
+    );
+
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(
+            root.join("src/future.ts"),
+            "export function future() { return undefined; }\n",
+        )
+        .unwrap();
+    }
+    assert_script_graph_matches_fresh(&incremental.path, &oracle.path);
+    assert_eq!(
+        named_edge_kind_count(
+            &incremental.path,
+            "tests/core.test.ts",
+            "future",
+            "src/future.ts",
+            "future",
+            "TEST_CALLS",
+        ),
+        1
+    );
+
+    let mut client = Client::start(&incremental.path);
+    let search = client.search("Service", Some("type"));
+    let search_text = response_text(&search);
+    let service = search_text
+        .lines()
+        .find(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next().is_some()
+                && fields.next() == Some("Type")
+                && fields.next() == Some("Service")
+                && fields
+                    .next()
+                    .is_some_and(|location| location.starts_with("src/core.ts:"))
+        })
+        .unwrap_or_else(|| panic!("missing Service type in src/core.ts: {search_text}"));
+    let node_ref = service.split_whitespace().next().unwrap();
+    let view = client.view(node_ref, 2, 30);
+    assert!(view.contains("dispatch"), "{view}");
+    assert!(view.contains("finish"), "{view}");
+    let changes = client.changes(1, 50, None);
+    assert!(changes.contains("future"), "{changes}");
+    assert!(changes.contains("run"), "{changes}");
+    client.close();
+}
+
+#[test]
+fn script_class_member_calls_require_callable_static_methods() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/service.ts"),
+        r#"
+            export abstract class Service {
+                static callable() {}
+                instance() {}
+                static staticField = () => {};
+                instanceField = () => {};
+                static get getter() { return () => {}; }
+                static set setter(value: () => void) {}
+                abstract declared(): void;
+                callInstance() { this.instance(); this.instanceField(); }
+            }
+            export function localStatic() { Service.callable(); }
+            export function localStaticField() { Service.staticField(); }
+            export function localInstance() { Service.instance(); }
+            export function localInstanceField() { Service.instanceField(); }
+            export function localGetter() { Service.getter(); }
+            export function localSetter() { Service.setter(); }
+            export function localDeclared() { Service.declared(); }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/ambient.d.ts"),
+        "export declare class Ambient { static signature(): void; }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/bridge.ts"),
+        "export { Service as ForwardedService } from './service';\n\
+         export { Ambient as ForwardedAmbient } from './ambient';\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/user.ts"),
+        r#"
+            import { Service } from "./service";
+            import { ForwardedService, ForwardedAmbient } from "./bridge";
+            export function importedStatic() { Service.callable(); }
+            export function importedStaticField() { Service.staticField(); }
+            export function importedInstance() { Service.instance(); }
+            export function importedInstanceField() { Service.instanceField(); }
+            export function importedDeclared() { Service.declared(); }
+            export function forwardedStatic() { ForwardedService.callable(); }
+            export function forwardedStaticField() { ForwardedService.staticField(); }
+            export function forwardedInstance() { ForwardedService.instance(); }
+            export function forwardedInstanceField() { ForwardedService.instanceField(); }
+            export function forwardedGetter() { ForwardedService.getter(); }
+            export function forwardedSignature() { ForwardedAmbient.signature(); }
+        "#,
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    index_repository(&fixture.path);
+
+    let edge = |source_path, source, target_path, target| {
+        named_edge_kind_count(
+            &fixture.path,
+            source_path,
+            source,
+            target_path,
+            target,
+            "CALLS",
+        )
+    };
+    for (source, target) in [
+        ("localStatic", "callable"),
+        ("callInstance", "instance"),
+        ("callInstance", "instanceField"),
+        ("localStaticField", "staticField"),
+    ] {
+        assert_eq!(edge("src/service.ts", source, "src/service.ts", target), 1);
+    }
+    for (source, target) in [
+        ("importedStatic", "callable"),
+        ("importedStaticField", "staticField"),
+        ("forwardedStatic", "callable"),
+        ("forwardedStaticField", "staticField"),
+    ] {
+        assert_eq!(edge("src/user.ts", source, "src/service.ts", target), 1);
+    }
+    for (source, target) in [
+        ("localInstance", "instance"),
+        ("localInstanceField", "instanceField"),
+        ("localGetter", "getter"),
+        ("localSetter", "setter"),
+        ("localDeclared", "declared"),
+    ] {
+        assert_eq!(edge("src/service.ts", source, "src/service.ts", target), 0);
+    }
+    for (source, target) in [
+        ("importedInstance", "instance"),
+        ("importedInstanceField", "instanceField"),
+        ("importedDeclared", "declared"),
+        ("forwardedInstance", "instance"),
+        ("forwardedInstanceField", "instanceField"),
+        ("forwardedGetter", "getter"),
+    ] {
+        assert_eq!(edge("src/user.ts", source, "src/service.ts", target), 0);
+    }
+    assert_eq!(
+        edge(
+            "src/user.ts",
+            "forwardedSignature",
+            "src/ambient.d.ts",
+            "signature",
+        ),
+        0
+    );
+}
+
+#[test]
+fn script_this_calls_respect_static_and_instance_receivers() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/service.ts"),
+        r#"
+            export class Service {
+                static staticOnly() {}
+                instanceOnly() {}
+                static shared() {}
+                shared() {}
+                static staticFactory = () => this.staticOnly();
+                instanceFactory = () => this.instanceOnly();
+                static staticFunction = function () { this.staticOnly(); };
+                instanceFunction = function () { this.instanceOnly(); };
+                static staticGenerator = function* () { this.staticOnly(); };
+                instanceGenerator = function* () { this.instanceOnly(); };
+                static staticValue = this.staticOnly();
+                instanceValue = this.instanceOnly();
+                static fromStatic() {
+                    this.staticOnly();
+                    this.instanceOnly();
+                    this.shared();
+                }
+                fromInstance() {
+                    this.instanceOnly();
+                    this.staticOnly();
+                    this.shared();
+                }
+                nestedFunction() {
+                    function nested() { this.instanceOnly(); }
+                    nested();
+                }
+                nestedObject() {
+                    const object = { nestedMethod() { this.instanceOnly(); } };
+                    object.nestedMethod();
+                }
+            }
+            export class StaticBlock {
+                static target() {}
+                static { this.target(); }
+            }
+        "#,
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    index_repository(&fixture.path);
+
+    let edge = |source, target| {
+        named_edge_kind_count(
+            &fixture.path,
+            "src/service.ts",
+            source,
+            "src/service.ts",
+            target,
+            "CALLS",
+        )
+    };
+    assert_eq!(edge("fromStatic", "staticOnly"), 1);
+    assert_eq!(edge("fromStatic", "instanceOnly"), 0);
+    assert_eq!(edge("fromStatic", "shared"), 1);
+    assert_eq!(edge("fromInstance", "instanceOnly"), 1);
+    assert_eq!(edge("fromInstance", "staticOnly"), 0);
+    assert_eq!(edge("fromInstance", "shared"), 1);
+    assert_eq!(edge("staticFactory", "staticOnly"), 1);
+    assert_eq!(edge("instanceFactory", "instanceOnly"), 1);
+    assert_eq!(edge("staticFunction", "staticOnly"), 1);
+    assert_eq!(edge("instanceFunction", "instanceOnly"), 1);
+    assert_eq!(edge("staticGenerator", "staticOnly"), 1);
+    assert_eq!(edge("instanceGenerator", "instanceOnly"), 1);
+    assert_eq!(edge("Service", "staticOnly"), 1);
+    assert_eq!(edge("Service", "instanceOnly"), 1);
+    assert_eq!(edge("nested", "instanceOnly"), 0);
+    assert_eq!(edge("nestedMethod", "instanceOnly"), 0);
+    assert_eq!(edge("StaticBlock", "target"), 1);
+}
+
+#[test]
+fn javascript_direct_class_reexport_methods_match_fresh_graph_after_targeted_edits() {
+    const FIRST_BEFORE: &str = "export class First { static before() {} static create() {} }\n";
+    const FIRST_AFTER: &str = "export class First { static after() {} static create() {} }\n";
+    const SECOND: &str = "export class Second { static create() {} }\n";
+    const BRIDGE_BEFORE: &str =
+        "export { First as TargetEdited, First as Retargeted } from './first';\n";
+    const BRIDGE_AFTER: &str = "export { First as TargetEdited } from './first';\n\
+         export { Second as Retargeted } from './second';\n";
+    const USER: &str = r#"
+        import { TargetEdited, Retargeted } from "./bridge";
+        export function useTargetEdited() { return TargetEdited.after(); }
+        export function useRetargeted() { return Retargeted.create(); }
+    "#;
+
+    let incremental = Fixture::new();
+    let oracle = Fixture::new();
+    for root in [&incremental.path, &oracle.path] {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/first.ts"), FIRST_BEFORE).unwrap();
+        fs::write(root.join("src/second.ts"), SECOND).unwrap();
+        fs::write(root.join("src/bridge.ts"), BRIDGE_BEFORE).unwrap();
+        fs::write(root.join("src/user.ts"), USER).unwrap();
+        init_git(root);
+    }
+    index_repository(&incremental.path);
+    for root in [&incremental.path, &oracle.path] {
+        fs::write(root.join("src/first.ts"), FIRST_AFTER).unwrap();
+        fs::write(root.join("src/bridge.ts"), BRIDGE_AFTER).unwrap();
+    }
+    index_repository(&incremental.path);
+    index_repository(&oracle.path);
+    assert_eq!(
+        [
+            named_edge_kind_count(
+                &incremental.path,
+                "src/user.ts",
+                "useTargetEdited",
+                "src/first.ts",
+                "after",
+                "CALLS",
+            ),
+            named_edge_kind_count(
+                &incremental.path,
+                "src/user.ts",
+                "useRetargeted",
+                "src/second.ts",
+                "create",
+                "CALLS",
+            ),
+            named_edge_kind_count(
+                &incremental.path,
+                "src/user.ts",
+                "useRetargeted",
+                "src/first.ts",
+                "create",
+                "CALLS",
+            ),
+        ],
+        [1, 1, 0]
+    );
+    assert_eq!(
+        semantic_graph(&incremental.path),
+        semantic_graph(&oracle.path)
+    );
+}
+
 #[test]
 fn immutable_snapshots_match_fresh_graphs_through_mutations() {
     const CALLER: &str = "use crate::target::answer;\npub fn call() { answer(); answer(); }\n";
@@ -3895,6 +4835,16 @@ fn assert_immutable_graphs_match(incremental: &Path, oracle: &Path) {
     assert_eq!(semantic_graph(incremental), semantic_graph(oracle));
 }
 
+fn assert_script_graph_matches_fresh(incremental: &Path, oracle: &Path) {
+    index_repository(incremental);
+    let oracle_cache = oracle.join(".git/graphr");
+    if oracle_cache.exists() {
+        fs::remove_dir_all(&oracle_cache).unwrap();
+    }
+    index_repository(oracle);
+    assert_eq!(semantic_graph(incremental), semantic_graph(oracle));
+}
+
 fn graph_path(path: &Path) -> PathBuf {
     latest_graphs()
         .lock()
@@ -3981,6 +4931,76 @@ fn named_edge_count(path: &Path, source: &str, target: &str) -> i64 {
               WHERE source.name=?1 AND target.name=?2",
             [source, target],
             |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn named_edge_kind_count(
+    path: &Path,
+    source_path: &str,
+    source: &str,
+    target_path: &str,
+    target: &str,
+    kind: &str,
+) -> i64 {
+    Connection::open(graph_path(path))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM edges edge
+               JOIN nodes source ON source.id=edge.source_id
+               JOIN files source_file ON source_file.id=source.file_id
+               JOIN nodes target ON target.id=edge.target_id
+               JOIN files target_file ON target_file.id=target.file_id
+              WHERE source_file.path=?1 AND source.name=?2
+                AND target_file.path=?3 AND target.name=?4 AND edge.kind=?5",
+            [source_path, source, target_path, target, kind],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn named_edge_support_count(
+    path: &Path,
+    source_path: &str,
+    source: &str,
+    target_path: &str,
+    target: &str,
+    kind: &str,
+) -> i64 {
+    Connection::open(graph_path(path))
+        .unwrap()
+        .query_row(
+            "SELECT edge.support_count FROM edges edge
+               JOIN nodes source ON source.id=edge.source_id
+               JOIN files source_file ON source_file.id=source.file_id
+               JOIN nodes target ON target.id=edge.target_id
+               JOIN files target_file ON target_file.id=target.file_id
+              WHERE source_file.path=?1 AND source.name=?2
+                AND target_file.path=?3 AND target.name=?4 AND edge.kind=?5",
+            [source_path, source, target_path, target, kind],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn language_file_count(path: &Path, language: &str) -> i64 {
+    Connection::open(graph_path(path))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM files WHERE language=?1",
+            [language],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn stored_file_language_and_context(path: &Path, source_path: &str) -> (String, String) {
+    Connection::open(graph_path(path))
+        .unwrap()
+        .query_row(
+            "SELECT language, parse_context FROM files WHERE path=?1",
+            [source_path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap()
 }

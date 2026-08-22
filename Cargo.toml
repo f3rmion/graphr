@@ -3,11 +3,11 @@ name = "graphr"
 version = "0.6.1"
 edition = "2024"
 rust-version = "1.97.1"
-description = "Fast, compact Rust and Python code graphs for AI code review over MCP stdio"
+description = "Fast, compact Rust, Python, JavaScript, and TypeScript code graphs for AI code review over MCP stdio"
 license = "MIT"
 repository = "https://github.com/f3rmion/graphr"
 readme = "README.md"
-keywords = ["mcp", "code-review", "code-graph", "rust", "python"]
+keywords = ["mcp", "rust", "python", "javascript", "typescript"]
 categories = ["development-tools"]
 exclude = ["/.agents", "/AGENTS.md"]
 
@@ -19,5 +19,7 @@ rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["macros", "rt", "sync"] }
 tree-sitter = "0.26.11"
+tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"

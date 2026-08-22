@@ -1,6 +1,7 @@
 mod artifact;
 mod git;
 mod index;
+mod javascript;
 pub mod job;
 mod mcp;
 mod parse;
