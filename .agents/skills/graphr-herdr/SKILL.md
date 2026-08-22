@@ -71,7 +71,7 @@ Return mismatches to the same worker. On truncation, have it write the handoff u
 
 ## Review and repair
 
-Compute `review_base=$(git -C "$repo_root" merge-base "$parent_branch" "$worker_head")`. Invoke `graphr-review` from `repo_root` with `review_base`, `worker_head`, `target={"kind":"commit"}`; never authorize child, use a live diff, or reuse a snapshot. The gate cannot run with unresolved actionable findings. A rejected finding needs an evidence-backed disposition; a repair returns to the same worker, and every new head needs verification and a fresh complete snapshot. A separate reviewer is only requested or broad/security-sensitive, and read-only in main.
+Set `review_base=$parent_head`. Invoke `graphr-review` from `repo_root` with `review_base`, `worker_head`, `target={"kind":"commit"}`; never authorize child, use a live diff, or reuse a snapshot. The gate cannot run with unresolved actionable findings. A rejected finding needs an evidence-backed disposition; a repair returns to the same worker, and every new head needs verification and a fresh complete snapshot. A separate reviewer is only requested or broad/security-sensitive, and read-only in main.
 
 ## Run the gate
 

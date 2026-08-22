@@ -189,7 +189,7 @@ Write these sections in this order:
 3. **Choose work** — default to one worker; permit more only for separately committable, non-overlapping tasks. Use ordinary repository search first. Use Graphr planning evidence only when a meaningful committed range already exists; never manufacture an arbitrary history range or index `HEAD..HEAD` as repository-wide discovery.
 4. **Create and brief the worker** — use `herdr worktree create --no-focus`, parse returned IDs, select agent kind without hard-coded model/effort, start the worker, and submit the compact brief.
 5. **Wait and verify** — use lifecycle waits, surface blocked questions to the human, and verify branch/OID/cleanliness independently.
-6. **Review and repair** — invoke `graphr-review` from the authorized parent root over merge-base-to-worker-head with commit target; return findings to the same worker and build a fresh snapshot after every new head.
+6. **Review and repair** — invoke `graphr-review` from the authorized parent root over captured-parent-head-to-worker-head with commit target; return findings to the same worker and build a fresh snapshot after every new head.
 7. **Run the gate** — create an ordinary checks tab rooted at the idle worker worktree, run the complete serial gate once, and restart from formatting after a repaired failure.
 8. **Report and stop** — emit the exact handoff shape from **Interfaces**, retain all Herdr/Git resources, and name the next human action.
 9. **Stop conditions** — include outside-Herdr, dirty/detached/linked parent, missing caller identity, Graphr rejection, missing sub-skill, collision, startup failure, blocked/unknown agent, handoff mismatch, incomplete review, and failed check.
@@ -255,7 +255,7 @@ Require the expected branch, reported OID equal to `worker_head`, empty status, 
 For review, compute the base in the parent checkout and invoke `graphr-review` rather than copying its mechanics:
 
 ```bash
-review_base=$(git -C "$repo_root" merge-base "$parent_branch" "$worker_head")
+review_base=$parent_head
 ```
 
 Pass `repo_root`, `review_base`, `worker_head`, and `target={"kind":"commit"}` to `graphr-review`. A separate reviewer is allowed only when requested or justified by broad/security-sensitive risk, and it remains read-only in the main workspace.

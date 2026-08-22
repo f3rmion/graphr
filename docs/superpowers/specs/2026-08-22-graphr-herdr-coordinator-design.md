@@ -194,8 +194,8 @@ so the review does not need the worker's linked root or a broader
 `--allow-root` list.
 
 The coordinator invokes `graphr-review` with the main worktree as the explicit
-root, the merge base with the worker branch as base, the worker commit as head,
-and a commit target. It follows that skill's complete cursor, remediation,
+root, the captured parent head as base, the worker commit as head, and a commit
+target. It follows that skill's complete cursor, remediation,
 provenance, and completeness rules.
 
 Findings return to the same worker. The worker amends through a new commit or
