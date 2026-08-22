@@ -1,15 +1,16 @@
 # Dynamic Evidence Graph Design
 
-**Status:** Draft for written review
+**Status:** Approved for implementation planning
 
 **Date:** 2026-08-22
 
 ## Context
 
-Graphr currently provides immutable Rust and Python source graphs, exact changed
-text coverage, bounded affected-flow analysis, and explicit pagination and
-artifact omissions. Its completion fields describe those mechanisms, but their
-names are broader than the predicates they enforce.
+Graphr currently provides immutable Rust, Python, JavaScript/JSX, and
+TypeScript/TSX source graphs, exact changed text coverage, bounded affected-flow
+analysis, and explicit pagination and artifact omissions. Its completion fields
+describe those mechanisms, but their names are broader than the predicates they
+enforce.
 
 In particular, native graph completion currently means that changed ranges were
 mapped and bounded graph traversal finished. It does not mean that every call,
@@ -48,7 +49,7 @@ Every relation-bearing syntax site that Graphr observes must produce exactly one
 of:
 
 - a resolved static reference and derived edge;
-- a verified syntax-backed provenance link;
+- a verified modeled-site record, including syntax-backed provenance;
 - an unresolved reference with an exact resolution state; or
 - an explicit gap describing why no relationship can be modeled.
 
@@ -66,8 +67,8 @@ replace them with a generic claim/evidence framework or execute repository code.
 - Make source, parser, resolution, macro, generated-code, dynamic-dispatch, and
   language-boundary omissions explicit.
 - Distinguish missing and ambiguous reference resolution.
-- Prove that every observed call, import, and macro site was classified exactly
-  once.
+- Prove that every observed call, import/export, macro, JSX, and
+  test-registration site was classified exactly once.
 - Separate changed-content capture, source capture, syntax parsing, site
   classification, static modeling, and bounded traversal.
 - State whether affected-caller, affected-flow, and static-test-path claims are
@@ -103,7 +104,9 @@ This milestone does not:
 - infer source, validator, materializer, or sink roles;
 - compare trust-boundary paths between base and head graphs;
 - link requirements or normative citations to symbols and tests;
-- add shell, JavaScript, TypeScript, TSX, Go, or other language parsing;
+- add shell, Go, or other language parsing;
+- ingest Istanbul, V8, or other JavaScript/TypeScript coverage in the first
+  milestone;
 - treat code not observed in one run as unreachable or untested by every run;
 - assign numeric confidence percentages.
 
@@ -247,8 +250,10 @@ manifest versions are fatal. Explicitly requested evidence is never quietly
 downgraded to a gap.
 
 Reuse current bounds: 64 KiB for the manifest, 2 MiB for each generated or
-source artifact, and 64 MiB for each coverage report. Larger real reports can
-justify streaming or a raised measured bound later; v1 does neither.
+source artifact, and 64 MiB for each coverage report. V1 accepts at most 64
+generated mappings and eight coverage reports, and captures at most 128 MiB of
+unique manifest-referenced bytes in aggregate. Larger real reports can justify
+streaming or a raised measured bound later; v1 does neither.
 
 The v1 manifest contains only fields needed by this milestone:
 
@@ -310,6 +315,11 @@ The first importers accept:
 - Coverage.py JSON for Python, including contexts when the report contains
   them.
 
+The v1 decoder accepts LLVM coverage-export major versions 2 and 3 for the
+explicit region and branch tuple layouts it consumes, and Coverage.py JSON
+`meta.format=3`. Other format versions are rejected. Package/tool version text
+is retained only as bounded metadata and is not treated as the schema version.
+
 The importers follow the documented
 [LLVM JSON export](https://llvm.org/docs/CommandGuide/llvm-cov.html#export-command)
 and [Coverage.py JSON context](https://coverage.readthedocs.io/en/latest/commands/cmd_json.html)
@@ -321,9 +331,10 @@ region execution and are rejected as invalid evidence for this milestone.
 
 Coverage paths map only to captured hand-written or verified generated files.
 Every executable region and reported branch outcome becomes a run-scoped
-observation with its exact range and count. Overlap with a symbol or changed
-span is computed from source ranges; coverage function names are hints, not
-resolution authority.
+observation with its exact range and count. LLVM true and false branch outcomes
+remain distinct; Coverage.py source/destination arcs remain arcs. Overlap with a
+symbol or changed span is computed from source ranges; coverage function names
+are hints, not resolution authority.
 
 Report-internal absolute filenames are accepted only when lexical
 normalization places them beneath the authorized worktree, then stored as safe
@@ -400,10 +411,10 @@ changes reason.
 
 ## Syntax-site classification
 
-Rust and Python queries will capture every grammar-level call expression, not
-only the statically supported target shapes. Existing resolution logic remains
-authoritative for supported forms. Unsupported forms emit a gap owned by their
-closest source node.
+Rust, Python, JavaScript/JSX, and TypeScript/TSX queries will capture every
+grammar-level call expression, not only the statically supported target shapes.
+Existing resolution logic remains authoritative for supported forms.
+Unsupported forms emit a gap owned by their closest source node.
 
 Rust additionally captures every macro invocation. A macro invocation is a gap
 unless Graphr has direct source-level evidence for the relationship. An
@@ -418,6 +429,14 @@ Python attribute calls, subscript calls, calls through computed expressions, and
 other unsupported targets are retained as `dynamic-or-unsupported-dispatch`
 gaps rather than discarded.
 
+JavaScript and TypeScript direct identifiers, supported member calls, `this`
+methods, constructors, static modules, and supported JSX component targets keep
+their current model. Computed/nested callees, unsupported member shapes, and
+unsupported JSX targets become `dynamic-or-unsupported-dispatch` gaps.
+Recognized `test`/`it` registrations are counted as modeled test-registration
+sites rather than call references. Static imports, exports, and supported
+`require` calls must likewise become references, modeled sites, or exact gaps.
+
 Each parser records outermost Tree-sitter error ranges and uncovered missing
 nodes deterministically. A parser returning no tree records one whole-file
 parse gap. Match-limit exhaustion and analyzer invariant failure remain fatal.
@@ -425,8 +444,12 @@ parse gap. Match-limit exhaustion and analyzer invariant failure remain fatal.
 For each successfully parsed file, indexing checks:
 
 ```text
-observed_relation_sites = references + syntax_backed_provenance_links + site_gaps
+observed_relation_sites = references + modeled_sites + site_gaps
 ```
+
+Initial modeled-site kinds are `generated-inclusion`, `test-registration`, and
+`static-export`. The last records JavaScript/TypeScript exports that are fully
+modeled by adding stable symbol keys rather than by creating a graph edge.
 
 Failure of that equality aborts publication. A parse gap makes syntax coverage
 partial because constructs hidden inside the erroneous region cannot be
@@ -452,15 +475,18 @@ an imported provenance record provides direct evidence for that boundary.
 
 ## Declared language and dependency boundaries
 
-The graph summary declares `languages=rust,python`. A changed path with a known
-JavaScript, TypeScript, TSX, or Go source suffix retains exact artifact diff
-coverage and adds a `language/not-indexed` review gap. Generic text does not
-become a language gap merely because it lacks a parser.
+The graph summary declares
+`languages=rust,python,javascript,typescript`. JavaScript includes JSX; TypeScript
+includes TSX and the supported script suffixes already selected by
+`ScriptDialect`. A changed path with a known Go source suffix retains exact
+artifact diff coverage and adds a `language/not-indexed` review gap. Generic
+text does not become a language gap merely because it lacks a parser.
 
-A Rust or Python import whose syntax directly identifies an external package is
-classified as `boundary/external-dependency` rather than an unexplained missing
-target. Boundary-mode Cargo dependency internals retain their existing package
-summary and add a counted `boundary/dependency-collapsed` confidence limit.
+A supported-language import whose syntax directly identifies an external
+package is classified as `boundary/external-dependency` rather than an
+unexplained missing target. Boundary-mode Cargo dependency internals retain
+their existing package summary and add a counted
+`boundary/dependency-collapsed` confidence limit.
 Imports that cannot be classified from syntax remain `missing`; Graphr does not
 consult a package manager or execute dependency discovery.
 
@@ -687,6 +713,8 @@ Implementation follows test-first red/green cycles. Focused tests cover:
 - Rust direct calls, unsupported call shapes, macro invocations, generated
   `OUT_DIR` includes, and parse-error ranges;
 - Python bare calls, attribute/dynamic calls, and parse-error ranges;
+- JavaScript/TypeScript direct, member, constructor, computed, JSX, module, and
+  test-registration sites plus parse-error ranges;
 - missing versus ambiguous references through full and incremental resolution;
 - safe per-path source omissions and aggregate unsafe-path omissions;
 - the exact relation-site accounting invariant;
@@ -763,8 +791,10 @@ producer and review query justify it:
    into explicit requirement-to-symbol and requirement-to-test evidence.
 6. Observed build traces provide execution ordering before a general shell CFG
    is justified. Static shell analysis remains a separate language slice.
-7. JavaScript, TypeScript, TSX, and Go producers follow the existing product
-   order and must expose the same completeness limits.
+7. Istanbul or V8 coverage adds JavaScript/TypeScript execution observations
+   after one exact format and test-context producer is selected.
+8. Go parsing and evidence follow the existing product order and must expose the
+   same completeness limits.
 
 Each producer must add evidence provenance, declare its own gaps, and leave a
 claim partial when its input is absent, stale, or mismatched.
