@@ -1053,11 +1053,13 @@ impl Store {
                 traversal_complete,
                 &evidence,
             ));
+            let static_status = accounting.overall(content_complete, true, traversal_complete);
+            let dynamic_status = evidence.status;
             return Ok(ChangeReview {
                 graph: output,
-                evidence: evidence.text,
-                static_status: accounting.overall(content_complete, true, traversal_complete),
-                dynamic_status: evidence.status,
+                evidence: ordered_evidence_text(evidence, static_status),
+                static_status,
+                dynamic_status,
             });
         }
         let untracked = changes
@@ -1342,15 +1344,14 @@ impl Store {
                 risk_metadata(top_risk),
             ),
         );
+        let static_status =
+            accounting.overall(content_complete, mapping_complete, traversal_complete);
+        let dynamic_status = evidence.status;
         Ok(ChangeReview {
             graph: lines.concat(),
-            evidence: evidence.text,
-            static_status: accounting.overall(
-                content_complete,
-                mapping_complete,
-                traversal_complete,
-            ),
-            dynamic_status: evidence.status,
+            evidence: ordered_evidence_text(evidence, static_status),
+            static_status,
+            dynamic_status,
         })
     }
 }
@@ -1597,10 +1598,20 @@ fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) 
                            AND gap.target_hint=region.context
                            AND gap.line_start=region.start_line AND gap.line_end=region.end_line
                     ))
+                    OR (region.file_id IS NOT NULL AND (
+                        region.path IS NULL OR region.path!=file.path
+                    ))
                     OR (region.file_id IS NULL AND NOT EXISTS(
                         SELECT 1 FROM graph_gaps gap
                          WHERE gap.run_id=run.id AND gap.category='coverage'
                            AND gap.reason='coverage-unmapped-file'
+                           AND (
+                               (region.path IS NULL AND gap.path IS NULL
+                                AND gap.line_start IS NULL AND gap.line_end IS NULL)
+                               OR (region.path IS NOT NULL AND gap.path=region.path
+                                   AND gap.line_start=region.start_line
+                                   AND gap.line_end=region.end_line)
+                           )
                     ))
                     OR (region.file_id IS NOT NULL AND NOT EXISTS(
                         SELECT 1 FROM nodes node
@@ -1623,10 +1634,20 @@ fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) 
                     OR (run.format='coverage_py' AND branch.test_id IS NOT NULL)
                     OR (branch.test_id IS NOT NULL AND test.kind!='test')
                     OR ((branch.kind='arc') != (branch.target_line IS NOT NULL))
+                    OR (branch.file_id IS NOT NULL AND (
+                        branch.path IS NULL OR branch.path!=file.path
+                    ))
                     OR (branch.file_id IS NULL AND NOT EXISTS(
                         SELECT 1 FROM graph_gaps gap
                          WHERE gap.run_id=run.id AND gap.category='coverage'
                            AND gap.reason='coverage-unmapped-file'
+                           AND (
+                               (branch.path IS NULL AND gap.path IS NULL
+                                AND gap.line_start IS NULL AND gap.line_end IS NULL)
+                               OR (branch.path IS NOT NULL AND gap.path=branch.path
+                                   AND gap.line_start=branch.start_line
+                                   AND gap.line_end=branch.end_line)
+                           )
                     ))
                     OR (branch.file_id IS NOT NULL AND NOT EXISTS(
                         SELECT 1 FROM nodes node
@@ -3321,6 +3342,7 @@ fn render_coverage_observations(
     text: &mut String,
 ) -> Result<()> {
     let mut observations = Vec::new();
+    let mut relevant_runs = HashSet::new();
     let mut regions = connection
         .prepare(
             "SELECT run.run_label, run.format, file.path,
@@ -3339,7 +3361,7 @@ fn render_coverage_observations(
                                 AND gap.line_start<=region.end_line
                                 AND gap.line_end>=region.start_line)
                          )
-                    )
+                    ), run.id
                FROM coverage_regions region
                JOIN coverage_runs run ON run.id=region.run_id
                JOIN files file ON file.id=region.file_id
@@ -3361,15 +3383,28 @@ fn render_coverage_observations(
                 row.get::<_, i64>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, bool>(9)?,
+                row.get::<_, i64>(10)?,
             ))
         })
         .map_err(db_error)?;
     for row in rows {
-        let (run, format, path, start, start_column, end, end_column, count, test, complete) =
-            row.map_err(db_error)?;
+        let (
+            run,
+            format,
+            path,
+            start,
+            start_column,
+            end,
+            end_column,
+            count,
+            test,
+            complete,
+            run_id,
+        ) = row.map_err(db_error)?;
         if scope.is_some_and(|scope| !scope.relevant(&path, start, end)) {
             continue;
         }
+        relevant_runs.insert(run_id);
         let count =
             u64::try_from(count).map_err(|_| "database coverage count is invalid".to_owned())?;
         let mut block = String::new();
@@ -3428,7 +3463,7 @@ fn render_coverage_observations(
                                 AND gap.line_start<=branch.end_line
                                 AND gap.line_end>=branch.start_line)
                          )
-                    )
+                    ), run.id
                FROM coverage_branches branch
                JOIN coverage_runs run ON run.id=branch.run_id
                JOIN files file ON file.id=branch.file_id
@@ -3452,6 +3487,7 @@ fn render_coverage_observations(
                 row.get::<_, i64>(9)?,
                 row.get::<_, Option<String>>(10)?,
                 row.get::<_, bool>(11)?,
+                row.get::<_, i64>(12)?,
             ))
         })
         .map_err(db_error)?;
@@ -3469,10 +3505,12 @@ fn render_coverage_observations(
             count,
             test,
             complete,
+            run_id,
         ) = row.map_err(db_error)?;
         if scope.is_some_and(|scope| !scope.relevant(&path, start, end)) {
             continue;
         }
+        relevant_runs.insert(run_id);
         let count =
             u64::try_from(count).map_err(|_| "database coverage count is invalid".to_owned())?;
         let mut block = String::new();
@@ -3548,6 +3586,7 @@ fn render_coverage_observations(
         .prepare(
             "SELECT run.run_label, run.format, gap.reason, gap.path,
                     gap.line_start, gap.line_end, gap.occurrences
+                    , run.id
                FROM graph_gaps gap JOIN coverage_runs run ON run.id=gap.run_id
               WHERE gap.category='coverage'
               ORDER BY run.run_label, gap.path, gap.line_start, gap.line_end,
@@ -3564,17 +3603,25 @@ fn render_coverage_observations(
                 row.get::<_, Option<u32>>(4)?,
                 row.get::<_, Option<u32>>(5)?,
                 row.get::<_, u32>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })
         .map_err(db_error)?;
     for row in rows {
-        let (run, format, reason, path, start, end, occurrences) = row.map_err(db_error)?;
-        if scope.is_some_and(|scope| {
-            path.as_deref().is_none_or(|path| {
-                !scope.relevant(path, start.unwrap_or(1), end.unwrap_or(u32::MAX))
-            })
-        }) {
-            continue;
+        let (run, format, reason, path, start, end, occurrences, run_id) = row.map_err(db_error)?;
+        if let Some(scope) = scope {
+            let relevant = match path.as_deref() {
+                Some(path) => scope.relevant(path, start.unwrap_or(1), end.unwrap_or(u32::MAX)),
+                None => {
+                    matches!(
+                        reason.as_str(),
+                        "missing-test-context" | "ambiguous-test-context"
+                    ) && relevant_runs.contains(&run_id)
+                }
+            };
+            if !relevant {
+                continue;
+            }
         }
         text.push_str("claim kind=changed-execution");
         if let Some(path) = &path {
@@ -3677,6 +3724,11 @@ fn assurance_preamble(
     if by_reason.is_empty() {
         by_reason.push_str("none");
     }
+    let static_test_paths = if evidence.execution_status == "not-applicable" {
+        static_test_paths_claim(static_status)
+    } else {
+        String::new()
+    };
     format!(
         "languages=rust,python,javascript,typescript\n\
 completeness content_capture={} source_capture={} syntax_parse={} site_classification=complete static_model={} evidence_capture={} provenance_model={} execution_mapping={} traversal={}\n\
@@ -3684,7 +3736,7 @@ gaps total={} relevant={} by_reason={}\n\
 references missing={} ambiguous={}\n\
 claim kind=affected-callers status={static_status} basis=resolved-static-call-graph\n\
 claim kind=affected-flows status={static_status} basis=resolved-static-call-graph\n\
-claim kind=static-test-paths status={static_status} basis=resolved-static-call-graph\n",
+{static_test_paths}",
         status(content_complete),
         status(accounting.source_complete),
         status(accounting.syntax_complete),
@@ -3699,6 +3751,22 @@ claim kind=static-test-paths status={static_status} basis=resolved-static-call-g
         accounting.missing,
         accounting.ambiguous,
     )
+}
+
+fn ordered_evidence_text(
+    mut evidence: EvidenceReview,
+    static_status: CompletenessStatus,
+) -> String {
+    if evidence.execution_status != "not-applicable" {
+        evidence
+            .text
+            .push_str(&static_test_paths_claim(static_status.as_str()));
+    }
+    evidence.text
+}
+
+fn static_test_paths_claim(status: &str) -> String {
+    format!("claim kind=static-test-paths status={status} basis=resolved-static-call-graph\n")
 }
 
 const fn dependency_analysis(mode: DependencyMode) -> &'static str {
@@ -4554,12 +4622,13 @@ fn insert_evidence(
         )?;
         tx.execute(
             "INSERT INTO coverage_regions(
-                run_id, file_id, test_id, start_line, start_column, end_line, end_column,
+                run_id, file_id, path, test_id, start_line, start_column, end_line, end_column,
                 execution_count, context
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 run_id,
                 file_id,
+                region.path,
                 test_id,
                 region.start_line,
                 region.start_column,
@@ -4603,12 +4672,13 @@ fn insert_evidence(
         )?;
         tx.execute(
             "INSERT INTO coverage_branches(
-                run_id, file_id, test_id, start_line, start_column, end_line, end_column,
+                run_id, file_id, path, test_id, start_line, start_column, end_line, end_column,
                 target_line, kind, execution_count
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 run_id,
                 file_id,
+                branch.path,
                 test_id,
                 branch.start_line,
                 branch.start_column,
@@ -5762,6 +5832,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             id INTEGER PRIMARY KEY,
             run_id INTEGER NOT NULL REFERENCES coverage_runs(id) ON DELETE CASCADE,
             file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+            path TEXT CHECK(path IS NULL OR length(path)>0),
             test_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
             start_line INTEGER NOT NULL CHECK(start_line>0),
             start_column INTEGER NOT NULL CHECK(start_column>=0),
@@ -5772,7 +5843,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             CHECK(end_line>start_line OR end_column>=start_column)
          );
          CREATE UNIQUE INDEX coverage_regions_identity ON coverage_regions(
-            run_id, ifnull(file_id,-1), start_line, start_column, end_line, end_column,
+            run_id, ifnull(path,''), start_line, start_column, end_line, end_column,
             ifnull(context,'')
          );
          CREATE INDEX coverage_regions_run_file
@@ -5781,6 +5852,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             id INTEGER PRIMARY KEY,
             run_id INTEGER NOT NULL REFERENCES coverage_runs(id) ON DELETE CASCADE,
             file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+            path TEXT CHECK(path IS NULL OR length(path)>0),
             test_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
             start_line INTEGER NOT NULL CHECK(start_line>0),
             start_column INTEGER NOT NULL CHECK(start_column>=0),
@@ -5793,7 +5865,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             CHECK((kind='arc') = (target_line IS NOT NULL))
          );
          CREATE UNIQUE INDEX coverage_branches_identity ON coverage_branches(
-            run_id, ifnull(file_id,-1), start_line, start_column, end_line, end_column,
+            run_id, ifnull(path,''), start_line, start_column, end_line, end_column,
             ifnull(target_line,-1), kind
          );
          CREATE INDEX coverage_branches_run_file
@@ -8314,6 +8386,175 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn coverage_mapping_preserves_distinct_unmapped_relative_path_identities() {
+        let cancelled = AtomicBool::new(false);
+        for branches in [false, true] {
+            let mut store = Store {
+                connection: Connection::open_in_memory().unwrap(),
+            };
+            store
+                .index_with(&cancelled, |_full, _existing| {
+                    Ok((single_node_graph("changed"), ()))
+                })
+                .unwrap();
+            let paths = ["missing-a.rs", "missing-b.rs"];
+            let evidence = EvidenceInput {
+                artifacts: vec![
+                    imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                    imported("report", "report.json", ArtifactRole::CoverageReport, 2),
+                ],
+                runs: vec![CoverageRunInput {
+                    key: "run".into(),
+                    format: CoverageFormat::Llvm,
+                    report_key: "report".into(),
+                    run_label: "run".into(),
+                    test_name: None,
+                }],
+                regions: if branches {
+                    Vec::new()
+                } else {
+                    paths
+                        .iter()
+                        .map(|path| coverage_region("run", path, 1, 1, 1, None))
+                        .collect()
+                },
+                branches: if branches {
+                    paths
+                        .iter()
+                        .map(|path| CoverageBranchInput {
+                            run_key: "run".into(),
+                            path: Some((*path).into()),
+                            start_line: 1,
+                            start_column: 1,
+                            end_line: 1,
+                            end_column: 2,
+                            target_line: None,
+                            kind: CoverageBranchKind::TrueOutcome,
+                            execution_count: 1,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                gaps: Vec::new(),
+                provenance: Vec::new(),
+            };
+
+            store
+                .replace_evidence(Graph::default(), &evidence, &cancelled)
+                .unwrap();
+            let table = if branches {
+                "coverage_branches"
+            } else {
+                "coverage_regions"
+            };
+            let stored = store
+                .connection
+                .prepare(&format!("SELECT path FROM {table} ORDER BY path"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(stored, paths);
+
+            let review = store
+                .changes(
+                    SNAPSHOT,
+                    &WorktreeChanges {
+                        files: paths
+                            .iter()
+                            .map(|path| ChangedFile {
+                                path: (*path).into(),
+                                whole_file: true,
+                                spans: Vec::new(),
+                                report_unmapped: true,
+                            })
+                            .collect(),
+                        records: Vec::new(),
+                        paths: Vec::new(),
+                        source_patch: String::new(),
+                        artifacts: Default::default(),
+                        skipped_paths: 0,
+                    },
+                    1,
+                    10,
+                    DependencyMode::Boundary,
+                    &cancelled,
+                )
+                .unwrap();
+            for path in paths {
+                assert!(
+                    review.evidence.contains(&format!(
+                        "claim kind=changed-execution path={path:?} lines=1 status=partial result=unknown"
+                    )),
+                    "{}",
+                    review.evidence
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_mapping_renders_relevant_pathless_manifest_test_gap_reasons() {
+        let cancelled = AtomicBool::new(false);
+        for (test_name, reason, ambiguous) in [
+            ("missing", "missing-test-context", false),
+            ("ambiguous", "ambiguous-test-context", true),
+        ] {
+            let mut graph = single_node_graph("changed");
+            if ambiguous {
+                graph.nodes.extend([
+                    test_node("ambiguous-one", "ambiguous", 10),
+                    test_node("ambiguous-two", "ambiguous", 11),
+                ]);
+            }
+            let mut store = Store {
+                connection: Connection::open_in_memory().unwrap(),
+            };
+            store
+                .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+                .unwrap();
+            let evidence = EvidenceInput {
+                artifacts: vec![
+                    imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                    imported("report", "report.json", ArtifactRole::CoverageReport, 2),
+                ],
+                runs: vec![CoverageRunInput {
+                    key: "run".into(),
+                    format: CoverageFormat::Llvm,
+                    report_key: "report".into(),
+                    run_label: "run".into(),
+                    test_name: Some(test_name.into()),
+                }],
+                regions: vec![coverage_region("run", "src/lib.rs", 1, 1, 1, None)],
+                ..EvidenceInput::default()
+            };
+            store
+                .replace_evidence(Graph::default(), &evidence, &cancelled)
+                .unwrap();
+
+            let review = store
+                .changes(
+                    SNAPSHOT,
+                    &changed_lib(),
+                    1,
+                    10,
+                    DependencyMode::Boundary,
+                    &cancelled,
+                )
+                .unwrap();
+            assert!(
+                review.evidence.contains(&format!(
+                    "gap category=coverage reason={reason} run=\"run\" occurrences=1"
+                )),
+                "{}",
+                review.evidence
+            );
+        }
     }
 
     #[test]

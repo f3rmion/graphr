@@ -315,17 +315,19 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                     let names = names
                         .as_array()
                         .ok_or_else(|| "Coverage.py context list is invalid".to_owned())?;
-                    let names = names
-                        .iter()
-                        .map(|name| {
-                            let name = name
-                                .as_str()
-                                .ok_or_else(|| "Coverage.py context is invalid".to_owned())?;
-                            validate_context(name, "Coverage.py context")?;
-                            Ok(name.to_owned())
-                        })
-                        .collect::<Result<Vec<_>, String>>()?;
-                    contexts.insert(parsed, names);
+                    let mut unique = BTreeSet::new();
+                    let mut parsed_names = Vec::with_capacity(names.len());
+                    for name in names {
+                        let name = name
+                            .as_str()
+                            .ok_or_else(|| "Coverage.py context is invalid".to_owned())?;
+                        validate_context(name, "Coverage.py context")?;
+                        if !unique.insert(name) {
+                            return Err("Coverage.py context is duplicated".into());
+                        }
+                        parsed_names.push(name.to_owned());
+                    }
+                    contexts.insert(parsed, parsed_names);
                 }
                 contexts
             }
@@ -344,14 +346,18 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                 match contexts.get(&line).filter(|contexts| !contexts.is_empty()) {
                     Some(contexts) => {
                         for context in contexts {
-                            add_count(
+                            insert_coverage_py(
                                 &mut regions,
                                 (path.clone(), line, 0, line, 0, Some(context.clone())),
                                 count,
                             )?;
                         }
                     }
-                    None => add_count(&mut regions, (path.clone(), line, 0, line, 0, None), count)?,
+                    None => insert_coverage_py(
+                        &mut regions,
+                        (path.clone(), line, 0, line, 0, None),
+                        count,
+                    )?,
                 }
             }
         }
@@ -366,7 +372,7 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                 let arc = exact_tuple(arc, 2, "Coverage.py branch")?;
                 let start_line = value_positive_u32(&arc[0], "Coverage.py branch source")?;
                 let target_line = value_positive_u32(&arc[1], "Coverage.py branch target")?;
-                add_count(
+                insert_coverage_py(
                     &mut branches,
                     (
                         path.clone(),
@@ -496,6 +502,18 @@ fn add_count<K: Ord>(values: &mut BTreeMap<K, u64>, key: K, count: u64) -> Resul
         .checked_add(count)
         .ok_or_else(|| "coverage count overflow".to_owned())?;
     Ok(())
+}
+
+fn insert_coverage_py<K: Ord>(
+    values: &mut BTreeMap<K, u64>,
+    key: K,
+    count: u64,
+) -> Result<(), String> {
+    if values.insert(key, count).is_some() {
+        Err("Coverage.py observation is duplicated or contradictory".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn coverage_path(
@@ -979,6 +997,52 @@ mod tests {
                 )
                 .is_err(),
                 "accepted malformed report: {report}"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_py_rejects_duplicate_and_contradictory_observation_identities() {
+        let entries = [
+            json!({
+                "executed_lines": [2, 2],
+                "missing_lines": []
+            }),
+            json!({
+                "executed_lines": [2],
+                "missing_lines": [2]
+            }),
+            json!({
+                "executed_lines": [2],
+                "missing_lines": [],
+                "contexts": {"2": ["named", "named"]}
+            }),
+            json!({
+                "executed_lines": [1],
+                "missing_lines": [],
+                "executed_branches": [[2, 3], [2, 3]],
+                "missing_branches": []
+            }),
+            json!({
+                "executed_lines": [1],
+                "missing_lines": [],
+                "executed_branches": [[2, 3]],
+                "missing_branches": [[2, 3]]
+            }),
+        ];
+        for entry in entries {
+            let report = json!({
+                "meta": {"format": 3, "version": "7.0"},
+                "files": {"pkg/a.py": entry}
+            });
+            assert!(
+                parse_coverage(
+                    CoverageFormat::CoveragePy,
+                    report.to_string().as_bytes(),
+                    Path::new("/repo")
+                )
+                .is_err(),
+                "accepted duplicate or contradictory observations: {report}"
             );
         }
     }

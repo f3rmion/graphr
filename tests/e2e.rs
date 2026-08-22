@@ -453,6 +453,20 @@ fn coverage_evidence_imports_python_contexts_with_run_scoped_arcs() {
         !changes.contains("observed-branch run=\"python-run\" test="),
         "{changes}"
     );
+    let named = changes
+        .find(
+            "claim kind=changed-execution path=\"src/lib.py\" lines=1 status=complete result=observed basis=coverage-py-json run=\"python-run\" test=\"test_named_py\"",
+        )
+        .unwrap();
+    let run_level = changes
+        .find(
+            "claim kind=changed-execution path=\"src/lib.py\" lines=2 status=complete result=observed basis=coverage-py-json run=\"python-run\"",
+        )
+        .unwrap();
+    let heuristic = changes
+        .find("claim kind=static-test-paths status=")
+        .unwrap_or_else(|| panic!("{changes}"));
+    assert!(named < run_level && run_level < heuristic, "{changes}");
     client.close();
 }
 
