@@ -127,7 +127,6 @@ pub(crate) struct EvidenceManifest {
 }
 
 impl EvidenceManifest {
-    #[cfg(test)]
     pub(crate) fn source_snapshot_id(&self) -> &str {
         &self.source_snapshot_id
     }

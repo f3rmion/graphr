@@ -1547,6 +1547,11 @@ fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) 
                    ON artifact.role='generated-rust' AND artifact.path=file.path
                  WHERE artifact.content_hash!=file.content_hash
                     OR artifact.byte_size!=file.byte_size
+                 UNION ALL
+                 SELECT 1 FROM provenance_links link
+                 JOIN imported_artifacts output ON output.id=link.output_artifact_id
+                 LEFT JOIN files file ON file.path=output.path
+                 WHERE link.modeled_site_id IS NOT NULL AND file.id IS NULL
              )",
             [],
             |row| row.get(0),
@@ -2839,13 +2844,18 @@ fn render_evidence(connection: &Connection) -> Result<EvidenceReview> {
                     input.path, p.input_line_start, p.input_line_end,
                     generator_file.path, p.generator_line_start, p.generator_line_end,
                     p.output_line_start, p.output_line_end,
-                    include_file.path, site.line_start
+                    include_file.path, site.line_start,
+                    generated_file.id
                FROM imported_artifacts output
                LEFT JOIN provenance_links p ON p.output_artifact_id=output.id
                LEFT JOIN imported_artifacts input ON input.id=p.input_artifact_id
                LEFT JOIN files generator_file ON generator_file.id=p.generator_file_id
                LEFT JOIN modeled_sites site ON site.id=p.modeled_site_id
                LEFT JOIN files include_file ON include_file.id=site.file_id
+               LEFT JOIN files generated_file
+                 ON generated_file.path=output.path
+                AND generated_file.content_hash=output.content_hash
+                AND generated_file.byte_size=output.byte_size
               WHERE output.role='generated-rust'
               ORDER BY output.path, p.id",
         )
@@ -2862,6 +2872,7 @@ fn render_evidence(connection: &Connection) -> Result<EvidenceReview> {
         Option<u32>,
         Option<String>,
         Option<u32>,
+        Option<i64>,
     );
     let rows = statement
         .query_map([], |row| {
@@ -2877,6 +2888,7 @@ fn render_evidence(connection: &Connection) -> Result<EvidenceReview> {
                 row.get(8)?,
                 row.get(9)?,
                 row.get(10)?,
+                row.get(11)?,
             ))
         })
         .map_err(db_error)?
@@ -2889,7 +2901,7 @@ fn render_evidence(connection: &Connection) -> Result<EvidenceReview> {
         .len();
     let complete_outputs = rows
         .iter()
-        .filter(|row| row.1.is_some() && row.9.is_some())
+        .filter(|row| row.1.is_some() && row.9.is_some() && row.11.is_some())
         .map(|row| row.0.as_str())
         .collect::<HashSet<_>>()
         .len();
@@ -2903,7 +2915,7 @@ fn render_evidence(connection: &Connection) -> Result<EvidenceReview> {
         }
     );
     for row in rows {
-        let complete = row.1.is_some() && row.9.is_some();
+        let complete = row.1.is_some() && row.9.is_some() && row.11.is_some();
         text.push_str(&format!(
             "claim kind=generated-provenance status={} result={} basis=verified-generated-manifest output={:?}\n",
             if complete { "complete" } else { "partial" },
@@ -7122,7 +7134,7 @@ mod tests {
         };
 
         let stats = store
-            .replace_evidence(Graph::default(), &evidence, &cancelled)
+            .replace_evidence(generated_output_graph(), &evidence, &cancelled)
             .unwrap();
         assert_eq!(stats.artifacts, 3);
         assert_eq!(stats.provenance_links, 1);
@@ -7218,6 +7230,113 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn provenance_replacement_rejects_complete_link_without_generated_file() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = provenance_source_store(None);
+
+        let error = store
+            .replace_evidence(Graph::default(), &provenance_evidence(), &cancelled)
+            .unwrap_err();
+
+        assert_eq!(error, "database evidence relationships are invalid");
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM imported_artifacts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn seal_and_image_validation_reject_complete_link_without_generated_file() {
+        for validate_after_seal in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "graphr-generated-provenance-invariant-{validate_after_seal}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&root).unwrap();
+            let path = root.join("graph.db");
+            let mut store = provenance_source_store(Some(&path));
+            store
+                .replace_evidence(
+                    generated_output_graph(),
+                    &provenance_evidence(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            store
+                .connection
+                .execute("DELETE FROM files WHERE path='target/out.rs'", [])
+                .unwrap();
+
+            let error = if validate_after_seal {
+                store
+                    .connection
+                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+                    .unwrap();
+                drop(store);
+                validate_image(&path).unwrap_err()
+            } else {
+                store.seal(&AtomicBool::new(false)).unwrap_err()
+            };
+
+            assert_eq!(error, "database evidence relationships are invalid");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn rendering_marks_link_without_generated_file_partial() {
+        let mut store = provenance_source_store(None);
+        store
+            .replace_evidence(
+                generated_output_graph(),
+                &provenance_evidence(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute("DELETE FROM files WHERE path='target/out.rs'", [])
+            .unwrap();
+
+        let rendered = store
+            .changes(
+                SNAPSHOT,
+                &WorktreeChanges {
+                    files: Vec::new(),
+                    records: Vec::new(),
+                    paths: Vec::new(),
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                0,
+                10,
+                DependencyMode::Boundary,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert!(rendered.evidence.contains(
+            "claim kind=generated-provenance status=partial result=unknown basis=verified-generated-manifest"
+        ));
+        assert!(
+            !rendered
+                .evidence
+                .contains("claim kind=generated-provenance status=complete result=linked")
+        );
+        assert_eq!(rendered.dynamic_status, CompletenessStatus::Partial);
     }
 
     #[test]
@@ -7944,6 +8063,72 @@ mod tests {
             role,
             content_hash: [byte; 32],
             byte_size: 1,
+        }
+    }
+
+    fn provenance_source_store(path: Option<&Path>) -> Store {
+        let cancelled = AtomicBool::new(false);
+        let mut source = single_node_graph("generator");
+        source.modeled_sites.push(ModeledSiteInput {
+            file_key: "src/lib.rs".into(),
+            source_key: Some("generator".into()),
+            kind: ModeledSiteKind::GeneratedInclusion,
+            line_start: 1,
+            line_end: 1,
+            target_hint: Some("out.rs".into()),
+            parse_context: Some("0:".into()),
+        });
+        source.files[0].observed_relation_sites = 1;
+        let mut store = match path {
+            Some(path) => Store::open_private_image(path, &cancelled).unwrap(),
+            None => Store {
+                connection: Connection::open_in_memory().unwrap(),
+            },
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((source, ())))
+            .unwrap();
+        store
+    }
+
+    fn generated_output_graph() -> Graph {
+        Graph {
+            files: vec![FileInput {
+                path: "target/out.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [3; 32],
+                parse_context: "0:".into(),
+                byte_size: 1,
+                replace: true,
+                observed_relation_sites: 0,
+            }],
+            ..Graph::default()
+        }
+    }
+
+    fn provenance_evidence() -> EvidenceInput {
+        EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                imported("input", "schema.proto", ArtifactRole::Input, 2),
+                imported("output", "target/out.rs", ArtifactRole::GeneratedRust, 3),
+            ],
+            provenance: vec![ProvenanceInput {
+                input_key: "input".into(),
+                input_lines: EvidenceLineSpan { start: 1, end: 1 },
+                generator_path: "src/lib.rs".into(),
+                generator_lines: EvidenceLineSpan { start: 1, end: 1 },
+                output_key: "output".into(),
+                output_lines: EvidenceLineSpan { start: 1, end: 1 },
+                inclusion_site: Some(ModeledSiteLocator {
+                    path: "src/lib.rs".into(),
+                    line: 1,
+                    kind: ModeledSiteKind::GeneratedInclusion,
+                    target_hint: Some("out.rs".into()),
+                }),
+            }],
+            ..EvidenceInput::default()
         }
     }
 

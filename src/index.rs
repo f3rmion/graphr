@@ -125,17 +125,7 @@ impl Engine {
             job.capture_root(),
             cancelled,
         )?;
-        let evidence = manifest
-            .map(|manifest| {
-                manifest.capture(
-                    &request.root.worktree_root,
-                    &capture.requested_artifacts,
-                    cancelled,
-                )
-            })
-            .transpose()?;
         let total = capture.sources.files.len();
-        report(BuildStage::Capturing, total, total, 0, 0, None);
 
         let source_graph_image_id = graph_image_key(
             &request.root.repository_id,
@@ -168,18 +158,28 @@ impl Engine {
             CACHE_FORMAT_VERSION,
             REVIEW_FORMAT_VERSION,
         );
-        let source_entry = evidence
+        let source_entry = manifest
             .as_ref()
-            .map(|evidence| {
+            .map(|manifest| {
                 validate_evidence_source(
                     &self.catalog,
                     &request,
-                    evidence,
+                    manifest.source_snapshot_id(),
                     &source_snapshot_id,
                     &source_graph_image_id,
                 )
             })
             .transpose()?;
+        let evidence = manifest
+            .map(|manifest| {
+                manifest.capture(
+                    &request.root.worktree_root,
+                    &capture.requested_artifacts,
+                    cancelled,
+                )
+            })
+            .transpose()?;
+        report(BuildStage::Capturing, total, total, 0, 0, None);
         let mut artifacts = evidence.as_ref().map(evidence_artifacts).transpose()?;
         let manifest_digest = evidence.as_ref().map(|evidence| {
             blake3::Hash::from_bytes(evidence.manifest.content_hash)
@@ -779,11 +779,11 @@ fn same_workspace(
 fn validate_evidence_source(
     catalog: &SnapshotCatalog,
     request: &ResolvedIndexRequest,
-    evidence: &CapturedEvidence,
+    declared_source_snapshot_id: &str,
     source_snapshot_id: &str,
     source_graph_image_id: &str,
 ) -> Result<Arc<SnapshotEntry>, OperationError> {
-    if evidence.source_snapshot_id != source_snapshot_id {
+    if declared_source_snapshot_id != source_snapshot_id {
         return Err(OperationError::new(
             ErrorCode::InvalidParameters,
             "source snapshot mismatch",

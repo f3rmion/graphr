@@ -54,6 +54,69 @@ fn evidence_source_snapshot_rejects_mismatch_and_preserves_source() {
 }
 
 #[test]
+fn evidence_source_binding_rejects_each_selected_state_change() {
+    for case in [
+        "source",
+        "tracked-input",
+        "range",
+        "target",
+        "dependency-mode",
+        "untracked-source",
+    ] {
+        let evidence = generated_evidence_fixture();
+        let root = &evidence.fixture.path;
+        let source_graph = graph_path(root);
+        let (mut base, mut head, mut target, mut include_untracked, mut dependency_mode) =
+            ("HEAD", "HEAD", "worktree", true, "boundary");
+        match case {
+            "source" => fs::write(
+                root.join("src/lib.rs"),
+                "fn predicate() -> bool { false }\nfn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n",
+            )
+            .unwrap(),
+            "tracked-input" => {
+                fs::write(root.join("schema.proto"), "message ChangedInput {}\n").unwrap()
+            }
+            "range" => {
+                fs::write(root.join("range.txt"), "range changed\n").unwrap();
+                git(root, &["add", "--", "range.txt"]);
+                git_commit(root, "change selected range");
+                base = "HEAD~1";
+                head = "HEAD";
+            }
+            "target" => {
+                target = "index";
+                include_untracked = false;
+            }
+            "dependency-mode" => dependency_mode = "full",
+            "untracked-source" => {
+                fs::write(root.join("src/untracked.rs"), "fn untracked() {}\n").unwrap()
+            }
+            _ => unreachable!("fixed source-binding case"),
+        }
+
+        let output = cli_index_with_evidence_request(
+            root,
+            "evidence.json",
+            base,
+            head,
+            target,
+            include_untracked,
+            dependency_mode,
+        );
+
+        assert!(!output.status.success(), "{case} unexpectedly succeeded");
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostics.contains("source snapshot mismatch"),
+            "{case} returned the wrong failure: {diagnostics}"
+        );
+        assert!(source_graph.exists(), "{case} removed the source graph");
+        crate_graph_is_valid(&source_graph);
+    }
+}
+
+#[test]
 fn evidence_cache_reuses_the_exact_verified_image() {
     let evidence = generated_evidence_fixture();
 
@@ -5071,20 +5134,38 @@ fn generated_evidence_fixture() -> GeneratedEvidenceFixture {
 }
 
 fn cli_index_with_evidence(path: &Path, manifest: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_graphr"))
+    cli_index_with_evidence_request(path, manifest, "HEAD", "HEAD", "worktree", true, "boundary")
+}
+
+#[allow(clippy::too_many_arguments)] // One call describes one complete public index request.
+fn cli_index_with_evidence_request(
+    path: &Path,
+    manifest: &str,
+    base: &str,
+    head: &str,
+    target: &str,
+    include_untracked: bool,
+    dependency_mode: &str,
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_graphr"));
+    command.args([
+        "index",
+        "--worktree-root",
+        path.to_str().unwrap(),
+        "--base",
+        base,
+        "--head",
+        head,
+        "--target",
+        target,
+    ]);
+    if include_untracked {
+        command.arg("--include-untracked");
+    }
+    command
         .args([
-            "index",
-            "--worktree-root",
-            path.to_str().unwrap(),
-            "--base",
-            "HEAD",
-            "--head",
-            "HEAD",
-            "--target",
-            "worktree",
-            "--include-untracked",
             "--dependency-mode",
-            "boundary",
+            dependency_mode,
             "--evidence-manifest",
             manifest,
         ])

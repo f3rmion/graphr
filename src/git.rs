@@ -907,7 +907,12 @@ impl Repository {
 
         let (sources, mut changes, dirty_digest) = match target {
             SnapshotTarget::Commit => {
-                self.reject_tracked_evidence_paths(evidence_only_paths, None, cancelled)?;
+                self.reject_tracked_evidence_paths(
+                    evidence_only_paths,
+                    Some(head_oid),
+                    None,
+                    cancelled,
+                )?;
                 let sources = self.capture_sources(head_oid, target, capture_root, cancelled)?;
                 let changes = capture_target_changes(
                     self,
@@ -948,6 +953,7 @@ impl Repository {
                 .map_err(capture_error)?;
                 self.reject_tracked_evidence_paths(
                     evidence_only_paths,
+                    None,
                     Some(&copied_index),
                     cancelled,
                 )?;
@@ -1084,20 +1090,36 @@ impl Repository {
     pub fn reject_tracked_evidence_paths(
         &self,
         paths: &BTreeSet<String>,
+        commit_oid: Option<&str>,
         index_file: Option<&Path>,
         cancelled: &AtomicBool,
     ) -> Result<(), OperationError> {
         for path in paths {
             let pathspec = format!(":(literal){path}");
-            if !run_with_index(
-                &self.root,
-                &["ls-files", "-z", "--", &pathspec],
-                index_file.unwrap_or(&self.index_path),
-                cancelled,
-            )
-            .map_err(capture_error)?
-            .is_empty()
-            {
+            let tracked = if let Some(commit_oid) = commit_oid {
+                run(
+                    &self.root,
+                    &[
+                        "ls-tree",
+                        "-z",
+                        "--full-tree",
+                        "--name-only",
+                        commit_oid,
+                        "--",
+                        &pathspec,
+                    ],
+                    cancelled,
+                )
+            } else {
+                run_with_index(
+                    &self.root,
+                    &["ls-files", "-z", "--", &pathspec],
+                    index_file.unwrap_or(&self.index_path),
+                    cancelled,
+                )
+            }
+            .map_err(capture_error)?;
+            if !tracked.is_empty() {
                 return Err(OperationError::new(
                     ErrorCode::InvalidParameters,
                     "evidence files must not be tracked",
@@ -7051,6 +7073,7 @@ mod tests {
                 .reject_tracked_evidence_paths(
                     &BTreeSet::from(["evidence.json".to_owned()]),
                     None,
+                    None,
                     &AtomicBool::new(false),
                 )
                 .is_err()
@@ -7059,9 +7082,48 @@ mod tests {
             .reject_tracked_evidence_paths(
                 &BTreeSet::from(["ignored.rs".to_owned()]),
                 None,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commit_evidence_tracking_uses_the_selected_tree_not_the_live_index() {
+        let root = initialized_repository("commit-evidence-selected-tree");
+        fs::write(root.join("src.rs"), "fn source() {}\n").unwrap();
+        fs::write(root.join("evidence.json"), "{}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "tracked evidence"]);
+        let selected = git_output(&root, &["rev-parse", "HEAD"]);
+        test_git(&root, &["rm", "--quiet", "--", "evidence.json"]);
+        test_git(&root, &["commit", "--quiet", "-m", "remove evidence"]);
+        assert!(
+            git_output(&root, &["ls-files", "--", "evidence.json"]).is_empty(),
+            "live index must disagree with the selected commit"
+        );
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let capture_root = private_dir("commit-evidence-selected-tree-capture");
+
+        let result = repository.capture_snapshot(
+            &selected,
+            &selected,
+            &SnapshotTarget::Commit,
+            DependencyMode::Boundary,
+            &BTreeSet::new(),
+            &BTreeSet::from(["evidence.json".to_owned()]),
+            &capture_root,
+            &AtomicBool::new(false),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("selected commit accepted a tracked evidence path"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::InvalidParameters);
+        assert_eq!(error.message, "evidence files must not be tracked");
+        assert!(!capture_root.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
