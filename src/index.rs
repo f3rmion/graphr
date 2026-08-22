@@ -194,7 +194,7 @@ impl Engine {
                 &evidence.source_snapshot_id,
                 manifest_digest,
                 artifacts,
-                1,
+                2,
                 CACHE_FORMAT_VERSION,
                 GRAPH_ANALYZER_VERSION,
                 crate::store::SCHEMA_VERSION,
@@ -889,12 +889,42 @@ fn build_generated_evidence(
     let mut gaps = Vec::new();
     let mut parsed_outputs = BTreeSet::new();
     let mut parser = RustParser::new()?;
+    let mut paths_by_basename = BTreeMap::<String, BTreeSet<String>>::new();
+    for generated in &captured.generated {
+        let basename = Path::new(&generated.output.artifact.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "generated output basename is invalid".to_owned())?;
+        paths_by_basename
+            .entry(basename.to_owned())
+            .or_default()
+            .insert(generated.output.artifact.path.clone());
+    }
     for generated in &captured.generated {
         check_cancelled(cancelled)?;
         let basename = Path::new(&generated.output.artifact.path)
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| "generated output basename is invalid".to_owned())?;
+        if paths_by_basename
+            .get(basename)
+            .is_some_and(|paths| paths.len() > 1)
+        {
+            gaps.push(GapInput {
+                file_key: None,
+                source_key: None,
+                run_key: None,
+                path: Some(generated.output.artifact.path.clone()),
+                line_start: None,
+                line_end: None,
+                category: GapCategory::Generated,
+                reason: GapReason::GeneratedOutputAmbiguous,
+                target_hint: Some(basename.to_owned()),
+                occurrences: 1,
+                relation_site: false,
+            });
+            continue;
+        }
         let candidates = store.generated_inclusion_candidates(basename)?;
         let inclusion_site = if candidates.len() == 1 {
             Some(candidates[0].locator.clone())
@@ -2746,7 +2776,8 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
         };
         let target = match reference_target(&reference.keys, &candidates, None) {
             ReferenceTarget::Resolved(target) => Candidate::Unique(target),
-            ReferenceTarget::Missing | ReferenceTarget::Ambiguous => Candidate::Ambiguous,
+            ReferenceTarget::Missing => continue,
+            ReferenceTarget::Ambiguous => Candidate::Ambiguous,
         };
         aliases
             .entry(alias.clone())
@@ -4001,6 +4032,92 @@ mod tests {
     }
 
     #[test]
+    fn same_basename_outputs_contending_for_one_include_are_all_ambiguous() {
+        let cancelled = AtomicBool::new(false);
+        let source_graph = build_graph(
+            &[Source {
+                path: "src/lib.rs".into(),
+                text: "fn predicate() -> bool { true }\nfn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n".into(),
+            }],
+            &cancelled,
+        )
+        .unwrap();
+        let fixture = std::env::temp_dir().join(format!(
+            "graphr-generated-basename-contention-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        let mut store =
+            Store::open_private_image(&fixture.join("graph.sqlite"), &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((source_graph, ())))
+            .unwrap();
+        let input = CapturedArtifact {
+            path: "schema.proto".into(),
+            content_hash: *blake3::hash(b"field\n").as_bytes(),
+            bytes: b"field\n".to_vec(),
+        };
+        let generated = ["target/a/out.rs", "target/b/out.rs"]
+            .into_iter()
+            .map(|path| {
+                let bytes = b"fn generated() -> bool { predicate() }\n".to_vec();
+                crate::evidence::CapturedGenerated {
+                    input: crate::evidence::CapturedArtifactSpan {
+                        artifact: input.clone(),
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                    generator: crate::evidence::SourceSpan {
+                        path: "src/lib.rs".into(),
+                        line_start: 2,
+                        line_end: 2,
+                    },
+                    output: crate::evidence::CapturedArtifactSpan {
+                        artifact: CapturedArtifact {
+                            path: path.into(),
+                            content_hash: *blake3::hash(&bytes).as_bytes(),
+                            bytes,
+                        },
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                }
+            })
+            .collect();
+        let captured = CapturedEvidence {
+            source_snapshot_id: "a".repeat(64),
+            manifest: CapturedArtifact {
+                path: "evidence.json".into(),
+                content_hash: *blake3::hash(b"manifest").as_bytes(),
+                bytes: b"manifest".to_vec(),
+            },
+            generated,
+            coverage: Vec::new(),
+        };
+        let artifacts = evidence_artifacts(&captured).unwrap();
+
+        let (graph, evidence) =
+            build_generated_evidence(&store, &captured, artifacts, &fixture, &cancelled).unwrap();
+        assert!(graph.files.is_empty());
+        assert!(graph.nodes.is_empty());
+        assert!(graph.refs.is_empty());
+        assert!(evidence.provenance.is_empty());
+        assert_eq!(
+            evidence
+                .gaps
+                .iter()
+                .filter(|gap| gap.reason == GapReason::GeneratedOutputAmbiguous)
+                .count(),
+            2
+        );
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     fn generated_rust_skips_zero_multiple_and_unmapped_contexts() {
         let cases = [
             (
@@ -4381,6 +4498,57 @@ fn run() {
         assert_eq!(graph.files[0].observed_relation_sites, 2);
         assert_eq!(graph.refs.len(), 1);
         assert_eq!(graph.gaps.iter().filter(|gap| gap.relation_site).count(), 1);
+    }
+
+    #[test]
+    fn python_absolute_import_resolves_sibling_and_keeps_unknown_missing() {
+        let sources = [
+            Source {
+                path: "app.py".into(),
+                text: "import util\nimport absent_package\n".into(),
+            },
+            Source {
+                path: "util.py".into(),
+                text: "def helper():\n    pass\n".into(),
+            },
+        ];
+        let mut graph = Graph::default();
+        let mut parser = PythonParser::new().unwrap();
+        for source in &sources {
+            graph.files.push(FileInput {
+                path: source.path.clone(),
+                language: Language::Python,
+                git_oid: None,
+                content_hash: *blake3::hash(source.text.as_bytes()).as_bytes(),
+                parse_context: "python".into(),
+                byte_size: source.text.len() as u64,
+                replace: true,
+                observed_relation_sites: 0,
+            });
+            crate::python::add_file(&mut graph, source, &mut parser).unwrap();
+        }
+        resolve(&mut graph, &AtomicBool::new(false)).unwrap();
+
+        let sibling = graph
+            .refs
+            .iter()
+            .find(|reference| reference.keys == ["python:item:util"])
+            .unwrap();
+        assert_eq!(sibling.resolution, ResolutionState::Resolved);
+        assert!(sibling.resolved_target_key.is_some());
+        let unknown = graph
+            .refs
+            .iter()
+            .find(|reference| reference.keys == ["python:item:absent_package"])
+            .unwrap();
+        assert_eq!(unknown.resolution, ResolutionState::Missing);
+        assert!(unknown.resolved_target_key.is_none());
+        assert!(
+            graph
+                .gaps
+                .iter()
+                .all(|gap| gap.reason != GapReason::ExternalDependency)
+        );
     }
 
     #[test]
@@ -4976,7 +5144,8 @@ fn run() {
         let review = engine
             .changes(&first.snapshot_id, 0, 10, None, &AtomicBool::new(false))
             .unwrap();
-        assert!(review.text.contains("basis=verified-generated-manifest"));
+        assert!(!review.text.contains("basis=verified-generated-manifest"));
+        assert!(review.text.contains("provenance_model=not-applicable"));
         assert!(review.text.contains("dynamic_evidence_status=complete"));
 
         let cancelled = AtomicBool::new(false);
@@ -6485,6 +6654,77 @@ fn register_dispatches() { register(); }
     }
 
     #[test]
+    fn imported_aliases_preserve_missing_and_ambiguous_candidates() {
+        let node = |key: &str, candidate_key: Option<&str>| NodeInput {
+            key: key.into(),
+            file_key: "src/lib.rs".into(),
+            kind: NodeKind::Function,
+            name: key.into(),
+            qualified_name: key.into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            keys: candidate_key.into_iter().map(str::to_owned).collect(),
+        };
+        let mut graph = Graph {
+            nodes: vec![
+                node("exporter", None),
+                node("missing-consumer", None),
+                node("ambiguous-consumer", None),
+                node("candidate-one", Some("candidate:multi")),
+                node("candidate-two", Some("candidate:multi")),
+            ],
+            refs: vec![
+                RefInput {
+                    source_key: "exporter".into(),
+                    kind: RefKind::Imports,
+                    line: 1,
+                    keys: vec!["candidate:missing".into()],
+                    alias_key: Some("alias:missing".into()),
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Pending,
+                },
+                RefInput {
+                    source_key: "exporter".into(),
+                    kind: RefKind::Imports,
+                    line: 2,
+                    keys: vec!["candidate:multi".into()],
+                    alias_key: Some("alias:multi".into()),
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Pending,
+                },
+                RefInput {
+                    source_key: "missing-consumer".into(),
+                    kind: RefKind::Calls,
+                    line: 1,
+                    keys: vec!["alias:missing".into()],
+                    alias_key: None,
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Pending,
+                },
+                RefInput {
+                    source_key: "ambiguous-consumer".into(),
+                    kind: RefKind::Calls,
+                    line: 1,
+                    keys: vec!["alias:multi".into()],
+                    alias_key: None,
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Pending,
+                },
+            ],
+            ..Graph::default()
+        };
+
+        resolve(&mut graph, &AtomicBool::new(false)).unwrap();
+        assert_eq!(graph.refs[0].resolution, ResolutionState::Missing);
+        assert_eq!(graph.refs[1].resolution, ResolutionState::Ambiguous);
+        assert_eq!(graph.refs[2].resolution, ResolutionState::Missing);
+        assert_eq!(graph.refs[3].resolution, ResolutionState::Ambiguous);
+    }
+
+    #[test]
     fn unqualified_calls_do_not_guess_across_modules() {
         let sources = [
             Source {
@@ -6799,7 +7039,7 @@ fn call(job: Job) {
                     .keys
                     .iter()
                     .any(|key| key == "rust:item:api::maybe")
-                && reference.resolved_target_key.is_none()
+                && reference.resolved_target_key.as_deref() == Some(target("helper"))
         }));
         assert!(!graph.refs.iter().any(|reference| {
             reference.source_key == call.key

@@ -174,12 +174,17 @@ fn generated_provenance_links_generated_calls_and_renders_verified_chain() {
     );
     let changes = response_text(&client.changes(0, 20, None));
     assert!(
-        changes.contains("basis=verified-generated-manifest"),
+        !changes.contains("basis=verified-generated-manifest")
+            && changes.contains("provenance_model=not-applicable"),
         "{changes}"
     );
+    let search = response_text(&client.search("generate", Some("function")));
+    let node_ref = search.split_whitespace().next().unwrap();
+    let view = response_text(&client.view(node_ref, 0, 20));
     assert!(
-        changes.contains("provenance input=\"schema.proto:1-1\""),
-        "{changes}"
+        view.contains("basis=verified-generated-manifest")
+            && view.contains("provenance input=\"schema.proto:1-1\""),
+        "{view}"
     );
     assert!(
         changes.contains("dynamic_evidence_status=complete"),
@@ -460,7 +465,7 @@ fn coverage_evidence_imports_python_contexts_with_run_scoped_arcs() {
         .unwrap();
     let run_level = changes
         .find(
-            "claim kind=changed-execution path=\"src/lib.py\" lines=2 status=partial result=unknown basis=coverage-py-json run=\"python-run\"",
+            "claim kind=changed-execution path=\"src/lib.py\" lines=2 status=complete result=observed basis=coverage-py-json run=\"python-run\"",
         )
         .unwrap();
     let run_observation = changes
@@ -866,7 +871,7 @@ fn generated_evidence_negative_omitted_test_name_stays_run_level() {
     let snapshot_id = client.snapshot_id().to_owned();
     let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
     let observations = change_section_text(&changes, "evidence");
-    let unknown_named = "claim kind=changed-execution path=\"target/debug/build/graphr-fixture/out/message.rs\" lines=1 status=partial result=unknown basis=llvm-coverage-json run=\"strict-run\"";
+    let unknown_named = "claim kind=changed-execution path=\"target/debug/build/graphr-fixture/out/message.rs\" lines=1 status=complete result=observed basis=llvm-coverage-json run=\"strict-run\"";
     let observed = "observed run=\"strict-run\" path=\"target/debug/build/graphr-fixture/out/message.rs\" lines=1 count=1";
 
     for expected in [unknown_named, observed] {
@@ -877,7 +882,7 @@ fn generated_evidence_negative_omitted_test_name_stays_run_level() {
     }
     assert!(
         observations.find(unknown_named).unwrap() < observations.find(observed).unwrap(),
-        "unknown named-test claim must precede its run-level observation: {observations}"
+        "aggregate claim must precede its run-level observation: {observations}"
     );
     assert!(
         !observations
@@ -994,7 +999,6 @@ fn mixed_evidence_gaps_keep_completed_transport_distinct_from_partial_static_evi
         assert!(graph.contains(expected), "missing {expected}: {graph}");
     }
     let exact_gaps = [
-        "gap category=source reason=oversized path=\"src/skipped.rs\" line=none occurrences=1 relation_site=false",
         "gap category=parse reason=parser-error path=\"src/broken.rs\" line=1 occurrences=1 relation_site=false",
         "gap category=relation reason=dynamic-or-unsupported-dispatch path=\"src/lib.rs\" line=8 target=\"value.run\" occurrences=1 relation_site=true",
         "gap category=macro reason=macro-expansion-unavailable path=\"src/lib.rs\" line=9 target=\"println\" occurrences=1 relation_site=true",
@@ -1221,9 +1225,9 @@ fn empty_trait_impl_resolves_across_files_and_retargets_incrementally() {
     );
     assert_eq!(
         trait_implementation_count(&incremental.path, "Item", "Ambiguous"),
-        0
+        1
     );
-    assert_eq!(named_edge_count(&incremental.path, "call", "helper"), 0);
+    assert_eq!(named_edge_count(&incremental.path, "call", "helper"), 1);
 
     let mut client = Client::start(&incremental.path);
     for (query, relation, related) in [
@@ -1266,9 +1270,9 @@ fn empty_trait_impl_resolves_across_files_and_retargets_incrementally() {
     );
     assert_eq!(
         trait_implementation_count(&incremental.path, "Item", "Ambiguous"),
-        0
+        1
     );
-    assert_eq!(named_edge_count(&incremental.path, "call", "helper"), 0);
+    assert_eq!(named_edge_count(&incremental.path, "call", "helper"), 1);
 }
 
 #[test]

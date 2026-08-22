@@ -854,11 +854,11 @@ pub struct CoverageRegionInput {
 pub struct CoverageBranchInput {
     pub run_key: String,
     pub path: Option<String>,
-    pub start_line: u32,
+    pub start_line: i64,
     pub start_column: u32,
-    pub end_line: u32,
+    pub end_line: i64,
     pub end_column: u32,
-    pub target_line: Option<u32>,
+    pub target_line: Option<i64>,
     pub kind: CoverageBranchKind,
     pub execution_count: u64,
 }
@@ -1143,11 +1143,11 @@ pub enum BranchObservationKind { TrueOutcome, FalseOutcome, Arc }
 
 pub struct BranchObservation {
     pub path: Option<String>,
-    pub start_line: u32,
+    pub start_line: i64,
     pub start_column: u32,
-    pub end_line: u32,
+    pub end_line: i64,
     pub end_column: u32,
-    pub target_line: Option<u32>,
+    pub target_line: Option<i64>,
     pub kind: BranchObservationKind,
     pub execution_count: u64,
     pub context: Option<String>,

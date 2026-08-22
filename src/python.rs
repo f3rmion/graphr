@@ -327,23 +327,6 @@ pub fn add_file(
             .source
             .and_then(|source| node_keys.get(source).cloned())
             .unwrap_or_else(|| file_key.clone());
-        if external_import(import, &target) {
-            graph.gaps.push(GapInput {
-                file_key: Some(source.path.clone()),
-                source_key: Some(source_key),
-                run_key: None,
-                path: Some(source.path.clone()),
-                line_start: Some(to_u32(import.line)?),
-                line_end: Some(to_u32(import.line)?),
-                category: GapCategory::Boundary,
-                reason: GapReason::ExternalDependency,
-                target_hint: Some(import.module.clone()),
-                occurrences: 1,
-                relation_site: true,
-            });
-            observed_relation_sites += 1;
-            continue;
-        }
         let Some(path) = import_path(import, &target)? else {
             graph.gaps.push(GapInput {
                 file_key: Some(source.path.clone()),
@@ -544,15 +527,6 @@ fn call_keys(
         return vec![item_key(path)];
     }
     vec![item_key(&join(&target.module, name))]
-}
-
-fn external_import(import: &Import, target: &PythonTarget) -> bool {
-    if import.module.starts_with('.') {
-        return false;
-    }
-    let imported = import.module.split(['.', ':']).next().unwrap_or_default();
-    let local = target.module.split("::").next().unwrap_or_default();
-    !imported.is_empty() && imported != local
 }
 
 fn lexical_scopes(source: usize, definitions: &[Definition]) -> impl Iterator<Item = usize> + '_ {
@@ -844,7 +818,11 @@ def dispatch(value):
 
         add_file(&mut graph, &source, &mut PythonParser::new().unwrap()).unwrap();
 
-        assert_eq!(graph.refs.len(), 2, "one local import and one bare call");
+        assert_eq!(
+            graph.refs.len(),
+            3,
+            "two classifiable imports and one bare call"
+        );
         assert_eq!(
             graph
                 .gaps
@@ -853,7 +831,6 @@ def dispatch(value):
                 .map(|gap| gap.reason)
                 .collect::<Vec<_>>(),
             [
-                crate::store::GapReason::ExternalDependency,
                 crate::store::GapReason::DynamicOrUnsupportedDispatch,
                 crate::store::GapReason::DynamicOrUnsupportedDispatch,
                 crate::store::GapReason::DynamicOrUnsupportedDispatch,

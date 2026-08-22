@@ -25,11 +25,11 @@ pub enum BranchObservationKind {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BranchObservation {
     pub path: Option<String>,
-    pub start_line: u32,
+    pub start_line: i64,
     pub start_column: u32,
-    pub end_line: u32,
+    pub end_line: i64,
     pub end_column: u32,
-    pub target_line: Option<u32>,
+    pub target_line: Option<i64>,
     pub kind: BranchObservationKind,
     pub execution_count: u64,
     pub context: Option<String>,
@@ -57,11 +57,11 @@ pub fn parse_coverage(
 type RegionKey = (Option<String>, u32, u32, u32, u32, Option<String>);
 type BranchKey = (
     Option<String>,
+    i64,
     u32,
+    i64,
     u32,
-    u32,
-    u32,
-    Option<u32>,
+    Option<i64>,
     BranchObservationKind,
     Option<String>,
 );
@@ -140,7 +140,7 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
                     let count = integer(tuple, 4, "LLVM coverage count")?;
                     let file_id = index(tuple, 5, "LLVM coverage file ID")?;
                     let expanded_file_id = index(tuple, 6, "LLVM coverage expanded file ID")?;
-                    let _kind = u32::try_from(integer(tuple, 7, "LLVM coverage region kind")?)
+                    let kind = u32::try_from(integer(tuple, 7, "LLVM coverage region kind")?)
                         .map_err(|_| "LLVM coverage region kind exceeds range".to_owned())?;
                     let filename = *filenames
                         .get(file_id)
@@ -148,12 +148,18 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
                     if filenames.get(expanded_file_id).is_none() {
                         return Err("LLVM coverage expanded file ID is invalid".into());
                     }
-                    let path = coverage_path(filename, &normalized_root, &mut external);
-                    add_count(
-                        &mut regions,
-                        (path, start_line, start_column, end_line, end_column, None),
-                        count,
-                    )?;
+                    match kind {
+                        0 => {
+                            let path = coverage_path(filename, &normalized_root, &mut external);
+                            add_count(
+                                &mut regions,
+                                (path, start_line, start_column, end_line, end_column, None),
+                                count,
+                            )?;
+                        }
+                        1..=6 => {}
+                        _ => return Err("LLVM coverage region kind is unsupported".into()),
+                    }
                 }
             }
         }
@@ -187,8 +193,11 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
                             .map_err(|_| {
                                 "LLVM coverage expanded file ID exceeds range".to_owned()
                             })?;
-                    let _kind = u32::try_from(integer(tuple, 8, "LLVM coverage branch kind")?)
+                    let kind = u32::try_from(integer(tuple, 8, "LLVM coverage branch kind")?)
                         .map_err(|_| "LLVM coverage branch kind exceeds range".to_owned())?;
+                    if !matches!(kind, 4 | 6) {
+                        return Err("LLVM coverage branch kind is unsupported".into());
+                    }
                     let path = coverage_path(filename, &normalized_root, &mut external);
                     for (kind, count) in [
                         (BranchObservationKind::TrueOutcome, true_count),
@@ -198,9 +207,9 @@ fn parse_llvm(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverage, Stri
                             &mut branches,
                             (
                                 path.clone(),
-                                start_line,
+                                i64::from(start_line),
                                 start_column,
-                                end_line,
+                                i64::from(end_line),
                                 end_column,
                                 None,
                                 kind,
@@ -304,7 +313,7 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                 let values = value
                     .as_object()
                     .ok_or_else(|| "Coverage.py contexts are invalid".to_owned())?;
-                let mut contexts = BTreeMap::<u32, Vec<String>>::new();
+                let mut contexts = BTreeMap::<u32, Vec<Option<String>>>::new();
                 for (line, names) in values {
                     let parsed = line
                         .parse::<u32>()
@@ -321,11 +330,16 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                         let name = name
                             .as_str()
                             .ok_or_else(|| "Coverage.py context is invalid".to_owned())?;
-                        validate_context(name, "Coverage.py context")?;
-                        if !unique.insert(name) {
+                        let name = if name.is_empty() {
+                            None
+                        } else {
+                            validate_context(name, "Coverage.py context")?;
+                            Some(name.to_owned())
+                        };
+                        if !unique.insert(name.clone()) {
                             return Err("Coverage.py context is duplicated".into());
                         }
-                        parsed_names.push(name.to_owned());
+                        parsed_names.push(name);
                     }
                     contexts.insert(parsed, parsed_names);
                 }
@@ -348,7 +362,7 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                         for context in contexts {
                             insert_coverage_py(
                                 &mut regions,
-                                (path.clone(), line, 0, line, 0, Some(context.clone())),
+                                (path.clone(), line, 0, line, 0, context.clone()),
                                 count,
                             )?;
                         }
@@ -370,8 +384,8 @@ fn parse_coverage_py(bytes: &[u8], worktree_root: &Path) -> Result<ParsedCoverag
                 .ok_or_else(|| format!("Coverage.py {field} are invalid"))?;
             for arc in arcs {
                 let arc = exact_tuple(arc, 2, "Coverage.py branch")?;
-                let start_line = value_positive_u32(&arc[0], "Coverage.py branch source")?;
-                let target_line = value_positive_u32(&arc[1], "Coverage.py branch target")?;
+                let start_line = value_nonzero_i64(&arc[0], "Coverage.py branch source")?;
+                let target_line = value_nonzero_i64(&arc[1], "Coverage.py branch target")?;
                 insert_coverage_py(
                     &mut branches,
                     (
@@ -477,6 +491,15 @@ fn positive_u32(tuple: &[Value], index: usize, kind: &str) -> Result<u32, String
 fn value_positive_u32(value: &Value, kind: &str) -> Result<u32, String> {
     let value = u32::try_from(value.as_u64().ok_or_else(|| format!("{kind} is invalid"))?)
         .map_err(|_| format!("{kind} exceeds range"))?;
+    if value == 0 {
+        Err(format!("{kind} is invalid"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn value_nonzero_i64(value: &Value, kind: &str) -> Result<i64, String> {
+    let value = value.as_i64().ok_or_else(|| format!("{kind} is invalid"))?;
     if value == 0 {
         Err(format!("{kind} is invalid"))
     } else {
@@ -801,6 +824,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn llvm_imports_only_code_regions_and_valid_branch_region_kinds() {
+        let report = json!({
+            "type": "llvm.coverage.json.export",
+            "version": "3.0.0",
+            "data": [{
+                "functions": [{
+                    "name": "ignored",
+                    "filenames": ["src/lib.rs"],
+                    "regions": [
+                        [1, 1, 1, 2, 1, 0, 0, 0],
+                        [2, 1, 2, 2, 1, 0, 0, 1],
+                        [3, 1, 3, 2, 1, 0, 0, 2],
+                        [4, 1, 4, 2, 1, 0, 0, 3],
+                        [5, 1, 5, 2, 1, 0, 0, 4],
+                        [6, 1, 6, 2, 1, 0, 0, 5],
+                        [7, 1, 7, 2, 1, 0, 0, 6]
+                    ]
+                }],
+                "files": [{
+                    "filename": "src/lib.rs",
+                    "branches": [
+                        [8, 1, 8, 2, 1, 0, 0, 0, 4],
+                        [9, 1, 9, 2, 1, 0, 0, 0, 6]
+                    ]
+                }]
+            }]
+        });
+        let parsed = parse_coverage(
+            CoverageFormat::Llvm,
+            report.to_string().as_bytes(),
+            Path::new("/repo"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed
+                .regions
+                .iter()
+                .map(|region| region.start_line)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(
+            parsed
+                .branches
+                .iter()
+                .map(|branch| branch.start_line)
+                .collect::<Vec<_>>(),
+            [8, 8, 9, 9]
+        );
+
+        for (field, tuple) in [
+            ("regions", json!([1, 1, 1, 2, 1, 0, 0, 7])),
+            ("branches", json!([1, 1, 1, 2, 1, 0, 0, 0, 0])),
+        ] {
+            let mut malformed = report.clone();
+            if field == "regions" {
+                malformed["data"][0]["functions"][0]["regions"] = json!([tuple]);
+            } else {
+                malformed["data"][0]["files"][0]["branches"] = json!([tuple]);
+            }
+            assert!(
+                parse_coverage(
+                    CoverageFormat::Llvm,
+                    malformed.to_string().as_bytes(),
+                    Path::new("/repo"),
+                )
+                .is_err(),
+                "accepted unsupported LLVM {field} kind"
+            );
+        }
+    }
+
     fn coverage_py_report() -> Value {
         json!({
             "meta": {
@@ -956,6 +1053,34 @@ mod tests {
     }
 
     #[test]
+    fn coverage_py_accepts_empty_run_context_and_signed_entry_exit_arcs() {
+        let report = json!({
+            "meta": {"format": 3, "version": "7.0"},
+            "files": {"pkg/a.py": {
+                "executed_lines": [8],
+                "missing_lines": [],
+                "executed_branches": [[-1, 8], [8, -1]],
+                "missing_branches": [],
+                "contexts": {"8": [""]}
+            }}
+        });
+        let parsed = parse_coverage(
+            CoverageFormat::CoveragePy,
+            report.to_string().as_bytes(),
+            Path::new("/repo"),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.regions.len(), 1);
+        assert_eq!(parsed.regions[0].context, None);
+        assert_eq!(parsed.branches.len(), 2);
+        assert_eq!(parsed.branches[0].start_line.to_string(), "-1");
+        assert_eq!(parsed.branches[0].target_line.unwrap().to_string(), "8");
+        assert_eq!(parsed.branches[1].start_line.to_string(), "8");
+        assert_eq!(parsed.branches[1].target_line.unwrap().to_string(), "-1");
+    }
+
+    #[test]
     fn coverage_py_rejects_malformed_lines_arcs_contexts_and_metadata() {
         let mut reports = Vec::new();
         for line in [json!(0), json!(-1), json!(1.5), json!("1")] {
@@ -975,7 +1100,6 @@ mod tests {
         for contexts in [
             json!({"0":["test"]}),
             json!({"1":"test"}),
-            json!({"1":[""]}),
             json!({"1":["bad\ncontext"]}),
         ] {
             let mut report = coverage_py_report();
@@ -1016,6 +1140,11 @@ mod tests {
                 "executed_lines": [2],
                 "missing_lines": [],
                 "contexts": {"2": ["named", "named"]}
+            }),
+            json!({
+                "executed_lines": [2],
+                "missing_lines": [],
+                "contexts": {"2": ["", ""]}
             }),
             json!({
                 "executed_lines": [1],
