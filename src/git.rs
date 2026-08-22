@@ -183,9 +183,9 @@ pub(crate) fn capture_evidence_file(
     // SAFETY: fstatat initialized the value on success.
     let current = unsafe { current.assume_init() };
     if !same_file_version(&before, &finished)
-        || before.dev() != current.st_dev
+        || i128::from(before.dev()) != i128::from(current.st_dev)
         || before.ino() != current.st_ino
-        || before.mode() != current.st_mode
+        || u64::from(before.mode()) != u64::from(current.st_mode)
         || before.len() != current.st_size as u64
         || before.mtime() != current.st_mtime
         || before.mtime_nsec() != current.st_mtime_nsec
