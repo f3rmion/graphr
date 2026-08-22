@@ -1,7 +1,7 @@
 # Graphr
 
-Fast, compact Rust and Python code-graph views for Codex and Claude over MCP
-stdio.
+Fast, compact Rust, Python, JavaScript/JSX, and TypeScript/TSX code-graph views
+for Codex and Claude over MCP stdio.
 
 Graphr is inspired by [code-review-graph](https://github.com/tirth8205/code-review-graph)'s approach to focusing AI review context. Thanks to @tirth8205 and its contributors for originating that work.
 
@@ -122,13 +122,22 @@ collection.
 
 ## Review output
 
-Graphr detects Rust and Python sources automatically. `changes` returns bounded
-8 KiB review pages with every safe changed path, an aggregate count of unsafe
-paths, Rust and Python source diffs, bounded non-source text diffs, Markdown/TSV
-semantics, explicit artifact omissions, risk-ranked changed symbols, affected
-static execution paths, and graph impact. `.cargo/vendor` changes collapse to
-deterministic package boundaries by default; select `dependency_mode="full"`
-while indexing to inspect dependency internals.
+Graphr detects Rust, Python, JavaScript/JSX, and TypeScript/TSX sources
+automatically. Rust uses `.rs`, Python uses `.py`, and the nine JavaScript and
+TypeScript script extensions are `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`,
+`.mts`, `.cts`, and `.d.ts`. `changes` returns bounded 8 KiB review pages with
+every safe changed path, an aggregate count of unsafe paths, supported source
+diffs, bounded non-source text diffs,
+Markdown/TSV semantics, explicit artifact omissions, risk-ranked changed
+symbols, affected static execution paths, and graph impact. `.cargo/vendor`
+changes collapse to deterministic package boundaries by default; select
+`dependency_mode="full"` while indexing to inspect dependency internals.
+
+For JavaScript and TypeScript, graph semantics include definitions, ESM and
+CommonJS imports, direct re-exports, resolvable calls, conventional tests, and
+JSX component calls. Module resolution is limited to relative repository-local
+specifiers. There is no package or `tsconfig` resolution and no type checker;
+ambiguous module aliases produce no edge.
 
 Affected-flow discovery follows `CALLS` edges up to 15 hops. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale. `test_path_confidence=heuristic` and `test_path_provenance=resolved-static-call-graph` describe bounded static evidence, not runtime test proof; community and churn factors are not used.
 
@@ -137,10 +146,12 @@ ranges map to their indexed file node and are reported as `file-mapped`;
 targeted `search` or `view` remediation is named for unresolved graph coverage.
 Binary, oversized, unsafe, non-regular, type-changed, unmerged, and other
 explicit artifact omissions keep `review_complete_when_pages_exhausted=false`.
-This is complete artifact coverage; Rust and Python remain the only indexed
-source languages.
+This is complete artifact coverage for every supported source language.
 
-Rename detection runs independently within regular Rust/Python source diffs and within non-source artifact diffs. Renames crossing those streams are conservatively represented as a deletion plus an addition.
+JavaScript and TypeScript use the existing incremental indexing and rename
+detection pipeline. Rename detection runs independently within regular source
+diffs and within non-source artifact diffs. Renames crossing those streams are
+conservatively represented as a deletion plus an addition.
 
 ## Codex review skill
 

@@ -3,11 +3,11 @@ name = "graphr"
 version = "0.6.1"
 edition = "2024"
 rust-version = "1.97.1"
-description = "Fast, compact Rust and Python code graphs for AI code review over MCP stdio"
+description = "Fast, compact Rust, Python, JavaScript, and TypeScript code graphs for AI code review over MCP stdio"
 license = "MIT"
 repository = "https://github.com/f3rmion/graphr"
 readme = "README.md"
-keywords = ["mcp", "code-review", "code-graph", "rust", "python"]
+keywords = ["mcp", "rust", "python", "javascript", "typescript"]
 categories = ["development-tools"]
 exclude = ["/.agents", "/AGENTS.md"]
 
