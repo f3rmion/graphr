@@ -1157,6 +1157,84 @@ fn script_class_member_calls_require_callable_static_methods() {
 }
 
 #[test]
+fn script_this_calls_respect_static_and_instance_receivers() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/service.ts"),
+        r#"
+            export class Service {
+                static staticOnly() {}
+                instanceOnly() {}
+                static shared() {}
+                shared() {}
+                static staticFactory = () => this.staticOnly();
+                instanceFactory = () => this.instanceOnly();
+                static staticFunction = function () { this.staticOnly(); };
+                instanceFunction = function () { this.instanceOnly(); };
+                static staticGenerator = function* () { this.staticOnly(); };
+                instanceGenerator = function* () { this.instanceOnly(); };
+                static staticValue = this.staticOnly();
+                instanceValue = this.instanceOnly();
+                static fromStatic() {
+                    this.staticOnly();
+                    this.instanceOnly();
+                    this.shared();
+                }
+                fromInstance() {
+                    this.instanceOnly();
+                    this.staticOnly();
+                    this.shared();
+                }
+                nestedFunction() {
+                    function nested() { this.instanceOnly(); }
+                    nested();
+                }
+                nestedObject() {
+                    const object = { nestedMethod() { this.instanceOnly(); } };
+                    object.nestedMethod();
+                }
+            }
+            export class StaticBlock {
+                static target() {}
+                static { this.target(); }
+            }
+        "#,
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    index_repository(&fixture.path);
+
+    let edge = |source, target| {
+        named_edge_kind_count(
+            &fixture.path,
+            "src/service.ts",
+            source,
+            "src/service.ts",
+            target,
+            "CALLS",
+        )
+    };
+    assert_eq!(edge("fromStatic", "staticOnly"), 1);
+    assert_eq!(edge("fromStatic", "instanceOnly"), 0);
+    assert_eq!(edge("fromStatic", "shared"), 1);
+    assert_eq!(edge("fromInstance", "instanceOnly"), 1);
+    assert_eq!(edge("fromInstance", "staticOnly"), 0);
+    assert_eq!(edge("fromInstance", "shared"), 1);
+    assert_eq!(edge("staticFactory", "staticOnly"), 1);
+    assert_eq!(edge("instanceFactory", "instanceOnly"), 1);
+    assert_eq!(edge("staticFunction", "staticOnly"), 1);
+    assert_eq!(edge("instanceFunction", "instanceOnly"), 1);
+    assert_eq!(edge("staticGenerator", "staticOnly"), 1);
+    assert_eq!(edge("instanceGenerator", "instanceOnly"), 1);
+    assert_eq!(edge("Service", "staticOnly"), 1);
+    assert_eq!(edge("Service", "instanceOnly"), 1);
+    assert_eq!(edge("nested", "instanceOnly"), 0);
+    assert_eq!(edge("nestedMethod", "instanceOnly"), 0);
+    assert_eq!(edge("StaticBlock", "target"), 1);
+}
+
+#[test]
 fn javascript_direct_class_reexport_methods_match_fresh_graph_after_targeted_edits() {
     const FIRST_BEFORE: &str = "export class First { static before() {} static create() {} }\n";
     const FIRST_AFTER: &str = "export class First { static after() {} static create() {} }\n";

@@ -164,6 +164,27 @@ impl ScriptParser {
         parsed
             .definitions
             .sort_unstable_by_key(|definition| definition.range.start);
+        collect_definition_bindings(&parsed.definitions, &mut parsed.bindings);
+        for capture in &captured {
+            if matches!(capture.name.as_str(), "module" | "typescript_module")
+                && capture.node.kind() == "import_statement"
+            {
+                collect_module(capture.node, source, &mut parsed);
+            }
+        }
+        for capture in &captured {
+            if capture.name == "call" && capture.node.kind() == "call_expression" {
+                collect_require(capture.node, path, source, &mut parsed);
+            }
+        }
+        let bindings = &parsed.bindings;
+        let imports = &parsed.imports;
+        parsed.definitions.retain(|definition| {
+            let DefinitionKind::Test(callee) = definition.kind else {
+                return true;
+            };
+            !shadows_test_callee(bindings, imports, callee, definition.range.start)
+        });
         for child in 0..parsed.definitions.len() {
             parsed.definitions[child].parent = parsed
                 .definitions
@@ -177,18 +198,8 @@ impl ScriptParser {
                 .min_by_key(|(_, definition)| definition.structure.end - definition.structure.start)
                 .map(|(parent, _)| parent);
         }
-        collect_definition_bindings(&parsed.definitions, &mut parsed.bindings);
-        for capture in &captured {
-            if matches!(capture.name.as_str(), "module" | "typescript_module")
-                && capture.node.kind() == "import_statement"
-            {
-                collect_module(capture.node, source, &mut parsed);
-            }
-        }
-        for capture in &captured {
-            if capture.name == "call" && capture.node.kind() == "call_expression" {
-                collect_require(capture.node, path, source, &mut parsed);
-            }
+        for import in &mut parsed.imports {
+            import.source = containing_definition(import.byte, &parsed.definitions);
         }
         for capture in &captured {
             if matches!(capture.name.as_str(), "module" | "typescript_module")
@@ -211,11 +222,19 @@ impl ScriptParser {
                 && left.range.end == right.range.end
         });
         for capture in &captured {
-            if capture.name == "call"
-                && test_parts(capture.node, path, source).is_none()
-                && let Some(call) = call(capture.node, source)
-            {
-                parsed.calls.push(call);
+            if capture.name == "call" {
+                let registration =
+                    test_parts(capture.node, path, source).is_some_and(|(callee, _, _)| {
+                        !shadows_test_callee(
+                            &parsed.bindings,
+                            &parsed.imports,
+                            callee,
+                            capture.node.start_byte(),
+                        )
+                    });
+                if !registration && let Some(call) = call(capture.node, source) {
+                    parsed.calls.push(call);
+                }
             }
             if capture.name == "jsx"
                 && let Some(target) = jsx_target(capture.node, source.as_bytes())
@@ -304,7 +323,7 @@ enum DefinitionKind {
     Type { runtime_value: bool },
     Function,
     Method,
-    Test,
+    Test(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -342,6 +361,7 @@ struct ImportBinding {
 
 struct Import {
     source: Option<usize>,
+    byte: usize,
     module: String,
     bindings: Vec<ImportBinding>,
     line: usize,
@@ -376,8 +396,14 @@ struct LexicalBinding {
 
 enum CallTarget {
     Identifier(String),
-    Member { object: String, property: String },
-    ThisMethod(String),
+    Member {
+        object: String,
+        property: String,
+    },
+    ThisMethod {
+        name: String,
+        resolution: MethodResolution,
+    },
 }
 
 struct Call {
@@ -711,14 +737,14 @@ fn definition_keys(
             match definition.method_resolution {
                 Some(MethodResolution::Instance) => vec![method],
                 Some(MethodResolution::Static) => {
-                    vec![method, static_method_key(stem, owner, &definition.name)]
+                    vec![static_method_key(stem, owner, &definition.name)]
                 }
                 None => Vec::new(),
             }
         }
         DefinitionKind::Method => Vec::new(),
         DefinitionKind::Function => vec![local_value_key(stem, path)],
-        DefinitionKind::Test => Vec::new(),
+        DefinitionKind::Test(_) => Vec::new(),
     }
 }
 
@@ -761,8 +787,8 @@ fn export_definition_keys(
             .iter()
             .map(|alias| export_value_key(alias, exported))
             .collect(),
-        (DefinitionKind::Function | DefinitionKind::Method | DefinitionKind::Test, true)
-        | (DefinitionKind::Method | DefinitionKind::Test, false) => Vec::new(),
+        (DefinitionKind::Function | DefinitionKind::Method | DefinitionKind::Test(_), true)
+        | (DefinitionKind::Method | DefinitionKind::Test(_), false) => Vec::new(),
     }
 }
 
@@ -796,11 +822,16 @@ fn call_keys(
             }
             VisibleValue::Ambiguous | VisibleValue::Missing => Vec::new(),
         },
-        CallTarget::ThisMethod(name) => containing_class(call.source, &parsed.definitions)
-            .and_then(|owner| paths.get(owner))
-            .map(|owner| method_key(stem, owner, name))
-            .into_iter()
-            .collect(),
+        CallTarget::ThisMethod { name, resolution } => {
+            containing_class(call.source, &parsed.definitions)
+                .and_then(|owner| paths.get(owner))
+                .map(|owner| match resolution {
+                    MethodResolution::Instance => method_key(stem, owner, name),
+                    MethodResolution::Static => static_method_key(stem, owner, name),
+                })
+                .into_iter()
+                .collect()
+        }
         CallTarget::Member { object, property } => match visible_value(call, object, parsed) {
             VisibleValue::Definition(target)
                 if matches!(parsed.definitions[target].kind, DefinitionKind::Class) =>
@@ -833,6 +864,26 @@ enum VisibleValue {
 fn is_lexically_bound(parsed: &ParsedFile, name: &str, byte: usize) -> bool {
     parsed.bindings.iter().any(|binding| {
         binding.name == name && binding.range.start <= byte && byte < binding.range.end
+    })
+}
+
+fn shadows_test_callee(
+    bindings: &[LexicalBinding],
+    imports: &[Import],
+    name: &str,
+    byte: usize,
+) -> bool {
+    bindings.iter().any(|binding| {
+        binding.name == name
+            && binding.range.start <= byte
+            && byte < binding.range.end
+            && match binding.import {
+                None => true,
+                Some((import, imported)) => imports
+                    .get(import)
+                    .and_then(|import| import.bindings.get(imported))
+                    .is_none_or(|binding| binding.type_only),
+            }
     })
 }
 
@@ -1159,7 +1210,7 @@ fn node_kind(kind: DefinitionKind) -> NodeKind {
     match kind {
         DefinitionKind::Class | DefinitionKind::Type { .. } => NodeKind::Type,
         DefinitionKind::Function | DefinitionKind::Method => NodeKind::Function,
-        DefinitionKind::Test => NodeKind::Test,
+        DefinitionKind::Test(_) => NodeKind::Test,
     }
 }
 
@@ -1177,9 +1228,11 @@ fn to_u32(value: usize) -> Result<u32, String> {
 }
 
 fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
-    let (kind, name, start, structure_start) = if let Some(name) = test_name(node, path, source) {
+    let (kind, name, start, structure_start) = if let Some((name, callee)) =
+        test_name(node, path, source)
+    {
         (
-            DefinitionKind::Test,
+            DefinitionKind::Test(callee),
             name,
             definition_start(node),
             node.start_byte(),
@@ -1417,7 +1470,7 @@ fn definition_binding(
     name: &str,
     source: &str,
 ) -> Option<ByteRange> {
-    if name == "default" || matches!(kind, DefinitionKind::Method | DefinitionKind::Test) {
+    if name == "default" || matches!(kind, DefinitionKind::Method | DefinitionKind::Test(_)) {
         return None;
     }
     matches!(
@@ -1565,7 +1618,7 @@ fn collect_import(node: Node<'_>, source: &str, parsed: &mut ParsedFile) {
     finish_import(
         parsed,
         module,
-        containing_definition(node.start_byte(), &parsed.definitions),
+        node.start_byte(),
         line_start(node),
         bindings,
         binding_bytes,
@@ -1649,7 +1702,7 @@ fn collect_require(node: Node<'_>, path: &str, source: &str, parsed: &mut Parsed
     finish_import(
         parsed,
         module,
-        containing_definition(node.start_byte(), &parsed.definitions),
+        node.start_byte(),
         line_start(node),
         bindings,
         binding_bytes,
@@ -1660,15 +1713,17 @@ fn collect_require(node: Node<'_>, path: &str, source: &str, parsed: &mut Parsed
 fn finish_import(
     parsed: &mut ParsedFile,
     module: &str,
-    source: Option<usize>,
+    byte: usize,
     line: usize,
     bindings: Vec<ImportBinding>,
     binding_bytes: Vec<usize>,
     range: ByteRange,
 ) {
+    let source = containing_definition(byte, &parsed.definitions);
     let import = parsed.imports.len();
     parsed.imports.push(Import {
         source,
+        byte,
         module: module.to_owned(),
         bindings,
         line,
@@ -2115,7 +2170,7 @@ fn binding_identifiers(node: Node<'_>) -> Vec<Node<'_>> {
     identifiers
 }
 
-fn test_name(node: Node<'_>, path: &str, source: &str) -> Option<String> {
+fn test_name(node: Node<'_>, path: &str, source: &str) -> Option<(String, &'static str)> {
     if !matches!(node.kind(), "arrow_function" | "function_expression") {
         return None;
     }
@@ -2132,7 +2187,7 @@ fn test_name(node: Node<'_>, path: &str, source: &str) -> Option<String> {
     let call = arguments
         .parent()
         .filter(|parent| parent.kind() == "call_expression")?;
-    let (title, callback) = test_parts(call, path, source)?;
+    let (callee, title, callback) = test_parts(call, path, source)?;
     if callback.id() != node.id() {
         return None;
     }
@@ -2140,9 +2195,9 @@ fn test_name(node: Node<'_>, path: &str, source: &str) -> Option<String> {
     if (title.starts_with(['\'', '"']) && title.ends_with(['\'', '"']))
         || (title.starts_with('`') && title.ends_with('`') && !title.contains("${"))
     {
-        return Some(title[1..title.len() - 1].to_owned());
+        return Some((title[1..title.len() - 1].to_owned(), callee));
     }
-    Some(format!("test@{}", line_start(call)))
+    Some((format!("test@{}", line_start(call)), callee))
 }
 
 fn is_test_path(path: &str) -> bool {
@@ -2157,11 +2212,11 @@ fn test_parts<'tree>(
     call: Node<'tree>,
     path: &str,
     source: &str,
-) -> Option<(Node<'tree>, Node<'tree>)> {
+) -> Option<(&'static str, Node<'tree>, Node<'tree>)> {
     if !is_test_path(path) || call.kind() != "call_expression" {
         return None;
     }
-    test_callee(call.child_by_field_name("function")?, source.as_bytes())?;
+    let callee = test_callee(call.child_by_field_name("function")?, source.as_bytes())?;
     let arguments = call.child_by_field_name("arguments")?;
     let mut cursor = arguments.walk();
     let mut children = arguments.named_children(&mut cursor);
@@ -2179,7 +2234,8 @@ fn test_parts<'tree>(
             return None;
         }
     }
-    matches!(callback.kind(), "arrow_function" | "function_expression").then_some((title, callback))
+    matches!(callback.kind(), "arrow_function" | "function_expression")
+        .then_some((callee, title, callback))
 }
 
 fn test_callee(node: Node<'_>, source: &[u8]) -> Option<&'static str> {
@@ -2204,7 +2260,10 @@ fn call(node: Node<'_>, source: &str) -> Option<Call> {
             let object = target.child_by_field_name("object")?;
             let property = target.child_by_field_name("property")?;
             if object.kind() == "this" {
-                CallTarget::ThisMethod(text(property, source).to_owned())
+                CallTarget::ThisMethod {
+                    name: text(property, source).to_owned(),
+                    resolution: this_resolution(object)?,
+                }
             } else if object.kind() == "identifier" && property.kind() == "property_identifier" {
                 CallTarget::Member {
                     object: text(object, source).to_owned(),
@@ -2222,6 +2281,51 @@ fn call(node: Node<'_>, source: &str) -> Option<Call> {
         target,
         line: line_start(node),
     })
+}
+
+fn this_resolution(node: Node<'_>) -> Option<MethodResolution> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "arrow_function" => {}
+            "method_definition"
+                if parent
+                    .parent()
+                    .is_some_and(|owner| owner.kind() == "class_body") =>
+            {
+                return Some(if has_direct_token(parent, "static") {
+                    MethodResolution::Static
+                } else {
+                    MethodResolution::Instance
+                });
+            }
+            "method_definition" => return None,
+            "field_definition" | "public_field_definition" => {
+                return Some(if has_direct_token(parent, "static") {
+                    MethodResolution::Static
+                } else {
+                    MethodResolution::Instance
+                });
+            }
+            "class_static_block" => return Some(MethodResolution::Static),
+            "function_expression" | "generator_function" => {
+                let direct_field = parent.parent().is_some_and(|field| {
+                    matches!(field.kind(), "field_definition" | "public_field_definition")
+                        && field
+                            .child_by_field_name("value")
+                            .is_some_and(|value| value.id() == parent.id())
+                });
+                if !direct_field {
+                    return None;
+                }
+            }
+            "function_declaration" | "generator_function_declaration" => return None,
+            "class" | "class_declaration" | "abstract_class_declaration" => return None,
+            _ => {}
+        }
+        current = parent;
+    }
+    None
 }
 
 fn jsx_target(node: Node<'_>, source: &[u8]) -> Option<CallTarget> {
@@ -2317,7 +2421,8 @@ impl ParsedFile {
         self.definitions
             .iter()
             .filter_map(|definition| {
-                matches!(definition.kind, DefinitionKind::Test).then_some(definition.name.as_str())
+                matches!(definition.kind, DefinitionKind::Test(_))
+                    .then_some(definition.name.as_str())
             })
             .collect()
     }
@@ -2677,7 +2782,7 @@ mod tests {
         let test = ownership
             .definitions
             .iter()
-            .position(|definition| matches!(definition.kind, DefinitionKind::Test))
+            .position(|definition| matches!(definition.kind, DefinitionKind::Test(_)))
             .unwrap();
         assert_eq!(
             ownership
@@ -2854,6 +2959,73 @@ const panel = <View />;
         assert!(!parsed.definition_names().contains(&"unstable"));
         assert!(!parsed.definition_names().contains(&"member"));
         assert!(!parsed.definition_names().contains(&"computed"));
+    }
+
+    #[test]
+    fn script_test_registrations_respect_local_shadowing() {
+        let parsed = ScriptParsers::default()
+            .parse(
+                "tests/shadowed.test.ts",
+                r#"
+                    import { test, it } from "vitest";
+                    test("real", () => real());
+                    function parameter(test: Function) {
+                        test.only("parameter", () => parameterCall());
+                    }
+                    function local() {
+                        const it = register;
+                        it.skip("local", () => localCall());
+                    }
+                    try {} catch (test) {
+                        test("caught", () => caughtCall());
+                    }
+                    function it() {}
+                    it("definition", () => definitionCall());
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(parsed.test_names(), ["real"]);
+        assert_eq!(
+            parsed
+                .calls
+                .iter()
+                .filter(|call| match &call.target {
+                    CallTarget::Identifier(name) => matches!(name.as_str(), "test" | "it"),
+                    CallTarget::Member { object, property } => {
+                        matches!(
+                            (object.as_str(), property.as_str()),
+                            ("test", "only") | ("it", "skip")
+                        )
+                    }
+                    CallTarget::ThisMethod { .. } => false,
+                })
+                .count(),
+            4
+        );
+
+        let commonjs = ScriptParsers::default()
+            .parse(
+                "tests/common.test.cjs",
+                r#"
+                    const { test } = require("./framework");
+                    test("common", () => common());
+                "#,
+            )
+            .unwrap();
+        assert_eq!(commonjs.test_names(), ["common"]);
+
+        let type_only = ScriptParsers::default()
+            .parse(
+                "tests/type-only.test.ts",
+                r#"
+                    import type { test } from "./framework";
+                    test("type only", () => impossible());
+                "#,
+            )
+            .unwrap();
+        assert!(type_only.test_names().is_empty());
+        assert!(type_only.call_names().contains(&"test"));
     }
 
     #[test]
