@@ -2398,7 +2398,7 @@ fn refresh_script_export_methods(tx: &Transaction<'_>, cancelled: &AtomicBool) -
               WHERE method.parent_id=?1
                 AND EXISTS(
                     SELECT 1 FROM node_keys key
-                     WHERE key.node_id=method.id AND key.key LIKE 'script:method:%'
+                     WHERE key.node_id=method.id AND key.key LIKE 'script:static-method:%'
                 )
               ORDER BY method.id",
         )

@@ -307,8 +307,15 @@ enum DefinitionKind {
     Test,
 }
 
+#[derive(Clone, Copy)]
+enum MethodResolution {
+    Instance,
+    Static,
+}
+
 struct Definition {
     kind: DefinitionKind,
+    method_resolution: Option<MethodResolution>,
     name: String,
     parent: Option<usize>,
     line_start: usize,
@@ -700,7 +707,14 @@ fn definition_keys(
         } => vec![local_type_key(stem, path)],
         DefinitionKind::Method if parent_is_class => {
             let (owner, _) = path.rsplit_once("::").unwrap_or(("", path));
-            vec![method_key(stem, owner, &definition.name)]
+            let method = method_key(stem, owner, &definition.name);
+            match definition.method_resolution {
+                Some(MethodResolution::Instance) => vec![method],
+                Some(MethodResolution::Static) => {
+                    vec![method, static_method_key(stem, owner, &definition.name)]
+                }
+                None => Vec::new(),
+            }
         }
         DefinitionKind::Method => Vec::new(),
         DefinitionKind::Function => vec![local_value_key(stem, path)],
@@ -793,7 +807,7 @@ fn call_keys(
             {
                 paths
                     .get(target)
-                    .map(|owner| method_key(stem, owner, property))
+                    .map(|owner| static_method_key(stem, owner, property))
                     .into_iter()
                     .collect()
             }
@@ -1133,6 +1147,10 @@ fn method_key(stem: &str, owner_path: &str, name: &str) -> String {
     format!("script:method:{stem}::{owner_path}::{name}")
 }
 
+fn static_method_key(stem: &str, owner_path: &str, name: &str) -> String {
+    format!("script:static-method:{stem}::{owner_path}::{name}")
+}
+
 fn export_method_key(stem: &str, owner: &str, name: &str) -> String {
     format!("script:export-method:{stem}::{owner}::{name}")
 }
@@ -1219,6 +1237,7 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
     Some(Definition {
         binding,
         kind,
+        method_resolution: method_resolution(node),
         name,
         parent: None,
         line_start: line_at(source, start),
@@ -1236,6 +1255,28 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
             start: structure_start,
             end: node.end_byte(),
         },
+    })
+}
+
+fn method_resolution(node: Node<'_>) -> Option<MethodResolution> {
+    let member = match node.kind() {
+        "method_definition" if !has_direct_token(node, "get") && !has_direct_token(node, "set") => {
+            node
+        }
+        "function_expression" | "generator_function" | "arrow_function" => {
+            node.parent().filter(|parent| {
+                matches!(
+                    parent.kind(),
+                    "field_definition" | "public_field_definition"
+                )
+            })?
+        }
+        _ => return None,
+    };
+    Some(if has_direct_token(member, "static") {
+        MethodResolution::Static
+    } else {
+        MethodResolution::Instance
     })
 }
 

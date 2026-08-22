@@ -1041,6 +1041,122 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
 }
 
 #[test]
+fn script_class_member_calls_require_callable_static_methods() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/service.ts"),
+        r#"
+            export abstract class Service {
+                static callable() {}
+                instance() {}
+                static staticField = () => {};
+                instanceField = () => {};
+                static get getter() { return () => {}; }
+                static set setter(value: () => void) {}
+                abstract declared(): void;
+                callInstance() { this.instance(); this.instanceField(); }
+            }
+            export function localStatic() { Service.callable(); }
+            export function localStaticField() { Service.staticField(); }
+            export function localInstance() { Service.instance(); }
+            export function localInstanceField() { Service.instanceField(); }
+            export function localGetter() { Service.getter(); }
+            export function localSetter() { Service.setter(); }
+            export function localDeclared() { Service.declared(); }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/ambient.d.ts"),
+        "export declare class Ambient { static signature(): void; }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/bridge.ts"),
+        "export { Service as ForwardedService } from './service';\n\
+         export { Ambient as ForwardedAmbient } from './ambient';\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/user.ts"),
+        r#"
+            import { Service } from "./service";
+            import { ForwardedService, ForwardedAmbient } from "./bridge";
+            export function importedStatic() { Service.callable(); }
+            export function importedStaticField() { Service.staticField(); }
+            export function importedInstance() { Service.instance(); }
+            export function importedInstanceField() { Service.instanceField(); }
+            export function importedDeclared() { Service.declared(); }
+            export function forwardedStatic() { ForwardedService.callable(); }
+            export function forwardedStaticField() { ForwardedService.staticField(); }
+            export function forwardedInstance() { ForwardedService.instance(); }
+            export function forwardedInstanceField() { ForwardedService.instanceField(); }
+            export function forwardedGetter() { ForwardedService.getter(); }
+            export function forwardedSignature() { ForwardedAmbient.signature(); }
+        "#,
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    index_repository(&fixture.path);
+
+    let edge = |source_path, source, target_path, target| {
+        named_edge_kind_count(
+            &fixture.path,
+            source_path,
+            source,
+            target_path,
+            target,
+            "CALLS",
+        )
+    };
+    for (source, target) in [
+        ("localStatic", "callable"),
+        ("callInstance", "instance"),
+        ("callInstance", "instanceField"),
+        ("localStaticField", "staticField"),
+    ] {
+        assert_eq!(edge("src/service.ts", source, "src/service.ts", target), 1);
+    }
+    for (source, target) in [
+        ("importedStatic", "callable"),
+        ("importedStaticField", "staticField"),
+        ("forwardedStatic", "callable"),
+        ("forwardedStaticField", "staticField"),
+    ] {
+        assert_eq!(edge("src/user.ts", source, "src/service.ts", target), 1);
+    }
+    for (source, target) in [
+        ("localInstance", "instance"),
+        ("localInstanceField", "instanceField"),
+        ("localGetter", "getter"),
+        ("localSetter", "setter"),
+        ("localDeclared", "declared"),
+    ] {
+        assert_eq!(edge("src/service.ts", source, "src/service.ts", target), 0);
+    }
+    for (source, target) in [
+        ("importedInstance", "instance"),
+        ("importedInstanceField", "instanceField"),
+        ("importedDeclared", "declared"),
+        ("forwardedInstance", "instance"),
+        ("forwardedInstanceField", "instanceField"),
+        ("forwardedGetter", "getter"),
+    ] {
+        assert_eq!(edge("src/user.ts", source, "src/service.ts", target), 0);
+    }
+    assert_eq!(
+        edge(
+            "src/user.ts",
+            "forwardedSignature",
+            "src/ambient.d.ts",
+            "signature",
+        ),
+        0
+    );
+}
+
+#[test]
 fn javascript_direct_class_reexport_methods_match_fresh_graph_after_targeted_edits() {
     const FIRST_BEFORE: &str = "export class First { static before() {} static create() {} }\n";
     const FIRST_AFTER: &str = "export class First { static after() {} static create() {} }\n";
