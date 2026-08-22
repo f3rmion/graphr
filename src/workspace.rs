@@ -20,9 +20,9 @@ use crate::store;
 
 pub use crate::index::Engine;
 
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 7;
-pub(crate) const GRAPH_ANALYZER_VERSION: u32 = 3;
-pub(crate) const REVIEW_FORMAT_VERSION: u32 = 3;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 8;
+pub(crate) const GRAPH_ANALYZER_VERSION: u32 = 4;
+pub(crate) const REVIEW_FORMAT_VERSION: u32 = 4;
 const MANIFEST_SIZE_LIMIT: u64 = 64 * 1024;
 const REVIEW_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 static PRIVATE_ID: AtomicU64 = AtomicU64::new(0);
@@ -170,6 +170,7 @@ pub struct IndexRequest {
     pub head_ref: String,
     pub target: SnapshotTarget,
     pub dependency_mode: DependencyMode,
+    pub evidence_manifest: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,6 +182,7 @@ pub struct ResolvedIndexRequest {
     pub head_oid: String,
     pub target: SnapshotTarget,
     pub dependency_mode: DependencyMode,
+    pub evidence_manifest: Option<PathBuf>,
 }
 
 #[derive(
@@ -206,6 +208,8 @@ pub struct Provenance {
     pub commits_base_to_head: u64,
     pub changed_files: usize,
     pub index_generation: i64,
+    pub source_snapshot_id: Option<String>,
+    pub evidence_manifest_digest: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -955,6 +959,18 @@ impl SnapshotCatalog {
             || !valid_id(&manifest.provenance.workspace_id)
             || !valid_id(&manifest.provenance.snapshot_id)
             || !valid_id(&manifest.provenance.dirty_digest)
+            || manifest
+                .provenance
+                .source_snapshot_id
+                .as_deref()
+                .is_some_and(|id| !valid_id(id))
+            || manifest
+                .provenance
+                .evidence_manifest_digest
+                .as_deref()
+                .is_some_and(|id| !valid_id(id))
+            || manifest.provenance.source_snapshot_id.is_some()
+                != manifest.provenance.evidence_manifest_digest.is_some()
             || manifest.provenance.snapshot_id != snapshot_id
             || !valid_git_oid(&manifest.provenance.base_oid)
             || !valid_git_oid(&manifest.provenance.head_oid)
@@ -999,12 +1015,16 @@ impl SnapshotCatalog {
         if selected_layers(&changes) != manifest.provenance.selected_layers
             || changed_file_count(&changes) != manifest.provenance.changed_files
             || manifest.no_change_reason
-                != expected_no_change_reason(
-                    &changes,
-                    &manifest.provenance.target_state,
-                    &manifest.provenance.base_oid,
-                    &manifest.provenance.head_oid,
-                )
+                != if manifest.provenance.evidence_manifest_digest.is_some() {
+                    None
+                } else {
+                    expected_no_change_reason(
+                        &changes,
+                        &manifest.provenance.target_state,
+                        &manifest.provenance.base_oid,
+                        &manifest.provenance.head_oid,
+                    )
+                }
         {
             return Err(cache_corrupt("snapshot review provenance is invalid"));
         }
@@ -1018,6 +1038,8 @@ impl SnapshotCatalog {
                 dependency_mode: manifest.dependency_mode,
                 dirty_digest: &manifest.provenance.dirty_digest,
                 review_id: &manifest.review_id,
+                source_snapshot_id: manifest.provenance.source_snapshot_id.as_deref(),
+                evidence_manifest_digest: manifest.provenance.evidence_manifest_digest.as_deref(),
             },
             CACHE_FORMAT_VERSION,
             REVIEW_FORMAT_VERSION,
@@ -1904,6 +1926,9 @@ pub fn resolve_request(
     request: IndexRequest,
     cancelled: &AtomicBool,
 ) -> Result<ResolvedIndexRequest, OperationError> {
+    if let Some(path) = &request.evidence_manifest {
+        validate_evidence_path(path)?;
+    }
     let root = roots.inspect(&request.worktree_root, cancelled)?;
     let base_oid = resolve_commit(&root.worktree_root, &request.base_ref, "base", cancelled)?;
     let head_oid = resolve_commit(&root.worktree_root, &request.head_ref, "head", cancelled)?;
@@ -1923,7 +1948,31 @@ pub fn resolve_request(
         head_oid,
         target: request.target,
         dependency_mode: request.dependency_mode,
+        evidence_manifest: request.evidence_manifest,
     })
+}
+
+fn validate_evidence_path(path: &Path) -> Result<(), OperationError> {
+    let value = path.to_str().ok_or_else(|| {
+        OperationError::new(
+            ErrorCode::InvalidParameters,
+            "evidence manifest path is not valid UTF-8",
+        )
+    })?;
+    if value.is_empty()
+        || value.len() > 1024
+        || value.chars().any(char::is_control)
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        || path.is_absolute()
+    {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "evidence manifest must be a safe relative path",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_path(path: &Path, label: &str) -> Result<(), OperationError> {
@@ -2019,6 +2068,45 @@ pub(crate) fn graph_image_key(
     hasher.finalize().to_hex().to_string()
 }
 
+#[allow(clippy::too_many_arguments)] // The version fields are deliberate cache boundaries.
+pub(crate) fn evidence_graph_image_key(
+    source_graph_image_id: &str,
+    source_snapshot_id: &str,
+    manifest_digest: &str,
+    artifacts: &[crate::store::ImportedArtifactInput],
+    evidence_semantics_version: u32,
+    cache_format_version: u32,
+    analyzer_version: u32,
+    schema_version: i64,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    b"graphr.evidence-graph-image.v1"[..].hash_field(&mut hasher);
+    source_graph_image_id.as_bytes().hash_field(&mut hasher);
+    source_snapshot_id.as_bytes().hash_field(&mut hasher);
+    manifest_digest.as_bytes().hash_field(&mut hasher);
+    let mut artifacts = artifacts.iter().collect::<Vec<_>>();
+    artifacts.sort_unstable_by(|left, right| {
+        (left.role, &left.path, left.content_hash, left.byte_size).cmp(&(
+            right.role,
+            &right.path,
+            right.content_hash,
+            right.byte_size,
+        ))
+    });
+    (artifacts.len() as u64).hash_field(&mut hasher);
+    for artifact in artifacts {
+        artifact.role.db().as_bytes().hash_field(&mut hasher);
+        artifact.path.as_bytes().hash_field(&mut hasher);
+        artifact.content_hash[..].hash_field(&mut hasher);
+        artifact.byte_size.hash_field(&mut hasher);
+    }
+    evidence_semantics_version.hash_field(&mut hasher);
+    schema_version.hash_field(&mut hasher);
+    analyzer_version.hash_field(&mut hasher);
+    cache_format_version.hash_field(&mut hasher);
+    hasher.finalize().to_hex().to_string()
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SnapshotKeyInput<'a> {
     pub(crate) graph_image_id: &'a str,
@@ -2029,6 +2117,8 @@ pub(crate) struct SnapshotKeyInput<'a> {
     pub(crate) dependency_mode: DependencyMode,
     pub(crate) dirty_digest: &'a str,
     pub(crate) review_id: &'a str,
+    pub(crate) source_snapshot_id: Option<&'a str>,
+    pub(crate) evidence_manifest_digest: Option<&'a str>,
 }
 
 pub(crate) fn snapshot_key(
@@ -2037,7 +2127,7 @@ pub(crate) fn snapshot_key(
     review_format_version: u32,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    b"graphr.snapshot.v1"[..].hash_field(&mut hasher);
+    b"graphr.snapshot.v2"[..].hash_field(&mut hasher);
     cache_format_version.hash_field(&mut hasher);
     review_format_version.hash_field(&mut hasher);
     input.graph_image_id.as_bytes().hash_field(&mut hasher);
@@ -2059,6 +2149,16 @@ pub(crate) fn snapshot_key(
         .hash_field(&mut hasher);
     input.dirty_digest.as_bytes().hash_field(&mut hasher);
     input.review_id.as_bytes().hash_field(&mut hasher);
+    input
+        .source_snapshot_id
+        .unwrap_or_default()
+        .as_bytes()
+        .hash_field(&mut hasher);
+    input
+        .evidence_manifest_digest
+        .unwrap_or_default()
+        .as_bytes()
+        .hash_field(&mut hasher);
     hasher.finalize().to_hex().to_string()
 }
 
@@ -2131,9 +2231,10 @@ mod tests {
 
     use super::{
         AllowedRoots, CacheDirectory, ErrorCode, IndexRequest, OperationError, PublicationPoint,
-        SnapshotCatalog, SnapshotKeyInput, SnapshotTarget, graph_image_key, read_dir_at,
-        remove_tree_at, resolve_request, set_after_repository_discovery_hook_for_test,
-        set_before_manifest_hook_for_test, set_before_review_hook_for_test, snapshot_key,
+        SnapshotCatalog, SnapshotKeyInput, SnapshotTarget, evidence_graph_image_key,
+        graph_image_key, read_dir_at, remove_tree_at, resolve_request,
+        set_after_repository_discovery_hook_for_test, set_before_manifest_hook_for_test,
+        set_before_review_hook_for_test, snapshot_key,
     };
 
     #[test]
@@ -2262,6 +2363,42 @@ mod tests {
     }
 
     #[test]
+    fn evidence_graph_image_key_covers_source_and_artifact_identity() {
+        use crate::store::{ArtifactRole, ImportedArtifactInput};
+
+        let artifact = ImportedArtifactInput {
+            key: "output".into(),
+            path: "target/out.rs".into(),
+            role: ArtifactRole::GeneratedRust,
+            content_hash: [7; 32],
+            byte_size: 42,
+        };
+        let key = evidence_graph_image_key(
+            "source-graph",
+            &"a".repeat(64),
+            &"b".repeat(64),
+            std::slice::from_ref(&artifact),
+            1,
+            8,
+            4,
+            6,
+        );
+        assert_ne!(
+            key,
+            evidence_graph_image_key(
+                "other-source-graph",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &[artifact],
+                1,
+                8,
+                4,
+                6,
+            )
+        );
+    }
+
+    #[test]
     fn snapshot_key_covers_workspace_range_target_digest_and_review_version() {
         let input = SnapshotKeyInput {
             graph_image_id: "graph",
@@ -2274,6 +2411,8 @@ mod tests {
             dependency_mode: DependencyMode::Boundary,
             dirty_digest: "dirty",
             review_id: "review",
+            source_snapshot_id: None,
+            evidence_manifest_digest: None,
         };
         let key = snapshot_key(&input, 6, 2);
         for changed in [
@@ -2899,6 +3038,7 @@ mod tests {
                 head_ref: "feature".into(),
                 target: SnapshotTarget::Commit,
                 dependency_mode: DependencyMode::Boundary,
+                evidence_manifest: None,
             },
             &AtomicBool::new(false),
         )
@@ -2939,6 +3079,7 @@ mod tests {
                 head_ref: "HEAD~1".into(),
                 target: SnapshotTarget::Index,
                 dependency_mode: DependencyMode::Boundary,
+                evidence_manifest: None,
             },
             &AtomicBool::new(false),
         )
@@ -2976,6 +3117,7 @@ mod tests {
                     head_ref: "HEAD".into(),
                     target: SnapshotTarget::Commit,
                     dependency_mode: DependencyMode::Boundary,
+                    evidence_manifest: None,
                 },
                 &AtomicBool::new(false),
             )
@@ -3185,6 +3327,7 @@ mod tests {
                 head_ref: head.into(),
                 target: SnapshotTarget::Commit,
                 dependency_mode: DependencyMode::Boundary,
+                evidence_manifest: None,
             },
             &AtomicBool::new(false),
         )

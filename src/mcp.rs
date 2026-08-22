@@ -53,6 +53,9 @@ struct IndexParams {
     head: String,
     target: SnapshotTarget,
     dependency_mode: DependencyMode,
+    #[serde(default)]
+    #[schemars(length(min = 1, max = 1024))]
+    evidence_manifest: Option<PathBuf>,
 }
 
 #[derive(Clone, Deserialize, rmcp::schemars::JsonSchema)]
@@ -291,6 +294,7 @@ fn queue_index(
             head_ref: params.head,
             target: params.target,
             dependency_mode: params.dependency_mode,
+            evidence_manifest: params.evidence_manifest,
         },
         cancelled,
     )?;
@@ -519,6 +523,27 @@ mod tests {
     }
 
     #[test]
+    fn index_schema_includes_evidence_manifest() {
+        let tools = Graphr::tool_router().list_all();
+        let index = tools.iter().find(|tool| tool.name == "index").unwrap();
+        let property = &index.input_schema["properties"]["evidence_manifest"];
+        assert!(
+            property["type"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "string")
+        );
+        assert!(
+            !index.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "evidence_manifest")
+        );
+    }
+
+    #[test]
     fn tool_and_server_guidance_requires_the_explicit_snapshot_workflow() {
         let root = repository("guidance");
         let jobs = JobRegistry::new();
@@ -593,6 +618,7 @@ mod tests {
                 head: "HEAD".into(),
                 target: SnapshotTarget::Commit,
                 dependency_mode: DependencyMode::Boundary,
+                evidence_manifest: None,
             },
             &AtomicBool::new(false),
         )
@@ -711,6 +737,8 @@ mod tests {
             commits_base_to_head: 0,
             changed_files: 0,
             index_generation: 1,
+            source_snapshot_id: None,
+            evidence_manifest_digest: None,
         }
     }
 }

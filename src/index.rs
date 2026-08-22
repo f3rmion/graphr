@@ -10,6 +10,7 @@ use std::sync::{
 };
 use std::thread;
 
+use crate::evidence::{CapturedArtifact, CapturedEvidence, capture_manifest};
 use crate::git::{
     ArtifactReview, CapturedSource, ChangeStatus, ChangedPath, DependencyMode, Language,
     Repository, Source, SourceContent, SourceOmissionReason, SourceSnapshot, WorktreeChanges,
@@ -19,15 +20,17 @@ use crate::javascript::ScriptParsers;
 use crate::parse::{DefinitionKind, ParsedFile, RustParser};
 use crate::python::PythonParser;
 use crate::store::{
-    ChangeReview, CompletenessStatus, EdgeInput, EdgeKind, FileInput, GapCategory, GapInput,
-    GapReason, Graph, ModeledSiteInput, ModeledSiteKind, NodeInput, NodeKind, RefInput, RefKind,
-    ResolutionState, Store, TraitImplementationInput,
+    ArtifactRole, ChangeReview, CompletenessStatus, EdgeInput, EdgeKind, EvidenceInput,
+    EvidenceLineSpan, FileInput, GapCategory, GapInput, GapReason, Graph, ImportedArtifactInput,
+    MappingStatus, ModeledSiteInput, ModeledSiteKind, NodeInput, NodeKind, ProvenanceInput,
+    RefInput, RefKind, ResolutionState, Store, TraitImplementationInput,
 };
 use crate::workspace::{
     BuildProgress, BuildStage, CACHE_FORMAT_VERSION, ErrorCode, GRAPH_ANALYZER_VERSION,
     IndexCompletion, OperationError, Provenance, QueryOutput, REVIEW_FORMAT_VERSION,
     ResolvedIndexRequest, RootInspection, SnapshotCatalog, SnapshotEntry, SnapshotKeyInput,
-    SnapshotTarget, graph_image_key, selected_layers, snapshot_key, validate_entry_graph,
+    SnapshotTarget, evidence_graph_image_key, graph_image_key, selected_layers, snapshot_key,
+    validate_entry_graph,
 };
 
 const QUALIFIED_PATH_LIMIT: usize = 1024;
@@ -36,6 +39,7 @@ const INITIAL_FILES_BUDGET: usize = 1792;
 const INITIAL_DIFF_BUDGET: usize = 2432;
 const INITIAL_ARTIFACTS_BUDGET: usize = 1920;
 const INITIAL_GRAPH_BUDGET: usize = 1920;
+const INITIAL_EVIDENCE_BUDGET: usize = 1400;
 const SECTION_OVERHEAD: usize = 704;
 
 #[derive(
@@ -100,18 +104,40 @@ impl Engine {
         self.catalog.attach(&current, cancelled)?;
         let job = self.catalog.begin(&request.root)?;
         let repository = repository_from_identity(&request.root);
+        let manifest = request
+            .evidence_manifest
+            .as_deref()
+            .map(|path| capture_manifest(&request.root.worktree_root, path, cancelled))
+            .transpose()?;
+        let requested_artifact_paths = manifest.as_ref().map_or_else(BTreeSet::new, |manifest| {
+            manifest.requested_artifact_paths()
+        });
+        let evidence_only_paths = manifest
+            .as_ref()
+            .map_or_else(BTreeSet::new, |manifest| manifest.evidence_only_paths());
         let capture = repository.capture_snapshot(
             &request.base_oid,
             &request.head_oid,
             &request.target,
             request.dependency_mode,
+            &requested_artifact_paths,
+            &evidence_only_paths,
             job.capture_root(),
             cancelled,
         )?;
+        let evidence = manifest
+            .map(|manifest| {
+                manifest.capture(
+                    &request.root.worktree_root,
+                    &capture.requested_artifacts,
+                    cancelled,
+                )
+            })
+            .transpose()?;
         let total = capture.sources.files.len();
         report(BuildStage::Capturing, total, total, 0, 0, None);
 
-        let graph_image_id = graph_image_key(
+        let source_graph_image_id = graph_image_key(
             &request.root.repository_id,
             &capture.sources.files,
             &capture.sources.omissions,
@@ -126,6 +152,54 @@ impl Engine {
             )
         })?;
         let review_id = blake3::hash(&review_bytes).to_hex().to_string();
+        let source_snapshot_id = snapshot_key(
+            &SnapshotKeyInput {
+                graph_image_id: &source_graph_image_id,
+                workspace_id: &request.root.workspace_id,
+                base_oid: &request.base_oid,
+                head_oid: &request.head_oid,
+                target: &request.target,
+                dependency_mode: request.dependency_mode,
+                dirty_digest: &capture.dirty_digest,
+                review_id: &review_id,
+                source_snapshot_id: None,
+                evidence_manifest_digest: None,
+            },
+            CACHE_FORMAT_VERSION,
+            REVIEW_FORMAT_VERSION,
+        );
+        let source_entry = evidence
+            .as_ref()
+            .map(|evidence| {
+                validate_evidence_source(
+                    &self.catalog,
+                    &request,
+                    evidence,
+                    &source_snapshot_id,
+                    &source_graph_image_id,
+                )
+            })
+            .transpose()?;
+        let mut artifacts = evidence.as_ref().map(evidence_artifacts).transpose()?;
+        let manifest_digest = evidence.as_ref().map(|evidence| {
+            blake3::Hash::from_bytes(evidence.manifest.content_hash)
+                .to_hex()
+                .to_string()
+        });
+        let graph_image_id = match (&evidence, &artifacts, manifest_digest.as_deref()) {
+            (Some(evidence), Some(artifacts), Some(manifest_digest)) => evidence_graph_image_key(
+                &source_graph_image_id,
+                &evidence.source_snapshot_id,
+                manifest_digest,
+                artifacts,
+                1,
+                CACHE_FORMAT_VERSION,
+                GRAPH_ANALYZER_VERSION,
+                crate::store::SCHEMA_VERSION,
+            ),
+            (None, None, None) => source_graph_image_id.clone(),
+            _ => unreachable!("evidence identity fields are all optional together"),
+        };
         let snapshot_id = snapshot_key(
             &SnapshotKeyInput {
                 graph_image_id: &graph_image_id,
@@ -136,6 +210,10 @@ impl Engine {
                 dependency_mode: request.dependency_mode,
                 dirty_digest: &capture.dirty_digest,
                 review_id: &review_id,
+                source_snapshot_id: evidence
+                    .as_ref()
+                    .map(|evidence| evidence.source_snapshot_id.as_str()),
+                evidence_manifest_digest: manifest_digest.as_deref(),
             },
             CACHE_FORMAT_VERSION,
             REVIEW_FORMAT_VERSION,
@@ -159,6 +237,10 @@ impl Engine {
             commits_base_to_head: capture.commits_base_to_head,
             changed_files: capture.changed_files,
             index_generation: 0,
+            source_snapshot_id: evidence
+                .as_ref()
+                .map(|evidence| evidence.source_snapshot_id.clone()),
+            evidence_manifest_digest: manifest_digest,
         };
 
         let mut rejected_cache =
@@ -245,11 +327,20 @@ impl Engine {
                             .cmp(&right.provenance.snapshot_id)
                     })
             });
+            let candidates = source_entry.into_iter().chain(
+                evidence
+                    .is_none()
+                    .then_some(candidates)
+                    .into_iter()
+                    .flatten(),
+            );
+            let mut seeded = false;
             for candidate in candidates {
                 match validate_entry_graph(&candidate, cancelled)
                     .and_then(|_| job.copy_seed(&candidate, cancelled))
                 {
                     Ok(_) => {
+                        seeded = true;
                         break;
                     }
                     Err(error) if error.code == crate::workspace::ErrorCode::JobCancelled => {
@@ -273,30 +364,58 @@ impl Engine {
                     }
                 }
             }
+            if evidence.is_some() && !seeded {
+                return Err(OperationError::new(
+                    ErrorCode::CacheCorrupt,
+                    "verified source snapshot graph is unavailable",
+                ));
+            }
             report(BuildStage::Indexing, 0, total, 0, 0, rejected_cache.clone());
             let mut store = Store::open_private_image(job.graph_temp(), cancelled)
                 .map_err(index_operation_error)?;
-            let (_, _, stats) = store
-                .index_with(cancelled, |full, existing| {
-                    build_index(
-                        &repository,
-                        &capture.sources,
-                        cancelled,
-                        full,
-                        existing,
-                        |done, total, reused| {
-                            report(
-                                BuildStage::Indexing,
-                                done,
-                                total,
-                                reused,
-                                done.saturating_sub(reused),
-                                rejected_cache.clone(),
-                            );
-                        },
-                    )
-                })
+            let stats = if let Some(evidence) = &evidence {
+                let (generated_graph, evidence_input) = build_generated_evidence(
+                    &store,
+                    evidence,
+                    artifacts
+                        .take()
+                        .expect("captured evidence always has artifact identity"),
+                    cancelled,
+                )
                 .map_err(index_operation_error)?;
+                let evidence_stats = store
+                    .replace_evidence(generated_graph, &evidence_input, cancelled)
+                    .map_err(index_operation_error)?;
+                IndexStats {
+                    files_total: total + evidence_stats.generated_files,
+                    files_reused: total,
+                    files_parsed: evidence_stats.generated_files,
+                    files_skipped: capture.sources.files_skipped(),
+                }
+            } else {
+                store
+                    .index_with(cancelled, |full, existing| {
+                        build_index(
+                            &repository,
+                            &capture.sources,
+                            cancelled,
+                            full,
+                            existing,
+                            |done, total, reused| {
+                                report(
+                                    BuildStage::Indexing,
+                                    done,
+                                    total,
+                                    reused,
+                                    done.saturating_sub(reused),
+                                    rejected_cache.clone(),
+                                );
+                            },
+                        )
+                    })
+                    .map(|(_, _, stats)| stats)
+                    .map_err(index_operation_error)?
+            };
             report(
                 BuildStage::Indexing,
                 total,
@@ -349,7 +468,10 @@ impl Engine {
             graph_temp,
             exact.as_ref(),
             request.dependency_mode,
-            capture.no_change_reason,
+            evidence
+                .is_none()
+                .then_some(capture.no_change_reason)
+                .flatten(),
             provenance,
             cancelled,
         )?;
@@ -403,12 +525,22 @@ impl Engine {
             SnapshotTarget::Commit => &snapshot.provenance.head_oid,
             SnapshotTarget::Index | SnapshotTarget::Worktree { .. } => &identity.head_oid,
         };
+        let evidence_only_paths = if snapshot.provenance.evidence_manifest_digest.is_some() {
+            snapshot
+                .open_graph()
+                .and_then(|store| store.evidence_only_paths())
+                .map_err(query_operation_error)?
+        } else {
+            BTreeSet::new()
+        };
         let job = self.catalog.begin(&identity)?;
         let capture = repository.capture_snapshot(
             &snapshot.provenance.base_oid,
             inspected_head,
             &snapshot.provenance.target_state,
             snapshot.dependency_mode,
+            &BTreeSet::new(),
+            &evidence_only_paths,
             job.capture_root(),
             cancelled,
         )?;
@@ -644,6 +776,235 @@ fn same_workspace(
         && current.object_format == resolved.object_format
 }
 
+fn validate_evidence_source(
+    catalog: &SnapshotCatalog,
+    request: &ResolvedIndexRequest,
+    evidence: &CapturedEvidence,
+    source_snapshot_id: &str,
+    source_graph_image_id: &str,
+) -> Result<Arc<SnapshotEntry>, OperationError> {
+    if evidence.source_snapshot_id != source_snapshot_id {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "source snapshot mismatch",
+        ));
+    }
+    let entry = match catalog.get(source_snapshot_id) {
+        Ok(entry) => entry,
+        Err(error) if error.code == ErrorCode::SnapshotNotFound => {
+            return Err(OperationError::new(
+                ErrorCode::InvalidParameters,
+                "source snapshot mismatch",
+            ));
+        }
+        Err(error) if error.code == ErrorCode::CacheCorrupt => {
+            catalog.quarantine_graph(&request.root, source_graph_image_id, source_snapshot_id)?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    if entry.graph_image_id != source_graph_image_id
+        || entry.provenance.repository_id != request.root.repository_id
+        || entry.provenance.workspace_id != request.root.workspace_id
+        || entry.provenance.base_oid != request.base_oid
+        || entry.provenance.head_oid != request.head_oid
+        || entry.provenance.target_state != request.target
+        || entry.dependency_mode != request.dependency_mode
+        || entry.provenance.evidence_manifest_digest.is_some()
+    {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "source snapshot mismatch",
+        ));
+    }
+    Ok(entry)
+}
+
+fn evidence_artifacts(
+    evidence: &CapturedEvidence,
+) -> Result<Vec<ImportedArtifactInput>, OperationError> {
+    let mut artifacts = BTreeMap::<(ArtifactRole, String), ([u8; 32], u64)>::new();
+    let mut insert = |role, artifact: &CapturedArtifact| -> Result<(), OperationError> {
+        let size = u64::try_from(artifact.bytes.len()).map_err(|_| {
+            OperationError::new(
+                ErrorCode::InvalidParameters,
+                "evidence artifact size exceeds supported range",
+            )
+        })?;
+        match artifacts.entry((role, artifact.path.clone())) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((artifact.content_hash, size));
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if entry.get().0 == artifact.content_hash && entry.get().1 == size =>
+            {
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(OperationError::new(
+                ErrorCode::InvalidParameters,
+                "evidence artifact identity conflicts",
+            )),
+        }
+    };
+    insert(ArtifactRole::Manifest, &evidence.manifest)?;
+    for generated in &evidence.generated {
+        insert(ArtifactRole::Input, &generated.input.artifact)?;
+        insert(ArtifactRole::GeneratedRust, &generated.output.artifact)?;
+    }
+    for coverage in &evidence.coverage {
+        insert(ArtifactRole::CoverageReport, &coverage.report)?;
+    }
+    Ok(artifacts
+        .into_iter()
+        .map(
+            |((role, path), (content_hash, byte_size))| ImportedArtifactInput {
+                key: format!(
+                    "{}:{}:{}",
+                    role.db(),
+                    path,
+                    blake3::Hash::from_bytes(content_hash).to_hex()
+                ),
+                path,
+                role,
+                content_hash,
+                byte_size,
+            },
+        )
+        .collect())
+}
+
+fn build_generated_evidence(
+    store: &Store,
+    captured: &CapturedEvidence,
+    artifacts: Vec<ImportedArtifactInput>,
+    cancelled: &AtomicBool,
+) -> Result<(Graph, EvidenceInput), String> {
+    let mut graph = Graph::default();
+    let mut provenance = Vec::with_capacity(captured.generated.len());
+    let mut gaps = Vec::new();
+    let mut parsed_outputs = BTreeSet::new();
+    let mut parser = RustParser::new()?;
+    for generated in &captured.generated {
+        check_cancelled(cancelled)?;
+        let basename = Path::new(&generated.output.artifact.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "generated output basename is invalid".to_owned())?;
+        let candidates = store.generated_inclusion_candidates(basename)?;
+        let inclusion_site = if candidates.len() == 1 {
+            Some(candidates[0].locator.clone())
+        } else {
+            gaps.push(GapInput {
+                file_key: None,
+                source_key: None,
+                run_key: None,
+                path: Some(generated.output.artifact.path.clone()),
+                line_start: None,
+                line_end: None,
+                category: GapCategory::Generated,
+                reason: if candidates.is_empty() {
+                    GapReason::GeneratedOutputUnobserved
+                } else {
+                    GapReason::GeneratedOutputAmbiguous
+                },
+                target_hint: Some(basename.to_owned()),
+                occurrences: 1,
+                relation_site: false,
+            });
+            None
+        };
+        if let Some(candidate) = candidates.first().filter(|_| candidates.len() == 1)
+            && parsed_outputs.insert(generated.output.artifact.path.clone())
+        {
+            let text = std::str::from_utf8(&generated.output.artifact.bytes)
+                .map_err(|_| "generated Rust output is not valid UTF-8".to_owned())?;
+            let target = TargetPath::from_parse_context(&candidate.parse_context)?;
+            graph.files.push(FileInput {
+                path: generated.output.artifact.path.clone(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: generated.output.artifact.content_hash,
+                parse_context: candidate.parse_context.clone(),
+                byte_size: u64::try_from(generated.output.artifact.bytes.len())
+                    .map_err(|_| "generated Rust output size exceeds supported range".to_owned())?,
+                replace: true,
+                observed_relation_sites: 0,
+            });
+            add_rust_file(
+                &mut graph,
+                &Source {
+                    path: generated.output.artifact.path.clone(),
+                    text: text.to_owned(),
+                },
+                &target,
+                &mut parser,
+            )?;
+        }
+        let generator_lines = EvidenceLineSpan {
+            start: generated.generator.line_start,
+            end: generated.generator.line_end,
+        };
+        match store.generator_mapping(&generated.generator.path, generator_lines)? {
+            MappingStatus::Unique => provenance.push(ProvenanceInput {
+                input_key: captured_artifact_key(ArtifactRole::Input, &generated.input.artifact),
+                input_lines: EvidenceLineSpan {
+                    start: generated.input.line_start,
+                    end: generated.input.line_end,
+                },
+                generator_path: generated.generator.path.clone(),
+                generator_lines,
+                output_key: captured_artifact_key(
+                    ArtifactRole::GeneratedRust,
+                    &generated.output.artifact,
+                ),
+                output_lines: EvidenceLineSpan {
+                    start: generated.output.line_start,
+                    end: generated.output.line_end,
+                },
+                inclusion_site,
+            }),
+            status => gaps.push(GapInput {
+                file_key: None,
+                source_key: None,
+                run_key: None,
+                path: Some(generated.output.artifact.path.clone()),
+                line_start: Some(generated.generator.line_start),
+                line_end: Some(generated.generator.line_end),
+                category: GapCategory::Generated,
+                reason: if status == MappingStatus::Missing {
+                    GapReason::GeneratedOutputUnobserved
+                } else {
+                    GapReason::GeneratedOutputAmbiguous
+                },
+                target_hint: Some(generated.generator.path.clone()),
+                occurrences: 1,
+                relation_site: false,
+            }),
+        }
+    }
+    Ok((
+        graph,
+        EvidenceInput {
+            artifacts,
+            provenance,
+            runs: Vec::new(),
+            regions: Vec::new(),
+            branches: Vec::new(),
+            gaps,
+        },
+    ))
+}
+
+fn captured_artifact_key(role: ArtifactRole, artifact: &CapturedArtifact) -> String {
+    format!(
+        "{}:{}:{}",
+        role.db(),
+        artifact.path,
+        blake3::Hash::from_bytes(artifact.content_hash).to_hex()
+    )
+}
+
 fn repository_from_identity(root: &crate::workspace::RootIdentity) -> Repository {
     Repository {
         root: root.worktree_root.clone(),
@@ -808,6 +1169,7 @@ enum ReviewSection {
     Diff,
     Artifacts,
     Graph,
+    Evidence,
 }
 
 impl ReviewSection {
@@ -817,6 +1179,7 @@ impl ReviewSection {
             Self::Diff => 'd',
             Self::Artifacts => 'a',
             Self::Graph => 'g',
+            Self::Evidence => 'e',
         }
     }
 
@@ -826,6 +1189,7 @@ impl ReviewSection {
             Self::Diff => "diff",
             Self::Artifacts => "artifacts",
             Self::Graph => "graph",
+            Self::Evidence => "evidence",
         }
     }
 
@@ -835,6 +1199,7 @@ impl ReviewSection {
             Self::Diff => "diff_next_cursor",
             Self::Artifacts => "artifacts_next_cursor",
             Self::Graph => "graph_next_cursor",
+            Self::Evidence => "evidence_next_cursor",
         }
     }
 }
@@ -857,6 +1222,7 @@ struct ReviewSnapshot {
     artifacts: String,
     changes: Arc<WorktreeChanges>,
     graph: String,
+    evidence: String,
     checksum: String,
     file_ranges: Vec<Range<usize>>,
     hunk_ranges: Vec<Range<usize>>,
@@ -864,6 +1230,7 @@ struct ReviewSnapshot {
     artifact_record_ranges: Vec<Range<usize>>,
     artifact_hunk_ranges: Vec<Range<usize>>,
     graph_record_ranges: Vec<Range<usize>>,
+    evidence_record_ranges: Vec<Range<usize>>,
     flow_ranges: Vec<Range<usize>>,
     patch_totals: String,
     artifact_patch_totals: String,
@@ -913,6 +1280,7 @@ impl ReviewSnapshot {
         let artifact_hunk_ranges = hunk_ranges(&artifacts);
         let hunk_ranges = hunk_ranges(&changes.source_patch);
         let graph_record_ranges = line_ranges(&graph, None);
+        let evidence_record_ranges = line_ranges(&evidence, None);
         let flow_ranges = line_ranges(&graph, Some("flow "));
         let all_path_hunks = change_hunk_totals(
             &changes,
@@ -949,6 +1317,7 @@ impl ReviewSnapshot {
             artifacts,
             changes,
             graph,
+            evidence,
             checksum,
             file_ranges,
             hunk_ranges,
@@ -956,6 +1325,7 @@ impl ReviewSnapshot {
             artifact_record_ranges,
             artifact_hunk_ranges,
             graph_record_ranges,
+            evidence_record_ranges,
             flow_ranges,
             patch_totals,
             artifact_patch_totals,
@@ -973,6 +1343,7 @@ impl ReviewSnapshot {
             ReviewSection::Diff => &self.changes.source_patch,
             ReviewSection::Artifacts => &self.artifacts,
             ReviewSection::Graph => &self.graph,
+            ReviewSection::Evidence => &self.evidence,
         }
     }
 
@@ -982,6 +1353,7 @@ impl ReviewSnapshot {
             ReviewSection::Diff => &self.hunk_ranges,
             ReviewSection::Artifacts => &self.artifact_hunk_ranges,
             ReviewSection::Graph => &self.flow_ranges,
+            ReviewSection::Evidence => &self.evidence_record_ranges,
         }
     }
 }
@@ -1017,21 +1389,37 @@ struct Page<'a> {
 }
 
 fn review_context(snapshot: &ReviewSnapshot) -> Result<String, String> {
-    let (files, files_more) =
-        render_section_page(snapshot, ReviewSection::Files, 0, INITIAL_FILES_BUDGET)?;
-    let (diff, diff_more) =
-        render_section_page(snapshot, ReviewSection::Diff, 0, INITIAL_DIFF_BUDGET)?;
-    let (artifacts, artifacts_more) = render_section_page(
-        snapshot,
-        ReviewSection::Artifacts,
-        0,
-        INITIAL_ARTIFACTS_BUDGET,
-    )?;
+    let with_evidence = !snapshot.evidence.is_empty();
+    let budgets = if with_evidence {
+        (1200, 1800, 1200, 1600)
+    } else {
+        (
+            INITIAL_FILES_BUDGET,
+            INITIAL_DIFF_BUDGET,
+            INITIAL_ARTIFACTS_BUDGET,
+            INITIAL_GRAPH_BUDGET,
+        )
+    };
+    let (files, files_more) = render_section_page(snapshot, ReviewSection::Files, 0, budgets.0)?;
+    let (diff, diff_more) = render_section_page(snapshot, ReviewSection::Diff, 0, budgets.1)?;
+    let (artifacts, artifacts_more) =
+        render_section_page(snapshot, ReviewSection::Artifacts, 0, budgets.2)?;
     let (graph_page, graph_more) =
-        render_section_page(snapshot, ReviewSection::Graph, 0, INITIAL_GRAPH_BUDGET)?;
-    let _all_initial_pages_complete = !files_more && !diff_more && !artifacts_more && !graph_more;
+        render_section_page(snapshot, ReviewSection::Graph, 0, budgets.3)?;
+    let (evidence, evidence_more) = if with_evidence {
+        render_section_page(
+            snapshot,
+            ReviewSection::Evidence,
+            0,
+            INITIAL_EVIDENCE_BUDGET,
+        )?
+    } else {
+        (String::new(), false)
+    };
+    let _all_initial_pages_complete =
+        !files_more && !diff_more && !artifacts_more && !graph_more && !evidence_more;
     let output = format!(
-        "{files}{diff}{artifacts}{graph_page}{}",
+        "{files}{diff}{artifacts}{graph_page}{evidence}{}",
         terminal_status(snapshot),
     );
     if output.len() > REVIEW_CONTEXT_BUDGET {
@@ -1225,6 +1613,27 @@ fn render_section_page(
                 mapping_complete,
             ));
         }
+        ReviewSection::Evidence => {
+            let records = record_coverage(&snapshot.evidence_record_ranges, &page);
+            output.push_str(&format!(
+                "evidence emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} page_complete={}\n",
+                emitted_bytes,
+                value.len(),
+                page.start,
+                value.len() - page.end,
+                page.start,
+                page.end,
+                starts_mid_line,
+                ends_mid_line,
+                framing_suffix_bytes,
+                records.emitted,
+                records.partial,
+                records.total,
+                records.prior,
+                records.remaining,
+                !more,
+            ));
+        }
     }
     output.push_str(page.text);
     if !page.text.is_empty() && !page.text.ends_with('\n') {
@@ -1377,6 +1786,7 @@ fn parse_review_cursor(
         Some("d") => ReviewSection::Diff,
         Some("a") => ReviewSection::Artifacts,
         Some("g") => ReviewSection::Graph,
+        Some("e") => ReviewSection::Evidence,
         _ => return Err("invalid changes cursor".into()),
     };
     let raw_offset = parts
@@ -3453,6 +3863,180 @@ mod tests {
     }
 
     #[test]
+    fn generated_rust_uses_unique_include_context_and_resolves_calls() {
+        let cancelled = AtomicBool::new(false);
+        let source = Source {
+            path: "src/lib.rs".into(),
+            text: "fn predicate() -> bool { true }\nfn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n".into(),
+        };
+        let source_graph = build_graph(&[source], &cancelled).unwrap();
+        let fixture = std::env::temp_dir().join(format!(
+            "graphr-generated-evidence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        let mut store =
+            Store::open_private_image(&fixture.join("graph.sqlite"), &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((source_graph, ())))
+            .unwrap();
+        let input_bytes = b"field\n".to_vec();
+        let output_bytes = b"fn generated() -> bool { predicate() }\n".to_vec();
+        let evidence = CapturedEvidence {
+            source_snapshot_id: "a".repeat(64),
+            manifest: CapturedArtifact {
+                path: "evidence.json".into(),
+                content_hash: *blake3::hash(b"manifest").as_bytes(),
+                bytes: b"manifest".to_vec(),
+            },
+            generated: vec![crate::evidence::CapturedGenerated {
+                input: crate::evidence::CapturedArtifactSpan {
+                    artifact: CapturedArtifact {
+                        path: "schema.proto".into(),
+                        content_hash: *blake3::hash(&input_bytes).as_bytes(),
+                        bytes: input_bytes,
+                    },
+                    line_start: 1,
+                    line_end: 1,
+                },
+                generator: crate::evidence::SourceSpan {
+                    path: "src/lib.rs".into(),
+                    line_start: 2,
+                    line_end: 2,
+                },
+                output: crate::evidence::CapturedArtifactSpan {
+                    artifact: CapturedArtifact {
+                        path: "target/out.rs".into(),
+                        content_hash: *blake3::hash(&output_bytes).as_bytes(),
+                        bytes: output_bytes,
+                    },
+                    line_start: 1,
+                    line_end: 1,
+                },
+            }],
+            coverage: Vec::new(),
+        };
+        let artifacts = evidence_artifacts(&evidence).unwrap();
+
+        let (generated, input) =
+            build_generated_evidence(&store, &evidence, artifacts, &cancelled).unwrap();
+        assert_eq!(generated.files[0].path, "target/out.rs");
+        assert!(generated.refs.iter().any(|reference| {
+            reference
+                .keys
+                .iter()
+                .any(|key| key == "rust:function:predicate")
+        }));
+        assert_eq!(input.provenance.len(), 1);
+        assert!(input.provenance[0].inclusion_site.is_some());
+        let stats = store
+            .replace_evidence(generated, &input, &cancelled)
+            .unwrap();
+        assert_eq!(stats.generated_files, 1);
+        assert_eq!(stats.provenance_links, 1);
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn generated_rust_skips_zero_multiple_and_unmapped_contexts() {
+        let cases = [
+            (
+                "fn generate() {}\n",
+                1,
+                GapReason::GeneratedOutputUnobserved,
+                1,
+            ),
+            (
+                "fn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\nfn other() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n",
+                1,
+                GapReason::GeneratedOutputAmbiguous,
+                1,
+            ),
+            (
+                "fn generate() {}\n",
+                99,
+                GapReason::GeneratedOutputUnobserved,
+                0,
+            ),
+        ];
+        for (ordinal, (source_text, generator_line, reason, provenance_count)) in
+            cases.into_iter().enumerate()
+        {
+            let cancelled = AtomicBool::new(false);
+            let source_graph = build_graph(
+                &[Source {
+                    path: "src/lib.rs".into(),
+                    text: source_text.into(),
+                }],
+                &cancelled,
+            )
+            .unwrap();
+            let fixture = std::env::temp_dir().join(format!(
+                "graphr-generated-context-{}-{ordinal}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&fixture).unwrap();
+            let mut store =
+                Store::open_private_image(&fixture.join("graph.sqlite"), &cancelled).unwrap();
+            store
+                .index_with(&cancelled, |_full, _existing| Ok((source_graph, ())))
+                .unwrap();
+            let input = b"field\n".to_vec();
+            let output = b"fn generated() {}\n".to_vec();
+            let captured = CapturedEvidence {
+                source_snapshot_id: "a".repeat(64),
+                manifest: CapturedArtifact {
+                    path: "evidence.json".into(),
+                    content_hash: *blake3::hash(b"manifest").as_bytes(),
+                    bytes: b"manifest".to_vec(),
+                },
+                generated: vec![crate::evidence::CapturedGenerated {
+                    input: crate::evidence::CapturedArtifactSpan {
+                        artifact: CapturedArtifact {
+                            path: "schema.proto".into(),
+                            content_hash: *blake3::hash(&input).as_bytes(),
+                            bytes: input,
+                        },
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                    generator: crate::evidence::SourceSpan {
+                        path: "src/lib.rs".into(),
+                        line_start: generator_line,
+                        line_end: generator_line,
+                    },
+                    output: crate::evidence::CapturedArtifactSpan {
+                        artifact: CapturedArtifact {
+                            path: "target/out.rs".into(),
+                            content_hash: *blake3::hash(&output).as_bytes(),
+                            bytes: output,
+                        },
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                }],
+                coverage: Vec::new(),
+            };
+            let artifacts = evidence_artifacts(&captured).unwrap();
+            let (graph, evidence) =
+                build_generated_evidence(&store, &captured, artifacts, &cancelled).unwrap();
+
+            assert!(graph.files.is_empty());
+            assert_eq!(evidence.provenance.len(), provenance_count);
+            assert!(evidence.gaps.iter().any(|gap| gap.reason == reason));
+            fs::remove_dir_all(fixture).unwrap();
+        }
+    }
+
+    #[test]
     fn review_status_fields_are_typed_and_independent_from_pagination() {
         let snapshot = ReviewSnapshot::new(
             REVIEW_SNAPSHOT_ID,
@@ -4227,6 +4811,167 @@ fn run() {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn evidence_source_snapshot_mismatch_is_fatal() {
+        let root = snapshot_repository("evidence-source-mismatch");
+        fs::write(root.join("schema.proto"), "message Input {}\n").unwrap();
+        test_git(&root, &["add", "--", "schema.proto"]);
+        test_git(&root, &["commit", "--quiet", "-m", "schema"]);
+        let head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        let source = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &head, &head),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        fs::write(root.join("out.rs"), "pub fn generated() {}\n").unwrap();
+        let input = fs::read(root.join("schema.proto")).unwrap();
+        let output = fs::read(root.join("out.rs")).unwrap();
+        fs::write(
+            root.join("evidence.json"),
+            format!(
+                "{{\"format_version\":1,\"source_snapshot_id\":\"{}\",\"generated\":[{{\"input\":{{\"path\":\"schema.proto\",\"blake3\":\"{}\",\"line_start\":1,\"line_end\":1}},\"generator\":{{\"path\":\"src/a.rs\",\"line_start\":1,\"line_end\":1}},\"output\":{{\"path\":\"out.rs\",\"blake3\":\"{}\",\"line_start\":1,\"line_end\":1}}}}],\"coverage\":[]}}",
+                "f".repeat(64),
+                blake3::hash(&input).to_hex(),
+                blake3::hash(&output).to_hex(),
+            ),
+        )
+        .unwrap();
+        let mut request = snapshot_request(&engine, &root, &head, &head);
+        request.evidence_manifest = Some("evidence.json".into());
+
+        let error = engine
+            .build_snapshot(request, &AtomicBool::new(false), |_| {})
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidParameters);
+        assert_eq!(error.message, "source snapshot mismatch");
+        assert!(engine.snapshot(&source.snapshot_id).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn evidence_cache_builds_generated_provenance_and_reuses_exact_image() {
+        let root = snapshot_repository("evidence-cache");
+        fs::write(
+            root.join("src/a.rs"),
+            "fn predicate() -> bool { true }\nfn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n",
+        )
+        .unwrap();
+        fs::write(root.join("schema.proto"), "message Input {}\n").unwrap();
+        test_git(&root, &["add", "--", "src/a.rs", "schema.proto"]);
+        test_git(&root, &["commit", "--quiet", "-m", "generator source"]);
+        let head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        let source = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &head, &head),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(
+            root.join("target/out.rs"),
+            "fn generated() -> bool { predicate() }\n",
+        )
+        .unwrap();
+        let input = fs::read(root.join("schema.proto")).unwrap();
+        let output = fs::read(root.join("target/out.rs")).unwrap();
+        fs::write(
+            root.join("evidence.json"),
+            format!(
+                "{{\"format_version\":1,\"source_snapshot_id\":\"{}\",\"generated\":[{{\"input\":{{\"path\":\"schema.proto\",\"blake3\":\"{}\",\"line_start\":1,\"line_end\":1}},\"generator\":{{\"path\":\"src/a.rs\",\"line_start\":2,\"line_end\":2}},\"output\":{{\"path\":\"target/out.rs\",\"blake3\":\"{}\",\"line_start\":1,\"line_end\":1}}}}],\"coverage\":[]}}",
+                source.snapshot_id,
+                blake3::hash(&input).to_hex(),
+                blake3::hash(&output).to_hex(),
+            ),
+        )
+        .unwrap();
+        let mut request = snapshot_request(&engine, &root, &head, &head);
+        request.evidence_manifest = Some("evidence.json".into());
+
+        let first = engine
+            .build_snapshot(request.clone(), &AtomicBool::new(false), |_| {})
+            .unwrap();
+        let repeat = engine
+            .build_snapshot(request.clone(), &AtomicBool::new(false), |_| {})
+            .unwrap();
+
+        assert_ne!(first.graph_image_id, source.graph_image_id);
+        assert_eq!(repeat.graph_image_id, first.graph_image_id);
+        assert_eq!(
+            first.provenance.source_snapshot_id.as_deref(),
+            Some(source.snapshot_id.as_str())
+        );
+        assert!(first.provenance.evidence_manifest_digest.is_some());
+        assert_eq!(first.stats.files_parsed, 1);
+        assert_eq!(repeat.stats.files_parsed, 0);
+        let generated = engine
+            .search(&first.snapshot_id, "generated", None, 5)
+            .unwrap();
+        assert!(generated.text.contains("generated"), "{}", generated.text);
+        let review = engine
+            .changes(&first.snapshot_id, 0, 10, None, &AtomicBool::new(false))
+            .unwrap();
+        assert!(review.text.contains("basis=verified-generated-manifest"));
+        assert!(review.text.contains("dynamic_evidence_status=complete"));
+
+        let cancelled = AtomicBool::new(false);
+        let error = engine
+            .build_snapshot(request.clone(), &cancelled, |progress| {
+                if progress.stage == BuildStage::SelectingSeed {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::JobCancelled);
+        assert!(engine.snapshot(&first.snapshot_id).is_ok());
+
+        let source_graph = engine
+            .snapshot(&source.snapshot_id)
+            .unwrap()
+            .graph_path
+            .clone();
+        fs::set_permissions(
+            &source_graph,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        fs::write(&source_graph, b"corrupt source seed").unwrap();
+        fs::write(
+            root.join("target/out.rs"),
+            "fn generated_changed() -> bool { predicate() }\n",
+        )
+        .unwrap();
+        let mut manifest: rmcp::serde_json::Value =
+            rmcp::serde_json::from_slice(&fs::read(root.join("evidence.json")).unwrap()).unwrap();
+        manifest["generated"][0]["output"]["blake3"] =
+            blake3::hash(&fs::read(root.join("target/out.rs")).unwrap())
+                .to_hex()
+                .to_string()
+                .into();
+        fs::write(
+            root.join("evidence.json"),
+            rmcp::serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = engine
+            .build_snapshot(request, &AtomicBool::new(false), |_| {})
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::CacheCorrupt, "{error:?}");
+        assert!(engine.snapshot(&first.snapshot_id).is_ok());
+        assert!(
+            fs::read_dir(root.join(".git/graphr/v6/quarantine"))
+                .unwrap()
+                .next()
+                .is_some()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn snapshot_repository(label: &str) -> PathBuf {
         let root = fs::canonicalize(std::env::temp_dir())
             .unwrap_or_else(|_| std::env::temp_dir())
@@ -4263,6 +5008,7 @@ fn run() {
                 head_ref: head.into(),
                 target: SnapshotTarget::Commit,
                 dependency_mode: DependencyMode::Boundary,
+                evidence_manifest: None,
             },
             &AtomicBool::new(false),
         )

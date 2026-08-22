@@ -1,4 +1,5 @@
 mod artifact;
+mod evidence;
 mod git;
 mod index;
 mod javascript;
@@ -12,6 +13,8 @@ pub mod workspace;
 
 use std::env;
 use std::ffi::OsString;
+#[cfg(test)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, atomic::AtomicBool};
@@ -22,7 +25,7 @@ use workspace::{AllowedRoots, IndexRequest, SnapshotTarget, resolve_request};
 
 const USAGE: &str = "Usage:
   graphr serve --allow-root PATH [--allow-root PATH ...]
-  graphr index --worktree-root PATH --base REF --head REF --target commit|index|worktree [--include-untracked] [--dependency-mode boundary|full]
+  graphr index --worktree-root PATH --base REF --head REF --target commit|index|worktree [--include-untracked] [--dependency-mode boundary|full] [--evidence-manifest RELATIVE_PATH]
   graphr --version";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -34,6 +37,7 @@ enum Action {
         head: String,
         target: SnapshotTarget,
         dependency_mode: DependencyMode,
+        evidence_manifest: Option<PathBuf>,
     },
     Serve {
         allowed_roots: Vec<PathBuf>,
@@ -61,7 +65,15 @@ async fn main() -> ExitCode {
             head,
             target,
             dependency_mode,
-        } => run_index(worktree_root, base, head, target, dependency_mode),
+            evidence_manifest,
+        } => run_index(
+            worktree_root,
+            base,
+            head,
+            target,
+            dependency_mode,
+            evidence_manifest,
+        ),
         Action::Serve { allowed_roots } => serve(allowed_roots).await,
     };
 
@@ -85,6 +97,7 @@ fn run_index(
     head: String,
     target: SnapshotTarget,
     dependency_mode: DependencyMode,
+    evidence_manifest: Option<PathBuf>,
 ) -> Result<String, String> {
     let cancelled = AtomicBool::new(false);
     let roots = Arc::new(AllowedRoots::new(vec![worktree_root.clone()]).map_err(operation_error)?);
@@ -97,6 +110,7 @@ fn run_index(
             head_ref: head,
             target,
             dependency_mode,
+            evidence_manifest,
         },
         &cancelled,
     )
@@ -143,6 +157,7 @@ fn parse_index(mut args: impl Iterator<Item = OsString>) -> Result<Action, &'sta
     let mut head = None;
     let mut target = None;
     let mut dependency_mode = None;
+    let mut evidence_manifest = None;
     let mut include_untracked = false;
     while let Some(option) = args.next() {
         match option.to_str() {
@@ -174,6 +189,11 @@ fn parse_index(mut args: impl Iterator<Item = OsString>) -> Result<Action, &'sta
                 )?)?)?,
                 "duplicate --dependency-mode",
             )?,
+            Some("--evidence-manifest") => set_once(
+                &mut evidence_manifest,
+                parse_evidence_path(next_value(&mut args, "missing --evidence-manifest value")?)?,
+                "duplicate --evidence-manifest",
+            )?,
             Some("--include-untracked") if !include_untracked => include_untracked = true,
             Some("--include-untracked") => return Err("duplicate --include-untracked"),
             _ => return Err("invalid index option"),
@@ -192,6 +212,7 @@ fn parse_index(mut args: impl Iterator<Item = OsString>) -> Result<Action, &'sta
         head: head.ok_or("missing --head")?,
         target,
         dependency_mode: dependency_mode.unwrap_or_default(),
+        evidence_manifest,
     })
 }
 
@@ -254,6 +275,25 @@ fn parse_dependency_mode(value: &str) -> Result<DependencyMode, &'static str> {
     }
 }
 
+fn parse_evidence_path(value: OsString) -> Result<PathBuf, &'static str> {
+    let value = utf8(value)?;
+    if value.is_empty()
+        || value.len() > 1024
+        || value.chars().any(char::is_control)
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return Err("--evidence-manifest must be a safe relative path");
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Err("--evidence-manifest must be a safe relative path")
+    } else {
+        Ok(path)
+    }
+}
+
 fn terminal_safe(value: &str) -> String {
     value
         .chars()
@@ -302,5 +342,72 @@ mod tests {
         ));
         assert!(parse_args(["serve".into()]).is_err());
         assert!(parse_args(["serve".into(), "repo".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_evidence_manifest() {
+        let action = parse_args([
+            "index".into(),
+            "--worktree-root".into(),
+            "/repo".into(),
+            "--base".into(),
+            "main".into(),
+            "--head".into(),
+            "HEAD".into(),
+            "--target".into(),
+            "worktree".into(),
+            "--evidence-manifest".into(),
+            "target/evidence.json".into(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            action,
+            Action::Index {
+                evidence_manifest: Some(path),
+                ..
+            } if path == Path::new("target/evidence.json")
+        ));
+
+        for path in [
+            "/tmp/evidence.json",
+            "../evidence.json",
+            "target//evidence.json",
+        ] {
+            assert!(
+                parse_args([
+                    "index".into(),
+                    "--worktree-root".into(),
+                    "/repo".into(),
+                    "--base".into(),
+                    "main".into(),
+                    "--head".into(),
+                    "HEAD".into(),
+                    "--target".into(),
+                    "worktree".into(),
+                    "--evidence-manifest".into(),
+                    path.into(),
+                ])
+                .is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            parse_args([
+                "index".into(),
+                "--worktree-root".into(),
+                "/repo".into(),
+                "--base".into(),
+                "main".into(),
+                "--head".into(),
+                "HEAD".into(),
+                "--target".into(),
+                "worktree".into(),
+                "--evidence-manifest".into(),
+                "one.json".into(),
+                "--evidence-manifest".into(),
+                "two.json".into(),
+            ])
+            .is_err()
+        );
     }
 }

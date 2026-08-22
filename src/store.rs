@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -10,12 +10,13 @@ use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
+use crate::evidence::CoverageFormat;
 use crate::git::{
     ChangedFile, DependencyMode, Language, LineSpan, PathRecord, WorktreeChanges,
     change_content_complete, dependency_package,
 };
 
-pub(crate) const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 6;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
@@ -354,6 +355,157 @@ pub struct EdgeInput {
     pub support_count: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ArtifactRole {
+    Manifest,
+    Input,
+    GeneratedRust,
+    CoverageReport,
+}
+
+impl ArtifactRole {
+    pub const fn db(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Input => "input",
+            Self::GeneratedRust => "generated-rust",
+            Self::CoverageReport => "coverage-report",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "manifest" => Some(Self::Manifest),
+            "input" => Some(Self::Input),
+            "generated-rust" => Some(Self::GeneratedRust),
+            "coverage-report" => Some(Self::CoverageReport),
+            _ => None,
+        }
+    }
+}
+
+pub struct ImportedArtifactInput {
+    pub key: String,
+    pub path: String,
+    pub role: ArtifactRole,
+    pub content_hash: [u8; 32],
+    pub byte_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverageBranchKind {
+    TrueOutcome,
+    FalseOutcome,
+    Arc,
+}
+
+impl CoverageBranchKind {
+    const fn db(self) -> &'static str {
+        match self {
+            Self::TrueOutcome => "true-outcome",
+            Self::FalseOutcome => "false-outcome",
+            Self::Arc => "arc",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "true-outcome" => Some(Self::TrueOutcome),
+            "false-outcome" => Some(Self::FalseOutcome),
+            "arc" => Some(Self::Arc),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvidenceLineSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModeledSiteLocator {
+    pub path: String,
+    pub line: u32,
+    pub kind: ModeledSiteKind,
+    pub target_hint: Option<String>,
+}
+
+pub struct GeneratedInclusionCandidate {
+    pub locator: ModeledSiteLocator,
+    pub parse_context: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MappingStatus {
+    Unique,
+    Missing,
+    Ambiguous,
+}
+
+pub struct ProvenanceInput {
+    pub input_key: String,
+    pub input_lines: EvidenceLineSpan,
+    pub generator_path: String,
+    pub generator_lines: EvidenceLineSpan,
+    pub output_key: String,
+    pub output_lines: EvidenceLineSpan,
+    pub inclusion_site: Option<ModeledSiteLocator>,
+}
+
+pub struct CoverageRunInput {
+    pub key: String,
+    pub format: CoverageFormat,
+    pub report_key: String,
+    pub run_label: String,
+    pub test_name: Option<String>,
+}
+
+pub struct CoverageRegionInput {
+    pub run_key: String,
+    pub path: Option<String>,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub execution_count: u64,
+    pub context: Option<String>,
+}
+
+pub struct CoverageBranchInput {
+    pub run_key: String,
+    pub path: Option<String>,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub target_line: Option<u32>,
+    pub kind: CoverageBranchKind,
+    pub execution_count: u64,
+}
+
+#[derive(Default)]
+pub struct EvidenceInput {
+    pub artifacts: Vec<ImportedArtifactInput>,
+    pub provenance: Vec<ProvenanceInput>,
+    pub runs: Vec<CoverageRunInput>,
+    pub regions: Vec<CoverageRegionInput>,
+    pub branches: Vec<CoverageBranchInput>,
+    pub gaps: Vec<GapInput>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvidenceStats {
+    pub generated_files: usize,
+    pub artifacts: usize,
+    pub provenance_links: usize,
+    pub runs: usize,
+    pub regions: usize,
+    pub branches: usize,
+    pub gaps: usize,
+}
+
 #[derive(Default)]
 pub struct Graph {
     pub files: Vec<FileInput>,
@@ -474,6 +626,7 @@ impl Store {
         }
         let state = read_state_cancelled(&self.connection, cancelled)?;
         require_graph_invariants(&self.connection, cancelled)?;
+        require_evidence_invariants(&self.connection, cancelled)?;
         let (busy, _, _): (i64, i64, i64) = retry_sqlite(cancelled, || {
             self.connection
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
@@ -567,6 +720,149 @@ impl Store {
         check_cancelled(cancelled)?;
         tx.commit().map_err(db_error)?;
         Ok((state, changed, value))
+    }
+
+    pub fn replace_evidence(
+        &mut self,
+        mut generated_graph: Graph,
+        evidence: &EvidenceInput,
+        cancelled: &AtomicBool,
+    ) -> Result<EvidenceStats> {
+        let tx = begin_immediate(&self.connection, cancelled)?;
+        check_cancelled(cancelled)?;
+        let version: i64 = tx
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(db_error)?;
+        if version != SCHEMA_VERSION {
+            return Err("database schema mismatch".into());
+        }
+        read_state(&tx)?;
+        let existing = load_stored_files(&tx)?;
+        generated_graph
+            .gaps
+            .extend(load_source_global_gaps(&tx, cancelled)?);
+        let old_generated = tx
+            .prepare(
+                "SELECT path FROM imported_artifacts WHERE role='generated-rust' ORDER BY path",
+            )
+            .map_err(db_error)?
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<HashSet<_>>>()
+            .map_err(db_error)?;
+        let new_generated = generated_graph
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<HashSet<_>>();
+        let generated_file_count = new_generated.len();
+        if new_generated.len() != generated_graph.files.len()
+            || new_generated
+                .iter()
+                .any(|path| existing.contains_key(path) && !old_generated.contains(path))
+        {
+            return Err("generated output conflicts with a source file".into());
+        }
+        for (path, file) in &existing {
+            if old_generated.contains(path) || new_generated.contains(path) {
+                continue;
+            }
+            generated_graph.files.push(FileInput {
+                path: path.clone(),
+                language: file.language,
+                git_oid: file.git_oid.clone(),
+                content_hash: file.content_hash,
+                parse_context: file.parse_context.clone(),
+                byte_size: file.byte_size,
+                replace: false,
+                observed_relation_sites: file.observed_relation_sites,
+            });
+        }
+        generated_graph
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        apply_incremental(&tx, &generated_graph, &existing, cancelled)?;
+
+        tx.execute("DELETE FROM imported_artifacts", [])
+            .map_err(db_error)?;
+        let stats = insert_evidence(&tx, evidence, generated_file_count, cancelled)?;
+        require_graph_invariants(&tx, cancelled)?;
+        require_evidence_invariants(&tx, cancelled)?;
+        tx.execute(
+            "UPDATE state SET generation=generation+1 WHERE singleton=1",
+            [],
+        )
+        .map_err(db_error)?;
+        check_cancelled(cancelled)?;
+        tx.commit().map_err(db_error)?;
+        Ok(stats)
+    }
+
+    pub fn generated_inclusion_candidates(
+        &self,
+        output_basename: &str,
+    ) -> Result<Vec<GeneratedInclusionCandidate>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT f.path, m.line_start, m.target_hint, m.parse_context
+                   FROM modeled_sites m JOIN files f ON f.id=m.file_id
+                  WHERE m.kind='generated-inclusion' AND m.target_hint=?1
+                    AND m.parse_context IS NOT NULL
+                  ORDER BY f.path, m.line_start, m.id LIMIT 2",
+            )
+            .map_err(db_error)?;
+        statement
+            .query_map([output_basename], |row| {
+                Ok(GeneratedInclusionCandidate {
+                    locator: ModeledSiteLocator {
+                        path: row.get(0)?,
+                        line: row.get(1)?,
+                        kind: ModeledSiteKind::GeneratedInclusion,
+                        target_hint: row.get(2)?,
+                    },
+                    parse_context: row.get(3)?,
+                })
+            })
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)
+    }
+
+    pub fn generator_mapping(&self, path: &str, span: EvidenceLineSpan) -> Result<MappingStatus> {
+        validate_evidence_span(span)?;
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT count(*) FROM (
+                     SELECT n.id FROM files f JOIN nodes n ON n.file_id=f.id
+                      WHERE f.path=?1 AND n.kind IN ('function','test')
+                        AND n.line_start<=?2 AND n.line_end>=?3
+                      ORDER BY n.id LIMIT 2
+                 )",
+                params![path, span.start, span.end],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        Ok(match count {
+            0 => MappingStatus::Missing,
+            1 => MappingStatus::Unique,
+            _ => MappingStatus::Ambiguous,
+        })
+    }
+
+    pub fn evidence_only_paths(&self) -> Result<BTreeSet<String>> {
+        self.connection
+            .prepare(
+                "SELECT path FROM imported_artifacts
+                  WHERE role IN ('manifest','generated-rust','coverage-report')
+                  ORDER BY path",
+            )
+            .map_err(db_error)?
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .map_err(db_error)
     }
 
     pub fn search(
@@ -678,6 +974,10 @@ impl Store {
                 break;
             }
         }
+        let evidence = render_evidence(&tx)?;
+        if !evidence.text.is_empty() {
+            lines.extend(evidence.text.split_inclusive('\n').map(str::to_owned));
+        }
         Ok(bounded(lines, VIEW_BUDGET, omitted))
     }
 
@@ -694,12 +994,13 @@ impl Store {
             return Err("invalid changes parameters".into());
         }
         check_cancelled(cancelled)?;
+        let evidence = render_evidence(&self.connection)?;
         if changes.is_empty() && changes.files.is_empty() && changes.records.is_empty() {
             return Ok(ChangeReview {
                 graph: "no changes\n".into(),
-                evidence: String::new(),
+                evidence: evidence.text,
                 static_status: CompletenessStatus::Complete,
-                dynamic_status: CompletenessStatus::NotApplicable,
+                dynamic_status: evidence.status,
             });
         }
         let deleted_paths_unanalyzed = changes
@@ -730,12 +1031,13 @@ impl Store {
                 content_complete,
                 true,
                 traversal_complete,
+                &evidence,
             ));
             return Ok(ChangeReview {
                 graph: output,
-                evidence: String::new(),
+                evidence: evidence.text,
                 static_status: accounting.overall(content_complete, true, traversal_complete),
-                dynamic_status: CompletenessStatus::NotApplicable,
+                dynamic_status: evidence.status,
             });
         }
         for file in &changes.files {
@@ -1007,6 +1309,7 @@ impl Store {
                 content_complete,
                 mapping_complete,
                 traversal_complete,
+                &evidence,
             ),
         );
         lines.insert(
@@ -1032,13 +1335,13 @@ impl Store {
         );
         Ok(ChangeReview {
             graph: lines.concat(),
-            evidence: String::new(),
+            evidence: evidence.text,
             static_status: accounting.overall(
                 content_complete,
                 mapping_complete,
                 traversal_complete,
             ),
-            dynamic_status: CompletenessStatus::NotApplicable,
+            dynamic_status: evidence.status,
         })
     }
 }
@@ -1072,6 +1375,7 @@ pub fn validate_image(path: &Path) -> Result<State> {
     let state = read_state(&connection)?;
     require_integrity(&connection)?;
     require_graph_invariants(&connection, &AtomicBool::new(false))?;
+    require_evidence_invariants(&connection, &AtomicBool::new(false))?;
     require_no_sidecars(path)?;
     Ok(state)
 }
@@ -1201,6 +1505,55 @@ fn require_graph_invariants(connection: &Connection, cancelled: &AtomicBool) -> 
         return Err(format!(
             "observed relation-site accounting mismatch for {path}"
         ));
+    }
+    check_cancelled(cancelled)
+}
+
+fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
+    check_cancelled(cancelled)?;
+    for role in distinct_text(connection, "SELECT DISTINCT role FROM imported_artifacts")? {
+        ArtifactRole::parse(&role).ok_or_else(|| "database artifact role is invalid".to_owned())?;
+    }
+    for format in distinct_text(connection, "SELECT DISTINCT format FROM coverage_runs")? {
+        match format.as_str() {
+            "llvm" | "coverage_py" => {}
+            _ => return Err("database coverage format is invalid".into()),
+        }
+    }
+    for kind in distinct_text(connection, "SELECT DISTINCT kind FROM coverage_branches")? {
+        CoverageBranchKind::parse(&kind)
+            .ok_or_else(|| "database coverage branch kind is invalid".to_owned())?;
+    }
+    let invalid: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM provenance_links p
+                 JOIN imported_artifacts input ON input.id=p.input_artifact_id
+                 JOIN imported_artifacts output ON output.id=p.output_artifact_id
+                 JOIN nodes generator ON generator.id=p.generator_node_id
+                 LEFT JOIN modeled_sites site ON site.id=p.modeled_site_id
+                 WHERE input.role!='input' OR output.role!='generated-rust'
+                    OR generator.file_id!=p.generator_file_id
+                    OR generator.kind NOT IN ('function','test')
+                    OR generator.line_start>p.generator_line_start
+                    OR generator.line_end<p.generator_line_end
+                    OR (site.id IS NOT NULL AND site.kind!='generated-inclusion')
+                 UNION ALL
+                 SELECT 1 FROM coverage_runs run
+                 JOIN imported_artifacts report ON report.id=run.report_artifact_id
+                 WHERE report.role!='coverage-report'
+                 UNION ALL
+                 SELECT 1 FROM files file JOIN imported_artifacts artifact
+                   ON artifact.role='generated-rust' AND artifact.path=file.path
+                 WHERE artifact.content_hash!=file.content_hash
+                    OR artifact.byte_size!=file.byte_size
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if invalid {
+        return Err("database evidence relationships are invalid".into());
     }
     check_cancelled(cancelled)
 }
@@ -2454,11 +2807,187 @@ fn static_accounting(
     Ok(accounting)
 }
 
+struct EvidenceReview {
+    text: String,
+    status: CompletenessStatus,
+    capture_status: &'static str,
+    provenance_status: &'static str,
+}
+
+fn render_evidence(connection: &Connection) -> Result<EvidenceReview> {
+    let manifest_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM imported_artifacts WHERE role='manifest'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if manifest_count == 0 {
+        return Ok(EvidenceReview {
+            text: String::new(),
+            status: CompletenessStatus::NotApplicable,
+            capture_status: "not-applicable",
+            provenance_status: "not-applicable",
+        });
+    }
+    if manifest_count != 1 {
+        return Err("database manifest evidence identity is invalid".into());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT output.path,
+                    input.path, p.input_line_start, p.input_line_end,
+                    generator_file.path, p.generator_line_start, p.generator_line_end,
+                    p.output_line_start, p.output_line_end,
+                    include_file.path, site.line_start
+               FROM imported_artifacts output
+               LEFT JOIN provenance_links p ON p.output_artifact_id=output.id
+               LEFT JOIN imported_artifacts input ON input.id=p.input_artifact_id
+               LEFT JOIN files generator_file ON generator_file.id=p.generator_file_id
+               LEFT JOIN modeled_sites site ON site.id=p.modeled_site_id
+               LEFT JOIN files include_file ON include_file.id=site.file_id
+              WHERE output.role='generated-rust'
+              ORDER BY output.path, p.id",
+        )
+        .map_err(db_error)?;
+    type ProvenanceRow = (
+        String,
+        Option<String>,
+        Option<u32>,
+        Option<u32>,
+        Option<String>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<String>,
+        Option<u32>,
+    );
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+            ))
+        })
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<ProvenanceRow>>>()
+        .map_err(db_error)?;
+    let output_count = rows
+        .iter()
+        .map(|row| row.0.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let complete_outputs = rows
+        .iter()
+        .filter(|row| row.1.is_some() && row.9.is_some())
+        .map(|row| row.0.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let provenance_complete = complete_outputs == output_count;
+    let mut text = format!(
+        "completeness evidence_capture=complete provenance_model={} execution_mapping=not-applicable\n",
+        if provenance_complete {
+            "complete"
+        } else {
+            "partial"
+        }
+    );
+    for row in rows {
+        let complete = row.1.is_some() && row.9.is_some();
+        text.push_str(&format!(
+            "claim kind=generated-provenance status={} result={} basis=verified-generated-manifest output={:?}\n",
+            if complete { "complete" } else { "partial" },
+            if complete { "linked" } else { "unknown" },
+            row.0,
+        ));
+        if let (
+            Some(input),
+            Some(input_start),
+            Some(input_end),
+            Some(generator),
+            Some(generator_start),
+            Some(generator_end),
+            Some(output_start),
+            Some(output_end),
+        ) = (row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8)
+        {
+            text.push_str(&format!(
+                "provenance input={:?} generator={:?} output={:?}\n",
+                format!("{input}:{input_start}-{input_end}"),
+                format!("{generator}:{generator_start}-{generator_end}"),
+                format!("{}:{output_start}-{output_end}", row.0),
+            ));
+        }
+        if let (Some(source), Some(line)) = (row.9, row.10) {
+            text.push_str(&format!(
+                "includes source={:?} output={:?}\n",
+                format!("{source}:{line}"),
+                row.0,
+            ));
+        }
+    }
+    let mut gaps = connection
+        .prepare(
+            "SELECT reason, path, line_start, line_end, occurrences
+               FROM graph_gaps WHERE category='generated'
+              ORDER BY path, line_start, line_end, reason, id",
+        )
+        .map_err(db_error)?;
+    let rows = gaps
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<u32>>(2)?,
+                row.get::<_, Option<u32>>(3)?,
+                row.get::<_, u32>(4)?,
+            ))
+        })
+        .map_err(db_error)?;
+    for row in rows {
+        let (reason, path, start, end, occurrences) = row.map_err(db_error)?;
+        let line = match (start, end) {
+            (Some(start), Some(end)) if start != end => format!("{start}-{end}"),
+            (Some(start), _) => start.to_string(),
+            _ => "none".into(),
+        };
+        text.push_str(&format!(
+            "gap category=generated reason={reason} path={:?} line={line} occurrences={occurrences}\n",
+            path.unwrap_or_default(),
+        ));
+    }
+    Ok(EvidenceReview {
+        text,
+        status: if provenance_complete {
+            CompletenessStatus::Complete
+        } else {
+            CompletenessStatus::Partial
+        },
+        capture_status: "complete",
+        provenance_status: if provenance_complete {
+            "complete"
+        } else {
+            "partial"
+        },
+    })
+}
+
 fn assurance_preamble(
     accounting: &StaticAccounting,
     content_complete: bool,
     mapping_complete: bool,
     traversal_complete: bool,
+    evidence: &EvidenceReview,
 ) -> String {
     let status = |complete| if complete { "complete" } else { "partial" };
     let static_status = accounting
@@ -2478,7 +3007,7 @@ fn assurance_preamble(
     }
     format!(
         "languages=rust,python,javascript,typescript\n\
-completeness content_capture={} source_capture={} syntax_parse={} site_classification=complete static_model={} evidence_capture=not-applicable provenance_model=not-applicable execution_mapping=not-applicable traversal={}\n\
+completeness content_capture={} source_capture={} syntax_parse={} site_classification=complete static_model={} evidence_capture={} provenance_model={} execution_mapping=not-applicable traversal={}\n\
 gaps total={} relevant={} by_reason={}\n\
 references missing={} ambiguous={}\n\
 claim kind=affected-callers status={static_status} basis=resolved-static-call-graph\n\
@@ -2488,6 +3017,8 @@ claim kind=static-test-paths status={static_status} basis=resolved-static-call-g
         status(accounting.source_complete),
         status(accounting.syntax_complete),
         status(accounting.static_model_complete && mapping_complete),
+        evidence.capture_status,
+        evidence.provenance_status,
         status(traversal_complete),
         accounting.total_gaps,
         accounting.relevant_gaps,
@@ -2780,6 +3311,58 @@ fn load_stored_files(connection: &Connection) -> Result<HashMap<String, StoredFi
     Ok(files)
 }
 
+fn load_source_global_gaps(
+    connection: &Connection,
+    cancelled: &AtomicBool,
+) -> Result<Vec<GapInput>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT path, line_start, line_end, category, reason, target_hint,
+                    occurrences, relation_site
+               FROM graph_gaps
+              WHERE file_id IS NULL AND source_id IS NULL AND run_id IS NULL
+                AND category NOT IN ('generated','coverage')
+              ORDER BY path, line_start, line_end, category, reason, target_hint, id",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<u32>>(1)?,
+                row.get::<_, Option<u32>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, bool>(7)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut gaps = Vec::new();
+    for row in rows {
+        check_cancelled(cancelled)?;
+        let (path, line_start, line_end, category, reason, target_hint, occurrences, relation_site) =
+            row.map_err(db_error)?;
+        gaps.push(GapInput {
+            file_key: None,
+            source_key: None,
+            run_key: None,
+            path,
+            line_start,
+            line_end,
+            category: GapCategory::parse(&category)
+                .ok_or_else(|| "database gap category is invalid".to_owned())?,
+            reason: GapReason::parse(&reason)
+                .ok_or_else(|| "database gap reason is invalid".to_owned())?,
+            target_hint,
+            occurrences,
+            relation_site,
+        });
+    }
+    Ok(gaps)
+}
+
 fn apply_incremental(
     tx: &Transaction<'_>,
     graph: &Graph,
@@ -3051,6 +3634,284 @@ fn apply_incremental(
 
 fn global_gap(gap: &GapInput) -> bool {
     gap.file_key.is_none() && gap.source_key.is_none() && gap.run_key.is_none()
+}
+
+fn insert_evidence(
+    tx: &Transaction<'_>,
+    evidence: &EvidenceInput,
+    generated_files: usize,
+    cancelled: &AtomicBool,
+) -> Result<EvidenceStats> {
+    let mut artifacts = HashMap::<String, (i64, ArtifactRole)>::new();
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO imported_artifacts(key, role, path, content_hash, byte_size)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(db_error)?;
+        for artifact in &evidence.artifacts {
+            check_cancelled(cancelled)?;
+            let byte_size = i64::try_from(artifact.byte_size)
+                .map_err(|_| "artifact size exceeds SQLite range".to_owned())?;
+            insert
+                .execute(params![
+                    artifact.key,
+                    artifact.role.db(),
+                    artifact.path,
+                    artifact.content_hash.as_slice(),
+                    byte_size
+                ])
+                .map_err(db_error)?;
+            if artifacts
+                .insert(
+                    artifact.key.clone(),
+                    (tx.last_insert_rowid(), artifact.role),
+                )
+                .is_some()
+            {
+                return Err("duplicate evidence artifact key".into());
+            }
+        }
+    }
+
+    let mut inserted_links = 0_usize;
+    for provenance in &evidence.provenance {
+        check_cancelled(cancelled)?;
+        validate_evidence_span(provenance.input_lines)?;
+        validate_evidence_span(provenance.generator_lines)?;
+        validate_evidence_span(provenance.output_lines)?;
+        let (input_id, input_role) = artifacts
+            .get(&provenance.input_key)
+            .copied()
+            .ok_or_else(|| "provenance references an unknown input artifact".to_owned())?;
+        let (output_id, output_role) = artifacts
+            .get(&provenance.output_key)
+            .copied()
+            .ok_or_else(|| "provenance references an unknown output artifact".to_owned())?;
+        if input_role != ArtifactRole::Input || output_role != ArtifactRole::GeneratedRust {
+            return Err("provenance artifact role is invalid".into());
+        }
+        let generator = tx
+            .prepare(
+                "SELECT f.id, n.id FROM files f JOIN nodes n ON n.file_id=f.id
+                  WHERE f.path=?1 AND n.kind IN ('function','test')
+                    AND n.line_start<=?2 AND n.line_end>=?3
+                  ORDER BY n.id LIMIT 2",
+            )
+            .map_err(db_error)?
+            .query_map(
+                params![
+                    provenance.generator_path,
+                    provenance.generator_lines.start,
+                    provenance.generator_lines.end
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        if generator.len() != 1 {
+            return Err("provenance generator span is not uniquely mapped".into());
+        }
+        let (generator_file_id, generator_node_id) = generator[0];
+        let modeled_site_id = if let Some(site) = &provenance.inclusion_site {
+            let candidates = tx
+                .prepare(
+                    "SELECT m.id FROM modeled_sites m JOIN files f ON f.id=m.file_id
+                      WHERE f.path=?1 AND m.kind=?2
+                        AND m.line_start<=?3 AND m.line_end>=?3
+                        AND ifnull(m.target_hint,'')=ifnull(?4,'')
+                      ORDER BY m.id LIMIT 2",
+                )
+                .map_err(db_error)?
+                .query_map(
+                    params![site.path, site.kind.db(), site.line, site.target_hint],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(db_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(db_error)?;
+            if candidates.len() != 1 {
+                return Err("provenance inclusion site is not uniquely mapped".into());
+            }
+            let site_id = candidates[0];
+            tx.execute(
+                "DELETE FROM graph_gaps
+                  WHERE reason='generated-output-unobserved'
+                    AND file_id=(SELECT file_id FROM modeled_sites WHERE id=?1)
+                    AND line_start=(SELECT line_start FROM modeled_sites WHERE id=?1)
+                    AND line_end=(SELECT line_end FROM modeled_sites WHERE id=?1)
+                    AND ifnull(target_hint,'')=ifnull(
+                        (SELECT target_hint FROM modeled_sites WHERE id=?1), '')",
+                [site_id],
+            )
+            .map_err(db_error)?;
+            Some(site_id)
+        } else {
+            None
+        };
+        tx.execute(
+            "INSERT INTO provenance_links(
+                input_artifact_id, input_line_start, input_line_end,
+                generator_file_id, generator_node_id, generator_line_start, generator_line_end,
+                output_artifact_id, output_line_start, output_line_end, modeled_site_id
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                input_id,
+                provenance.input_lines.start,
+                provenance.input_lines.end,
+                generator_file_id,
+                generator_node_id,
+                provenance.generator_lines.start,
+                provenance.generator_lines.end,
+                output_id,
+                provenance.output_lines.start,
+                provenance.output_lines.end,
+                modeled_site_id
+            ],
+        )
+        .map_err(db_error)?;
+        inserted_links += 1;
+    }
+
+    let mut runs = HashMap::<String, i64>::new();
+    for run in &evidence.runs {
+        check_cancelled(cancelled)?;
+        let (report_id, role) = artifacts
+            .get(&run.report_key)
+            .copied()
+            .ok_or_else(|| "coverage run references an unknown report artifact".to_owned())?;
+        if role != ArtifactRole::CoverageReport {
+            return Err("coverage report artifact role is invalid".into());
+        }
+        tx.execute(
+            "INSERT INTO coverage_runs(key, report_artifact_id, format, run_label, test_name)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![
+                run.key,
+                report_id,
+                run.format.db(),
+                run.run_label,
+                run.test_name
+            ],
+        )
+        .map_err(db_error)?;
+        if runs
+            .insert(run.key.clone(), tx.last_insert_rowid())
+            .is_some()
+        {
+            return Err("duplicate coverage run key".into());
+        }
+    }
+    for region in &evidence.regions {
+        check_cancelled(cancelled)?;
+        let run_id = lookup_id(&runs, &region.run_key, "coverage region run")?;
+        let file_id = evidence_file_id(tx, region.path.as_deref())?;
+        tx.execute(
+            "INSERT INTO coverage_regions(
+                run_id, file_id, start_line, start_column, end_line, end_column,
+                execution_count, context
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run_id,
+                file_id,
+                region.start_line,
+                region.start_column,
+                region.end_line,
+                region.end_column,
+                i64::try_from(region.execution_count)
+                    .map_err(|_| "coverage count exceeds SQLite range".to_owned())?,
+                region.context
+            ],
+        )
+        .map_err(db_error)?;
+    }
+    for branch in &evidence.branches {
+        check_cancelled(cancelled)?;
+        let run_id = lookup_id(&runs, &branch.run_key, "coverage branch run")?;
+        let file_id = evidence_file_id(tx, branch.path.as_deref())?;
+        tx.execute(
+            "INSERT INTO coverage_branches(
+                run_id, file_id, start_line, start_column, end_line, end_column,
+                target_line, kind, execution_count
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                run_id,
+                file_id,
+                branch.start_line,
+                branch.start_column,
+                branch.end_line,
+                branch.end_column,
+                branch.target_line,
+                branch.kind.db(),
+                i64::try_from(branch.execution_count)
+                    .map_err(|_| "coverage count exceeds SQLite range".to_owned())?
+            ],
+        )
+        .map_err(db_error)?;
+    }
+    for gap in &evidence.gaps {
+        check_cancelled(cancelled)?;
+        if gap.file_key.is_some() || gap.source_key.is_some() || gap.run_key.is_some() {
+            return Err("evidence gap ownership is invalid".into());
+        }
+        tx.execute(
+            "INSERT INTO graph_gaps(
+                file_id, source_id, run_id, path, line_start, line_end, category, reason,
+                target_hint, occurrences, relation_site
+             ) VALUES(NULL, NULL, NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT DO UPDATE
+                 SET occurrences=graph_gaps.occurrences+excluded.occurrences",
+            params![
+                gap.path,
+                gap.line_start,
+                gap.line_end,
+                gap.category.db(),
+                gap.reason.db(),
+                gap.target_hint,
+                gap.occurrences,
+                gap.relation_site
+            ],
+        )
+        .map_err(db_error)?;
+    }
+    Ok(EvidenceStats {
+        generated_files,
+        artifacts: evidence.artifacts.len(),
+        provenance_links: inserted_links,
+        runs: evidence.runs.len(),
+        regions: evidence.regions.len(),
+        branches: evidence.branches.len(),
+        gaps: evidence.gaps.len(),
+    })
+}
+
+fn validate_evidence_span(span: EvidenceLineSpan) -> Result<()> {
+    if span.start == 0 || span.end < span.start {
+        Err("evidence line span is invalid".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn lookup_id(values: &HashMap<String, i64>, key: &str, kind: &str) -> Result<i64> {
+    values
+        .get(key)
+        .copied()
+        .ok_or_else(|| format!("{kind} is unknown"))
+}
+
+fn evidence_file_id(tx: &Transaction<'_>, path: Option<&str>) -> Result<Option<i64>> {
+    path.map(|path| {
+        tx.query_row("SELECT id FROM files WHERE path=?1", [path], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| "coverage row references an unknown file".to_owned())
+    })
+    .transpose()
 }
 
 fn refresh_script_export_methods(tx: &Transaction<'_>, cancelled: &AtomicBool) -> Result<()> {
@@ -3940,48 +4801,76 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE TABLE imported_artifacts(
             id INTEGER PRIMARY KEY,
             key TEXT NOT NULL UNIQUE CHECK(length(key)>0),
-            kind TEXT NOT NULL CHECK(kind IN ('generated','coverage')),
+            role TEXT NOT NULL CHECK(role IN (
+                'manifest','input','generated-rust','coverage-report'
+            )),
             path TEXT NOT NULL CHECK(length(path)>0),
             content_hash BLOB NOT NULL CHECK(length(content_hash)=32),
-            byte_size INTEGER NOT NULL CHECK(byte_size>=0)
+            byte_size INTEGER NOT NULL CHECK(byte_size>=0),
+            UNIQUE(role, path)
          );
          CREATE TABLE provenance_links(
             id INTEGER PRIMARY KEY,
-            artifact_id INTEGER NOT NULL REFERENCES imported_artifacts(id) ON DELETE CASCADE,
-            file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+            input_artifact_id INTEGER NOT NULL
+                REFERENCES imported_artifacts(id) ON DELETE CASCADE,
+            input_line_start INTEGER NOT NULL CHECK(input_line_start>0),
+            input_line_end INTEGER NOT NULL CHECK(input_line_end>=input_line_start),
+            generator_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            generator_node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            generator_line_start INTEGER NOT NULL CHECK(generator_line_start>0),
+            generator_line_end INTEGER NOT NULL CHECK(generator_line_end>=generator_line_start),
+            output_artifact_id INTEGER NOT NULL
+                REFERENCES imported_artifacts(id) ON DELETE CASCADE,
+            output_line_start INTEGER NOT NULL CHECK(output_line_start>0),
+            output_line_end INTEGER NOT NULL CHECK(output_line_end>=output_line_start),
             modeled_site_id INTEGER REFERENCES modeled_sites(id) ON DELETE CASCADE,
-            kind TEXT NOT NULL CHECK(kind IN ('generated','coverage')),
-            CHECK(file_id IS NOT NULL OR modeled_site_id IS NOT NULL)
+            UNIQUE(
+                input_artifact_id, input_line_start, input_line_end,
+                generator_file_id, generator_node_id, generator_line_start, generator_line_end,
+                output_artifact_id, output_line_start, output_line_end
+            )
          );
-         CREATE INDEX provenance_links_artifact ON provenance_links(artifact_id, id);
+         CREATE INDEX provenance_links_input ON provenance_links(input_artifact_id, id);
+         CREATE INDEX provenance_links_output ON provenance_links(output_artifact_id, id);
+         CREATE INDEX provenance_links_generator ON provenance_links(generator_node_id, id);
          CREATE TABLE coverage_runs(
             id INTEGER PRIMARY KEY,
             key TEXT NOT NULL UNIQUE CHECK(length(key)>0),
-            artifact_id INTEGER NOT NULL REFERENCES imported_artifacts(id) ON DELETE CASCADE,
-            format TEXT NOT NULL CHECK(format IN ('coverage.py','llvm-cov','v8'))
+            report_artifact_id INTEGER NOT NULL
+                REFERENCES imported_artifacts(id) ON DELETE CASCADE,
+            format TEXT NOT NULL CHECK(format IN ('llvm','coverage_py')),
+            run_label TEXT NOT NULL CHECK(length(run_label)>0),
+            test_name TEXT
          );
+         CREATE UNIQUE INDEX coverage_runs_identity
+             ON coverage_runs(format, run_label, ifnull(test_name,''));
          CREATE TABLE coverage_regions(
             id INTEGER PRIMARY KEY,
             run_id INTEGER NOT NULL REFERENCES coverage_runs(id) ON DELETE CASCADE,
-            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-            test_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
-            line_start INTEGER NOT NULL CHECK(line_start>0),
-            line_end INTEGER NOT NULL CHECK(line_end>=line_start),
-            covered INTEGER NOT NULL CHECK(covered IN (0,1))
+            file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+            start_line INTEGER NOT NULL CHECK(start_line>0),
+            start_column INTEGER NOT NULL,
+            end_line INTEGER NOT NULL CHECK(end_line>=start_line),
+            end_column INTEGER NOT NULL,
+            execution_count INTEGER NOT NULL CHECK(execution_count>=0),
+            context TEXT
          );
          CREATE INDEX coverage_regions_run_file
-             ON coverage_regions(run_id, file_id, line_start, line_end, test_id, id);
+             ON coverage_regions(run_id, file_id, start_line, end_line, id);
          CREATE TABLE coverage_branches(
             id INTEGER PRIMARY KEY,
             run_id INTEGER NOT NULL REFERENCES coverage_runs(id) ON DELETE CASCADE,
-            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-            test_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
-            line INTEGER NOT NULL CHECK(line>0),
-            branch INTEGER NOT NULL CHECK(branch>=0),
-            covered INTEGER NOT NULL CHECK(covered IN (0,1))
+            file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+            start_line INTEGER NOT NULL CHECK(start_line>0),
+            start_column INTEGER NOT NULL,
+            end_line INTEGER NOT NULL CHECK(end_line>=start_line),
+            end_column INTEGER NOT NULL,
+            target_line INTEGER CHECK(target_line IS NULL OR target_line>0),
+            kind TEXT NOT NULL CHECK(kind IN ('true-outcome','false-outcome','arc')),
+            execution_count INTEGER NOT NULL CHECK(execution_count>=0)
          );
          CREATE INDEX coverage_branches_run_file
-             ON coverage_branches(run_id, file_id, line, branch, test_id, id);
+             ON coverage_branches(run_id, file_id, start_line, target_line, kind, id);
          CREATE TABLE graph_gaps(
             id INTEGER PRIMARY KEY,
             file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
@@ -4017,7 +4906,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          );
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=5;",
+         PRAGMA user_version=6;",
     )
     .map_err(db_error)
 }
@@ -6177,6 +7066,161 @@ mod tests {
     }
 
     #[test]
+    fn provenance_replacement_is_atomic_and_unique() {
+        let cancelled = AtomicBool::new(false);
+        let mut source = single_node_graph("generator");
+        source.modeled_sites.push(ModeledSiteInput {
+            file_key: "src/lib.rs".into(),
+            source_key: Some("generator".into()),
+            kind: ModeledSiteKind::GeneratedInclusion,
+            line_start: 1,
+            line_end: 1,
+            target_hint: Some("out.rs".into()),
+            parse_context: Some("0:".into()),
+        });
+        source.files[0].observed_relation_sites = 1;
+        source.gaps.push(GapInput {
+            file_key: None,
+            source_key: None,
+            run_key: None,
+            path: Some("schema.proto".into()),
+            line_start: None,
+            line_end: None,
+            category: GapCategory::Language,
+            reason: GapReason::LanguageNotIndexed,
+            target_hint: None,
+            occurrences: 1,
+            relation_site: false,
+        });
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        let (source_state, _, ()) = store
+            .index_with(&cancelled, |_full, _existing| Ok((source, ())))
+            .unwrap();
+        let evidence = EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                imported("input", "schema.proto", ArtifactRole::Input, 2),
+                imported("output", "target/out.rs", ArtifactRole::GeneratedRust, 3),
+            ],
+            provenance: vec![ProvenanceInput {
+                input_key: "input".into(),
+                input_lines: EvidenceLineSpan { start: 1, end: 1 },
+                generator_path: "src/lib.rs".into(),
+                generator_lines: EvidenceLineSpan { start: 1, end: 1 },
+                output_key: "output".into(),
+                output_lines: EvidenceLineSpan { start: 1, end: 1 },
+                inclusion_site: Some(ModeledSiteLocator {
+                    path: "src/lib.rs".into(),
+                    line: 1,
+                    kind: ModeledSiteKind::GeneratedInclusion,
+                    target_hint: Some("out.rs".into()),
+                }),
+            }],
+            ..EvidenceInput::default()
+        };
+
+        let stats = store
+            .replace_evidence(Graph::default(), &evidence, &cancelled)
+            .unwrap();
+        assert_eq!(stats.artifacts, 3);
+        assert_eq!(stats.provenance_links, 1);
+        assert_eq!(
+            read_state(&store.connection).unwrap().generation,
+            source_state.generation + 1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT occurrences FROM graph_gaps WHERE path='schema.proto'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let rendered = store
+            .changes(
+                SNAPSHOT,
+                &WorktreeChanges {
+                    files: Vec::new(),
+                    records: Vec::new(),
+                    paths: Vec::new(),
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(rendered.evidence.contains(
+            "claim kind=generated-provenance status=complete result=linked basis=verified-generated-manifest"
+        ));
+        assert!(rendered
+            .evidence
+            .contains("provenance input=\"schema.proto:1-1\" generator=\"src/lib.rs:1-1\" output=\"target/out.rs:1-1\""));
+        assert!(
+            rendered
+                .evidence
+                .contains("includes source=\"src/lib.rs:1\" output=\"target/out.rs\"")
+        );
+        assert_eq!(rendered.dynamic_status, CompletenessStatus::Complete);
+
+        let collision = Graph {
+            files: vec![FileInput {
+                path: "src/lib.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [9; 32],
+                parse_context: "0:".into(),
+                byte_size: 1,
+                replace: true,
+                observed_relation_sites: 0,
+            }],
+            ..Graph::default()
+        };
+        assert!(
+            store
+                .replace_evidence(collision, &EvidenceInput::default(), &cancelled)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM provenance_links", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        let invalid = EvidenceInput {
+            artifacts: vec![
+                imported("duplicate", "one", ArtifactRole::Input, 1),
+                imported("duplicate", "two", ArtifactRole::Input, 2),
+            ],
+            ..EvidenceInput::default()
+        };
+        assert!(
+            store
+                .replace_evidence(Graph::default(), &invalid, &cancelled)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM provenance_links", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn changes_do_not_truncate_on_visited_rows_with_budget_left() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
@@ -6891,6 +7935,16 @@ mod tests {
             });
         }
         graph
+    }
+
+    fn imported(key: &str, path: &str, role: ArtifactRole, byte: u8) -> ImportedArtifactInput {
+        ImportedArtifactInput {
+            key: key.into(),
+            path: path.into(),
+            role,
+            content_hash: [byte; 32],
+            byte_size: 1,
+        }
     }
 
     fn global_gap_graph(reason: GapReason, occurrences: u32) -> Graph {

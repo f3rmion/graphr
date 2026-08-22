@@ -14,6 +14,118 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension};
 
 #[test]
+fn evidence_manifest_validation_rejects_unknown_fields_without_publication() {
+    let fixture = Fixture::new();
+    init_git(&fixture.path);
+    fs::write(
+        fixture.path.join("evidence.json"),
+        format!(
+            "{{\"format_version\":1,\"source_snapshot_id\":\"{}\",\"generated\":[],\"coverage\":[],\"unknown\":true}}",
+            "a".repeat(64)
+        ),
+    )
+    .unwrap();
+
+    let output = cli_index_with_evidence(&fixture.path, "evidence.json");
+
+    assert!(!output.status.success());
+    let snapshots = fixture.path.join(".git/graphr/v6/snapshots");
+    assert!(!snapshots.exists() || fs::read_dir(snapshots).unwrap().next().is_none());
+}
+
+#[test]
+fn evidence_source_snapshot_rejects_mismatch_and_preserves_source() {
+    let evidence = generated_evidence_fixture();
+    let source_graph = graph_path(&evidence.fixture.path);
+    let mut manifest: rmcp::serde_json::Value =
+        rmcp::serde_json::from_slice(&fs::read(&evidence.manifest).unwrap()).unwrap();
+    manifest["source_snapshot_id"] = "f".repeat(64).into();
+    fs::write(
+        &evidence.manifest,
+        rmcp::serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let output = cli_index_with_evidence(&evidence.fixture.path, "evidence.json");
+
+    assert!(!output.status.success());
+    assert!(source_graph.exists());
+    crate_graph_is_valid(&source_graph);
+}
+
+#[test]
+fn evidence_cache_reuses_the_exact_verified_image() {
+    let evidence = generated_evidence_fixture();
+
+    let first = successful_evidence_index(&evidence.fixture.path);
+    let second = successful_evidence_index(&evidence.fixture.path);
+
+    assert_eq!(first["snapshot_id"], second["snapshot_id"]);
+    assert_eq!(first["graph_image_id"], second["graph_image_id"]);
+    assert_eq!(first["stats"]["files_parsed"], 1);
+    assert_eq!(second["stats"]["files_parsed"], 0);
+}
+
+#[test]
+fn generated_provenance_links_generated_calls_and_renders_verified_chain() {
+    let evidence = generated_evidence_fixture();
+    let completion = successful_evidence_index(&evidence.fixture.path);
+    remember_graph(&evidence.fixture.path, &completion);
+    let graph = graph_path(&evidence.fixture.path);
+    let connection = Connection::open(graph).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM provenance_links", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM edges e JOIN nodes source ON source.id=e.source_id
+                 JOIN nodes target ON target.id=e.target_id
+                 WHERE source.name='generated' AND target.name='predicate' AND e.kind='CALLS'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    let mut client = Client::start_unindexed(&evidence.fixture.path);
+    client.snapshot_id = Some(completion["snapshot_id"].as_str().unwrap().into());
+    let snapshot_id = client.snapshot_id().to_owned();
+    let inspection = client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({
+            "worktree_root": &evidence.fixture.path,
+            "snapshot_id": snapshot_id,
+        }),
+    );
+    assert!(!tool_failed(&inspection), "{inspection}");
+    assert_eq!(
+        response_json(&inspection)["result"]["structuredContent"]["snapshot_matches_worktree"],
+        true,
+        "{inspection}"
+    );
+    let changes = response_text(&client.changes(0, 20, None));
+    assert!(
+        changes.contains("basis=verified-generated-manifest"),
+        "{changes}"
+    );
+    assert!(
+        changes.contains("provenance input=\"schema.proto:1-1\""),
+        "{changes}"
+    );
+    assert!(
+        changes.contains("dynamic_evidence_status=complete"),
+        "{changes}"
+    );
+    client.close();
+}
+
+#[test]
 fn completeness_reports_direct_static_calls_without_legacy_fields() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
@@ -4916,6 +5028,84 @@ fn queued_jobs_ignore_request_cancellation_and_eof_closes_them() {
     wait_for_file(&entered);
     assert!(!second_job.is_empty());
     client.close();
+}
+
+struct GeneratedEvidenceFixture {
+    fixture: Fixture,
+    manifest: PathBuf,
+}
+
+fn generated_evidence_fixture() -> GeneratedEvidenceFixture {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "fn predicate() -> bool { true }\nfn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n",
+    )
+    .unwrap();
+    fs::write(fixture.path.join("schema.proto"), "message Input {}\n").unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "src/lib.rs", "schema.proto"]);
+    git_commit(&fixture.path, "generated evidence source");
+    let source = index_repository(&fixture.path);
+    fs::create_dir(fixture.path.join("target")).unwrap();
+    fs::write(
+        fixture.path.join("target/out.rs"),
+        "fn generated() -> bool { predicate() }\n",
+    )
+    .unwrap();
+    let input = fs::read(fixture.path.join("schema.proto")).unwrap();
+    let output = fs::read(fixture.path.join("target/out.rs")).unwrap();
+    let manifest = fixture.path.join("evidence.json");
+    fs::write(
+        &manifest,
+        format!(
+            "{{\"format_version\":1,\"source_snapshot_id\":\"{}\",\"generated\":[{{\"input\":{{\"path\":\"schema.proto\",\"blake3\":\"{}\",\"line_start\":1,\"line_end\":1}},\"generator\":{{\"path\":\"src/lib.rs\",\"line_start\":2,\"line_end\":2}},\"output\":{{\"path\":\"target/out.rs\",\"blake3\":\"{}\",\"line_start\":1,\"line_end\":1}}}}],\"coverage\":[]}}",
+            source["snapshot_id"].as_str().unwrap(),
+            blake3::hash(&input).to_hex(),
+            blake3::hash(&output).to_hex(),
+        ),
+    )
+    .unwrap();
+    GeneratedEvidenceFixture { fixture, manifest }
+}
+
+fn cli_index_with_evidence(path: &Path, manifest: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_graphr"))
+        .args([
+            "index",
+            "--worktree-root",
+            path.to_str().unwrap(),
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--target",
+            "worktree",
+            "--include-untracked",
+            "--dependency-mode",
+            "boundary",
+            "--evidence-manifest",
+            manifest,
+        ])
+        .output()
+        .unwrap()
+}
+
+fn successful_evidence_index(path: &Path) -> rmcp::serde_json::Value {
+    let output = cli_index_with_evidence(path, "evidence.json");
+    assert!(output.status.success(), "{:?}", output.stderr);
+    rmcp::serde_json::from_slice(output.stdout.trim_ascii()).unwrap()
+}
+
+fn crate_graph_is_valid(path: &Path) {
+    assert_eq!(
+        Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
 }
 
 fn index_repository(path: &Path) -> rmcp::serde_json::Value {
