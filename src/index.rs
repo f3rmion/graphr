@@ -23,9 +23,9 @@ use crate::python::PythonParser;
 use crate::store::{
     ArtifactRole, ChangeReview, CompletenessStatus, CoverageBranchInput, CoverageBranchKind,
     CoverageRegionInput, CoverageRunInput, EdgeInput, EdgeKind, EvidenceInput, EvidenceLineSpan,
-    FileInput, GapCategory, GapInput, GapReason, Graph, ImportedArtifactInput, MappingStatus,
-    ModeledSiteInput, ModeledSiteKind, NodeInput, NodeKind, ProvenanceInput, RefInput, RefKind,
-    ResolutionState, Store, TraitImplementationInput,
+    FileInput, GapCategory, GapInput, GapReason, Graph, ImportedArtifactInput, ModeledSiteInput,
+    ModeledSiteKind, NodeInput, NodeKind, ProvenanceInput, RefInput, RefKind, ResolutionState,
+    Store, TraitImplementationInput,
 };
 use crate::workspace::{
     BuildProgress, BuildStage, CACHE_FORMAT_VERSION, ErrorCode, GRAPH_ANALYZER_VERSION,
@@ -194,7 +194,7 @@ impl Engine {
                 &evidence.source_snapshot_id,
                 manifest_digest,
                 artifacts,
-                2,
+                3,
                 CACHE_FORMAT_VERSION,
                 GRAPH_ANALYZER_VERSION,
                 crate::store::SCHEMA_VERSION,
@@ -906,47 +906,13 @@ fn build_generated_evidence(
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| "generated output basename is invalid".to_owned())?;
-        if paths_by_basename
+        let basename_contended = paths_by_basename
             .get(basename)
-            .is_some_and(|paths| paths.len() > 1)
-        {
-            gaps.push(GapInput {
-                file_key: None,
-                source_key: None,
-                run_key: None,
-                path: Some(generated.output.artifact.path.clone()),
-                line_start: None,
-                line_end: None,
-                category: GapCategory::Generated,
-                reason: GapReason::GeneratedOutputAmbiguous,
-                target_hint: Some(basename.to_owned()),
-                occurrences: 1,
-                relation_site: false,
-            });
-            continue;
-        }
-        let candidates = store.generated_inclusion_candidates(basename)?;
-        let inclusion_site = if candidates.len() == 1 {
-            Some(candidates[0].locator.clone())
+            .is_some_and(|paths| paths.len() > 1);
+        let candidates = if basename_contended {
+            Vec::new()
         } else {
-            gaps.push(GapInput {
-                file_key: None,
-                source_key: None,
-                run_key: None,
-                path: Some(generated.output.artifact.path.clone()),
-                line_start: None,
-                line_end: None,
-                category: GapCategory::Generated,
-                reason: if candidates.is_empty() {
-                    GapReason::GeneratedOutputUnobserved
-                } else {
-                    GapReason::GeneratedOutputAmbiguous
-                },
-                target_hint: Some(basename.to_owned()),
-                occurrences: 1,
-                relation_site: false,
-            });
-            None
+            store.generated_inclusion_candidates(basename)?
         };
         if let Some(candidate) = candidates.first().filter(|_| candidates.len() == 1)
             && parsed_outputs.insert(generated.output.artifact.path.clone())
@@ -979,43 +945,23 @@ fn build_generated_evidence(
             start: generated.generator.line_start,
             end: generated.generator.line_end,
         };
-        match store.generator_mapping(&generated.generator.path, generator_lines)? {
-            MappingStatus::Unique => provenance.push(ProvenanceInput {
-                input_key: captured_artifact_key(ArtifactRole::Input, &generated.input.artifact),
-                input_lines: EvidenceLineSpan {
-                    start: generated.input.line_start,
-                    end: generated.input.line_end,
-                },
-                generator_path: generated.generator.path.clone(),
-                generator_lines,
-                output_key: captured_artifact_key(
-                    ArtifactRole::GeneratedRust,
-                    &generated.output.artifact,
-                ),
-                output_lines: EvidenceLineSpan {
-                    start: generated.output.line_start,
-                    end: generated.output.line_end,
-                },
-                inclusion_site,
-            }),
-            status => gaps.push(GapInput {
-                file_key: None,
-                source_key: None,
-                run_key: None,
-                path: Some(generated.output.artifact.path.clone()),
-                line_start: Some(generated.generator.line_start),
-                line_end: Some(generated.generator.line_end),
-                category: GapCategory::Generated,
-                reason: if status == MappingStatus::Missing {
-                    GapReason::GeneratedOutputUnobserved
-                } else {
-                    GapReason::GeneratedOutputAmbiguous
-                },
-                target_hint: Some(generated.generator.path.clone()),
-                occurrences: 1,
-                relation_site: false,
-            }),
-        }
+        provenance.push(ProvenanceInput {
+            input_key: captured_artifact_key(ArtifactRole::Input, &generated.input.artifact),
+            input_lines: EvidenceLineSpan {
+                start: generated.input.line_start,
+                end: generated.input.line_end,
+            },
+            generator_path: generated.generator.path.clone(),
+            generator_lines,
+            output_key: captured_artifact_key(
+                ArtifactRole::GeneratedRust,
+                &generated.output.artifact,
+            ),
+            output_lines: EvidenceLineSpan {
+                start: generated.output.line_start,
+                end: generated.output.line_end,
+            },
+        });
     }
     let mut runs = Vec::with_capacity(captured.coverage.len());
     let mut regions = Vec::new();
@@ -3916,8 +3862,8 @@ mod tests {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     use crate::artifact::AnalyzerKind;
     use crate::git::{
-        ArtifactFile, ArtifactOmission, ArtifactReview, CapturedSource, ChangeLayer, PathRecord,
-        SourceOmission,
+        ArtifactFile, ArtifactOmission, ArtifactReview, CapturedSource, ChangeLayer, ChangedFile,
+        LineSpan, PathRecord, SourceOmission,
     };
     use crate::workspace::{
         AllowedRoots, ErrorCode, IndexRequest, SnapshotCatalog, SnapshotTarget, resolve_request,
@@ -4022,7 +3968,6 @@ mod tests {
                 .any(|key| key == "rust:function:predicate")
         }));
         assert_eq!(input.provenance.len(), 1);
-        assert!(input.provenance[0].inclusion_site.is_some());
         let stats = store
             .replace_evidence(generated, &input, &cancelled)
             .unwrap();
@@ -4105,43 +4050,191 @@ mod tests {
         assert!(graph.files.is_empty());
         assert!(graph.nodes.is_empty());
         assert!(graph.refs.is_empty());
-        assert!(evidence.provenance.is_empty());
-        assert_eq!(
+        assert_eq!(evidence.provenance.len(), 2);
+        assert!(
             evidence
                 .gaps
                 .iter()
-                .filter(|gap| gap.reason == GapReason::GeneratedOutputAmbiguous)
-                .count(),
-            2
+                .all(|gap| gap.category != GapCategory::Generated)
         );
+        let stats = store
+            .replace_evidence(graph, &evidence, &cancelled)
+            .unwrap();
+        assert_eq!(stats.provenance_links, 0);
+        let review = store
+            .changes(
+                REVIEW_SNAPSHOT_ID,
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        whole_file: false,
+                        spans: vec![LineSpan { start: 4, end: 4 }],
+                        report_unmapped: false,
+                    }],
+                    records: Vec::new(),
+                    paths: Vec::new(),
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                0,
+                20,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert_eq!(
+            review
+                .evidence
+                .matches("claim kind=generated-provenance status=partial")
+                .count(),
+            2,
+            "{}",
+            review.evidence
+        );
+        assert_eq!(
+            review
+                .evidence
+                .matches("reason=generated-output-ambiguous")
+                .count(),
+            2,
+            "{}",
+            review.evidence
+        );
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn failed_generated_declarations_keep_distinct_input_identity_and_one_claim_each() {
+        let cancelled = AtomicBool::new(false);
+        let source_graph = build_graph(
+            &[Source {
+                path: "src/lib.rs".into(),
+                text: "fn generate() {}\n".into(),
+            }],
+            &cancelled,
+        )
+        .unwrap();
+        let fixture = std::env::temp_dir().join(format!(
+            "graphr-generated-declaration-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        let mut store =
+            Store::open_private_image(&fixture.join("graph.sqlite"), &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((source_graph, ())))
+            .unwrap();
+        let output = b"fn generated() {}\n".to_vec();
+        let generated = ["schema-a.proto", "schema-b.proto"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let input = format!("field-{index}\n").into_bytes();
+                crate::evidence::CapturedGenerated {
+                    input: crate::evidence::CapturedArtifactSpan {
+                        artifact: CapturedArtifact {
+                            path: path.into(),
+                            content_hash: *blake3::hash(&input).as_bytes(),
+                            bytes: input,
+                        },
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                    generator: crate::evidence::SourceSpan {
+                        path: "src/lib.rs".into(),
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                    output: crate::evidence::CapturedArtifactSpan {
+                        artifact: CapturedArtifact {
+                            path: "target/out.rs".into(),
+                            content_hash: *blake3::hash(&output).as_bytes(),
+                            bytes: output.clone(),
+                        },
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                }
+            })
+            .collect();
+        let captured = CapturedEvidence {
+            source_snapshot_id: "a".repeat(64),
+            manifest: CapturedArtifact {
+                path: "evidence.json".into(),
+                content_hash: *blake3::hash(b"manifest").as_bytes(),
+                bytes: b"manifest".to_vec(),
+            },
+            generated,
+            coverage: Vec::new(),
+        };
+        let artifacts = evidence_artifacts(&captured).unwrap();
+
+        let (graph, evidence) =
+            build_generated_evidence(&store, &captured, artifacts, &fixture, &cancelled).unwrap();
+        assert_eq!(evidence.provenance.len(), 2);
+        assert!(
+            evidence
+                .gaps
+                .iter()
+                .all(|gap| gap.category != GapCategory::Generated),
+            "manifest declarations must not escape into generic graph gaps"
+        );
+        store
+            .replace_evidence(graph, &evidence, &cancelled)
+            .unwrap();
+
+        let review = store
+            .changes(
+                REVIEW_SNAPSHOT_ID,
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        whole_file: false,
+                        spans: vec![LineSpan { start: 1, end: 1 }],
+                        report_unmapped: true,
+                    }],
+                    records: vec![],
+                    paths: vec![],
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                0,
+                20,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert_eq!(
+            review
+                .evidence
+                .matches("claim kind=generated-provenance")
+                .count(),
+            2,
+            "{}",
+            review.evidence
+        );
+        assert!(review.evidence.contains("input=\"schema-a.proto:1-1\""));
+        assert!(review.evidence.contains("input=\"schema-b.proto:1-1\""));
         fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
     fn generated_rust_skips_zero_multiple_and_unmapped_contexts() {
         let cases = [
-            (
-                "fn generate() {}\n",
-                1,
-                GapReason::GeneratedOutputUnobserved,
-                1,
-            ),
+            ("fn generate() {}\n", 1),
             (
                 "fn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\nfn other() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n",
                 1,
-                GapReason::GeneratedOutputAmbiguous,
-                1,
             ),
-            (
-                "fn generate() {}\n",
-                99,
-                GapReason::GeneratedOutputUnobserved,
-                0,
-            ),
+            ("fn generate() {}\n", 99),
         ];
-        for (ordinal, (source_text, generator_line, reason, provenance_count)) in
-            cases.into_iter().enumerate()
-        {
+        for (ordinal, (source_text, generator_line)) in cases.into_iter().enumerate() {
             let cancelled = AtomicBool::new(false);
             let source_graph = build_graph(
                 &[Source {
@@ -4207,8 +4300,13 @@ mod tests {
                     .unwrap();
 
             assert!(graph.files.is_empty());
-            assert_eq!(evidence.provenance.len(), provenance_count);
-            assert!(evidence.gaps.iter().any(|gap| gap.reason == reason));
+            assert_eq!(evidence.provenance.len(), 1);
+            assert!(
+                evidence
+                    .gaps
+                    .iter()
+                    .all(|gap| gap.category != GapCategory::Generated)
+            );
             fs::remove_dir_all(fixture).unwrap();
         }
     }

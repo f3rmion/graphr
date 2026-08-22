@@ -20,9 +20,9 @@ use crate::store;
 
 pub use crate::index::Engine;
 
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 9;
-pub(crate) const GRAPH_ANALYZER_VERSION: u32 = 5;
-pub(crate) const REVIEW_FORMAT_VERSION: u32 = 5;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 10;
+pub(crate) const GRAPH_ANALYZER_VERSION: u32 = 6;
+pub(crate) const REVIEW_FORMAT_VERSION: u32 = 6;
 const MANIFEST_SIZE_LIMIT: u64 = 64 * 1024;
 const REVIEW_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 static PRIVATE_ID: AtomicU64 = AtomicU64::new(0);

@@ -395,19 +395,22 @@ fn safe_path(path: &Path) -> Result<String, OperationError> {
 }
 
 fn safe_str_path(value: &str) -> Result<String, OperationError> {
-    let path = Path::new(value);
-    if value.is_empty()
-        || value.len() > 1024
-        || value.chars().any(char::is_control)
-        || value
-            .split('/')
-            .any(|part| part.is_empty() || matches!(part, "." | ".."))
-        || path.is_absolute()
-    {
+    if !evidence_path_is_safe(value) {
         Err(invalid("evidence path is unsafe"))
     } else {
         Ok(value.to_owned())
     }
+}
+
+pub(crate) fn evidence_path_is_safe(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && value.len() <= 1024
+        && !value.chars().any(char::is_control)
+        && !value
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        && !path.is_absolute()
 }
 
 fn record_unique(

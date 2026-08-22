@@ -736,7 +736,7 @@ fn generated_evidence_chain_joins_provenance_static_calls_and_named_coverage() {
         "{graph}"
     );
     for expected in [
-        "claim kind=generated-provenance status=complete result=linked basis=verified-generated-manifest output=\"target/debug/build/graphr-fixture/out/message.rs\"",
+        "claim kind=generated-provenance status=complete result=linked basis=verified-generated-manifest input=\"proto/message.proto:2-2\" generator=\"src/generator.rs:2-2\" output=\"target/debug/build/graphr-fixture/out/message.rs:1-2\"",
         "provenance input=\"proto/message.proto:2-2\" generator=\"src/generator.rs:2-2\" output=\"target/debug/build/graphr-fixture/out/message.rs:1-2\"",
         "includes source=\"src/lib.rs:6\" output=\"target/debug/build/graphr-fixture/out/message.rs\"",
         "claim kind=changed-execution path=\"target/debug/build/graphr-fixture/out/message.rs\" lines=1 status=complete result=observed basis=llvm-coverage-json run=\"strict-run\" test=\"strict_roundtrip\"",
@@ -762,7 +762,7 @@ fn generated_evidence_chain_joins_provenance_static_calls_and_named_coverage() {
             .unwrap_or_else(|| panic!("missing generated {name}: {search}"));
         let view = response_text(&client.view(node_ref, 1, 20));
         for expected in [
-            "claim kind=generated-provenance status=complete result=linked basis=verified-generated-manifest output=\"target/debug/build/graphr-fixture/out/message.rs\"".to_owned(),
+            "claim kind=generated-provenance status=complete result=linked basis=verified-generated-manifest input=\"proto/message.proto:2-2\" generator=\"src/generator.rs:2-2\" output=\"target/debug/build/graphr-fixture/out/message.rs:1-2\"".to_owned(),
             "provenance input=\"proto/message.proto:2-2\" generator=\"src/generator.rs:2-2\" output=\"target/debug/build/graphr-fixture/out/message.rs:1-2\"".to_owned(),
             "includes source=\"src/lib.rs:6\" output=\"target/debug/build/graphr-fixture/out/message.rs\"".to_owned(),
             format!("claim kind=changed-execution path=\"target/debug/build/graphr-fixture/out/message.rs\" lines={line} status=complete result=observed basis=llvm-coverage-json run=\"strict-run\" test=\"strict_roundtrip\""),

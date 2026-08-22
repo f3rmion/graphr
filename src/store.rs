@@ -16,7 +16,7 @@ use crate::git::{
     change_content_complete, dependency_package,
 };
 
-pub(crate) const SCHEMA_VERSION: i64 = 7;
+pub(crate) const SCHEMA_VERSION: i64 = 8;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
@@ -424,26 +424,11 @@ pub struct EvidenceLineSpan {
     pub end: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModeledSiteLocator {
-    pub path: String,
-    pub line: u32,
-    pub kind: ModeledSiteKind,
-    pub target_hint: Option<String>,
-}
-
 pub struct GeneratedInclusionCandidate {
-    pub locator: ModeledSiteLocator,
     pub parse_context: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MappingStatus {
-    Unique,
-    Missing,
-    Ambiguous,
-}
-
+#[derive(Clone)]
 pub struct ProvenanceInput {
     pub input_key: String,
     pub input_lines: EvidenceLineSpan,
@@ -451,7 +436,6 @@ pub struct ProvenanceInput {
     pub generator_lines: EvidenceLineSpan,
     pub output_key: String,
     pub output_lines: EvidenceLineSpan,
-    pub inclusion_site: Option<ModeledSiteLocator>,
 }
 
 pub struct CoverageRunInput {
@@ -805,51 +789,21 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT f.path, m.line_start, m.target_hint, m.parse_context
-                   FROM modeled_sites m JOIN files f ON f.id=m.file_id
+                "SELECT m.parse_context FROM modeled_sites m
                   WHERE m.kind='generated-inclusion' AND m.target_hint=?1
                     AND m.parse_context IS NOT NULL
-                  ORDER BY f.path, m.line_start, m.id LIMIT 2",
+                  ORDER BY m.file_id, m.line_start, m.id LIMIT 2",
             )
             .map_err(db_error)?;
         statement
             .query_map([output_basename], |row| {
                 Ok(GeneratedInclusionCandidate {
-                    locator: ModeledSiteLocator {
-                        path: row.get(0)?,
-                        line: row.get(1)?,
-                        kind: ModeledSiteKind::GeneratedInclusion,
-                        target_hint: row.get(2)?,
-                    },
-                    parse_context: row.get(3)?,
+                    parse_context: row.get(0)?,
                 })
             })
             .map_err(db_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_error)
-    }
-
-    pub fn generator_mapping(&self, path: &str, span: EvidenceLineSpan) -> Result<MappingStatus> {
-        validate_evidence_span(span)?;
-        let count: i64 = self
-            .connection
-            .query_row(
-                "SELECT count(*) FROM (
-                     SELECT n.id FROM files f JOIN nodes n ON n.file_id=f.id
-                      WHERE f.path=?1 AND f.language IN ('rust','python')
-                        AND n.kind IN ('function','test')
-                        AND n.line_start<=?2 AND n.line_end>=?3
-                      ORDER BY n.id LIMIT 2
-                 )",
-                params![path, span.start, span.end],
-                |row| row.get(0),
-            )
-            .map_err(db_error)?;
-        Ok(match count {
-            0 => MappingStatus::Missing,
-            1 => MappingStatus::Unique,
-            _ => MappingStatus::Ambiguous,
-        })
     }
 
     pub fn evidence_only_paths(&self) -> Result<BTreeSet<String>> {
@@ -983,12 +937,18 @@ impl Store {
             })
             .map_err(db_error)?
         };
-        let static_gaps = static_gap_records(&tx, &HashSet::from([root_id]))?;
+        let mut evidence_scope = CoverageScope::node(
+            root_id,
+            &root.path,
+            root.line,
+            root_end,
+            root.kind == "file",
+        );
+        evidence_scope.expand_provenance(&tx)?;
+        let static_gaps = static_gap_records(&tx, &evidence_scope)?;
         if !static_gaps.is_empty() {
             lines.extend(static_gaps.split_inclusive('\n').map(str::to_owned));
         }
-        let mut evidence_scope = CoverageScope::node(&root.path, root.line, root_end);
-        evidence_scope.expand_provenance(&tx)?;
         let evidence = render_evidence(&tx, Some(&evidence_scope))?;
         if !evidence.text.is_empty() {
             lines.extend(evidence.text.split_inclusive('\n').map(str::to_owned));
@@ -1050,7 +1010,7 @@ impl Store {
                 dependency_analysis(dependency_mode),
                 risk_metadata(None),
             );
-            let accounting = static_accounting(&self.connection, &HashSet::new())?;
+            let accounting = static_accounting(&self.connection, &evidence_scope)?;
             let content_complete = change_content_complete(changes, dependency_mode);
             output.push_str(&assurance_preamble(
                 &accounting,
@@ -1271,6 +1231,7 @@ impl Store {
             lines.push(line);
         }
         let mut traversed_ids = roots.iter().map(|root| root.id).collect::<HashSet<_>>();
+        let mut evidence_node_ids = traversed_ids.clone();
         let neighborhood_omitted = if root_neighborhood_omitted {
             true
         } else if roots.is_empty() {
@@ -1291,6 +1252,8 @@ impl Store {
         for flow in &analysis.flows {
             traversed_ids.insert(flow.entry.id);
             traversed_ids.extend(flow.nodes.iter().map(|node| node.id));
+            evidence_node_ids.insert(flow.entry.id);
+            evidence_node_ids.extend(flow.nodes.iter().map(|node| node.id));
             lines.push(flow_line(flow, dependency_mode)?);
         }
         let overall = analysis
@@ -1320,9 +1283,9 @@ impl Store {
             !analysis_incomplete && !neighborhood_omitted && changed_symbols_omitted == 0;
         let mapping_complete = unmapped_range_count == 0;
         let mut evidence_scope = CoverageScope::changes(changes, dependency_mode, &tx)?;
-        evidence_scope.add_nodes(&tx, &traversed_ids)?;
+        evidence_scope.add_nodes(&tx, &evidence_node_ids)?;
         let evidence = render_evidence(&tx, Some(&evidence_scope))?;
-        let accounting = static_accounting(&tx, &traversed_ids)?;
+        let accounting = static_accounting(&tx, &evidence_scope)?;
         let content_complete = change_content_complete(changes, dependency_mode);
         lines.insert(
             0,
@@ -1535,6 +1498,11 @@ fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) 
     for role in distinct_text(connection, "SELECT DISTINCT role FROM imported_artifacts")? {
         ArtifactRole::parse(&role).ok_or_else(|| "database artifact role is invalid".to_owned())?;
     }
+    for path in distinct_text(connection, "SELECT DISTINCT path FROM imported_artifacts")? {
+        if !crate::evidence::evidence_path_is_safe(&path) {
+            return Err("database evidence artifact path is unsafe".into());
+        }
+    }
     for format in distinct_text(connection, "SELECT DISTINCT format FROM coverage_runs")? {
         match format.as_str() {
             "llvm" | "coverage_py" => {}
@@ -1558,21 +1526,26 @@ fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) 
     {
         validate_coverage_label(&label.map_err(db_error)?)?;
     }
+    require_provenance_invariants(connection, cancelled)?;
     let invalid: bool = connection
         .query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM provenance_links p
                  JOIN imported_artifacts input ON input.id=p.input_artifact_id
                  JOIN imported_artifacts output ON output.id=p.output_artifact_id
-                 JOIN nodes generator ON generator.id=p.generator_node_id
-                 JOIN files generator_file ON generator_file.id=p.generator_file_id
+                 LEFT JOIN nodes generator ON generator.id=p.generator_node_id
+                 LEFT JOIN files generator_file ON generator_file.id=p.generator_file_id
                  LEFT JOIN modeled_sites site ON site.id=p.modeled_site_id
                  WHERE input.role!='input' OR output.role!='generated-rust'
-                    OR generator.file_id!=p.generator_file_id
-                    OR generator_file.language NOT IN ('rust','python')
-                    OR generator.kind NOT IN ('function','test')
-                    OR generator.line_start>p.generator_line_start
-                    OR generator.line_end<p.generator_line_end
+                    OR (p.generator_file_id IS NULL)!=(p.generator_node_id IS NULL)
+                    OR (generator.id IS NOT NULL AND (
+                        generator.file_id!=p.generator_file_id
+                        OR generator_file.path!=p.generator_path
+                        OR generator_file.language NOT IN ('rust','python')
+                        OR generator.kind NOT IN ('function','test')
+                        OR generator.line_start>p.generator_line_start
+                        OR generator.line_end<p.generator_line_end
+                    ))
                     OR (site.id IS NOT NULL AND site.kind!='generated-inclusion')
                  UNION ALL
                  SELECT 1 FROM provenance_links
@@ -1756,6 +1729,155 @@ fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) 
         return Err("database evidence relationships are invalid".into());
     }
     check_cancelled(cancelled)
+}
+
+struct StoredProvenance {
+    input_id: i64,
+    input_role: Option<String>,
+    input_lines: EvidenceLineSpan,
+    generator_path: String,
+    generator_file_id: Option<i64>,
+    generator_node_id: Option<i64>,
+    generator_lines: EvidenceLineSpan,
+    output_id: i64,
+    output_path: Option<String>,
+    output_role: Option<String>,
+    output_lines: EvidenceLineSpan,
+    modeled_site_id: Option<i64>,
+    mapping_state: String,
+}
+
+fn require_provenance_invariants(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
+    let rows = connection
+        .prepare(
+            "SELECT p.input_artifact_id, input.role,
+                    p.input_line_start, p.input_line_end,
+                    p.generator_path, p.generator_file_id, p.generator_node_id,
+                    p.generator_line_start, p.generator_line_end,
+                    p.output_artifact_id, output.path, output.role,
+                    p.output_line_start, p.output_line_end,
+                    p.modeled_site_id, p.mapping_state
+               FROM provenance_links p
+               LEFT JOIN imported_artifacts input ON input.id=p.input_artifact_id
+               LEFT JOIN imported_artifacts output ON output.id=p.output_artifact_id
+              ORDER BY p.id",
+        )
+        .map_err(db_error)?
+        .query_map([], |row| {
+            Ok(StoredProvenance {
+                input_id: row.get(0)?,
+                input_role: row.get(1)?,
+                input_lines: EvidenceLineSpan {
+                    start: row.get(2)?,
+                    end: row.get(3)?,
+                },
+                generator_path: row.get(4)?,
+                generator_file_id: row.get(5)?,
+                generator_node_id: row.get(6)?,
+                generator_lines: EvidenceLineSpan {
+                    start: row.get(7)?,
+                    end: row.get(8)?,
+                },
+                output_id: row.get(9)?,
+                output_path: row.get(10)?,
+                output_role: row.get(11)?,
+                output_lines: EvidenceLineSpan {
+                    start: row.get(12)?,
+                    end: row.get(13)?,
+                },
+                modeled_site_id: row.get(14)?,
+                mapping_state: row.get(15)?,
+            })
+        })
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?;
+    let mut paths_by_basename = BTreeMap::<String, BTreeSet<String>>::new();
+    for row in &rows {
+        let output_path = row
+            .output_path
+            .as_deref()
+            .ok_or_else(|| "database provenance output artifact is missing".to_owned())?;
+        let basename = Path::new(output_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "database provenance output basename is invalid".to_owned())?;
+        paths_by_basename
+            .entry(basename.to_owned())
+            .or_default()
+            .insert(output_path.to_owned());
+    }
+    let mut identities = HashSet::new();
+    for row in rows {
+        check_cancelled(cancelled)?;
+        validate_evidence_span(row.input_lines)?;
+        validate_evidence_span(row.generator_lines)?;
+        validate_evidence_span(row.output_lines)?;
+        if row.input_role.as_deref() != Some(ArtifactRole::Input.db())
+            || row.output_role.as_deref() != Some(ArtifactRole::GeneratedRust.db())
+        {
+            return Err("database provenance artifact role is invalid".into());
+        }
+        if !crate::evidence::evidence_path_is_safe(&row.generator_path) {
+            return Err("database provenance declaration path is unsafe".into());
+        }
+        if !identities.insert((
+            row.input_id,
+            row.input_lines.start,
+            row.input_lines.end,
+            row.generator_path.clone(),
+            row.generator_lines.start,
+            row.generator_lines.end,
+            row.output_id,
+            row.output_lines.start,
+            row.output_lines.end,
+        )) {
+            return Err("database provenance declaration identity is duplicated".into());
+        }
+        let output_path = row
+            .output_path
+            .as_deref()
+            .ok_or_else(|| "database provenance output artifact is missing".to_owned())?;
+        let basename = Path::new(output_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "database provenance output basename is invalid".to_owned())?;
+        let contended = paths_by_basename
+            .get(basename)
+            .is_some_and(|paths| paths.len() > 1);
+        let resolution = provenance_resolution(
+            connection,
+            &row.generator_path,
+            row.generator_lines,
+            basename,
+            contended,
+        )?;
+        if row.generator_file_id != resolution.generator_file_id
+            || row.generator_node_id != resolution.generator_node_id
+            || row.modeled_site_id != resolution.modeled_site_id
+            || row.mapping_state != resolution.mapping_state
+        {
+            return Err("database provenance declaration mapping is inconsistent".into());
+        }
+        if row.modeled_site_id.is_some() {
+            let generated_file: bool = connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM files file JOIN imported_artifacts output
+                           ON output.id=?1 AND output.path=file.path
+                          AND output.content_hash=file.content_hash
+                          AND output.byte_size=file.byte_size
+                     )",
+                    [row.output_id],
+                    |result| result.get(0),
+                )
+                .map_err(db_error)?;
+            if !generated_file {
+                return Err("database provenance generated output is missing".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
@@ -2880,10 +3002,7 @@ impl StaticAccounting {
     }
 }
 
-fn static_accounting(
-    connection: &Connection,
-    relevant_nodes: &HashSet<i64>,
-) -> Result<StaticAccounting> {
+fn static_accounting(connection: &Connection, scope: &CoverageScope) -> Result<StaticAccounting> {
     let mut accounting = StaticAccounting {
         source_complete: true,
         syntax_complete: true,
@@ -2949,7 +3068,7 @@ fn static_accounting(
             }
         }
     }
-    accounting.gap_records = static_gap_records(connection, relevant_nodes)?;
+    accounting.gap_records = static_gap_records(connection, scope)?;
     let (missing, ambiguous) = connection
         .query_row(
             "SELECT
@@ -2973,7 +3092,7 @@ fn static_accounting(
     let mut load_keys = connection
         .prepare("SELECT key FROM node_keys WHERE node_id=?1 ORDER BY key")
         .map_err(db_error)?;
-    let mut relevant_nodes = relevant_nodes.iter().copied().collect::<Vec<_>>();
+    let mut relevant_nodes = scope.nodes.iter().copied().collect::<Vec<_>>();
     relevant_nodes.sort_unstable();
     for node_id in relevant_nodes {
         for row in load_keys
@@ -3009,39 +3128,11 @@ fn static_accounting(
     Ok(accounting)
 }
 
-fn static_gap_records(connection: &Connection, relevant_nodes: &HashSet<i64>) -> Result<String> {
-    let mut scopes = Vec::with_capacity(relevant_nodes.len());
-    let mut load_scope = connection
-        .prepare(
-            "SELECT node.file_id, file.path, node.line_start, node.line_end, node.kind
-               FROM nodes node JOIN files file ON file.id=node.file_id
-              WHERE node.id=?1",
-        )
-        .map_err(db_error)?;
-    let mut node_ids = relevant_nodes.iter().copied().collect::<Vec<_>>();
-    node_ids.sort_unstable();
-    for node_id in node_ids {
-        if let Some(scope) = load_scope
-            .query_row([node_id], |row| {
-                Ok((
-                    node_id,
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, u32>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .optional()
-            .map_err(db_error)?
-        {
-            scopes.push(scope);
-        }
-    }
+fn static_gap_records(connection: &Connection, scope: &CoverageScope) -> Result<String> {
     let mut statement = connection
         .prepare(
             "SELECT category, reason, path, line_start, line_end, target_hint,
-                    occurrences, relation_site, id, file_id, source_id
+                    occurrences, relation_site, id, source_id
                FROM graph_gaps
               WHERE category NOT IN ('coverage','generated')",
         )
@@ -3059,43 +3150,14 @@ fn static_gap_records(connection: &Connection, relevant_nodes: &HashSet<i64>) ->
                 row.get::<_, bool>(7)?,
                 row.get::<_, i64>(8)?,
                 row.get::<_, Option<i64>>(9)?,
-                row.get::<_, Option<i64>>(10)?,
             ))
         })
         .map_err(db_error)?;
     let mut gaps = Vec::new();
     for row in rows {
-        let (
-            category,
-            reason,
-            path,
-            start,
-            end,
-            target,
-            occurrences,
-            relation_site,
-            id,
-            file_id,
-            source_id,
-        ) = row.map_err(db_error)?;
-        let relevant = source_id.is_some_and(|source| relevant_nodes.contains(&source))
-            || scopes.iter().any(
-                |(_, scope_file_id, scope_path, scope_start, scope_end, scope_kind)| {
-                    let same_owner = file_id == Some(*scope_file_id)
-                        || path.as_deref() == Some(scope_path.as_str());
-                    if !same_owner {
-                        return false;
-                    }
-                    if scope_kind == "file" {
-                        return true;
-                    }
-                    match (start, end) {
-                        (Some(start), Some(end)) => *scope_start <= end && *scope_end >= start,
-                        (Some(start), None) => *scope_start <= start && *scope_end >= start,
-                        (None, _) => true,
-                    }
-                },
-            );
+        let (category, reason, path, start, end, target, occurrences, relation_site, id, source_id) =
+            row.map_err(db_error)?;
+        let relevant = scope.gap_relevant(path.as_deref(), start, end, source_id);
         if !relevant {
             continue;
         }
@@ -3140,12 +3202,18 @@ fn static_gap_records(connection: &Connection, relevant_nodes: &HashSet<i64>) ->
 #[derive(Default)]
 struct CoverageScope {
     ranges: BTreeMap<String, Option<Vec<(u32, u32)>>>,
+    nodes: HashSet<i64>,
 }
 
 impl CoverageScope {
-    fn node(path: &str, start: u32, end: u32) -> Self {
+    fn node(node_id: i64, path: &str, start: u32, end: u32, whole_file: bool) -> Self {
         let mut scope = Self::default();
-        scope.add_range(path, start, end);
+        scope.nodes.insert(node_id);
+        if whole_file {
+            scope.ranges.insert(path.to_owned(), None);
+        } else {
+            scope.add_range(path, start, end);
+        }
         scope
     }
 
@@ -3171,35 +3239,48 @@ impl CoverageScope {
                 scope.add_range(&file.path, start, end);
             }
         }
+        for path in &changes.paths {
+            if path.language.is_none()
+                && (dependency_mode == DependencyMode::Full
+                    || dependency_package(&path.path).is_none())
+            {
+                scope.ranges.entry(path.path.clone()).or_insert(None);
+            }
+        }
         let mut nodes = connection
             .prepare(
-                "SELECT node.line_start, node.line_end
+                "SELECT node.id, node.line_start, node.line_end
                    FROM nodes node JOIN files file ON file.id=node.file_id
                   WHERE file.path=?1
                   ORDER BY node.line_start, node.line_end, node.id",
             )
             .map_err(db_error)?;
         for file in &changes.files {
-            if file.whole_file
-                || dependency_mode == DependencyMode::Boundary
-                    && dependency_package(&file.path).is_some()
+            if dependency_mode == DependencyMode::Boundary
+                && dependency_package(&file.path).is_some()
             {
                 continue;
             }
             let rows = nodes
                 .query_map([&file.path], |row| {
-                    Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u32>(2)?,
+                    ))
                 })
                 .map_err(db_error)?;
             for row in rows {
-                let (start, end) = row.map_err(db_error)?;
+                let (id, start, end) = row.map_err(db_error)?;
                 let node_start = u64::from(start).saturating_mul(2);
                 let node_end = u64::from(end).saturating_mul(2);
-                if file
-                    .spans
-                    .iter()
-                    .any(|span| span.start <= node_end && span.end >= node_start)
+                if file.whole_file
+                    || file
+                        .spans
+                        .iter()
+                        .any(|span| span.start <= node_end && span.end >= node_start)
                 {
+                    scope.nodes.insert(id);
                     scope.add_range(&file.path, start, end);
                 }
             }
@@ -3230,6 +3311,7 @@ impl CoverageScope {
                 .optional()
                 .map_err(db_error)?
             {
+                self.nodes.insert(node_id);
                 self.add_range(&path, start, end);
             }
         }
@@ -3244,17 +3326,24 @@ impl CoverageScope {
             String,
             u32,
             u32,
+            String,
+            u32,
+            u32,
             Option<String>,
             Option<u32>,
+            Option<i64>,
+            Option<i64>,
         );
         let rows = connection
             .prepare(
-                "SELECT output.path, link.output_line_start, link.output_line_end,
-                        generator.path, link.generator_line_start, link.generator_line_end,
-                        include_file.path, site.line_start
+                "SELECT input.path, link.input_line_start, link.input_line_end,
+                        output.path, link.output_line_start, link.output_line_end,
+                        link.generator_path, link.generator_line_start, link.generator_line_end,
+                        include_file.path, site.line_start,
+                        link.generator_node_id, site.source_id
                    FROM provenance_links link
+                   JOIN imported_artifacts input ON input.id=link.input_artifact_id
                    JOIN imported_artifacts output ON output.id=link.output_artifact_id
-                   JOIN files generator ON generator.id=link.generator_file_id
                    LEFT JOIN modeled_sites site ON site.id=link.modeled_site_id
                    LEFT JOIN files include_file ON include_file.id=site.file_id
                   ORDER BY link.id",
@@ -3270,6 +3359,11 @@ impl CoverageScope {
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
                 ))
             })
             .map_err(db_error)?
@@ -3278,6 +3372,9 @@ impl CoverageScope {
         loop {
             let mut changed = false;
             for (
+                input,
+                input_start,
+                input_end,
                 output,
                 output_start,
                 output_end,
@@ -3286,17 +3383,27 @@ impl CoverageScope {
                 generator_end,
                 include,
                 include_line,
+                generator_node_id,
+                include_source_id,
             ) in &rows
             {
-                let relevant = self.relevant(output, *output_start, *output_end)
+                let relevant = self.relevant(input, *input_start, *input_end)
+                    || self.relevant(output, *output_start, *output_end)
                     || self.relevant(generator, *generator_start, *generator_end)
                     || include
                         .as_deref()
                         .zip(*include_line)
                         .is_some_and(|(path, line)| self.relevant(path, line, line));
                 if relevant {
+                    changed |= self.add_range(input, *input_start, *input_end);
                     changed |= self.add_range(output, *output_start, *output_end);
                     changed |= self.add_range(generator, *generator_start, *generator_end);
+                    if let Some(node_id) = generator_node_id {
+                        changed |= self.nodes.insert(*node_id);
+                    }
+                    if let Some(node_id) = include_source_id {
+                        changed |= self.nodes.insert(*node_id);
+                    }
                     if let Some((include, line)) = include.as_deref().zip(*include_line) {
                         changed |= self.add_range(include, line, line);
                     }
@@ -3328,8 +3435,27 @@ impl CoverageScope {
         }
     }
 
-    fn contains_path(&self, path: &str) -> bool {
-        self.ranges.contains_key(path)
+    fn whole_file(&self, path: &str) -> bool {
+        self.ranges.get(path).is_some_and(Option::is_none)
+    }
+
+    fn gap_relevant(
+        &self,
+        path: Option<&str>,
+        start: Option<u32>,
+        end: Option<u32>,
+        source_id: Option<i64>,
+    ) -> bool {
+        if path.is_some_and(|path| self.whole_file(path)) {
+            return true;
+        }
+        if let Some(source_id) = source_id {
+            return self.nodes.contains(&source_id);
+        }
+        path.is_some_and(|path| match start {
+            Some(start) => self.relevant(path, start, end.unwrap_or(start)),
+            None => false,
+        })
     }
 
     fn relevant(&self, path: &str, start: u32, end: u32) -> bool {
@@ -3411,37 +3537,36 @@ fn render_evidence(
         .prepare(
             "SELECT output.path,
                     input.path, p.input_line_start, p.input_line_end,
-                    generator_file.path, p.generator_line_start, p.generator_line_end,
+                    p.generator_path, p.generator_line_start, p.generator_line_end,
                     p.output_line_start, p.output_line_end,
                     include_file.path, site.line_start,
-                    generated_file.id
-               FROM imported_artifacts output
-               LEFT JOIN provenance_links p ON p.output_artifact_id=output.id
-               LEFT JOIN imported_artifacts input ON input.id=p.input_artifact_id
-               LEFT JOIN files generator_file ON generator_file.id=p.generator_file_id
+                    generated_file.id, p.mapping_state
+               FROM provenance_links p
+               JOIN imported_artifacts output ON output.id=p.output_artifact_id
+               JOIN imported_artifacts input ON input.id=p.input_artifact_id
                LEFT JOIN modeled_sites site ON site.id=p.modeled_site_id
                LEFT JOIN files include_file ON include_file.id=site.file_id
                LEFT JOIN files generated_file
                  ON generated_file.path=output.path
                 AND generated_file.content_hash=output.content_hash
                 AND generated_file.byte_size=output.byte_size
-              WHERE output.role='generated-rust'
               ORDER BY output.path, p.id",
         )
         .map_err(db_error)?;
     type ProvenanceRow = (
         String,
-        Option<String>,
-        Option<u32>,
-        Option<u32>,
-        Option<String>,
-        Option<u32>,
-        Option<u32>,
-        Option<u32>,
-        Option<u32>,
+        String,
+        u32,
+        u32,
+        String,
+        u32,
+        u32,
+        u32,
+        u32,
         Option<String>,
         Option<u32>,
         Option<i64>,
+        String,
     );
     let rows = statement
         .query_map([], |row| {
@@ -3458,6 +3583,7 @@ fn render_evidence(
                 row.get(9)?,
                 row.get(10)?,
                 row.get(11)?,
+                row.get(12)?,
             ))
         })
         .map_err(db_error)?
@@ -3467,20 +3593,14 @@ fn render_evidence(
         .into_iter()
         .filter(|row| {
             scope.is_none_or(|scope| {
-                row.4
-                    .as_deref()
-                    .zip(row.5.zip(row.6))
-                    .is_some_and(|(path, (start, end))| scope.relevant(path, start, end))
-                    || row
-                        .7
-                        .zip(row.8)
-                        .is_some_and(|(start, end)| scope.relevant(&row.0, start, end))
+                scope.relevant(&row.1, row.2, row.3)
+                    || scope.relevant(&row.4, row.5, row.6)
+                    || scope.relevant(&row.0, row.7, row.8)
                     || row
                         .9
                         .as_deref()
                         .zip(row.10)
                         .is_some_and(|(path, line)| scope.relevant(path, line, line))
-                    || row.7.is_none() && scope.contains_path(&row.0)
             })
         })
         .collect::<Vec<_>>();
@@ -3491,12 +3611,12 @@ fn render_evidence(
         Option<u32>,
         Option<String>,
         u32,
-        bool,
+        Option<i64>,
     );
     let generated_gaps = connection
         .prepare(
             "SELECT reason, path, line_start, line_end, target_hint, occurrences,
-                    file_id IS NULL AND source_id IS NULL
+                    source_id
                FROM graph_gaps WHERE category='generated'
               ORDER BY path, line_start, line_end, reason, id",
         )
@@ -3516,28 +3636,15 @@ fn render_evidence(
         .collect::<rusqlite::Result<Vec<GeneratedGapRow>>>()
         .map_err(db_error)?
         .into_iter()
-        .filter(|(_, path, start, end, target, _, _)| {
-            scope.is_none_or(|scope| {
-                path.as_deref()
-                    .is_some_and(|path| scope.contains_path(path))
-                    || target.as_deref().zip(*start).is_some_and(|(path, start)| {
-                        scope.relevant(path, start, end.unwrap_or(start))
-                    })
-            })
+        .filter(|(_, path, start, end, _, _, source_id)| {
+            scope.is_none_or(|scope| scope.gap_relevant(path.as_deref(), *start, *end, *source_id))
         })
         .collect::<Vec<_>>();
-    let output_count = rows
-        .iter()
-        .map(|row| row.0.as_str())
-        .collect::<HashSet<_>>()
-        .len();
-    let has_evidence_gap = generated_gaps.iter().any(|gap| gap.6);
-    let provenance_applicable = output_count != 0 || has_evidence_gap;
+    let provenance_applicable = !rows.is_empty();
     let provenance_complete = provenance_applicable
         && rows
             .iter()
-            .all(|row| row.1.is_some() && row.9.is_some() && row.11.is_some())
-        && !has_evidence_gap;
+            .all(|row| row.12 == "linked" && row.11.is_some());
     let provenance_status = if !provenance_applicable {
         "not-applicable"
     } else if provenance_complete {
@@ -3561,31 +3668,18 @@ fn render_evidence(
         provenance_status
     );
     for row in rows {
-        let complete = row.1.is_some() && row.9.is_some() && row.11.is_some();
+        let complete = row.12 == "linked" && row.11.is_some();
+        let input = format!("{}:{}-{}", row.1, row.2, row.3);
+        let generator = format!("{}:{}-{}", row.4, row.5, row.6);
+        let output = format!("{}:{}-{}", row.0, row.7, row.8);
         text.push_str(&format!(
-            "claim kind=generated-provenance status={} result={} basis=verified-generated-manifest output={:?}\n",
+            "claim kind=generated-provenance status={} result={} basis=verified-generated-manifest input={input:?} generator={generator:?} output={output:?}\n",
             if complete { "complete" } else { "partial" },
             if complete { "linked" } else { "unknown" },
-            row.0,
         ));
-        if let (
-            Some(input),
-            Some(input_start),
-            Some(input_end),
-            Some(generator),
-            Some(generator_start),
-            Some(generator_end),
-            Some(output_start),
-            Some(output_end),
-        ) = (row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8)
-        {
-            text.push_str(&format!(
-                "provenance input={:?} generator={:?} output={:?}\n",
-                format!("{input}:{input_start}-{input_end}"),
-                format!("{generator}:{generator_start}-{generator_end}"),
-                format!("{}:{output_start}-{output_end}", row.0),
-            ));
-        }
+        text.push_str(&format!(
+            "provenance input={input:?} generator={generator:?} output={output:?}\n"
+        ));
         if let (Some(source), Some(line)) = (row.9, row.10) {
             text.push_str(&format!(
                 "includes source={:?} output={:?}\n",
@@ -3593,25 +3687,23 @@ fn render_evidence(
                 row.0,
             ));
         }
+        if !complete {
+            let reason = if row.12 == "ambiguous" {
+                "ambiguous"
+            } else {
+                "unobserved"
+            };
+            text.push_str(&format!(
+                "gap category=generated reason=generated-output-{reason} input={input:?} generator={generator:?} output={output:?} occurrences=1\n"
+            ));
+        }
     }
-    for (reason, path, start, end, target, occurrences, evidence_gap) in generated_gaps {
+    for (reason, path, start, end, target, occurrences, _) in generated_gaps {
         let line = match (start, end) {
             (Some(start), Some(end)) if start != end => format!("{start}-{end}"),
             (Some(start), _) => start.to_string(),
             _ => "none".into(),
         };
-        if evidence_gap && let Some(output) = &path {
-            text.push_str(&format!(
-                "claim kind=generated-provenance status=partial result=unknown basis=verified-generated-manifest output={output:?}"
-            ));
-            if let (Some(generator), Some(start)) = (&target, start) {
-                text.push_str(&format!(
-                    " generator={:?}",
-                    format!("{generator}:{start}-{}", end.unwrap_or(start))
-                ));
-            }
-            text.push('\n');
-        }
         text.push_str(&format!(
             "gap category=generated reason={reason} path={:?} line={line}",
             path.unwrap_or_default(),
@@ -4788,6 +4880,74 @@ fn global_gap(gap: &GapInput) -> bool {
     gap.file_key.is_none() && gap.source_key.is_none() && gap.run_key.is_none()
 }
 
+struct ProvenanceResolution {
+    generator_file_id: Option<i64>,
+    generator_node_id: Option<i64>,
+    modeled_site_id: Option<i64>,
+    mapping_state: &'static str,
+}
+
+fn provenance_resolution(
+    connection: &Connection,
+    generator_path: &str,
+    generator_lines: EvidenceLineSpan,
+    output_basename: &str,
+    basename_contended: bool,
+) -> Result<ProvenanceResolution> {
+    let generators = connection
+        .prepare(
+            "SELECT f.id, n.id FROM files f JOIN nodes n ON n.file_id=f.id
+              WHERE f.path=?1 AND f.language IN ('rust','python')
+                AND n.kind IN ('function','test')
+                AND n.line_start<=?2 AND n.line_end>=?3
+              ORDER BY n.id LIMIT 2",
+        )
+        .map_err(db_error)?
+        .query_map(
+            params![generator_path, generator_lines.start, generator_lines.end],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?;
+    let sites = if basename_contended {
+        Vec::new()
+    } else {
+        connection
+            .prepare(
+                "SELECT m.id FROM modeled_sites m
+                  WHERE m.kind='generated-inclusion' AND m.target_hint=?1
+                    AND m.parse_context IS NOT NULL
+                  ORDER BY m.id LIMIT 2",
+            )
+            .map_err(db_error)?
+            .query_map([output_basename], |row| row.get::<_, i64>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?
+    };
+    let ambiguous = basename_contended || generators.len() > 1 || sites.len() > 1;
+    let state = if ambiguous {
+        "ambiguous"
+    } else if generators.len() == 1 && sites.len() == 1 {
+        "linked"
+    } else {
+        "unobserved"
+    };
+    let (generator_file_id, generator_node_id) = generators
+        .first()
+        .filter(|_| generators.len() == 1)
+        .copied()
+        .map_or((None, None), |(file, node)| (Some(file), Some(node)));
+    let modeled_site_id = sites.first().filter(|_| sites.len() == 1).copied();
+    Ok(ProvenanceResolution {
+        generator_file_id,
+        generator_node_id,
+        modeled_site_id,
+        mapping_state: state,
+    })
+}
+
 fn insert_evidence(
     tx: &Transaction<'_>,
     evidence: &EvidenceInput,
@@ -4795,6 +4955,7 @@ fn insert_evidence(
     cancelled: &AtomicBool,
 ) -> Result<EvidenceStats> {
     let mut artifacts = HashMap::<String, (i64, ArtifactRole, [u8; 32])>::new();
+    let mut artifact_paths = HashMap::<String, String>::new();
     {
         let mut insert = tx
             .prepare(
@@ -4804,6 +4965,9 @@ fn insert_evidence(
             .map_err(db_error)?;
         for artifact in &evidence.artifacts {
             check_cancelled(cancelled)?;
+            if !crate::evidence::evidence_path_is_safe(&artifact.path) {
+                return Err("evidence artifact path is unsafe".into());
+            }
             let byte_size = i64::try_from(artifact.byte_size)
                 .map_err(|_| "artifact size exceeds SQLite range".to_owned())?;
             insert
@@ -4824,12 +4988,31 @@ fn insert_evidence(
             {
                 return Err("duplicate evidence artifact key".into());
             }
+            artifact_paths.insert(artifact.key.clone(), artifact.path.clone());
         }
     }
 
+    let mut output_paths_by_basename = BTreeMap::<String, BTreeSet<String>>::new();
+    for provenance in &evidence.provenance {
+        let output_path = artifact_paths
+            .get(&provenance.output_key)
+            .ok_or_else(|| "provenance references an unknown output artifact".to_owned())?;
+        let basename = Path::new(output_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "provenance output basename is invalid".to_owned())?;
+        output_paths_by_basename
+            .entry(basename.to_owned())
+            .or_default()
+            .insert(output_path.clone());
+    }
     let mut inserted_links = 0_usize;
+    let mut declarations = HashSet::new();
     for provenance in &evidence.provenance {
         check_cancelled(cancelled)?;
+        if !crate::evidence::evidence_path_is_safe(&provenance.generator_path) {
+            return Err("provenance generator path is unsafe".into());
+        }
         validate_evidence_span(provenance.input_lines)?;
         validate_evidence_span(provenance.generator_lines)?;
         validate_evidence_span(provenance.output_lines)?;
@@ -4844,68 +5027,36 @@ fn insert_evidence(
         if input_role != ArtifactRole::Input || output_role != ArtifactRole::GeneratedRust {
             return Err("provenance artifact role is invalid".into());
         }
-        let generator = tx
-            .prepare(
-                "SELECT f.id, n.id FROM files f JOIN nodes n ON n.file_id=f.id
-                  WHERE f.path=?1 AND f.language IN ('rust','python')
-                    AND n.kind IN ('function','test')
-                    AND n.line_start<=?2 AND n.line_end>=?3
-                  ORDER BY n.id LIMIT 2",
-            )
-            .map_err(db_error)?
-            .query_map(
-                params![
-                    provenance.generator_path,
-                    provenance.generator_lines.start,
-                    provenance.generator_lines.end
-                ],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .map_err(db_error)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(db_error)?;
-        if generator.len() != 1 {
-            return Err("provenance generator span is not uniquely mapped".into());
+        let declaration = (
+            input_id,
+            provenance.input_lines.start,
+            provenance.input_lines.end,
+            provenance.generator_path.clone(),
+            provenance.generator_lines.start,
+            provenance.generator_lines.end,
+            output_id,
+            provenance.output_lines.start,
+            provenance.output_lines.end,
+        );
+        if !declarations.insert(declaration) {
+            return Err("duplicate provenance declaration".into());
         }
-        let (generator_file_id, generator_node_id) = generator[0];
-        let modeled_site_id = if let Some(site) = &provenance.inclusion_site {
-            let candidates = tx
-                .prepare(
-                    "SELECT m.id FROM modeled_sites m JOIN files f ON f.id=m.file_id
-                      WHERE f.path=?1 AND m.kind=?2
-                        AND m.line_start<=?3 AND m.line_end>=?3
-                        AND ifnull(m.target_hint,'')=ifnull(?4,'')
-                      ORDER BY m.id LIMIT 2",
-                )
-                .map_err(db_error)?
-                .query_map(
-                    params![site.path, site.kind.db(), site.line, site.target_hint],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(db_error)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(db_error)?;
-            if candidates.len() != 1 {
-                return Err("provenance inclusion site is not uniquely mapped".into());
-            }
-            let site_id = candidates[0];
-            let contended: bool = tx
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM provenance_links
-                          WHERE modeled_site_id=?1 AND output_artifact_id!=?2
-                         UNION ALL
-                         SELECT 1 FROM provenance_links
-                          WHERE output_artifact_id=?2 AND modeled_site_id IS NOT NULL
-                            AND modeled_site_id!=?1
-                     )",
-                    params![site_id, output_id],
-                    |row| row.get(0),
-                )
-                .map_err(db_error)?;
-            if contended {
-                return Err("provenance output/inclusion site is ambiguous".into());
-            }
+        let output_path = &artifact_paths[&provenance.output_key];
+        let basename = Path::new(output_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "provenance output basename is invalid".to_owned())?;
+        let basename_contended = output_paths_by_basename
+            .get(basename)
+            .is_some_and(|paths| paths.len() > 1);
+        let resolution = provenance_resolution(
+            tx,
+            &provenance.generator_path,
+            provenance.generator_lines,
+            basename,
+            basename_contended,
+        )?;
+        if let Some(site_id) = resolution.modeled_site_id {
             tx.execute(
                 "DELETE FROM graph_gaps
                   WHERE reason='generated-output-unobserved'
@@ -4917,32 +5068,33 @@ fn insert_evidence(
                 [site_id],
             )
             .map_err(db_error)?;
-            Some(site_id)
-        } else {
-            None
-        };
+        }
         tx.execute(
             "INSERT INTO provenance_links(
                 input_artifact_id, input_line_start, input_line_end,
-                generator_file_id, generator_node_id, generator_line_start, generator_line_end,
-                output_artifact_id, output_line_start, output_line_end, modeled_site_id
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                generator_path, generator_file_id, generator_node_id,
+                generator_line_start, generator_line_end,
+                output_artifact_id, output_line_start, output_line_end,
+                modeled_site_id, mapping_state
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 input_id,
                 provenance.input_lines.start,
                 provenance.input_lines.end,
-                generator_file_id,
-                generator_node_id,
+                provenance.generator_path,
+                resolution.generator_file_id,
+                resolution.generator_node_id,
                 provenance.generator_lines.start,
                 provenance.generator_lines.end,
                 output_id,
                 provenance.output_lines.start,
                 provenance.output_lines.end,
-                modeled_site_id
+                resolution.modeled_site_id,
+                resolution.mapping_state
             ],
         )
         .map_err(db_error)?;
-        inserted_links += 1;
+        inserted_links += usize::from(resolution.mapping_state == "linked");
     }
 
     let mut runs = HashMap::<String, (i64, CoverageFormat, Option<i64>)>::new();
@@ -5127,6 +5279,9 @@ fn insert_evidence(
         check_cancelled(cancelled)?;
         if gap.file_key.is_some() || gap.source_key.is_some() {
             return Err("evidence gap ownership is invalid".into());
+        }
+        if gap.category != GapCategory::Coverage {
+            return Err("evidence gap category is invalid".into());
         }
         let run_id = gap
             .run_key
@@ -6270,8 +6425,9 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
                 REFERENCES imported_artifacts(id) ON DELETE CASCADE,
             input_line_start INTEGER NOT NULL CHECK(input_line_start>0),
             input_line_end INTEGER NOT NULL CHECK(input_line_end>=input_line_start),
-            generator_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-            generator_node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            generator_path TEXT NOT NULL CHECK(length(generator_path)>0),
+            generator_file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+            generator_node_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
             generator_line_start INTEGER NOT NULL CHECK(generator_line_start>0),
             generator_line_end INTEGER NOT NULL CHECK(generator_line_end>=generator_line_start),
             output_artifact_id INTEGER NOT NULL
@@ -6279,9 +6435,15 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             output_line_start INTEGER NOT NULL CHECK(output_line_start>0),
             output_line_end INTEGER NOT NULL CHECK(output_line_end>=output_line_start),
             modeled_site_id INTEGER REFERENCES modeled_sites(id) ON DELETE CASCADE,
+            mapping_state TEXT NOT NULL
+                CHECK(mapping_state IN ('linked','unobserved','ambiguous')),
+            CHECK((generator_file_id IS NULL)=(generator_node_id IS NULL)),
+            CHECK((mapping_state='linked')=(
+                generator_node_id IS NOT NULL AND modeled_site_id IS NOT NULL
+            )),
             UNIQUE(
                 input_artifact_id, input_line_start, input_line_end,
-                generator_file_id, generator_node_id, generator_line_start, generator_line_end,
+                generator_path, generator_line_start, generator_line_end,
                 output_artifact_id, output_line_start, output_line_end
             )
          );
@@ -6379,7 +6541,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          );
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=7;",
+         PRAGMA user_version=8;",
     )
     .map_err(db_error)
 }
@@ -8584,12 +8746,6 @@ mod tests {
                 generator_lines: EvidenceLineSpan { start: 1, end: 1 },
                 output_key: "output".into(),
                 output_lines: EvidenceLineSpan { start: 1, end: 1 },
-                inclusion_site: Some(ModeledSiteLocator {
-                    path: "src/lib.rs".into(),
-                    line: 1,
-                    kind: ModeledSiteKind::GeneratedInclusion,
-                    target_hint: Some("out.rs".into()),
-                }),
             }],
             ..EvidenceInput::default()
         };
@@ -8684,6 +8840,132 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn duplicate_provenance_declaration_rolls_back_the_evidence_transaction() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = provenance_source_store(None);
+        let before = read_state(&store.connection).unwrap();
+        let mut evidence = provenance_evidence();
+        evidence.provenance.push(evidence.provenance[0].clone());
+
+        assert_eq!(
+            store
+                .replace_evidence(generated_output_graph(), &evidence, &cancelled)
+                .unwrap_err(),
+            "duplicate provenance declaration"
+        );
+        assert_eq!(read_state(&store.connection).unwrap(), before);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM imported_artifacts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM provenance_links", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn seal_and_image_validation_recompute_provenance_declaration_state() {
+        let cancelled = AtomicBool::new(false);
+        let root = std::env::temp_dir().join(format!(
+            "graphr-provenance-state-validation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let mut store = provenance_source_store(Some(&path));
+        store
+            .replace_evidence(generated_output_graph(), &provenance_evidence(), &cancelled)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE provenance_links
+                    SET modeled_site_id=NULL, mapping_state='unobserved'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.seal(&cancelled).unwrap_err(),
+            "database provenance declaration mapping is inconsistent"
+        );
+
+        let store = Store::open_private_image(&path, &cancelled).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE provenance_links
+                    SET modeled_site_id=(SELECT id FROM modeled_sites), mapping_state='linked'",
+                [],
+            )
+            .unwrap();
+        store.seal(&cancelled).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE provenance_links
+                    SET modeled_site_id=NULL, mapping_state='unobserved'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            validate_image(&path).unwrap_err(),
+            "database provenance declaration mapping is inconsistent"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seal_rejects_unsafe_provenance_declaration_identity() {
+        let cancelled = AtomicBool::new(false);
+        let root = std::env::temp_dir().join(format!(
+            "graphr-provenance-path-validation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let mut store = provenance_source_store(Some(&path));
+        store
+            .replace_evidence(generated_output_graph(), &provenance_evidence(), &cancelled)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE provenance_links
+                    SET generator_path='../escape.rs',
+                        generator_file_id=NULL, generator_node_id=NULL,
+                        mapping_state='unobserved'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.seal(&cancelled).unwrap_err(),
+            "database provenance declaration path is unsafe"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -9322,18 +9604,13 @@ mod tests {
             ArtifactRole::Input,
             4,
         ));
-        evidence.gaps.push(GapInput {
-            file_key: None,
-            source_key: None,
-            run_key: None,
-            path: Some("target/out.rs".into()),
-            line_start: Some(7),
-            line_end: Some(7),
-            category: GapCategory::Generated,
-            reason: GapReason::GeneratedOutputUnobserved,
-            target_hint: Some("src/missing.rs".into()),
-            occurrences: 1,
-            relation_site: false,
+        evidence.provenance.push(ProvenanceInput {
+            input_key: "failed-input".into(),
+            input_lines: EvidenceLineSpan { start: 1, end: 1 },
+            generator_path: "src/missing.rs".into(),
+            generator_lines: EvidenceLineSpan { start: 7, end: 7 },
+            output_key: "output".into(),
+            output_lines: EvidenceLineSpan { start: 1, end: 1 },
         });
         store
             .replace_evidence(generated_output_graph(), &evidence, &cancelled)
@@ -9351,11 +9628,20 @@ mod tests {
             .unwrap();
         assert!(rendered.evidence.contains("provenance_model=partial"));
         assert!(rendered.evidence.contains(
-            "claim kind=generated-provenance status=partial result=unknown basis=verified-generated-manifest output=\"target/out.rs\" generator=\"src/missing.rs:7-7\""
+            "claim kind=generated-provenance status=partial result=unknown basis=verified-generated-manifest input=\"failed.proto:1-1\" generator=\"src/missing.rs:7-7\" output=\"target/out.rs:1-1\""
         ));
         assert!(rendered.evidence.contains(
-            "gap category=generated reason=generated-output-unobserved path=\"target/out.rs\" line=7 target=\"src/missing.rs\" occurrences=1"
+            "gap category=generated reason=generated-output-unobserved input=\"failed.proto:1-1\" generator=\"src/missing.rs:7-7\" output=\"target/out.rs:1-1\" occurrences=1"
         ));
+        assert_eq!(
+            rendered
+                .evidence
+                .matches("claim kind=generated-provenance")
+                .count(),
+            2,
+            "{}",
+            rendered.evidence
+        );
         assert_eq!(rendered.dynamic_status, CompletenessStatus::Partial);
     }
 
@@ -9427,18 +9713,10 @@ mod tests {
     fn generator_mapping_accepts_only_repository_rust_and_python_nodes() {
         let cancelled = AtomicBool::new(false);
         let cases = [
-            ("src/generator.rs", Language::Rust, MappingStatus::Unique),
-            ("pkg/generator.py", Language::Python, MappingStatus::Unique),
-            (
-                "web/generator.js",
-                Language::JavaScript,
-                MappingStatus::Missing,
-            ),
-            (
-                "web/generator.ts",
-                Language::TypeScript,
-                MappingStatus::Missing,
-            ),
+            ("src/generator.rs", Language::Rust, true),
+            ("pkg/generator.py", Language::Python, true),
+            ("web/generator.js", Language::JavaScript, false),
+            ("web/generator.ts", Language::TypeScript, false),
         ];
         let graph = Graph {
             files: cases
@@ -9482,9 +9760,16 @@ mod tests {
 
         for (path, _, expected) in cases {
             assert_eq!(
-                store
-                    .generator_mapping(path, EvidenceLineSpan { start: 1, end: 1 })
-                    .unwrap(),
+                provenance_resolution(
+                    &store.connection,
+                    path,
+                    EvidenceLineSpan { start: 1, end: 1 },
+                    "out.rs",
+                    false,
+                )
+                .unwrap()
+                .generator_node_id
+                .is_some(),
                 expected,
                 "unexpected generator mapping for {path}"
             );
@@ -9703,12 +9988,6 @@ mod tests {
                     generator_lines: EvidenceLineSpan { start: 1, end: 1 },
                     output_key: "changed-output".into(),
                     output_lines: EvidenceLineSpan { start: 1, end: 1 },
-                    inclusion_site: Some(ModeledSiteLocator {
-                        path: "src/changed.rs".into(),
-                        line: 1,
-                        kind: ModeledSiteKind::GeneratedInclusion,
-                        target_hint: Some("changed-out.rs".into()),
-                    }),
                 },
                 ProvenanceInput {
                     input_key: "unrelated-input".into(),
@@ -9717,12 +9996,6 @@ mod tests {
                     generator_lines: EvidenceLineSpan { start: 1, end: 1 },
                     output_key: "unrelated-output".into(),
                     output_lines: EvidenceLineSpan { start: 1, end: 1 },
-                    inclusion_site: Some(ModeledSiteLocator {
-                        path: "src/unrelated.rs".into(),
-                        line: 1,
-                        kind: ModeledSiteKind::GeneratedInclusion,
-                        target_hint: Some("unrelated-out.rs".into()),
-                    }),
                 },
             ],
             runs: vec![CoverageRunInput {
@@ -9849,6 +10122,309 @@ mod tests {
     }
 
     #[test]
+    fn traverse_only_neighbor_does_not_enter_exact_evidence_scope() {
+        let cancelled = AtomicBool::new(false);
+        let file = |path: &str, byte, observed_relation_sites| FileInput {
+            path: path.into(),
+            language: Language::Rust,
+            git_oid: None,
+            content_hash: [byte; 32],
+            parse_context: "0:".into(),
+            byte_size: 1,
+            replace: true,
+            observed_relation_sites,
+        };
+        let node = |key: &str, path: &str| NodeInput {
+            key: key.into(),
+            file_key: path.into(),
+            kind: NodeKind::Function,
+            name: key.into(),
+            qualified_name: key.into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            keys: Vec::new(),
+        };
+        let mut graph = Graph {
+            files: vec![file("src/root.rs", 1, 0), file("src/neighbor.rs", 2, 1)],
+            nodes: vec![
+                node("root", "src/root.rs"),
+                node("neighbor", "src/neighbor.rs"),
+            ],
+            edges: vec![EdgeInput {
+                source_key: "root".into(),
+                target_key: "neighbor".into(),
+                kind: EdgeKind::Imports,
+                support_count: 1,
+            }],
+            modeled_sites: vec![ModeledSiteInput {
+                file_key: "src/neighbor.rs".into(),
+                source_key: Some("neighbor".into()),
+                kind: ModeledSiteKind::GeneratedInclusion,
+                line_start: 1,
+                line_end: 1,
+                target_hint: Some("out.rs".into()),
+                parse_context: Some("0:".into()),
+            }],
+            gaps: vec![GapInput {
+                file_key: Some("src/neighbor.rs".into()),
+                source_key: Some("neighbor".into()),
+                run_key: None,
+                path: Some("src/neighbor.rs".into()),
+                line_start: Some(1),
+                line_end: Some(1),
+                category: GapCategory::Relation,
+                reason: GapReason::DynamicOrUnsupportedDispatch,
+                target_hint: Some("neighbor-gap".into()),
+                occurrences: 1,
+                relation_site: false,
+            }],
+            ..Graph::default()
+        };
+        own_graph_edges(&mut graph);
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        let evidence = EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 9),
+                imported("input", "schema.proto", ArtifactRole::Input, 3),
+                imported("output", "target/out.rs", ArtifactRole::GeneratedRust, 3),
+                imported("report", "coverage.json", ArtifactRole::CoverageReport, 5),
+            ],
+            provenance: vec![ProvenanceInput {
+                input_key: "input".into(),
+                input_lines: EvidenceLineSpan { start: 1, end: 1 },
+                generator_path: "src/neighbor.rs".into(),
+                generator_lines: EvidenceLineSpan { start: 1, end: 1 },
+                output_key: "output".into(),
+                output_lines: EvidenceLineSpan { start: 1, end: 1 },
+            }],
+            runs: vec![CoverageRunInput {
+                key: "run".into(),
+                format: CoverageFormat::Llvm,
+                report_key: "report".into(),
+                run_label: "neighbor-run".into(),
+                test_name: None,
+            }],
+            regions: vec![coverage_region("run", "src/neighbor.rs", 1, 1, 1, None)],
+            ..EvidenceInput::default()
+        };
+        store
+            .replace_evidence(generated_output_graph(), &evidence, &cancelled)
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/root.rs".into(),
+                        whole_file: false,
+                        spans: vec![LineSpan { start: 2, end: 2 }],
+                        report_unmapped: false,
+                    }],
+                    records: Vec::new(),
+                    paths: Vec::new(),
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                1,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(
+            review.graph.contains("neighbor src/neighbor.rs:1"),
+            "{}",
+            review.graph
+        );
+        assert!(review.graph.contains("gaps total=1"), "{}", review.graph);
+        assert!(!review.graph.contains("neighbor-gap"), "{}", review.graph);
+        assert!(
+            !review.evidence.contains("target/out.rs"),
+            "{}",
+            review.evidence
+        );
+        assert!(
+            !review.evidence.contains("src/neighbor.rs"),
+            "{}",
+            review.evidence
+        );
+    }
+
+    #[test]
+    fn changed_input_span_pulls_its_exact_provenance_chain() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = provenance_source_store(None);
+        let mut evidence = provenance_evidence();
+        evidence.artifacts.push(imported(
+            "report",
+            "coverage.json",
+            ArtifactRole::CoverageReport,
+            4,
+        ));
+        evidence.runs.push(CoverageRunInput {
+            key: "run".into(),
+            format: CoverageFormat::Llvm,
+            report_key: "report".into(),
+            run_label: "generated-run".into(),
+            test_name: None,
+        });
+        evidence
+            .regions
+            .push(coverage_region("run", "target/out.rs", 1, 1, 1, None));
+        let mut generated = generated_output_graph();
+        generated.nodes.push(NodeInput {
+            key: "generated".into(),
+            file_key: "target/out.rs".into(),
+            kind: NodeKind::Function,
+            name: "generated".into(),
+            qualified_name: "generated".into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            keys: Vec::new(),
+        });
+        store
+            .replace_evidence(generated, &evidence, &cancelled)
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &WorktreeChanges {
+                    files: Vec::new(),
+                    records: Vec::new(),
+                    paths: vec![crate::git::ChangedPath {
+                        status: crate::git::ChangeStatus::Modified,
+                        old_path: None,
+                        old_language: None,
+                        path: "schema.proto".into(),
+                        language: None,
+                        additions: Some(1),
+                        deletions: Some(1),
+                        layers: vec![crate::git::ChangeLayer::Unstaged],
+                    }],
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+
+        assert!(
+            review.evidence.contains(
+                "claim kind=generated-provenance status=complete result=linked basis=verified-generated-manifest input=\"schema.proto:1-1\""
+            ),
+            "{}",
+            review.evidence
+        );
+        assert!(review.evidence.contains("generator=\"src/lib.rs:1-1\""));
+        assert!(review.evidence.contains("output=\"target/out.rs:1-1\""));
+        assert!(
+            review.evidence.contains(
+                "claim kind=changed-execution path=\"target/out.rs\" lines=1 status=complete result=observed basis=llvm-coverage-json run=\"generated-run\""
+            ),
+            "{}",
+            review.evidence
+        );
+    }
+
+    #[test]
+    fn same_file_generated_gap_is_scoped_by_owner_not_path() {
+        let cancelled = AtomicBool::new(false);
+        let mut graph = single_node_graph("selected");
+        graph.nodes[0].line_end = 2;
+        graph.nodes.push(function_node("other", 10));
+        graph.gaps.push(GapInput {
+            file_key: Some("src/lib.rs".into()),
+            source_key: Some("other".into()),
+            run_key: None,
+            path: Some("src/lib.rs".into()),
+            line_start: Some(10),
+            line_end: Some(10),
+            category: GapCategory::Generated,
+            reason: GapReason::GeneratedOutputUnobserved,
+            target_hint: Some("other-generated.rs".into()),
+            occurrences: 1,
+            relation_site: false,
+        });
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        store
+            .replace_evidence(
+                Graph::default(),
+                &EvidenceInput {
+                    artifacts: vec![imported(
+                        "manifest",
+                        "evidence.json",
+                        ArtifactRole::Manifest,
+                        1,
+                    )],
+                    ..EvidenceInput::default()
+                },
+                &cancelled,
+            )
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(review.graph.contains("gaps total=1"), "{}", review.graph);
+        assert_eq!(review.static_status, CompletenessStatus::Partial);
+        assert!(
+            !review.evidence.contains("other-generated.rs"),
+            "{}",
+            review.evidence
+        );
+
+        let state = read_state(&store.connection).unwrap();
+        let selected_id = store
+            .connection
+            .query_row("SELECT id FROM nodes WHERE name='selected'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let view = store
+            .view(
+                SNAPSHOT,
+                &format!(
+                    "n1:{SNAPSHOT}:{}:{}:{selected_id}",
+                    state.epoch, state.generation
+                ),
+                1,
+                10,
+            )
+            .unwrap();
+        assert!(!view.contains("other-generated.rs"), "{view}");
+    }
+
+    #[test]
     fn provenance_replacement_rejects_complete_link_without_generated_file() {
         let cancelled = AtomicBool::new(false);
         let mut store = provenance_source_store(None);
@@ -9857,7 +10433,7 @@ mod tests {
             .replace_evidence(Graph::default(), &provenance_evidence(), &cancelled)
             .unwrap_err();
 
-        assert_eq!(error, "database evidence relationships are invalid");
+        assert_eq!(error, "database provenance generated output is missing");
         assert_eq!(
             store
                 .connection
@@ -9906,7 +10482,7 @@ mod tests {
                 store.seal(&AtomicBool::new(false)).unwrap_err()
             };
 
-            assert_eq!(error, "database evidence relationships are invalid");
+            assert_eq!(error, "database provenance generated output is missing");
             fs::remove_dir_all(root).unwrap();
         }
     }
@@ -10730,12 +11306,6 @@ mod tests {
                 generator_lines: EvidenceLineSpan { start: 1, end: 1 },
                 output_key: "output".into(),
                 output_lines: EvidenceLineSpan { start: 1, end: 1 },
-                inclusion_site: Some(ModeledSiteLocator {
-                    path: "src/lib.rs".into(),
-                    line: 1,
-                    kind: ModeledSiteKind::GeneratedInclusion,
-                    target_hint: Some("out.rs".into()),
-                }),
             }],
             ..EvidenceInput::default()
         }
