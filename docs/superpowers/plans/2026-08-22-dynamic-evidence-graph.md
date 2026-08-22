@@ -807,6 +807,13 @@ pub struct EvidenceLineSpan {
     pub end: u32,
 }
 
+pub struct ModeledSiteLocator {
+    pub path: String,
+    pub line: u32,
+    pub kind: ModeledSiteKind,
+    pub target_hint: Option<String>,
+}
+
 pub struct ImportedArtifactInput {
     pub key: String,
     pub path: String,
@@ -822,10 +829,8 @@ pub struct ProvenanceInput {
     pub generator_lines: EvidenceLineSpan,
     pub output_key: String,
     pub output_lines: EvidenceLineSpan,
+    pub inclusion_site: Option<ModeledSiteLocator>,
 }
-
-// The store resolves and validates the modeled inclusion site and declaration
-// state transactionally from the indexed source graph.
 
 pub struct CoverageRunInput {
     pub key: String,
@@ -849,11 +854,11 @@ pub struct CoverageRegionInput {
 pub struct CoverageBranchInput {
     pub run_key: String,
     pub path: Option<String>,
-    pub start_line: i64,
+    pub start_line: u32,
     pub start_column: u32,
-    pub end_line: i64,
+    pub end_line: u32,
     pub end_column: u32,
-    pub target_line: Option<i64>,
+    pub target_line: Option<u32>,
     pub kind: CoverageBranchKind,
     pub execution_count: u64,
 }
@@ -1138,11 +1143,11 @@ pub enum BranchObservationKind { TrueOutcome, FalseOutcome, Arc }
 
 pub struct BranchObservation {
     pub path: Option<String>,
-    pub start_line: i64,
+    pub start_line: u32,
     pub start_column: u32,
-    pub end_line: i64,
+    pub end_line: u32,
     pub end_column: u32,
-    pub target_line: Option<i64>,
+    pub target_line: Option<u32>,
     pub kind: BranchObservationKind,
     pub execution_count: u64,
     pub context: Option<String>,
@@ -1467,7 +1472,7 @@ git commit -m "feat: review dynamic evidence paths"
 
 **Steps:**
 
-- [x] **Step 1: Document the producer/consumer workflow**
+- [ ] **Step 1: Document the producer/consumer workflow**
 
 Update `README.md` with:
 
@@ -1485,7 +1490,7 @@ Update `README.md` with:
 
 Do not describe the manifest as proof that a process caused an output.
 
-- [x] **Step 2: Audit the implementation against the approved design**
+- [ ] **Step 2: Audit the implementation against the approved design**
 
 Run these searches and resolve every hit intentionally:
 
@@ -1507,7 +1512,7 @@ Expected results:
 Compare each spec verification bullet to a named unit/E2E test. If behavior
 deviated, either fix it or amend the spec only after explicit user approval.
 
-- [x] **Step 3: Run the complete serial gate with fresh evidence**
+- [ ] **Step 3: Run the complete serial gate with fresh evidence**
 
 Run every command from the repository root and retain exit status/output:
 
@@ -1522,12 +1527,6 @@ git status --short
 
 If a command fails, use `superpowers:systematic-debugging`, repair the root
 cause, and restart the gate from `cargo fmt --check`.
-
-Controller-approved process ownership: the mandatory final whole-branch review
-will satisfy Step 4's review requirement once, with this documentation
-included. This task commits the documentation after the serial gate without a
-duplicate review. The controller also owns Step 5 and branch handoff; this task
-does not invoke the branch-finishing workflow or integrate the branch.
 
 - [ ] **Step 4: Request review and commit documentation**
 
@@ -1555,95 +1554,3 @@ Next human integration choices
 
 Do not merge, push, delete the worktree, or remove the branch without the user's
 explicit selection.
-
----
-
-### Task 6: Preserve declaration identity and exact evidence ownership
-
-**Files:**
-
-- Modify: `src/index.rs`
-- Modify: `src/store.rs`
-- Modify only if the evidence-image identity changes: `src/workspace.rs`
-- Test: `src/store.rs`
-- Test if orchestration needs a public-path regression: `src/index.rs` or `tests/e2e.rs`
-
-**Interfaces:**
-
-- Consumes: the v1 manifest's exact input, generator, output, and inclusion-site
-  declaration; changed roots and emitted `AffectedFlow` nodes; the selected
-  `view` node; the existing immutable evidence transaction.
-- Produces: exactly one stored/rendered provenance claim per manifest
-  declaration, including failures, and exact evidence scoped only to changed
-  roots plus emitted affected flows or the selected view node and their
-  provenance closure.
-
-**Steps:**
-
-- [x] **Step 1: Write RED declaration-identity tests**
-
-Add behavior tests proving that two failed declarations which differ only by
-input artifact remain two distinct claims naming both inputs, while one failed
-inclusion produces exactly one partial claim rather than both a provenance row
-and a generic generated gap. Prove the evidence transaction and sealed-image
-validation reject duplicate or internally inconsistent declaration identity.
-
-Run each new test with `--exact --nocapture` and retain the expected failure
-showing the current generic output/generator gap collapse or duplicate claim.
-
-- [x] **Step 2: Store every manifest declaration once**
-
-Replace generic evidence-only generated gaps as the identity for failed
-manifest chains. Persist every declaration's input artifact/span, generator
-path/span and resolved node when unique, output artifact/span, inclusion site
-when unique, and explicit failure state in one constrained row. Complete and
-failed declarations share one uniqueness identity. Render the claim and its
-gap/limit from that row exactly once. Static parser/generated gaps remain in
-`graph_gaps` and must not become manifest-chain claims.
-
-Use the current create-schema SQL only: bump the schema/evidence cache identity
-as required, with no migration or compatibility path. Keep replacement atomic,
-cancel-safe, and sealed-image validation exact.
-
-- [x] **Step 3: Write RED evidence-ownership tests**
-
-Add behavior tests proving:
-
-1. a graph neighbor displayed by `changes(depth > 0)` but absent from every
-   emitted affected flow contributes no exact gap, provenance, or observation;
-2. selecting/changing a declared input span pulls in its own complete or failed
-   provenance chain;
-3. a generated gap owned by another function in the same file is excluded from
-   both `view` and span-scoped `changes`;
-4. repository-wide/out-of-neighborhood gap counts still affect the summary and
-   confidence status without emitting unrelated exact rows.
-
-Run each new test with `--exact --nocapture` and retain the expected scope leak
-or missing-chain failure before production edits.
-
-- [x] **Step 4: Separate graph display breadth from exact evidence scope**
-
-Keep `traversed_ids` for graph output/accounting only. Build exact `changes`
-evidence scope from changed roots and the nodes in emitted `AffectedFlow`
-records. Keep `view` rooted at the selected node. Extend provenance closure and
-row relevance to the declared input artifact/span as well as generator, output,
-and inclusion site. Filter generated/static gaps by owning node or overlapping
-line range; path-only membership is insufficient except for an explicitly
-whole-file scope.
-
-- [x] **Step 5: Run the serial gate, self-review, and commit**
-
-Run from the isolated worktree:
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build --locked --release
-git diff --check
-git status --short
-```
-
-Review the diff for duplicate claims, path-only evidence matching, unvalidated
-nullable identities, accidental migrations/fallbacks, and unrelated changes.
-Commit the complete slice without merging or pushing.
