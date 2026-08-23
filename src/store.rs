@@ -6962,6 +6962,10 @@ mod tests {
 
     const SNAPSHOT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    fn canonical_temp_dir() -> PathBuf {
+        fs::canonicalize(std::env::temp_dir()).expect("temporary directory must resolve")
+    }
+
     #[test]
     fn resolution_state_resolved_missing_and_ambiguous_own_exact_edges() {
         for (targets, state, edges) in [
@@ -7049,7 +7053,7 @@ mod tests {
 
     #[test]
     fn resolution_state_constraints_and_seal_reject_invalid_rows() {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "graphr-resolution-state-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -7474,7 +7478,7 @@ mod tests {
 
     #[test]
     fn schema_mismatch_does_not_change_journal_mode() {
-        let path = std::env::temp_dir().join(format!(
+        let path = canonical_temp_dir().join(format!(
             "graphr-store-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
@@ -8891,7 +8895,7 @@ mod tests {
     #[test]
     fn seal_and_image_validation_recompute_provenance_declaration_state() {
         let cancelled = AtomicBool::new(false);
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "graphr-provenance-state-validation-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -8947,7 +8951,7 @@ mod tests {
     #[test]
     fn seal_rejects_unsafe_provenance_declaration_identity() {
         let cancelled = AtomicBool::new(false);
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "graphr-provenance-path-validation-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -9520,7 +9524,7 @@ mod tests {
     #[test]
     fn coverage_py_signed_arcs_round_trip_through_store_render_and_seal() {
         let cancelled = AtomicBool::new(false);
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "graphr-signed-coverage-arcs-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -9859,7 +9863,7 @@ mod tests {
     #[test]
     fn seal_recomputes_missing_and_ambiguous_aliases_without_conflating_them() {
         let cancelled = AtomicBool::new(false);
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "graphr-alias-state-seal-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -10601,7 +10605,7 @@ mod tests {
     #[test]
     fn seal_and_image_validation_reject_complete_link_without_generated_file() {
         for validate_after_seal in [false, true] {
-            let root = std::env::temp_dir().join(format!(
+            let root = canonical_temp_dir().join(format!(
                 "graphr-generated-provenance-invariant-{validate_after_seal}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
@@ -11237,7 +11241,7 @@ mod tests {
     }
 
     fn sealed_resolution_corruption(label: &str, corrupt: impl FnOnce(&Connection)) -> String {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "graphr-seal-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -11260,7 +11264,7 @@ mod tests {
     }
 
     fn sealed_image_corruption(label: &str, corrupt: impl FnOnce(&Connection)) -> String {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "graphr-image-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

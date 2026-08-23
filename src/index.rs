@@ -3877,6 +3877,10 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
+    fn canonical_temp_dir() -> PathBuf {
+        fs::canonicalize(std::env::temp_dir()).expect("temporary directory must resolve")
+    }
+
     fn complete_artifact(path: &str, analyzer: AnalyzerKind) -> ArtifactFile {
         ArtifactFile {
             path: path.into(),
@@ -3911,7 +3915,7 @@ mod tests {
             text: "fn predicate() -> bool { true }\nfn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n".into(),
         };
         let source_graph = build_graph(&[source], &cancelled).unwrap();
-        let fixture = std::env::temp_dir().join(format!(
+        let fixture = canonical_temp_dir().join(format!(
             "graphr-generated-evidence-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -3992,7 +3996,7 @@ mod tests {
             &cancelled,
         )
         .unwrap();
-        let fixture = std::env::temp_dir().join(format!(
+        let fixture = canonical_temp_dir().join(format!(
             "graphr-generated-basename-contention-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -4120,7 +4124,7 @@ mod tests {
             &cancelled,
         )
         .unwrap();
-        let fixture = std::env::temp_dir().join(format!(
+        let fixture = canonical_temp_dir().join(format!(
             "graphr-generated-declaration-identity-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -4249,7 +4253,7 @@ mod tests {
                 &cancelled,
             )
             .unwrap();
-            let fixture = std::env::temp_dir().join(format!(
+            let fixture = canonical_temp_dir().join(format!(
                 "graphr-generated-context-{}-{ordinal}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
