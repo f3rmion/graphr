@@ -10,31 +10,38 @@ use std::sync::{
 };
 use std::thread;
 
+use crate::coverage::{BranchObservationKind, parse_coverage};
+use crate::evidence::{CapturedArtifact, CapturedEvidence, capture_manifest};
 use crate::git::{
     ArtifactReview, CapturedSource, ChangeStatus, ChangedPath, DependencyMode, Language,
-    Repository, Source, SourceContent, SourceSnapshot, WorktreeChanges, changed_dependency_package,
-    read_captured_source,
+    Repository, Source, SourceContent, SourceOmissionReason, SourceSnapshot, WorktreeChanges,
+    change_content_complete, changed_dependency_package, read_captured_source,
 };
 use crate::javascript::ScriptParsers;
 use crate::parse::{DefinitionKind, ParsedFile, RustParser};
 use crate::python::PythonParser;
 use crate::store::{
-    EdgeInput, EdgeKind, FileInput, Graph, NodeInput, NodeKind, RefInput, RefKind, Store,
-    TraitImplementationInput,
+    ArtifactRole, ChangeReview, CompletenessStatus, CoverageBranchInput, CoverageBranchKind,
+    CoverageRegionInput, CoverageRunInput, EdgeInput, EdgeKind, EvidenceInput, EvidenceLineSpan,
+    FileInput, GapCategory, GapInput, GapReason, Graph, ImportedArtifactInput, ModeledSiteInput,
+    ModeledSiteKind, NodeInput, NodeKind, ProvenanceInput, RefInput, RefKind, ResolutionState,
+    Store, TraitImplementationInput,
 };
 use crate::workspace::{
     BuildProgress, BuildStage, CACHE_FORMAT_VERSION, ErrorCode, GRAPH_ANALYZER_VERSION,
     IndexCompletion, OperationError, Provenance, QueryOutput, REVIEW_FORMAT_VERSION,
     ResolvedIndexRequest, RootInspection, SnapshotCatalog, SnapshotEntry, SnapshotKeyInput,
-    SnapshotTarget, graph_image_key, selected_layers, snapshot_key, validate_entry_graph,
+    SnapshotTarget, evidence_graph_image_key, graph_image_key, selected_layers, snapshot_key,
+    validate_entry_graph,
 };
 
 const QUALIFIED_PATH_LIMIT: usize = 1024;
 const REVIEW_CONTEXT_BUDGET: usize = 8192;
-const INITIAL_FILES_BUDGET: usize = 1792;
-const INITIAL_DIFF_BUDGET: usize = 2432;
-const INITIAL_ARTIFACTS_BUDGET: usize = 1920;
-const INITIAL_GRAPH_BUDGET: usize = 1920;
+const INITIAL_FILES_BUDGET: usize = 1200;
+const INITIAL_DIFF_BUDGET: usize = 1800;
+const INITIAL_ARTIFACTS_BUDGET: usize = 1200;
+const INITIAL_GRAPH_BUDGET: usize = 1600;
+const INITIAL_EVIDENCE_BUDGET: usize = 1400;
 const SECTION_OVERHEAD: usize = 704;
 
 #[derive(
@@ -99,20 +106,33 @@ impl Engine {
         self.catalog.attach(&current, cancelled)?;
         let job = self.catalog.begin(&request.root)?;
         let repository = repository_from_identity(&request.root);
+        let manifest = request
+            .evidence_manifest
+            .as_deref()
+            .map(|path| capture_manifest(&request.root.worktree_root, path, cancelled))
+            .transpose()?;
+        let requested_artifact_paths = manifest.as_ref().map_or_else(BTreeSet::new, |manifest| {
+            manifest.requested_artifact_paths()
+        });
+        let evidence_only_paths = manifest
+            .as_ref()
+            .map_or_else(BTreeSet::new, |manifest| manifest.evidence_only_paths());
         let capture = repository.capture_snapshot(
             &request.base_oid,
             &request.head_oid,
             &request.target,
             request.dependency_mode,
+            &requested_artifact_paths,
+            &evidence_only_paths,
             job.capture_root(),
             cancelled,
         )?;
         let total = capture.sources.files.len();
-        report(BuildStage::Capturing, total, total, 0, 0, None);
 
-        let graph_image_id = graph_image_key(
+        let source_graph_image_id = graph_image_key(
             &request.root.repository_id,
             &capture.sources.files,
+            &capture.sources.omissions,
             CACHE_FORMAT_VERSION,
             GRAPH_ANALYZER_VERSION,
             crate::store::SCHEMA_VERSION,
@@ -124,6 +144,64 @@ impl Engine {
             )
         })?;
         let review_id = blake3::hash(&review_bytes).to_hex().to_string();
+        let source_snapshot_id = snapshot_key(
+            &SnapshotKeyInput {
+                graph_image_id: &source_graph_image_id,
+                workspace_id: &request.root.workspace_id,
+                base_oid: &request.base_oid,
+                head_oid: &request.head_oid,
+                target: &request.target,
+                dependency_mode: request.dependency_mode,
+                dirty_digest: &capture.dirty_digest,
+                review_id: &review_id,
+                source_snapshot_id: None,
+                evidence_manifest_digest: None,
+            },
+            CACHE_FORMAT_VERSION,
+            REVIEW_FORMAT_VERSION,
+        );
+        let source_entry = manifest
+            .as_ref()
+            .map(|manifest| {
+                validate_evidence_source(
+                    &self.catalog,
+                    &request,
+                    manifest.source_snapshot_id(),
+                    &source_snapshot_id,
+                    &source_graph_image_id,
+                )
+            })
+            .transpose()?;
+        let evidence = manifest
+            .map(|manifest| {
+                manifest.capture(
+                    &request.root.worktree_root,
+                    &capture.requested_artifacts,
+                    cancelled,
+                )
+            })
+            .transpose()?;
+        report(BuildStage::Capturing, total, total, 0, 0, None);
+        let mut artifacts = evidence.as_ref().map(evidence_artifacts).transpose()?;
+        let manifest_digest = evidence.as_ref().map(|evidence| {
+            blake3::Hash::from_bytes(evidence.manifest.content_hash)
+                .to_hex()
+                .to_string()
+        });
+        let graph_image_id = match (&evidence, &artifacts, manifest_digest.as_deref()) {
+            (Some(evidence), Some(artifacts), Some(manifest_digest)) => evidence_graph_image_key(
+                &source_graph_image_id,
+                &evidence.source_snapshot_id,
+                manifest_digest,
+                artifacts,
+                4,
+                CACHE_FORMAT_VERSION,
+                GRAPH_ANALYZER_VERSION,
+                crate::store::SCHEMA_VERSION,
+            ),
+            (None, None, None) => source_graph_image_id.clone(),
+            _ => unreachable!("evidence identity fields are all optional together"),
+        };
         let snapshot_id = snapshot_key(
             &SnapshotKeyInput {
                 graph_image_id: &graph_image_id,
@@ -134,6 +212,10 @@ impl Engine {
                 dependency_mode: request.dependency_mode,
                 dirty_digest: &capture.dirty_digest,
                 review_id: &review_id,
+                source_snapshot_id: evidence
+                    .as_ref()
+                    .map(|evidence| evidence.source_snapshot_id.as_str()),
+                evidence_manifest_digest: manifest_digest.as_deref(),
             },
             CACHE_FORMAT_VERSION,
             REVIEW_FORMAT_VERSION,
@@ -157,6 +239,10 @@ impl Engine {
             commits_base_to_head: capture.commits_base_to_head,
             changed_files: capture.changed_files,
             index_generation: 0,
+            source_snapshot_id: evidence
+                .as_ref()
+                .map(|evidence| evidence.source_snapshot_id.clone()),
+            evidence_manifest_digest: manifest_digest,
         };
 
         let mut rejected_cache =
@@ -213,7 +299,7 @@ impl Engine {
                 files_total: total,
                 files_reused: total,
                 files_parsed: 0,
-                files_skipped: capture.sources.skipped,
+                files_skipped: capture.sources.files_skipped(),
             };
             report(
                 BuildStage::Indexing,
@@ -243,11 +329,20 @@ impl Engine {
                             .cmp(&right.provenance.snapshot_id)
                     })
             });
+            let candidates = source_entry.into_iter().chain(
+                evidence
+                    .is_none()
+                    .then_some(candidates)
+                    .into_iter()
+                    .flatten(),
+            );
+            let mut seeded = false;
             for candidate in candidates {
                 match validate_entry_graph(&candidate, cancelled)
                     .and_then(|_| job.copy_seed(&candidate, cancelled))
                 {
                     Ok(_) => {
+                        seeded = true;
                         break;
                     }
                     Err(error) if error.code == crate::workspace::ErrorCode::JobCancelled => {
@@ -271,30 +366,59 @@ impl Engine {
                     }
                 }
             }
+            if evidence.is_some() && !seeded {
+                return Err(OperationError::new(
+                    ErrorCode::CacheCorrupt,
+                    "verified source snapshot graph is unavailable",
+                ));
+            }
             report(BuildStage::Indexing, 0, total, 0, 0, rejected_cache.clone());
             let mut store = Store::open_private_image(job.graph_temp(), cancelled)
                 .map_err(index_operation_error)?;
-            let (_, _, stats) = store
-                .index_with(cancelled, |full, existing| {
-                    build_index(
-                        &repository,
-                        &capture.sources,
-                        cancelled,
-                        full,
-                        existing,
-                        |done, total, reused| {
-                            report(
-                                BuildStage::Indexing,
-                                done,
-                                total,
-                                reused,
-                                done.saturating_sub(reused),
-                                rejected_cache.clone(),
-                            );
-                        },
-                    )
-                })
+            let stats = if let Some(evidence) = &evidence {
+                let (generated_graph, evidence_input) = build_generated_evidence(
+                    &store,
+                    evidence,
+                    artifacts
+                        .take()
+                        .expect("captured evidence always has artifact identity"),
+                    &request.root.worktree_root,
+                    cancelled,
+                )
                 .map_err(index_operation_error)?;
+                let evidence_stats = store
+                    .replace_evidence(generated_graph, &evidence_input, cancelled)
+                    .map_err(index_operation_error)?;
+                IndexStats {
+                    files_total: total + evidence_stats.generated_files,
+                    files_reused: total,
+                    files_parsed: evidence_stats.generated_files,
+                    files_skipped: capture.sources.files_skipped(),
+                }
+            } else {
+                store
+                    .index_with(cancelled, |full, existing| {
+                        build_index(
+                            &repository,
+                            &capture.sources,
+                            cancelled,
+                            full,
+                            existing,
+                            |done, total, reused| {
+                                report(
+                                    BuildStage::Indexing,
+                                    done,
+                                    total,
+                                    reused,
+                                    done.saturating_sub(reused),
+                                    rejected_cache.clone(),
+                                );
+                            },
+                        )
+                    })
+                    .map(|(_, _, stats)| stats)
+                    .map_err(index_operation_error)?
+            };
             report(
                 BuildStage::Indexing,
                 total,
@@ -347,7 +471,10 @@ impl Engine {
             graph_temp,
             exact.as_ref(),
             request.dependency_mode,
-            capture.no_change_reason,
+            evidence
+                .is_none()
+                .then_some(capture.no_change_reason)
+                .flatten(),
             provenance,
             cancelled,
         )?;
@@ -401,12 +528,22 @@ impl Engine {
             SnapshotTarget::Commit => &snapshot.provenance.head_oid,
             SnapshotTarget::Index | SnapshotTarget::Worktree { .. } => &identity.head_oid,
         };
+        let evidence_only_paths = if snapshot.provenance.evidence_manifest_digest.is_some() {
+            snapshot
+                .open_graph()
+                .and_then(|store| store.evidence_only_paths())
+                .map_err(query_operation_error)?
+        } else {
+            BTreeSet::new()
+        };
         let job = self.catalog.begin(&identity)?;
         let capture = repository.capture_snapshot(
             &snapshot.provenance.base_oid,
             inspected_head,
             &snapshot.provenance.target_state,
             snapshot.dependency_mode,
+            &BTreeSet::new(),
+            &evidence_only_paths,
             job.capture_root(),
             cancelled,
         )?;
@@ -495,7 +632,13 @@ impl Engine {
                 ));
             }
             return Ok(QueryOutput {
-                text: format!("no changes reason={}\n", reason.as_str()),
+                text: format!(
+                    "no changes reason={}\n\
+                     content_complete_when_pages_exhausted=true\n\
+                     static_evidence_status=complete\n\
+                     dynamic_evidence_status=not-applicable\n",
+                    reason.as_str()
+                ),
                 provenance: snapshot.provenance.clone(),
                 no_change_reason: Some(reason),
             });
@@ -634,6 +777,287 @@ fn same_workspace(
         && current.common_git_dir == resolved.common_git_dir
         && current.index_path == resolved.index_path
         && current.object_format == resolved.object_format
+}
+
+fn validate_evidence_source(
+    catalog: &SnapshotCatalog,
+    request: &ResolvedIndexRequest,
+    declared_source_snapshot_id: &str,
+    source_snapshot_id: &str,
+    source_graph_image_id: &str,
+) -> Result<Arc<SnapshotEntry>, OperationError> {
+    if declared_source_snapshot_id != source_snapshot_id {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "source snapshot mismatch",
+        ));
+    }
+    let entry = match catalog.get(source_snapshot_id) {
+        Ok(entry) => entry,
+        Err(error) if error.code == ErrorCode::SnapshotNotFound => {
+            return Err(OperationError::new(
+                ErrorCode::InvalidParameters,
+                "source snapshot mismatch",
+            ));
+        }
+        Err(error) if error.code == ErrorCode::CacheCorrupt => {
+            catalog.quarantine_graph(&request.root, source_graph_image_id, source_snapshot_id)?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    if entry.graph_image_id != source_graph_image_id
+        || entry.provenance.repository_id != request.root.repository_id
+        || entry.provenance.workspace_id != request.root.workspace_id
+        || entry.provenance.base_oid != request.base_oid
+        || entry.provenance.head_oid != request.head_oid
+        || entry.provenance.target_state != request.target
+        || entry.dependency_mode != request.dependency_mode
+        || entry.provenance.evidence_manifest_digest.is_some()
+    {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "source snapshot mismatch",
+        ));
+    }
+    Ok(entry)
+}
+
+fn evidence_artifacts(
+    evidence: &CapturedEvidence,
+) -> Result<Vec<ImportedArtifactInput>, OperationError> {
+    let mut artifacts = BTreeMap::<(ArtifactRole, String), ([u8; 32], u64)>::new();
+    let mut insert = |role, artifact: &CapturedArtifact| -> Result<(), OperationError> {
+        let size = u64::try_from(artifact.bytes.len()).map_err(|_| {
+            OperationError::new(
+                ErrorCode::InvalidParameters,
+                "evidence artifact size exceeds supported range",
+            )
+        })?;
+        match artifacts.entry((role, artifact.path.clone())) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((artifact.content_hash, size));
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if entry.get().0 == artifact.content_hash && entry.get().1 == size =>
+            {
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(OperationError::new(
+                ErrorCode::InvalidParameters,
+                "evidence artifact identity conflicts",
+            )),
+        }
+    };
+    insert(ArtifactRole::Manifest, &evidence.manifest)?;
+    for generated in &evidence.generated {
+        insert(ArtifactRole::Input, &generated.input.artifact)?;
+        insert(ArtifactRole::GeneratedRust, &generated.output.artifact)?;
+    }
+    for coverage in &evidence.coverage {
+        insert(ArtifactRole::CoverageReport, &coverage.report)?;
+    }
+    Ok(artifacts
+        .into_iter()
+        .map(
+            |((role, path), (content_hash, byte_size))| ImportedArtifactInput {
+                key: format!(
+                    "{}:{}:{}",
+                    role.db(),
+                    path,
+                    blake3::Hash::from_bytes(content_hash).to_hex()
+                ),
+                path,
+                role,
+                content_hash,
+                byte_size,
+            },
+        )
+        .collect())
+}
+
+fn build_generated_evidence(
+    store: &Store,
+    captured: &CapturedEvidence,
+    artifacts: Vec<ImportedArtifactInput>,
+    worktree_root: &Path,
+    cancelled: &AtomicBool,
+) -> Result<(Graph, EvidenceInput), String> {
+    let mut graph = Graph::default();
+    let mut provenance = Vec::with_capacity(captured.generated.len());
+    let mut gaps = Vec::new();
+    let mut parsed_outputs = BTreeSet::new();
+    let mut parser = RustParser::new()?;
+    let mut paths_by_basename = BTreeMap::<String, BTreeSet<String>>::new();
+    for generated in &captured.generated {
+        let basename = Path::new(&generated.output.artifact.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "generated output basename is invalid".to_owned())?;
+        paths_by_basename
+            .entry(basename.to_owned())
+            .or_default()
+            .insert(generated.output.artifact.path.clone());
+    }
+    for generated in &captured.generated {
+        check_cancelled(cancelled)?;
+        let basename = Path::new(&generated.output.artifact.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "generated output basename is invalid".to_owned())?;
+        let basename_contended = paths_by_basename
+            .get(basename)
+            .is_some_and(|paths| paths.len() > 1);
+        let candidates = if basename_contended {
+            Vec::new()
+        } else {
+            store.generated_inclusion_candidates(basename)?
+        };
+        if let Some(candidate) = candidates.first().filter(|_| candidates.len() == 1)
+            && parsed_outputs.insert(generated.output.artifact.path.clone())
+        {
+            let text = std::str::from_utf8(&generated.output.artifact.bytes)
+                .map_err(|_| "generated Rust output is not valid UTF-8".to_owned())?;
+            let target = TargetPath::from_parse_context(&candidate.parse_context)?;
+            graph.files.push(FileInput {
+                path: generated.output.artifact.path.clone(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: generated.output.artifact.content_hash,
+                parse_context: candidate.parse_context.clone(),
+                byte_size: u64::try_from(generated.output.artifact.bytes.len())
+                    .map_err(|_| "generated Rust output size exceeds supported range".to_owned())?,
+                replace: true,
+                observed_relation_sites: 0,
+            });
+            add_rust_file(
+                &mut graph,
+                &Source {
+                    path: generated.output.artifact.path.clone(),
+                    text: text.to_owned(),
+                },
+                &target,
+                &mut parser,
+            )?;
+        }
+        let generator_lines = EvidenceLineSpan {
+            start: generated.generator.line_start,
+            end: generated.generator.line_end,
+        };
+        provenance.push(ProvenanceInput {
+            input_key: captured_artifact_key(ArtifactRole::Input, &generated.input.artifact),
+            input_lines: EvidenceLineSpan {
+                start: generated.input.line_start,
+                end: generated.input.line_end,
+            },
+            generator_path: generated.generator.path.clone(),
+            generator_lines,
+            output_key: captured_artifact_key(
+                ArtifactRole::GeneratedRust,
+                &generated.output.artifact,
+            ),
+            output_lines: EvidenceLineSpan {
+                start: generated.output.line_start,
+                end: generated.output.line_end,
+            },
+        });
+    }
+    let mut runs = Vec::with_capacity(captured.coverage.len());
+    let mut regions = Vec::new();
+    let mut branches = Vec::new();
+    for coverage in &captured.coverage {
+        check_cancelled(cancelled)?;
+        let report_digest = blake3::Hash::from_bytes(coverage.report.content_hash).to_hex();
+        let run_key = format!(
+            "coverage:{}:{}:{report_digest}",
+            coverage.format.db(),
+            coverage.run_label
+        );
+        let parsed = parse_coverage(
+            coverage.format,
+            &coverage.report.bytes,
+            worktree_root,
+            cancelled,
+        )?;
+        runs.push(CoverageRunInput {
+            key: run_key.clone(),
+            format: parsed.format,
+            report_key: captured_artifact_key(ArtifactRole::CoverageReport, &coverage.report),
+            run_label: coverage.run_label.clone(),
+            test_name: coverage.test_name.clone(),
+        });
+        regions.extend(
+            parsed
+                .regions
+                .into_iter()
+                .map(|region| CoverageRegionInput {
+                    run_key: run_key.clone(),
+                    path: region.path,
+                    start_line: region.start_line,
+                    start_column: region.start_column,
+                    end_line: region.end_line,
+                    end_column: region.end_column,
+                    execution_count: region.execution_count,
+                    context: region.context,
+                }),
+        );
+        branches.extend(
+            parsed
+                .branches
+                .into_iter()
+                .map(|branch| CoverageBranchInput {
+                    run_key: run_key.clone(),
+                    path: branch.path,
+                    start_line: branch.start_line,
+                    start_column: branch.start_column,
+                    end_line: branch.end_line,
+                    end_column: branch.end_column,
+                    target_line: branch.target_line,
+                    kind: match branch.kind {
+                        BranchObservationKind::TrueOutcome => CoverageBranchKind::TrueOutcome,
+                        BranchObservationKind::FalseOutcome => CoverageBranchKind::FalseOutcome,
+                        BranchObservationKind::Arc => CoverageBranchKind::Arc,
+                    },
+                    execution_count: branch.execution_count,
+                }),
+        );
+        if parsed.external_paths > 0 {
+            gaps.push(GapInput {
+                file_key: None,
+                source_key: None,
+                run_key: Some(run_key),
+                path: None,
+                line_start: None,
+                line_end: None,
+                category: GapCategory::Coverage,
+                reason: GapReason::CoverageUnmappedFile,
+                target_hint: None,
+                occurrences: parsed.external_paths,
+                relation_site: false,
+            });
+        }
+    }
+    Ok((
+        graph,
+        EvidenceInput {
+            artifacts,
+            provenance,
+            runs,
+            regions,
+            branches,
+            gaps,
+        },
+    ))
+}
+
+fn captured_artifact_key(role: ArtifactRole, artifact: &CapturedArtifact) -> String {
+    format!(
+        "{}:{}:{}",
+        role.db(),
+        artifact.path,
+        blake3::Hash::from_bytes(artifact.content_hash).to_hex()
+    )
 }
 
 fn repository_from_identity(root: &crate::workspace::RootIdentity) -> Repository {
@@ -800,6 +1224,7 @@ enum ReviewSection {
     Diff,
     Artifacts,
     Graph,
+    Evidence,
 }
 
 impl ReviewSection {
@@ -809,6 +1234,7 @@ impl ReviewSection {
             Self::Diff => 'd',
             Self::Artifacts => 'a',
             Self::Graph => 'g',
+            Self::Evidence => 'e',
         }
     }
 
@@ -818,6 +1244,7 @@ impl ReviewSection {
             Self::Diff => "diff",
             Self::Artifacts => "artifacts",
             Self::Graph => "graph",
+            Self::Evidence => "evidence",
         }
     }
 
@@ -827,6 +1254,7 @@ impl ReviewSection {
             Self::Diff => "diff_next_cursor",
             Self::Artifacts => "artifacts_next_cursor",
             Self::Graph => "graph_next_cursor",
+            Self::Evidence => "evidence_next_cursor",
         }
     }
 }
@@ -849,6 +1277,7 @@ struct ReviewSnapshot {
     artifacts: String,
     changes: Arc<WorktreeChanges>,
     graph: String,
+    evidence: String,
     checksum: String,
     file_ranges: Vec<Range<usize>>,
     hunk_ranges: Vec<Range<usize>>,
@@ -856,12 +1285,15 @@ struct ReviewSnapshot {
     artifact_record_ranges: Vec<Range<usize>>,
     artifact_hunk_ranges: Vec<Range<usize>>,
     graph_record_ranges: Vec<Range<usize>>,
+    evidence_record_ranges: Vec<Range<usize>>,
     flow_ranges: Vec<Range<usize>>,
     patch_totals: String,
     artifact_patch_totals: String,
     all_path_totals: String,
     all_path_hunks: String,
-    complete_after_pagination: bool,
+    content_complete_when_pages_exhausted: bool,
+    static_status: CompletenessStatus,
+    dynamic_status: CompletenessStatus,
 }
 
 impl ReviewSnapshot {
@@ -871,8 +1303,14 @@ impl ReviewSnapshot {
         max_nodes: u32,
         dependency_mode: DependencyMode,
         changes: impl Into<Arc<WorktreeChanges>>,
-        graph: String,
+        review: ChangeReview,
     ) -> Self {
+        let ChangeReview {
+            graph,
+            evidence,
+            static_status,
+            dynamic_status,
+        } = review;
         let changes = changes.into();
         let manifest = change_manifest(&changes, dependency_mode);
         let artifacts = artifact_text(&changes.artifacts);
@@ -881,7 +1319,13 @@ impl ReviewSnapshot {
             depth,
             max_nodes,
             dependency_mode,
-            [&manifest, &changes.source_patch, &artifacts, &graph],
+            [
+                &manifest,
+                &changes.source_patch,
+                &artifacts,
+                &graph,
+                &evidence,
+            ],
         );
         let file_ranges = line_ranges(&manifest, None);
         let artifact_file_ranges = line_ranges(&artifacts, Some("artifact "));
@@ -891,6 +1335,7 @@ impl ReviewSnapshot {
         let artifact_hunk_ranges = hunk_ranges(&artifacts);
         let hunk_ranges = hunk_ranges(&changes.source_patch);
         let graph_record_ranges = line_ranges(&graph, None);
+        let evidence_record_ranges = line_ranges(&evidence, None);
         let flow_ranges = line_ranges(&graph, Some("flow "));
         let all_path_hunks = change_hunk_totals(
             &changes,
@@ -916,8 +1361,8 @@ impl ReviewSnapshot {
         );
         let all_path_totals =
             change_totals("all_path", changes.paths.iter(), changes.skipped_paths);
-        let complete_after_pagination =
-            graph_review_complete(&graph) && change_content_complete(&changes, dependency_mode);
+        let content_complete_when_pages_exhausted =
+            change_content_complete(&changes, dependency_mode);
         Self {
             snapshot_id: snapshot_id.into(),
             depth,
@@ -927,6 +1372,7 @@ impl ReviewSnapshot {
             artifacts,
             changes,
             graph,
+            evidence,
             checksum,
             file_ranges,
             hunk_ranges,
@@ -934,12 +1380,15 @@ impl ReviewSnapshot {
             artifact_record_ranges,
             artifact_hunk_ranges,
             graph_record_ranges,
+            evidence_record_ranges,
             flow_ranges,
             patch_totals,
             artifact_patch_totals,
             all_path_totals,
             all_path_hunks,
-            complete_after_pagination,
+            content_complete_when_pages_exhausted,
+            static_status,
+            dynamic_status,
         }
     }
 
@@ -949,6 +1398,7 @@ impl ReviewSnapshot {
             ReviewSection::Diff => &self.changes.source_patch,
             ReviewSection::Artifacts => &self.artifacts,
             ReviewSection::Graph => &self.graph,
+            ReviewSection::Evidence => &self.evidence,
         }
     }
 
@@ -958,6 +1408,7 @@ impl ReviewSnapshot {
             ReviewSection::Diff => &self.hunk_ranges,
             ReviewSection::Artifacts => &self.artifact_hunk_ranges,
             ReviewSection::Graph => &self.flow_ranges,
+            ReviewSection::Evidence => &self.evidence_record_ranges,
         }
     }
 }
@@ -966,11 +1417,10 @@ fn artifact_text(review: &ArtifactReview) -> String {
     let mut output = String::new();
     for file in &review.files {
         output.push_str(&format!(
-            "artifact path={:?} analyzer={} diff_complete={} analysis_complete={}",
+            "artifact path={:?} analyzer={} diff_complete={}",
             file.path,
             file.analyzer.as_str(),
             file.diff_complete,
-            file.analysis_complete,
         ));
         if let Some(reason) = file.omission {
             output.push_str(" reason=");
@@ -993,26 +1443,25 @@ struct Page<'a> {
 }
 
 fn review_context(snapshot: &ReviewSnapshot) -> Result<String, String> {
-    let (files, files_more) =
-        render_section_page(snapshot, ReviewSection::Files, 0, INITIAL_FILES_BUDGET)?;
-    let (diff, diff_more) =
-        render_section_page(snapshot, ReviewSection::Diff, 0, INITIAL_DIFF_BUDGET)?;
-    let (artifacts, artifacts_more) = render_section_page(
+    let (files, _) = render_section_page(snapshot, ReviewSection::Files, 0, INITIAL_FILES_BUDGET)?;
+    let (diff, _) = render_section_page(snapshot, ReviewSection::Diff, 0, INITIAL_DIFF_BUDGET)?;
+    let (artifacts, _) = render_section_page(
         snapshot,
         ReviewSection::Artifacts,
         0,
         INITIAL_ARTIFACTS_BUDGET,
     )?;
-    let (graph_page, graph_more) =
+    let (graph_page, _) =
         render_section_page(snapshot, ReviewSection::Graph, 0, INITIAL_GRAPH_BUDGET)?;
+    let (evidence, _) = render_section_page(
+        snapshot,
+        ReviewSection::Evidence,
+        0,
+        INITIAL_EVIDENCE_BUDGET,
+    )?;
     let output = format!(
-        "{files}{diff}{artifacts}{graph_page}review_complete={} review_complete_when_pages_exhausted={}\n",
-        !files_more
-            && !diff_more
-            && !artifacts_more
-            && !graph_more
-            && snapshot.complete_after_pagination,
-        snapshot.complete_after_pagination,
+        "{files}{diff}{artifacts}{graph_page}{evidence}{}",
+        terminal_status(snapshot),
     );
     if output.len() > REVIEW_CONTEXT_BUDGET {
         return Err("review context exceeds output budget".into());
@@ -1032,10 +1481,7 @@ fn render_section(snapshot: &ReviewSnapshot, cursor: &ReviewCursor) -> Result<St
     if cursor.checksum != expected {
         return Err("invalid changes cursor".into());
     }
-    let completion = format!(
-        "review_complete_when_pages_exhausted={}\n",
-        snapshot.complete_after_pagination
-    );
+    let completion = terminal_status(snapshot);
     let page_budget = REVIEW_CONTEXT_BUDGET
         .checked_sub(completion.len())
         .ok_or_else(|| "review completion metadata exceeds output budget".to_owned())?;
@@ -1046,6 +1492,15 @@ fn render_section(snapshot: &ReviewSnapshot, cursor: &ReviewCursor) -> Result<St
         return Err("review section exceeds output budget".into());
     }
     Ok(output)
+}
+
+fn terminal_status(snapshot: &ReviewSnapshot) -> String {
+    format!(
+        "content_complete_when_pages_exhausted={}\nstatic_evidence_status={}\ndynamic_evidence_status={}\n",
+        snapshot.content_complete_when_pages_exhausted,
+        snapshot.static_status.as_str(),
+        snapshot.dynamic_status.as_str(),
+    )
 }
 
 fn render_section_page(
@@ -1127,7 +1582,7 @@ fn render_section_page(
             let records = record_coverage(&snapshot.artifact_record_ranges, &page);
             let hunks = record_coverage(&snapshot.artifact_hunk_ranges, &page);
             output.push_str(&format!(
-                "artifacts emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_files={} partial_files={} total_files={} prior_files={} remaining_files={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} emitted_hunks={} partial_hunks={} total_hunks={} prior_hunks={} remaining_hunks={} {} analysis_complete={} page_complete={}\n",
+                "artifacts emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_files={} partial_files={} total_files={} prior_files={} remaining_files={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} emitted_hunks={} partial_hunks={} total_hunks={} prior_hunks={} remaining_hunks={} {} page_complete={}\n",
                 emitted_bytes,
                 value.len(),
                 page.start,
@@ -1153,25 +1608,24 @@ fn render_section_page(
                 hunks.prior,
                 hunks.remaining,
                 snapshot.artifact_patch_totals,
-                snapshot.changes.artifacts.analysis_complete(),
                 !more,
             ));
         }
         ReviewSection::Graph => {
             let coverage = record_coverage(snapshot.ranges(section), &page);
             let records = record_coverage(&snapshot.graph_record_ranges, &page);
-            let analysis_complete = graph_flow_analysis_complete(&snapshot.graph);
+            let traversal_complete = graph_traversal_complete(&snapshot.graph);
             let neighborhood_complete =
                 graph_summary_value(&snapshot.graph, "neighborhood_omitted") == Some("false");
             let mapping_complete =
                 graph_summary_value(&snapshot.graph, "unmapped_ranges") == Some("0");
-            let flow_total = if analysis_complete {
+            let flow_total = if traversal_complete {
                 coverage.total.to_string()
             } else {
                 "unknown".into()
             };
             output.push_str(&format!(
-                "graph emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} page_record_limit={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} emitted_flows={} partial_flows={} discovered_flows={} total_flows={} prior_flows={} remaining_discovered_flows={} page_complete={} analysis_complete={} neighborhood_complete={} mapping_complete={}\n",
+                "graph emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} page_record_limit={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} emitted_flows={} partial_flows={} discovered_flows={} total_flows={} prior_flows={} remaining_discovered_flows={} page_complete={} traversal_complete={} neighborhood_complete={} mapping_complete={}\n",
                 emitted_bytes,
                 value.len(),
                 page.start,
@@ -1194,9 +1648,30 @@ fn render_section_page(
                 coverage.prior,
                 coverage.remaining,
                 !more,
-                analysis_complete,
+                traversal_complete,
                 neighborhood_complete,
                 mapping_complete,
+            ));
+        }
+        ReviewSection::Evidence => {
+            let records = record_coverage(&snapshot.evidence_record_ranges, &page);
+            output.push_str(&format!(
+                "evidence emitted_bytes={} total_bytes={} prior_bytes={} remaining_bytes={} byte_range={}..{} starts_mid_line={} ends_mid_line={} framing_suffix_bytes={} emitted_records={} partial_records={} total_records={} prior_records={} remaining_records={} page_complete={}\n",
+                emitted_bytes,
+                value.len(),
+                page.start,
+                value.len() - page.end,
+                page.start,
+                page.end,
+                starts_mid_line,
+                ends_mid_line,
+                framing_suffix_bytes,
+                records.emitted,
+                records.partial,
+                records.total,
+                records.prior,
+                records.remaining,
+                !more,
             ));
         }
     }
@@ -1272,7 +1747,7 @@ fn review_snapshot(
     depth: u32,
     max_nodes: u32,
     dependency_mode: DependencyMode,
-    sections: [&str; 4],
+    sections: [&str; 5],
 ) -> String {
     let depth = depth.to_string();
     let max_nodes = max_nodes.to_string();
@@ -1351,6 +1826,7 @@ fn parse_review_cursor(
         Some("d") => ReviewSection::Diff,
         Some("a") => ReviewSection::Artifacts,
         Some("g") => ReviewSection::Graph,
+        Some("e") => ReviewSection::Evidence,
         _ => return Err("invalid changes cursor".into()),
     };
     let raw_offset = parts
@@ -1557,8 +2033,8 @@ fn hunk_ranges(value: &str) -> Vec<Range<usize>> {
     ranges
 }
 
-fn graph_flow_analysis_complete(value: &str) -> bool {
-    graph_summary_value(value, "analysis_complete") == Some("true")
+fn graph_traversal_complete(value: &str) -> bool {
+    graph_summary_value(value, "traversal_complete") == Some("true")
 }
 
 fn graph_summary_value<'a>(value: &'a str, name: &str) -> Option<&'a str> {
@@ -1569,38 +2045,6 @@ fn graph_summary_value<'a>(value: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|field| {
             let (key, value) = field.split_once('=')?;
             (key == name).then_some(value)
-        })
-}
-
-fn graph_review_complete(value: &str) -> bool {
-    graph_flow_analysis_complete(value)
-        && graph_summary_value(value, "changed_symbols_omitted") == Some("0")
-        && graph_summary_value(value, "neighborhood_omitted") == Some("false")
-        && graph_summary_value(value, "unmapped_ranges") == Some("0")
-}
-
-fn change_content_complete(changes: &WorktreeChanges, dependency_mode: DependencyMode) -> bool {
-    changes.skipped_paths == 0
-        && changes.artifacts.is_complete()
-        && changes
-            .artifacts
-            .files
-            .iter()
-            .all(|file| file.omission.is_none())
-        && changes.paths.iter().all(|path| {
-            if dependency_mode == DependencyMode::Boundary
-                && changed_dependency_package(path).is_some()
-            {
-                true
-            } else if path.language.is_none() {
-                changes.artifacts.file(&path.path).is_some_and(|file| {
-                    file.diff_complete && file.analysis_complete && file.omission.is_none()
-                })
-            } else {
-                (path.status != ChangeStatus::Renamed || path.old_language.is_some())
-                    && path.additions.is_some()
-                    && path.deletions.is_some()
-            }
         })
 }
 
@@ -1617,7 +2061,7 @@ fn build_index(
         files_total: total,
         files_reused: 0,
         files_parsed: 0,
-        files_skipped: sources.skipped,
+        files_skipped: sources.files_skipped(),
     };
     progress(0, total, 0);
     let mut outputs = (0..total).map(|_| None).collect::<Vec<Option<Graph>>>();
@@ -1646,6 +2090,7 @@ fn build_index(
                 parse_context: file.parse_context.clone(),
                 byte_size: old.byte_size,
                 replace: false,
+                observed_relation_sites: old.observed_relation_sites,
             });
             outputs[index] = Some(graph);
             stats.files_reused += 1;
@@ -1680,8 +2125,12 @@ fn build_index(
                 &mut blob_reader,
             )? {
                 Some(graph) => {
+                    if graph.files.is_empty() {
+                        stats.files_skipped += 1;
+                    } else {
+                        stats.files_parsed += 1;
+                    }
                     outputs[work.index] = Some(graph);
-                    stats.files_parsed += 1;
                 }
                 None => stats.files_skipped += 1,
             }
@@ -1737,8 +2186,12 @@ fn build_index(
         for (index, part) in parts {
             match part {
                 Some(graph) => {
+                    if graph.files.is_empty() {
+                        stats.files_skipped += 1;
+                    } else {
+                        stats.files_parsed += 1;
+                    }
                     outputs[index] = Some(graph);
-                    stats.files_parsed += 1;
                 }
                 None => stats.files_skipped += 1,
             }
@@ -1746,6 +2199,25 @@ fn build_index(
     }
 
     let mut graph = Graph::default();
+    graph
+        .gaps
+        .extend(sources.omissions.iter().map(|omission| GapInput {
+            file_key: None,
+            source_key: None,
+            run_key: None,
+            path: omission.path.clone(),
+            line_start: None,
+            line_end: None,
+            category: if omission.reason == SourceOmissionReason::LanguageNotIndexed {
+                GapCategory::Language
+            } else {
+                GapCategory::Source
+            },
+            reason: source_gap_reason(omission.reason),
+            target_hint: None,
+            occurrences: omission.occurrences,
+            relation_site: false,
+        }));
     for mut part in outputs.into_iter().flatten() {
         graph.files.append(&mut part.files);
         graph.nodes.append(&mut part.nodes);
@@ -1754,6 +2226,8 @@ fn build_index(
             .trait_implementations
             .append(&mut part.trait_implementations);
         graph.edges.append(&mut part.edges);
+        graph.modeled_sites.append(&mut part.modeled_sites);
+        graph.gaps.append(&mut part.gaps);
     }
     if full {
         resolve(&mut graph, cancelled)?;
@@ -1802,7 +2276,10 @@ fn build_file(
                 .read(oid, cancelled)?;
             let Some(content) = content else {
                 *blob_reader = None;
-                return Ok(None);
+                return Ok(Some(global_source_gap(
+                    &work.file.path,
+                    GapReason::Oversized,
+                )));
             };
             content
         }
@@ -1812,7 +2289,10 @@ fn build_file(
         } => read_captured_source(&sources.capture_root, relative_path, digest, cancelled)?,
     };
     let Ok(text) = String::from_utf8(content) else {
-        return Ok(None);
+        return Ok(Some(global_source_gap(
+            &work.file.path,
+            GapReason::InvalidUtf8,
+        )));
     };
     let source = Source {
         path: work.file.path.clone(),
@@ -1830,6 +2310,7 @@ fn build_file(
         parse_context: work.file.parse_context.clone(),
         byte_size,
         replace: true,
+        observed_relation_sites: 0,
     });
     match work.file.language {
         Language::Rust => {
@@ -1860,6 +2341,37 @@ fn build_file(
     Ok(Some(graph))
 }
 
+fn global_source_gap(path: &str, reason: GapReason) -> Graph {
+    Graph {
+        gaps: vec![GapInput {
+            file_key: None,
+            source_key: None,
+            run_key: None,
+            path: Some(path.to_owned()),
+            line_start: None,
+            line_end: None,
+            category: GapCategory::Source,
+            reason,
+            target_hint: None,
+            occurrences: 1,
+            relation_site: false,
+        }],
+        ..Graph::default()
+    }
+}
+
+fn source_gap_reason(reason: SourceOmissionReason) -> GapReason {
+    match reason {
+        SourceOmissionReason::UnsafePath => GapReason::UnsafePath,
+        SourceOmissionReason::NonRegular => GapReason::NonRegular,
+        SourceOmissionReason::Unmerged => GapReason::Unmerged,
+        SourceOmissionReason::Oversized => GapReason::Oversized,
+        SourceOmissionReason::InvalidUtf8 => GapReason::InvalidUtf8,
+        SourceOmissionReason::MissingDuringRead => GapReason::MissingDuringRead,
+        SourceOmissionReason::LanguageNotIndexed => GapReason::LanguageNotIndexed,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn build_snapshot_for_test(
     repository: &Repository,
@@ -1887,6 +2399,8 @@ fn build_graph(sources: &[Source], cancelled: &AtomicBool) -> Result<Graph, Stri
         refs: Vec::new(),
         trait_implementations: Vec::new(),
         edges: Vec::new(),
+        modeled_sites: Vec::new(),
+        gaps: Vec::new(),
     };
     for source in sources {
         check_cancelled(cancelled)?;
@@ -1900,6 +2414,7 @@ fn build_graph(sources: &[Source], cancelled: &AtomicBool) -> Result<Graph, Stri
             byte_size: u64::try_from(source.text.len())
                 .map_err(|_| "source byte size exceeds supported range".to_owned())?,
             replace: true,
+            observed_relation_sites: 0,
         });
         add_rust_file(&mut graph, source, &target, &mut parser)?;
     }
@@ -1914,6 +2429,7 @@ fn add_rust_file(
     parser: &mut RustParser,
 ) -> Result<(), String> {
     let parsed = parser.parse(&source.text)?;
+    let mut observed_relation_sites = 0_u32;
 
     let file_key = identity(&source.path, "file", &source.path, 0, 0);
     graph.nodes.push(NodeInput {
@@ -1929,6 +2445,25 @@ fn add_rust_file(
         signature: String::new(),
         keys: vec![format!("rust:file:{}", source.path)],
     });
+    for gap in &parsed.parse_gaps {
+        graph.gaps.push(GapInput {
+            file_key: Some(source.path.clone()),
+            source_key: None,
+            run_key: None,
+            path: Some(source.path.clone()),
+            line_start: Some(to_u32(gap.line_start)?),
+            line_end: Some(to_u32(gap.line_end)?),
+            category: GapCategory::Parse,
+            reason: if parsed.parser_no_tree {
+                GapReason::ParserNoTree
+            } else {
+                GapReason::ParserError
+            },
+            target_hint: None,
+            occurrences: 1,
+            relation_site: false,
+        });
+    }
 
     let module = target.module.as_str();
     let module_paths = inline_module_paths(&parsed, module)?;
@@ -2026,7 +2561,25 @@ fn add_rust_file(
     }
     for import in &parsed.imports {
         let import_module = lexical_module(import.module, module, &module_paths);
+        let source_key = import
+            .source
+            .and_then(|source| node_keys.get(source).cloned())
+            .unwrap_or_else(|| file_key.clone());
         let Some(path) = normalize_use(&import.path, import_module, &target.root) else {
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(source_key),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(import.line)?),
+                line_end: Some(to_u32(import.line)?),
+                category: GapCategory::Relation,
+                reason: GapReason::DynamicOrUnsupportedDispatch,
+                target_hint: Some(import.path.clone()),
+                occurrences: 1,
+                relation_site: true,
+            });
+            observed_relation_sites += 1;
             continue;
         };
         let alias_key = import
@@ -2035,41 +2588,112 @@ fn add_rust_file(
             .flatten()
             .map(|(alias, _)| item_key(&join_path(import_module, &alias)));
         graph.refs.push(RefInput {
-            source_key: import
-                .source
-                .and_then(|source| node_keys.get(source).cloned())
-                .unwrap_or_else(|| file_key.clone()),
+            source_key,
             kind: RefKind::Imports,
             line: to_u32(import.line)?,
             keys: vec![item_key(&path)],
             alias_key,
             resolved_target_key: None,
+            resolution: ResolutionState::Pending,
         });
+        observed_relation_sites += 1;
     }
 
     for call in &parsed.calls {
-        let Some(source_key) = node_keys.get(call.source) else {
-            continue;
+        let source_key = call
+            .source
+            .and_then(|source| node_keys.get(source).cloned())
+            .unwrap_or_else(|| file_key.clone());
+        let keys = if supported_rust_call_target(&call.target) {
+            call_keys(
+                call,
+                &parsed,
+                &absolute_paths,
+                target,
+                &module_paths,
+                &bindings,
+            )
+        } else {
+            Vec::new()
         };
-        let keys = call_keys(
-            call,
-            &parsed,
-            &absolute_paths,
-            target,
-            &module_paths,
-            &bindings,
-        );
         if !keys.is_empty() {
             graph.refs.push(RefInput {
-                source_key: source_key.clone(),
+                source_key,
                 kind: RefKind::Calls,
                 line: to_u32(call.line)?,
                 keys,
                 alias_key: None,
                 resolved_target_key: None,
+                resolution: ResolutionState::Pending,
+            });
+        } else {
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(source_key),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(call.line)?),
+                line_end: Some(to_u32(call.line)?),
+                category: GapCategory::Relation,
+                reason: GapReason::DynamicOrUnsupportedDispatch,
+                target_hint: Some(call.target.clone()),
+                occurrences: 1,
+                relation_site: true,
             });
         }
+        observed_relation_sites += 1;
     }
+    for site in &parsed.macros {
+        let source_key = site
+            .source
+            .and_then(|source| node_keys.get(source).cloned())
+            .unwrap_or_else(|| file_key.clone());
+        if let Some(output) = generated_include_basename(&site.text) {
+            graph.modeled_sites.push(ModeledSiteInput {
+                file_key: source.path.clone(),
+                source_key: Some(source_key),
+                kind: ModeledSiteKind::GeneratedInclusion,
+                line_start: to_u32(site.line)?,
+                line_end: to_u32(site.line_end)?,
+                target_hint: Some(output.clone()),
+                parse_context: Some(target.parse_context()),
+            });
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: None,
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(site.line)?),
+                line_end: Some(to_u32(site.line_end)?),
+                category: GapCategory::Generated,
+                reason: GapReason::GeneratedOutputUnobserved,
+                target_hint: Some(output),
+                occurrences: 1,
+                relation_site: false,
+            });
+        } else {
+            graph.gaps.push(GapInput {
+                file_key: Some(source.path.clone()),
+                source_key: Some(source_key),
+                run_key: None,
+                path: Some(source.path.clone()),
+                line_start: Some(to_u32(site.line)?),
+                line_end: Some(to_u32(site.line_end)?),
+                category: GapCategory::Macro,
+                reason: GapReason::MacroExpansionUnavailable,
+                target_hint: Some(site.target.clone()),
+                occurrences: 1,
+                relation_site: true,
+            });
+        }
+        observed_relation_sites += 1;
+    }
+    graph
+        .files
+        .iter_mut()
+        .find(|file| file.path == source.path)
+        .ok_or_else(|| "Rust graph file is missing".to_owned())?
+        .observed_relation_sites = observed_relation_sites;
     Ok(())
 }
 
@@ -2101,8 +2725,11 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
         let Some(alias) = reference.alias_key.as_ref() else {
             continue;
         };
-        let target = reference_target(&reference.keys, &candidates, None)
-            .map_or(Candidate::Ambiguous, Candidate::Unique);
+        let target = match reference_target(&reference.keys, &candidates, None) {
+            ReferenceTarget::Resolved(target) => Candidate::Unique(target),
+            ReferenceTarget::Missing => continue,
+            ReferenceTarget::Ambiguous => Candidate::Ambiguous,
+        };
         aliases
             .entry(alias.clone())
             .and_modify(|candidate| {
@@ -2144,8 +2771,19 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
     for (index, reference) in graph.refs.iter_mut().enumerate() {
         check_progress(index, cancelled)?;
         let alias_candidates = reference.alias_key.is_none().then_some(&aliases);
-        let Some(target) = reference_target(&reference.keys, &candidates, alias_candidates) else {
-            continue;
+        let target = match reference_target(&reference.keys, &candidates, alias_candidates) {
+            ReferenceTarget::Resolved(target) => {
+                reference.resolution = ResolutionState::Resolved;
+                target
+            }
+            ReferenceTarget::Missing => {
+                reference.resolution = ResolutionState::Missing;
+                continue;
+            }
+            ReferenceTarget::Ambiguous => {
+                reference.resolution = ResolutionState::Ambiguous;
+                continue;
+            }
         };
         reference.resolved_target_key = Some(graph.nodes[target].key.clone());
         let source = node_by_key
@@ -2191,26 +2829,34 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
     check_cancelled(cancelled)
 }
 
+enum ReferenceTarget {
+    Resolved(usize),
+    Missing,
+    Ambiguous,
+}
+
 fn reference_target(
     keys: &[String],
     candidates: &HashMap<&str, Candidate>,
     aliases: Option<&HashMap<String, Candidate>>,
-) -> Option<usize> {
+) -> ReferenceTarget {
     for key in keys {
         let direct = candidates.get(key.as_str());
         let alias = aliases.and_then(|aliases| aliases.get(key));
         match (direct, alias) {
-            (Some(Candidate::Ambiguous), _) | (_, Some(Candidate::Ambiguous)) => return None,
+            (Some(Candidate::Ambiguous), _) | (_, Some(Candidate::Ambiguous)) => {
+                return ReferenceTarget::Ambiguous;
+            }
             (Some(Candidate::Unique(left)), Some(Candidate::Unique(right))) if left != right => {
-                return None;
+                return ReferenceTarget::Ambiguous;
             }
             (Some(Candidate::Unique(node)), _) | (_, Some(Candidate::Unique(node))) => {
-                return Some(*node);
+                return ReferenceTarget::Resolved(*node);
             }
             (None, None) => {}
         }
     }
-    None
+    ReferenceTarget::Missing
 }
 
 fn definition_path(
@@ -2428,7 +3074,7 @@ fn call_keys(
     bindings: &Bindings,
 ) -> Vec<String> {
     let source = call.source;
-    let definition = parsed.definitions.get(source);
+    let definition = source.and_then(|source| parsed.definitions.get(source));
     let module_index = definition.and_then(|definition| definition.module);
     let module = definition.map_or(target.module.as_str(), |definition| {
         lexical_module(definition.module, &target.module, module_paths)
@@ -2447,8 +3093,10 @@ fn call_keys(
             return Vec::new();
         }
         let owner = if receiver == "self" {
-            source_owner(source, parsed, paths).map(str::to_owned)
-        } else if valid_identifier(receiver) {
+            source.and_then(|source| source_owner(source, parsed, paths).map(str::to_owned))
+        } else if valid_identifier(receiver)
+            && let Some(source) = source
+        {
             bindings
                 .values
                 .get(&source)
@@ -2482,12 +3130,12 @@ fn call_keys(
         // add block ranges only when the lost pre-binding edges matter.
         if bindings
             .values
-            .get(&source)
+            .get(&source.unwrap_or(usize::MAX))
             .is_some_and(|bindings| bindings.contains_key(name))
         {
             return vec![format!("rust:shadowed-value:{name}")];
         }
-        if let Some(binding) = import_binding(&bindings.imports, source, module_index, name) {
+        if let Some(binding) = call_import_binding(&bindings.imports, source, module_index, name) {
             return match binding {
                 Binding::Unique(path) => {
                     vec![format!("rust:function:{path}"), item_key(path)]
@@ -2496,7 +3144,7 @@ fn call_keys(
             };
         }
         let mut keys = Vec::with_capacity(4);
-        if let Some(scope) = source_scope(source, parsed, paths, module) {
+        if let Some(scope) = source.and_then(|source| source_scope(source, parsed, paths, module)) {
             let target = join_path(scope, name);
             keys.push(format!("rust:function:{target}"));
             keys.push(item_key(&target));
@@ -2504,7 +3152,7 @@ fn call_keys(
         let target = join_path(module, name);
         keys.push(format!("rust:function:{target}"));
         keys.push(item_key(&target));
-        if let Some(prefix) = glob_import_binding(&bindings.imports, source, module_index) {
+        if let Some(prefix) = call_glob_import_binding(&bindings.imports, source, module_index) {
             let target = join_path(prefix, name);
             keys.push(format!("rust:function:{target}"));
             keys.push(item_key(&target));
@@ -2515,14 +3163,15 @@ fn call_keys(
     let method = parts[parts.len() - 1];
     let owner = parts[..parts.len() - 1].join("::");
     if owner == "Self" {
-        return source_owner(source, parsed, paths)
+        return source
+            .and_then(|source| source_owner(source, parsed, paths))
             .map(|owner| vec![format!("rust:method:{}", join_path(owner, method))])
             .unwrap_or_default();
     }
 
     let first = parts[0];
     let mut owners = Vec::with_capacity(3);
-    match import_binding(&bindings.imports, source, module_index, first) {
+    match call_import_binding(&bindings.imports, source, module_index, first) {
         Some(Binding::Unique(path)) => owners.push(if parts.len() == 2 {
             path.clone()
         } else {
@@ -2533,8 +3182,9 @@ fn call_keys(
         }
         None => {
             if !matches!(first, "crate" | "self" | "super")
-                && let Some(scope) =
+                && let Some(scope) = source.and_then(|source| {
                     visible_local_type_scope(&owner, source, call.byte, parsed, paths)
+                })
             {
                 owners.push(join_path(scope, &owner));
             }
@@ -2542,7 +3192,8 @@ fn call_keys(
                 owners.push(local);
             }
             if !matches!(first, "crate" | "self" | "super")
-                && let Some(prefix) = glob_import_binding(&bindings.imports, source, module_index)
+                && let Some(prefix) =
+                    call_glob_import_binding(&bindings.imports, source, module_index)
             {
                 owners.push(join_path(prefix, &owner));
             }
@@ -2556,6 +3207,75 @@ fn call_keys(
         keys.push(item_key(&target));
     }
     dedup_keys(keys)
+}
+
+fn call_import_binding<'a>(
+    imports: &'a ImportBindings,
+    source: Option<usize>,
+    module: Option<usize>,
+    alias: &str,
+) -> Option<&'a Binding> {
+    source
+        .and_then(|source| import_binding(imports, source, module, alias))
+        .or_else(|| module_import_binding(imports, module, alias))
+}
+
+fn call_glob_import_binding(
+    imports: &ImportBindings,
+    source: Option<usize>,
+    module: Option<usize>,
+) -> Option<&str> {
+    match call_import_binding(imports, source, module, "*") {
+        Some(Binding::Unique(path)) => Some(path),
+        Some(Binding::Ambiguous) | None => None,
+    }
+}
+
+fn supported_rust_call_target(raw: &str) -> bool {
+    let Some(raw) = strip_generics(raw.trim()) else {
+        return false;
+    };
+    let mut dots = raw.split('.');
+    let left = dots.next().unwrap_or_default();
+    if let Some(method) = dots.next() {
+        return dots.next().is_none()
+            && (matches!(left, "self") || valid_identifier(left))
+            && valid_identifier(method);
+    }
+    !left.is_empty()
+        && left.split("::").all(|part| {
+            matches!(part, "crate" | "self" | "super" | "Self") || valid_identifier(part)
+        })
+}
+
+fn generated_include_basename(raw: &str) -> Option<String> {
+    let mut compact = Vec::with_capacity(raw.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for byte in raw.bytes() {
+        if quoted {
+            compact.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else if !byte.is_ascii_whitespace() {
+            compact.push(byte);
+            quoted = byte == b'"';
+        }
+    }
+    if quoted {
+        return None;
+    }
+    let compact = std::str::from_utf8(&compact).ok()?;
+    let suffix = compact
+        .strip_prefix("include!(concat!(env!(\"OUT_DIR\"),\"/")?
+        .strip_suffix("\"))")?;
+    (!suffix.is_empty() && !suffix.contains(['/', '\\']) && suffix.ends_with(".rs"))
+        .then(|| suffix.to_owned())
 }
 
 fn visible_local_type_scope<'a>(
@@ -2628,17 +3348,6 @@ fn import_binding<'a>(
                 })
                 .and_then(|scope| scope.get(alias))
         })
-}
-
-fn glob_import_binding(
-    imports: &ImportBindings,
-    source: usize,
-    module: Option<usize>,
-) -> Option<&str> {
-    match import_binding(imports, source, module, "*") {
-        Some(Binding::Unique(path)) => Some(path),
-        Some(Binding::Ambiguous) | None => None,
-    }
 }
 
 fn source_scope<'a>(
@@ -3157,13 +3866,20 @@ mod tests {
     const REVIEW_SNAPSHOT_ID: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     use crate::artifact::AnalyzerKind;
-    use crate::git::{ArtifactFile, ArtifactOmission, ArtifactReview, ChangeLayer};
+    use crate::git::{
+        ArtifactFile, ArtifactOmission, ArtifactReview, CapturedSource, ChangeLayer, ChangedFile,
+        LineSpan, PathRecord, SourceOmission,
+    };
     use crate::workspace::{
         AllowedRoots, ErrorCode, IndexRequest, SnapshotCatalog, SnapshotTarget, resolve_request,
         set_before_seed_open_hook_for_test,
     };
     use std::fs;
     use std::process::Command;
+
+    fn canonical_temp_dir() -> PathBuf {
+        fs::canonicalize(std::env::temp_dir()).expect("temporary directory must resolve")
+    }
 
     fn complete_artifact(path: &str, analyzer: AnalyzerKind) -> ArtifactFile {
         ArtifactFile {
@@ -3173,6 +3889,482 @@ mod tests {
             analysis_complete: true,
             omission: None,
         }
+    }
+
+    fn complete_review(graph: String) -> ChangeReview {
+        ChangeReview {
+            graph,
+            evidence: String::new(),
+            static_status: CompletenessStatus::Complete,
+            dynamic_status: CompletenessStatus::NotApplicable,
+        }
+    }
+
+    fn partial_review(graph: String) -> ChangeReview {
+        ChangeReview {
+            static_status: CompletenessStatus::Partial,
+            ..complete_review(graph)
+        }
+    }
+
+    #[test]
+    fn generated_rust_uses_unique_include_context_and_resolves_calls() {
+        let cancelled = AtomicBool::new(false);
+        let source = Source {
+            path: "src/lib.rs".into(),
+            text: "fn predicate() -> bool { true }\nfn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n".into(),
+        };
+        let source_graph = build_graph(&[source], &cancelled).unwrap();
+        let fixture = canonical_temp_dir().join(format!(
+            "graphr-generated-evidence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        let mut store =
+            Store::open_private_image(&fixture.join("graph.sqlite"), &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((source_graph, ())))
+            .unwrap();
+        let input_bytes = b"field\n".to_vec();
+        let output_bytes = b"fn generated() -> bool { predicate() }\n".to_vec();
+        let evidence = CapturedEvidence {
+            source_snapshot_id: "a".repeat(64),
+            manifest: CapturedArtifact {
+                path: "evidence.json".into(),
+                content_hash: *blake3::hash(b"manifest").as_bytes(),
+                bytes: b"manifest".to_vec(),
+            },
+            generated: vec![crate::evidence::CapturedGenerated {
+                input: crate::evidence::CapturedArtifactSpan {
+                    artifact: CapturedArtifact {
+                        path: "schema.proto".into(),
+                        content_hash: *blake3::hash(&input_bytes).as_bytes(),
+                        bytes: input_bytes,
+                    },
+                    line_start: 1,
+                    line_end: 1,
+                },
+                generator: crate::evidence::SourceSpan {
+                    path: "src/lib.rs".into(),
+                    line_start: 2,
+                    line_end: 2,
+                },
+                output: crate::evidence::CapturedArtifactSpan {
+                    artifact: CapturedArtifact {
+                        path: "target/out.rs".into(),
+                        content_hash: *blake3::hash(&output_bytes).as_bytes(),
+                        bytes: output_bytes,
+                    },
+                    line_start: 1,
+                    line_end: 1,
+                },
+            }],
+            coverage: Vec::new(),
+        };
+        let artifacts = evidence_artifacts(&evidence).unwrap();
+
+        let (generated, input) =
+            build_generated_evidence(&store, &evidence, artifacts, &fixture, &cancelled).unwrap();
+        assert_eq!(generated.files[0].path, "target/out.rs");
+        assert!(generated.refs.iter().any(|reference| {
+            reference
+                .keys
+                .iter()
+                .any(|key| key == "rust:function:predicate")
+        }));
+        assert_eq!(input.provenance.len(), 1);
+        let stats = store
+            .replace_evidence(generated, &input, &cancelled)
+            .unwrap();
+        assert_eq!(stats.generated_files, 1);
+        assert_eq!(stats.provenance_links, 1);
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn same_basename_outputs_contending_for_one_include_are_all_ambiguous() {
+        let cancelled = AtomicBool::new(false);
+        let source_graph = build_graph(
+            &[Source {
+                path: "src/lib.rs".into(),
+                text: "fn predicate() -> bool { true }\nfn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n".into(),
+            }],
+            &cancelled,
+        )
+        .unwrap();
+        let fixture = canonical_temp_dir().join(format!(
+            "graphr-generated-basename-contention-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        let mut store =
+            Store::open_private_image(&fixture.join("graph.sqlite"), &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((source_graph, ())))
+            .unwrap();
+        let input = CapturedArtifact {
+            path: "schema.proto".into(),
+            content_hash: *blake3::hash(b"field\n").as_bytes(),
+            bytes: b"field\n".to_vec(),
+        };
+        let generated = ["target/a/out.rs", "target/b/out.rs"]
+            .into_iter()
+            .map(|path| {
+                let bytes = b"fn generated() -> bool { predicate() }\n".to_vec();
+                crate::evidence::CapturedGenerated {
+                    input: crate::evidence::CapturedArtifactSpan {
+                        artifact: input.clone(),
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                    generator: crate::evidence::SourceSpan {
+                        path: "src/lib.rs".into(),
+                        line_start: 2,
+                        line_end: 2,
+                    },
+                    output: crate::evidence::CapturedArtifactSpan {
+                        artifact: CapturedArtifact {
+                            path: path.into(),
+                            content_hash: *blake3::hash(&bytes).as_bytes(),
+                            bytes,
+                        },
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                }
+            })
+            .collect();
+        let captured = CapturedEvidence {
+            source_snapshot_id: "a".repeat(64),
+            manifest: CapturedArtifact {
+                path: "evidence.json".into(),
+                content_hash: *blake3::hash(b"manifest").as_bytes(),
+                bytes: b"manifest".to_vec(),
+            },
+            generated,
+            coverage: Vec::new(),
+        };
+        let artifacts = evidence_artifacts(&captured).unwrap();
+
+        let (graph, evidence) =
+            build_generated_evidence(&store, &captured, artifacts, &fixture, &cancelled).unwrap();
+        assert!(graph.files.is_empty());
+        assert!(graph.nodes.is_empty());
+        assert!(graph.refs.is_empty());
+        assert_eq!(evidence.provenance.len(), 2);
+        assert!(
+            evidence
+                .gaps
+                .iter()
+                .all(|gap| gap.category != GapCategory::Generated)
+        );
+        let stats = store
+            .replace_evidence(graph, &evidence, &cancelled)
+            .unwrap();
+        assert_eq!(stats.provenance_links, 0);
+        let review = store
+            .changes(
+                REVIEW_SNAPSHOT_ID,
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        whole_file: false,
+                        spans: vec![LineSpan { start: 4, end: 4 }],
+                        report_unmapped: false,
+                    }],
+                    records: Vec::new(),
+                    paths: Vec::new(),
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                0,
+                20,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert_eq!(
+            review
+                .evidence
+                .matches("claim kind=generated-provenance status=partial")
+                .count(),
+            2,
+            "{}",
+            review.evidence
+        );
+        assert_eq!(
+            review
+                .evidence
+                .matches("reason=generated-output-ambiguous")
+                .count(),
+            2,
+            "{}",
+            review.evidence
+        );
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn failed_generated_declarations_keep_distinct_input_identity_and_one_claim_each() {
+        let cancelled = AtomicBool::new(false);
+        let source_graph = build_graph(
+            &[Source {
+                path: "src/lib.rs".into(),
+                text: "fn generate() {}\n".into(),
+            }],
+            &cancelled,
+        )
+        .unwrap();
+        let fixture = canonical_temp_dir().join(format!(
+            "graphr-generated-declaration-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        let mut store =
+            Store::open_private_image(&fixture.join("graph.sqlite"), &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((source_graph, ())))
+            .unwrap();
+        let output = b"fn generated() {}\n".to_vec();
+        let generated = ["schema-a.proto", "schema-b.proto"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let input = format!("field-{index}\n").into_bytes();
+                crate::evidence::CapturedGenerated {
+                    input: crate::evidence::CapturedArtifactSpan {
+                        artifact: CapturedArtifact {
+                            path: path.into(),
+                            content_hash: *blake3::hash(&input).as_bytes(),
+                            bytes: input,
+                        },
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                    generator: crate::evidence::SourceSpan {
+                        path: "src/lib.rs".into(),
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                    output: crate::evidence::CapturedArtifactSpan {
+                        artifact: CapturedArtifact {
+                            path: "target/out.rs".into(),
+                            content_hash: *blake3::hash(&output).as_bytes(),
+                            bytes: output.clone(),
+                        },
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                }
+            })
+            .collect();
+        let captured = CapturedEvidence {
+            source_snapshot_id: "a".repeat(64),
+            manifest: CapturedArtifact {
+                path: "evidence.json".into(),
+                content_hash: *blake3::hash(b"manifest").as_bytes(),
+                bytes: b"manifest".to_vec(),
+            },
+            generated,
+            coverage: Vec::new(),
+        };
+        let artifacts = evidence_artifacts(&captured).unwrap();
+
+        let (graph, evidence) =
+            build_generated_evidence(&store, &captured, artifacts, &fixture, &cancelled).unwrap();
+        assert_eq!(evidence.provenance.len(), 2);
+        assert!(
+            evidence
+                .gaps
+                .iter()
+                .all(|gap| gap.category != GapCategory::Generated),
+            "manifest declarations must not escape into generic graph gaps"
+        );
+        store
+            .replace_evidence(graph, &evidence, &cancelled)
+            .unwrap();
+
+        let review = store
+            .changes(
+                REVIEW_SNAPSHOT_ID,
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/lib.rs".into(),
+                        whole_file: false,
+                        spans: vec![LineSpan { start: 1, end: 1 }],
+                        report_unmapped: true,
+                    }],
+                    records: vec![],
+                    paths: vec![],
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                0,
+                20,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert_eq!(
+            review
+                .evidence
+                .matches("claim kind=generated-provenance")
+                .count(),
+            2,
+            "{}",
+            review.evidence
+        );
+        assert!(review.evidence.contains("input=\"schema-a.proto:1-1\""));
+        assert!(review.evidence.contains("input=\"schema-b.proto:1-1\""));
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn generated_rust_skips_zero_multiple_and_unmapped_contexts() {
+        let cases = [
+            ("fn generate() {}\n", 1),
+            (
+                "fn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\nfn other() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n",
+                1,
+            ),
+            ("fn generate() {}\n", 99),
+        ];
+        for (ordinal, (source_text, generator_line)) in cases.into_iter().enumerate() {
+            let cancelled = AtomicBool::new(false);
+            let source_graph = build_graph(
+                &[Source {
+                    path: "src/lib.rs".into(),
+                    text: source_text.into(),
+                }],
+                &cancelled,
+            )
+            .unwrap();
+            let fixture = canonical_temp_dir().join(format!(
+                "graphr-generated-context-{}-{ordinal}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&fixture).unwrap();
+            let mut store =
+                Store::open_private_image(&fixture.join("graph.sqlite"), &cancelled).unwrap();
+            store
+                .index_with(&cancelled, |_full, _existing| Ok((source_graph, ())))
+                .unwrap();
+            let input = b"field\n".to_vec();
+            let output = b"fn generated() {}\n".to_vec();
+            let captured = CapturedEvidence {
+                source_snapshot_id: "a".repeat(64),
+                manifest: CapturedArtifact {
+                    path: "evidence.json".into(),
+                    content_hash: *blake3::hash(b"manifest").as_bytes(),
+                    bytes: b"manifest".to_vec(),
+                },
+                generated: vec![crate::evidence::CapturedGenerated {
+                    input: crate::evidence::CapturedArtifactSpan {
+                        artifact: CapturedArtifact {
+                            path: "schema.proto".into(),
+                            content_hash: *blake3::hash(&input).as_bytes(),
+                            bytes: input,
+                        },
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                    generator: crate::evidence::SourceSpan {
+                        path: "src/lib.rs".into(),
+                        line_start: generator_line,
+                        line_end: generator_line,
+                    },
+                    output: crate::evidence::CapturedArtifactSpan {
+                        artifact: CapturedArtifact {
+                            path: "target/out.rs".into(),
+                            content_hash: *blake3::hash(&output).as_bytes(),
+                            bytes: output,
+                        },
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                }],
+                coverage: Vec::new(),
+            };
+            let artifacts = evidence_artifacts(&captured).unwrap();
+            let (graph, evidence) =
+                build_generated_evidence(&store, &captured, artifacts, &fixture, &cancelled)
+                    .unwrap();
+
+            assert!(graph.files.is_empty());
+            assert_eq!(evidence.provenance.len(), 1);
+            assert!(
+                evidence
+                    .gaps
+                    .iter()
+                    .all(|gap| gap.category != GapCategory::Generated)
+            );
+            fs::remove_dir_all(fixture).unwrap();
+        }
+    }
+
+    #[test]
+    fn review_status_fields_are_typed_and_independent_from_pagination() {
+        let snapshot = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            50,
+            DependencyMode::Boundary,
+            WorktreeChanges {
+                files: vec![],
+                records: vec![],
+                paths: vec![],
+                source_patch: String::new(),
+                artifacts: Default::default(),
+                skipped_paths: 1,
+            },
+            ChangeReview {
+                graph: "risk traversal_complete=true\n".into(),
+                evidence: String::new(),
+                static_status: CompletenessStatus::Complete,
+                dynamic_status: CompletenessStatus::NotApplicable,
+            },
+        );
+
+        let output = review_context(&snapshot).unwrap();
+        assert!(
+            output.contains("content_complete_when_pages_exhausted=false"),
+            "{output}"
+        );
+        assert!(
+            output.contains("static_evidence_status=complete"),
+            "{output}"
+        );
+        assert!(
+            output.contains("dynamic_evidence_status=not-applicable"),
+            "{output}"
+        );
+        assert!(!output.contains("review_complete"), "{output}");
+        assert!(
+            !output
+                .split_once("graph\n")
+                .unwrap()
+                .1
+                .contains("analysis_complete"),
+            "{output}"
+        );
     }
 
     #[test]
@@ -3193,6 +4385,315 @@ mod tests {
         assert_eq!(second.stats.files_reused, 2);
         assert_eq!(second.stats.files_parsed, 0);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_gap_preserves_omission_inventory() {
+        let root = snapshot_repository("source-gap");
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let snapshot = SourceSnapshot {
+            capture_root: root.clone(),
+            files: Vec::new(),
+            omissions: vec![SourceOmission {
+                path: Some("cmd/main.go".into()),
+                reason: SourceOmissionReason::LanguageNotIndexed,
+                occurrences: 1,
+            }],
+        };
+
+        let graph =
+            build_snapshot_for_test(&repository, &snapshot, &AtomicBool::new(false)).unwrap();
+
+        assert_eq!(graph.gaps.len(), 1);
+        assert_eq!(graph.gaps[0].category, GapCategory::Language);
+        assert_eq!(graph.gaps[0].reason, GapReason::LanguageNotIndexed);
+        assert_eq!(graph.gaps[0].path.as_deref(), Some("cmd/main.go"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incremental_source_omissions_replace_global_gaps() {
+        let root = snapshot_repository("incremental-source-omissions");
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let graph_path = root.join("incremental-source-omissions.db");
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store::open_private_image(&graph_path, &cancelled).unwrap();
+
+        for (reason, expected) in [
+            (Some(SourceOmissionReason::UnsafePath), "unsafe-path:1"),
+            (Some(SourceOmissionReason::Oversized), "oversized:1"),
+            (None, "none"),
+        ] {
+            let snapshot = SourceSnapshot {
+                capture_root: root.clone(),
+                files: Vec::new(),
+                omissions: reason
+                    .map(|reason| SourceOmission {
+                        path: Some("src/omitted.rs".into()),
+                        reason,
+                        occurrences: 1,
+                    })
+                    .into_iter()
+                    .collect(),
+            };
+            let graph = build_snapshot_for_test(&repository, &snapshot, &cancelled).unwrap();
+            store
+                .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+                .unwrap();
+            let review = store
+                .changes(
+                    REVIEW_SNAPSHOT_ID,
+                    &WorktreeChanges {
+                        files: Vec::new(),
+                        records: vec![PathRecord::Deleted("README.md".into())],
+                        paths: Vec::new(),
+                        source_patch: String::new(),
+                        artifacts: ArtifactReview::default(),
+                        skipped_paths: 0,
+                    },
+                    0,
+                    1,
+                    DependencyMode::Boundary,
+                    &cancelled,
+                )
+                .unwrap();
+            assert!(
+                review.graph.contains(&format!("by_reason={expected}")),
+                "{}",
+                review.graph
+            );
+        }
+        fs::remove_file(graph_path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_source_digest_mismatch_is_fatal() {
+        let root = snapshot_repository("source-digest-mismatch");
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let original = fs::read(root.join("src/a.rs")).unwrap();
+        let digest = *blake3::hash(&original).as_bytes();
+        fs::write(root.join("src/a.rs"), "fn mutated_after_capture() {}\n").unwrap();
+        let mut files = vec![CapturedSource {
+            path: "src/a.rs".into(),
+            language: Language::Rust,
+            git_oid: None,
+            content_key: blake3::Hash::from_bytes(digest).to_hex().to_string(),
+            parse_context: String::new(),
+            content: SourceContent::Captured {
+                relative_path: "src/a.rs".into(),
+                digest,
+            },
+        }];
+        assign_parse_contexts(&mut files, &BTreeSet::new());
+        let snapshot = SourceSnapshot {
+            capture_root: root.clone(),
+            files,
+            omissions: Vec::new(),
+        };
+
+        let error = match build_snapshot_for_test(&repository, &snapshot, &AtomicBool::new(false)) {
+            Ok(_) => panic!("mutated captured source unexpectedly indexed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "captured source digest mismatch");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rust_relation_sites_are_fully_accounted() {
+        let graph = build_graph(
+            &[Source {
+                path: "src/lib.rs".into(),
+                text: r#"fn direct() {}
+fn factory() -> fn() { direct }
+fn run() {
+    direct();
+    factory()();
+    println!("hello");
+    include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+}"#
+                .into(),
+            }],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(graph.files[0].observed_relation_sites, 5);
+        assert_eq!(graph.refs.len(), 2);
+        assert_eq!(graph.modeled_sites.len(), 1);
+        assert_eq!(graph.gaps.iter().filter(|gap| gap.relation_site).count(), 2);
+        assert!(graph.gaps.iter().any(|gap| {
+            gap.reason == GapReason::GeneratedOutputUnobserved && !gap.relation_site
+        }));
+        assert_eq!(
+            graph.modeled_sites[0].target_hint.as_deref(),
+            Some("generated.rs")
+        );
+    }
+
+    #[test]
+    fn rust_wildcard_import_is_an_accounted_relation_gap() {
+        let graph = build_graph(
+            &[Source {
+                path: "src/lib.rs".into(),
+                text: "mod tests { use super::*; }".into(),
+            }],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(graph.files[0].observed_relation_sites, 1);
+        assert!(graph.refs.is_empty());
+        assert_eq!(
+            graph
+                .gaps
+                .iter()
+                .filter(|gap| gap.relation_site)
+                .map(|gap| (
+                    gap.category,
+                    gap.reason,
+                    gap.target_hint.as_deref(),
+                    gap.occurrences
+                ))
+                .collect::<Vec<_>>(),
+            [(
+                GapCategory::Relation,
+                GapReason::DynamicOrUnsupportedDispatch,
+                Some("super::*"),
+                1
+            )]
+        );
+    }
+
+    #[test]
+    fn generated_include_matches_out_dir_lexically() {
+        assert_eq!(
+            generated_include_basename(
+                r#"include! ( concat! ( env! ( "OUT_DIR" ) , "/generated.rs" ) )"#
+            )
+            .as_deref(),
+            Some("generated.rs")
+        );
+        assert_eq!(
+            generated_include_basename(r#"include!(concat!(env!("OUT_ DIR"), "/generated.rs"))"#),
+            None
+        );
+    }
+
+    #[test]
+    fn python_relation_sites_are_fully_accounted() {
+        let source = Source {
+            path: "pkg/app.py".into(),
+            text: "def local():\n    pass\ndef run(value):\n    local()\n    value.method()\n"
+                .into(),
+        };
+        let mut graph = Graph::default();
+        graph.files.push(FileInput {
+            path: source.path.clone(),
+            language: Language::Python,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: "python".into(),
+            byte_size: source.text.len() as u64,
+            replace: true,
+            observed_relation_sites: 0,
+        });
+        crate::python::add_file(&mut graph, &source, &mut PythonParser::new().unwrap()).unwrap();
+
+        assert_eq!(graph.files[0].observed_relation_sites, 2);
+        assert_eq!(graph.refs.len(), 1);
+        assert_eq!(graph.gaps.iter().filter(|gap| gap.relation_site).count(), 1);
+    }
+
+    #[test]
+    fn python_absolute_import_resolves_sibling_and_keeps_unknown_missing() {
+        let sources = [
+            Source {
+                path: "app.py".into(),
+                text: "import util\nimport absent_package\n".into(),
+            },
+            Source {
+                path: "util.py".into(),
+                text: "def helper():\n    pass\n".into(),
+            },
+        ];
+        let mut graph = Graph::default();
+        let mut parser = PythonParser::new().unwrap();
+        for source in &sources {
+            graph.files.push(FileInput {
+                path: source.path.clone(),
+                language: Language::Python,
+                git_oid: None,
+                content_hash: *blake3::hash(source.text.as_bytes()).as_bytes(),
+                parse_context: "python".into(),
+                byte_size: source.text.len() as u64,
+                replace: true,
+                observed_relation_sites: 0,
+            });
+            crate::python::add_file(&mut graph, source, &mut parser).unwrap();
+        }
+        resolve(&mut graph, &AtomicBool::new(false)).unwrap();
+
+        let sibling = graph
+            .refs
+            .iter()
+            .find(|reference| reference.keys == ["python:item:util"])
+            .unwrap();
+        assert_eq!(sibling.resolution, ResolutionState::Resolved);
+        assert!(sibling.resolved_target_key.is_some());
+        let unknown = graph
+            .refs
+            .iter()
+            .find(|reference| reference.keys == ["python:item:absent_package"])
+            .unwrap();
+        assert_eq!(unknown.resolution, ResolutionState::Missing);
+        assert!(unknown.resolved_target_key.is_none());
+        assert!(
+            graph
+                .gaps
+                .iter()
+                .all(|gap| gap.reason != GapReason::ExternalDependency)
+        );
+    }
+
+    #[test]
+    fn script_relation_sites_are_fully_accounted() {
+        let source = Source {
+            path: "src/app.ts".into(),
+            text: "function direct() {}\nfunction run(value: unknown) { direct(); value(); }\n"
+                .into(),
+        };
+        let mut graph = Graph::default();
+        graph.files.push(FileInput {
+            path: source.path.clone(),
+            language: Language::TypeScript,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: "typescript".into(),
+            byte_size: source.text.len() as u64,
+            replace: true,
+            observed_relation_sites: 0,
+        });
+        crate::javascript::add_file(
+            &mut graph,
+            &source,
+            Language::TypeScript,
+            &mut ScriptParsers::default(),
+        )
+        .unwrap();
+
+        let accounted = graph.refs.len()
+            + graph.modeled_sites.len()
+            + graph
+                .gaps
+                .iter()
+                .filter(|gap| gap.relation_site)
+                .map(|gap| gap.occurrences as usize)
+                .sum::<usize>();
+        assert_eq!(graph.files[0].observed_relation_sites as usize, accounted);
+        assert!(accounted > 0);
     }
 
     #[test]
@@ -3645,6 +5146,168 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn evidence_source_snapshot_mismatch_is_fatal() {
+        let root = snapshot_repository("evidence-source-mismatch");
+        fs::write(root.join("schema.proto"), "message Input {}\n").unwrap();
+        test_git(&root, &["add", "--", "schema.proto"]);
+        test_git(&root, &["commit", "--quiet", "-m", "schema"]);
+        let head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        let source = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &head, &head),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        fs::write(root.join("out.rs"), "pub fn generated() {}\n").unwrap();
+        let input = fs::read(root.join("schema.proto")).unwrap();
+        let output = fs::read(root.join("out.rs")).unwrap();
+        fs::write(
+            root.join("evidence.json"),
+            format!(
+                "{{\"format_version\":1,\"source_snapshot_id\":\"{}\",\"generated\":[{{\"input\":{{\"path\":\"schema.proto\",\"blake3\":\"{}\",\"line_start\":1,\"line_end\":1}},\"generator\":{{\"path\":\"src/a.rs\",\"line_start\":1,\"line_end\":1}},\"output\":{{\"path\":\"out.rs\",\"blake3\":\"{}\",\"line_start\":1,\"line_end\":1}}}}],\"coverage\":[]}}",
+                "f".repeat(64),
+                blake3::hash(&input).to_hex(),
+                blake3::hash(&output).to_hex(),
+            ),
+        )
+        .unwrap();
+        let mut request = snapshot_request(&engine, &root, &head, &head);
+        request.evidence_manifest = Some("evidence.json".into());
+
+        let error = engine
+            .build_snapshot(request, &AtomicBool::new(false), |_| {})
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidParameters);
+        assert_eq!(error.message, "source snapshot mismatch");
+        assert!(engine.snapshot(&source.snapshot_id).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn evidence_cache_builds_generated_provenance_and_reuses_exact_image() {
+        let root = snapshot_repository("evidence-cache");
+        fs::write(
+            root.join("src/a.rs"),
+            "fn predicate() -> bool { true }\nfn generate() { include!(concat!(env!(\"OUT_DIR\"), \"/out.rs\")); }\n",
+        )
+        .unwrap();
+        fs::write(root.join("schema.proto"), "message Input {}\n").unwrap();
+        test_git(&root, &["add", "--", "src/a.rs", "schema.proto"]);
+        test_git(&root, &["commit", "--quiet", "-m", "generator source"]);
+        let head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        let source = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &head, &head),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(
+            root.join("target/out.rs"),
+            "fn generated() -> bool { predicate() }\n",
+        )
+        .unwrap();
+        let input = fs::read(root.join("schema.proto")).unwrap();
+        let output = fs::read(root.join("target/out.rs")).unwrap();
+        fs::write(
+            root.join("evidence.json"),
+            format!(
+                "{{\"format_version\":1,\"source_snapshot_id\":\"{}\",\"generated\":[{{\"input\":{{\"path\":\"schema.proto\",\"blake3\":\"{}\",\"line_start\":1,\"line_end\":1}},\"generator\":{{\"path\":\"src/a.rs\",\"line_start\":2,\"line_end\":2}},\"output\":{{\"path\":\"target/out.rs\",\"blake3\":\"{}\",\"line_start\":1,\"line_end\":1}}}}],\"coverage\":[]}}",
+                source.snapshot_id,
+                blake3::hash(&input).to_hex(),
+                blake3::hash(&output).to_hex(),
+            ),
+        )
+        .unwrap();
+        let mut request = snapshot_request(&engine, &root, &head, &head);
+        request.evidence_manifest = Some("evidence.json".into());
+
+        let first = engine
+            .build_snapshot(request.clone(), &AtomicBool::new(false), |_| {})
+            .unwrap();
+        let repeat = engine
+            .build_snapshot(request.clone(), &AtomicBool::new(false), |_| {})
+            .unwrap();
+
+        assert_ne!(first.graph_image_id, source.graph_image_id);
+        assert_eq!(repeat.graph_image_id, first.graph_image_id);
+        assert_eq!(
+            first.provenance.source_snapshot_id.as_deref(),
+            Some(source.snapshot_id.as_str())
+        );
+        assert!(first.provenance.evidence_manifest_digest.is_some());
+        assert_eq!(first.stats.files_parsed, 1);
+        assert_eq!(repeat.stats.files_parsed, 0);
+        let generated = engine
+            .search(&first.snapshot_id, "generated", None, 5)
+            .unwrap();
+        assert!(generated.text.contains("generated"), "{}", generated.text);
+        let review = engine
+            .changes(&first.snapshot_id, 0, 10, None, &AtomicBool::new(false))
+            .unwrap();
+        assert!(!review.text.contains("basis=verified-generated-manifest"));
+        assert!(review.text.contains("provenance_model=not-applicable"));
+        assert!(review.text.contains("dynamic_evidence_status=complete"));
+
+        let cancelled = AtomicBool::new(false);
+        let error = engine
+            .build_snapshot(request.clone(), &cancelled, |progress| {
+                if progress.stage == BuildStage::SelectingSeed {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::JobCancelled);
+        assert!(engine.snapshot(&first.snapshot_id).is_ok());
+
+        let source_graph = engine
+            .snapshot(&source.snapshot_id)
+            .unwrap()
+            .graph_path
+            .clone();
+        fs::set_permissions(
+            &source_graph,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        fs::write(&source_graph, b"corrupt source seed").unwrap();
+        fs::write(
+            root.join("target/out.rs"),
+            "fn generated_changed() -> bool { predicate() }\n",
+        )
+        .unwrap();
+        let mut manifest: rmcp::serde_json::Value =
+            rmcp::serde_json::from_slice(&fs::read(root.join("evidence.json")).unwrap()).unwrap();
+        manifest["generated"][0]["output"]["blake3"] =
+            blake3::hash(&fs::read(root.join("target/out.rs")).unwrap())
+                .to_hex()
+                .to_string()
+                .into();
+        fs::write(
+            root.join("evidence.json"),
+            rmcp::serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = engine
+            .build_snapshot(request, &AtomicBool::new(false), |_| {})
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::CacheCorrupt, "{error:?}");
+        assert!(engine.snapshot(&first.snapshot_id).is_ok());
+        assert!(
+            fs::read_dir(root.join(".git/graphr/v6/quarantine"))
+                .unwrap()
+                .next()
+                .is_some()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn snapshot_repository(label: &str) -> PathBuf {
         let root = fs::canonicalize(std::env::temp_dir())
             .unwrap_or_else(|_| std::env::temp_dir())
@@ -3681,6 +5344,7 @@ mod tests {
                 head_ref: head.into(),
                 target: SnapshotTarget::Commit,
                 dependency_mode: DependencyMode::Boundary,
+                evidence_manifest: None,
             },
             &AtomicBool::new(false),
         )
@@ -3885,20 +5549,21 @@ mod tests {
             },
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n";
         let snapshot = ReviewSnapshot::new(
             REVIEW_SNAPSHOT_ID,
             6,
             50,
             DependencyMode::Boundary,
             changes,
-            graph.into(),
+            complete_review(graph.into()),
         );
 
         let initial = review_context(&snapshot).unwrap();
         assert!(initial.contains("\nartifacts\n"), "{initial}");
         assert!(initial.contains("artifacts_next_cursor="), "{initial}");
-        assert!(initial.contains("review_complete_when_pages_exhausted=true"));
+        assert!(initial.contains("content_complete_when_pages_exhausted=true"));
+        assert!(initial.contains("static_evidence_status=complete"));
         let mut stale = next_cursor(&initial, "artifacts_next_cursor").unwrap();
         let replacement = if stale.ends_with('0') { "1" } else { "0" };
         stale.replace_range(stale.len() - 1.., replacement);
@@ -3918,7 +5583,7 @@ mod tests {
         );
 
         let expected = format!(
-            "artifact path=\"README.md\" analyzer=markdown diff_complete=true analysis_complete=true\n{}{}",
+            "artifact path=\"README.md\" analyzer=markdown diff_complete=true\n{}{}",
             snapshot.changes.artifacts.analysis, artifact_patch
         );
         let mut reconstructed = String::new();
@@ -3931,6 +5596,7 @@ mod tests {
                 SECTION_OVERHEAD + 257,
             )
             .unwrap();
+            assert!(!page.contains("analysis_complete="), "{page}");
             let metadata = page.lines().nth(1).unwrap();
             let emitted = metadata
                 .split_ascii_whitespace()
@@ -3996,6 +5662,39 @@ mod tests {
     }
 
     #[test]
+    fn exact_changed_content_is_independent_from_artifact_semantics() {
+        let changes = WorktreeChanges {
+            files: vec![],
+            records: vec![],
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: "README.md".into(),
+                language: None,
+                additions: Some(1),
+                deletions: Some(1),
+                layers: Vec::new(),
+            }],
+            source_patch: String::new(),
+            artifacts: ArtifactReview {
+                files: vec![ArtifactFile {
+                    path: "README.md".into(),
+                    analyzer: AnalyzerKind::Markdown,
+                    diff_complete: true,
+                    analysis_complete: false,
+                    omission: None,
+                }],
+                analysis: String::new(),
+                patch: "diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            },
+            skipped_paths: 0,
+        };
+
+        assert!(change_content_complete(&changes, DependencyMode::Boundary));
+    }
+
+    #[test]
     fn source_looking_nonregular_path_is_not_source_complete() {
         let changes = WorktreeChanges {
             files: vec![],
@@ -4039,7 +5738,7 @@ mod tests {
             "@@ -1 +1 @@\n-é old\n+é changed\n".repeat(400)
         );
         let graph = format!(
-            "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=300 static_test_path_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
+            "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=300 static_test_path_gaps=1 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
             (0..300)
                 .map(|index| format!(
                     "flow 0.1000 entry_{index}@src/lib.rs:1 -> changed@src/lib.rs:2\n"
@@ -4069,7 +5768,7 @@ mod tests {
             50,
             DependencyMode::Boundary,
             changes,
-            graph,
+            complete_review(graph),
         );
         let initial = review_context(&snapshot).unwrap();
         assert!(initial.len() <= REVIEW_CONTEXT_BUDGET);
@@ -4077,9 +5776,9 @@ mod tests {
         assert!(initial.contains("rename_detection=within-source-and-artifact"));
         assert!(initial.contains("total_hunks=400"));
         assert!(initial.contains("total_flows=300"));
-        assert!(
-            initial.contains("review_complete=false review_complete_when_pages_exhausted=true")
-        );
+        assert!(initial.contains("content_complete_when_pages_exhausted=true"));
+        assert!(initial.contains("static_evidence_status=complete"));
+        assert!(!initial.contains("review_complete"));
         assert!(!initial.contains("[truncated]"));
 
         let mut pages = initial.clone();
@@ -4105,7 +5804,9 @@ mod tests {
                 assert!(output.len() <= REVIEW_CONTEXT_BUDGET);
                 assert!(output.is_char_boundary(output.len()));
                 assert!(!output.contains("[truncated]"));
-                assert!(output.contains("review_complete_when_pages_exhausted=true"));
+                assert!(output.contains("content_complete_when_pages_exhausted=true"));
+                assert!(output.contains("static_evidence_status=complete"));
+                assert!(output.contains("dynamic_evidence_status=not-applicable"));
                 cursor = next_cursor(&output, label);
                 pages.push_str(&output);
             }
@@ -4140,9 +5841,237 @@ mod tests {
     }
 
     #[test]
+    fn evidence_page_initializes_all_five_independent_sections_without_a_manifest() {
+        let snapshot = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            1,
+            DependencyMode::Boundary,
+            WorktreeChanges {
+                files: Vec::new(),
+                records: Vec::new(),
+                paths: Vec::new(),
+                source_patch: String::new(),
+                artifacts: Default::default(),
+                skipped_paths: 0,
+            },
+            complete_review(
+                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n"
+                    .into(),
+            ),
+        );
+
+        let output = review_context(&snapshot).unwrap();
+
+        for header in ["files", "diff", "artifacts", "graph", "evidence"] {
+            assert!(
+                output.lines().any(|line| line == header),
+                "missing {header} section: {output}"
+            );
+        }
+        assert_eq!(
+            output
+                .lines()
+                .find(|line| line.starts_with("evidence emitted_bytes="))
+                .unwrap(),
+            "evidence emitted_bytes=0 total_bytes=0 prior_bytes=0 remaining_bytes=0 byte_range=0..0 starts_mid_line=false ends_mid_line=false framing_suffix_bytes=0 emitted_records=0 partial_records=0 total_records=0 prior_records=0 remaining_records=0 page_complete=true"
+        );
+        assert!(output.len() <= REVIEW_CONTEXT_BUDGET, "{}", output.len());
+        assert!(output.contains("dynamic_evidence_status=not-applicable"));
+    }
+
+    #[test]
+    fn evidence_page_reconstructs_ordered_unicode_records_with_exact_accounting() {
+        let evidence = format!(
+            "claim named-test={}\nclaim run-level=second\nclaim kind=static-test-paths status=partial basis=resolved-static-call-graph\n",
+            "é".repeat(5_000)
+        );
+        let snapshot = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            1,
+            DependencyMode::Boundary,
+            WorktreeChanges {
+                files: Vec::new(),
+                records: Vec::new(),
+                paths: Vec::new(),
+                source_patch: String::new(),
+                artifacts: Default::default(),
+                skipped_paths: 0,
+            },
+            ChangeReview {
+                graph: "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n".into(),
+                evidence: evidence.clone(),
+                static_status: CompletenessStatus::Partial,
+                dynamic_status: CompletenessStatus::Partial,
+            },
+        );
+        let initial = review_context(&snapshot).unwrap();
+        assert!(initial.contains("evidence_next_cursor="), "{initial}");
+        assert_eq!(
+            initial.lines().filter(|line| line == &"files").count(),
+            1,
+            "{initial}"
+        );
+        assert!(initial.contains("page_record_limit=1"), "{initial}");
+
+        let mut reconstructed = String::new();
+        let mut offset = 0;
+        let mut saw_mid_line_continuation = false;
+        loop {
+            let (rendered, more) = render_section_page(
+                &snapshot,
+                ReviewSection::Evidence,
+                offset,
+                SECTION_OVERHEAD + 257,
+            )
+            .unwrap();
+            let metadata = rendered.lines().nth(1).unwrap();
+            let field = |name: &str| {
+                metadata
+                    .split_ascii_whitespace()
+                    .find_map(|field| field.strip_prefix(&format!("{name}=")))
+                    .unwrap()
+            };
+            let emitted = field("emitted_bytes").parse::<usize>().unwrap();
+            let prior = field("prior_bytes").parse::<usize>().unwrap();
+            let remaining = field("remaining_bytes").parse::<usize>().unwrap();
+            let total = field("total_bytes").parse::<usize>().unwrap();
+            let emitted_records = field("emitted_records").parse::<usize>().unwrap();
+            let partial_records = field("partial_records").parse::<usize>().unwrap();
+            let prior_records = field("prior_records").parse::<usize>().unwrap();
+            let remaining_records = field("remaining_records").parse::<usize>().unwrap();
+            let total_records = field("total_records").parse::<usize>().unwrap();
+            assert_eq!(prior, offset, "{rendered}");
+            assert_eq!(prior + emitted + remaining, total, "{rendered}");
+            if offset == 0 {
+                assert_eq!(field("starts_mid_line"), "false", "{rendered}");
+                assert_eq!(field("ends_mid_line"), "true", "{rendered}");
+                assert_eq!(field("framing_suffix_bytes"), "1", "{rendered}");
+            } else if field("starts_mid_line") == "true" {
+                saw_mid_line_continuation = true;
+            }
+            assert_eq!(
+                prior_records + emitted_records + partial_records + remaining_records,
+                total_records,
+                "{rendered}"
+            );
+            let content_start = rendered.match_indices('\n').nth(1).unwrap().0 + 1;
+            let content_end = content_start + emitted;
+            assert!(rendered.is_char_boundary(content_end), "{rendered}");
+            reconstructed.push_str(&rendered[content_start..content_end]);
+            offset += emitted;
+            assert_eq!(more, offset < evidence.len(), "{rendered}");
+            if !more {
+                assert!(field("page_complete") == "true", "{rendered}");
+                break;
+            }
+        }
+        assert_eq!(reconstructed, evidence);
+        assert!(saw_mid_line_continuation);
+        let named = reconstructed.find("claim named-test=").unwrap();
+        let run = reconstructed.find("claim run-level=second").unwrap();
+        let static_paths = reconstructed.find("claim kind=static-test-paths").unwrap();
+        assert!(named < run && run < static_paths);
+    }
+
+    #[test]
+    fn evidence_page_cursor_binds_snapshot_parameters_and_evidence_checksum() {
+        let review = |suffix: &str| {
+            ChangeReview {
+            graph: "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n".into(),
+            evidence: format!("{}sentinel-{suffix}\n", "evidence-record\n".repeat(600)),
+            static_status: CompletenessStatus::Complete,
+            dynamic_status: CompletenessStatus::Partial,
+        }
+        };
+        let changes = WorktreeChanges {
+            files: Vec::new(),
+            records: Vec::new(),
+            paths: Vec::new(),
+            source_patch: String::new(),
+            artifacts: Default::default(),
+            skipped_paths: 0,
+        };
+        let snapshot = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            1,
+            DependencyMode::Boundary,
+            changes.clone(),
+            review("original"),
+        );
+        let initial = review_context(&snapshot).unwrap();
+        let cursor = next_cursor(&initial, "evidence_next_cursor").unwrap();
+
+        assert_eq!(
+            parse_review_cursor(&cursor, &"b".repeat(64), 6, 1)
+                .err()
+                .unwrap(),
+            "cursor_snapshot_mismatch"
+        );
+        assert_eq!(
+            parse_review_cursor(&cursor, REVIEW_SNAPSHOT_ID, 5, 1)
+                .err()
+                .unwrap(),
+            "cursor_parameters_mismatch"
+        );
+        assert_eq!(
+            parse_review_cursor(&cursor, REVIEW_SNAPSHOT_ID, 6, 2)
+                .err()
+                .unwrap(),
+            "cursor_parameters_mismatch"
+        );
+        let mut tampered = cursor.clone();
+        let replacement = if tampered.ends_with('0') { "1" } else { "0" };
+        tampered.replace_range(tampered.len() - 1.., replacement);
+        assert_eq!(
+            render_section(
+                &snapshot,
+                &parse_review_cursor(&tampered, REVIEW_SNAPSHOT_ID, 6, 1).unwrap(),
+            )
+            .unwrap_err(),
+            "invalid changes cursor"
+        );
+        let changed = ReviewSnapshot::new(
+            REVIEW_SNAPSHOT_ID,
+            6,
+            1,
+            DependencyMode::Boundary,
+            changes,
+            review("changed"),
+        );
+        assert_eq!(
+            render_section(
+                &changed,
+                &parse_review_cursor(&cursor, REVIEW_SNAPSHOT_ID, 6, 1).unwrap(),
+            )
+            .unwrap_err(),
+            "invalid changes cursor"
+        );
+
+        let mut output = initial;
+        let mut cursor = next_cursor(&output, "evidence_next_cursor");
+        while let Some(token) = cursor {
+            output = render_section(
+                &snapshot,
+                &parse_review_cursor(&token, REVIEW_SNAPSHOT_ID, 6, 1).unwrap(),
+            )
+            .unwrap();
+            assert!(output.starts_with("evidence\n"), "{output}");
+            assert!(output.contains("content_complete_when_pages_exhausted=true"));
+            assert!(output.contains("static_evidence_status=complete"));
+            assert!(output.contains("dynamic_evidence_status=partial"));
+            cursor = next_cursor(&output, "evidence_next_cursor");
+        }
+        assert!(output.contains("sentinel-original"), "{output}");
+        assert!(output.contains("page_complete=true"), "{output}");
+    }
+
+    #[test]
     fn max_nodes_limits_each_graph_page_not_the_snapshot() {
         let graph = format!(
-            "risk overall=0.3000 changed_symbols_total=6 changed_symbols_analyzed=6 changed_symbols_emitted=6 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=6 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
+            "risk overall=0.3000 changed_symbols_total=6 changed_symbols_analyzed=6 changed_symbols_emitted=6 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=6 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n{}",
             (0..6)
                 .map(|index| format!("  risk 0.3000 node-{index}\n"))
                 .collect::<String>()
@@ -4170,7 +6099,7 @@ mod tests {
                 artifacts: Default::default(),
                 skipped_paths: 0,
             },
-            graph,
+            complete_review(graph),
         );
         let initial = review_context(&snapshot).unwrap();
         assert!(
@@ -4221,7 +6150,7 @@ mod tests {
                 artifacts: Default::default(),
                 skipped_paths: 0,
             },
-            String::new(),
+            complete_review(String::new()),
         );
         let cursor = cursor_token(&snapshot, ReviewSection::Files, 0);
 
@@ -4264,7 +6193,7 @@ mod tests {
     }
 
     #[test]
-    fn review_complete_rejects_omitted_changed_symbols() {
+    fn typed_static_status_reports_omitted_changed_symbols() {
         let changes = WorktreeChanges {
             files: vec![],
             records: vec![],
@@ -4282,7 +6211,7 @@ mod tests {
             artifacts: Default::default(),
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=2 changed_symbols_analyzed=2 changed_symbols_emitted=1 changed_symbols_omitted=1 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             REVIEW_SNAPSHOT_ID,
@@ -4290,15 +6219,19 @@ mod tests {
             50,
             DependencyMode::Boundary,
             changes,
-            graph.into(),
+            partial_review(graph.into()),
         );
         let output = review_context(&snapshot).unwrap();
 
-        assert!(output.contains("review_complete=false"), "{output}");
         assert!(
-            output.contains("review_complete_when_pages_exhausted=false"),
+            output.contains("content_complete_when_pages_exhausted=true"),
             "{output}"
         );
+        assert!(
+            output.contains("static_evidence_status=partial"),
+            "{output}"
+        );
+        assert!(!output.contains("review_complete"), "{output}");
     }
 
     #[test]
@@ -4330,7 +6263,7 @@ mod tests {
             },
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             REVIEW_SNAPSHOT_ID,
@@ -4338,7 +6271,7 @@ mod tests {
             50,
             DependencyMode::Boundary,
             changes,
-            graph.into(),
+            complete_review(graph.into()),
         );
         let output = review_context(&snapshot).unwrap();
 
@@ -4346,18 +6279,21 @@ mod tests {
             output.contains("renamed artifact omitted src/old.rs -> tests/fixture.tsv analyzer=tsv reason=type-changed"),
             "{output}"
         );
-        assert!(output.contains("review_complete=false"), "{output}");
         assert!(
-            output.contains("review_complete_when_pages_exhausted=false"),
+            output.contains("content_complete_when_pages_exhausted=false"),
             "{output}"
         );
+        assert!(
+            output.contains("static_evidence_status=complete"),
+            "{output}"
+        );
+        assert!(!output.contains("review_complete"), "{output}");
     }
 
     #[test]
-    fn graph_completeness_reads_only_the_summary() {
-        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n  risk 0.0000 node src/analysis_complete=false.rs:1\n";
-        assert!(graph_flow_analysis_complete(graph));
-        assert!(graph_review_complete(graph));
+    fn graph_traversal_reads_only_the_summary() {
+        let graph = "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n  risk 0.0000 node src/traversal_complete=false.rs:1\n";
+        assert!(graph_traversal_complete(graph));
     }
 
     #[test]
@@ -4396,7 +6332,7 @@ mod tests {
             },
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
 
         let snapshot = ReviewSnapshot::new(
             REVIEW_SNAPSHOT_ID,
@@ -4404,7 +6340,7 @@ mod tests {
             50,
             DependencyMode::Boundary,
             changes,
-            graph.into(),
+            complete_review(graph.into()),
         );
         let output = review_context(&snapshot).unwrap();
 
@@ -4476,14 +6412,14 @@ mod tests {
             artifacts: Default::default(),
             skipped_paths: 0,
         };
-        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=1 analysis_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
+        let graph = "risk overall=0.3000 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=1 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n";
         let output = review_context(&ReviewSnapshot::new(
             REVIEW_SNAPSHOT_ID,
             0,
             1,
             DependencyMode::Boundary,
             changes,
-            graph.into(),
+            complete_review(graph.into()),
         ))
         .unwrap();
 
@@ -4494,9 +6430,14 @@ mod tests {
         );
         assert!(output.contains("all_path_hunks=1"), "{output}");
         assert!(
-            output.contains("review_complete=true review_complete_when_pages_exhausted=true"),
+            output.contains("content_complete_when_pages_exhausted=true"),
             "{output}"
         );
+        assert!(
+            output.contains("static_evidence_status=complete"),
+            "{output}"
+        );
+        assert!(!output.contains("review_complete"), "{output}");
     }
 
     #[test]
@@ -4629,7 +6570,7 @@ mod tests {
             1,
             DependencyMode::Boundary,
             Arc::clone(&changes),
-            String::new(),
+            complete_review(String::new()),
         );
 
         assert!(Arc::ptr_eq(&snapshot.changes, &changes));
@@ -4660,7 +6601,7 @@ mod tests {
                 artifacts: Default::default(),
                 skipped_paths: 0,
             },
-            "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n".into(),
+            complete_review("risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 neighborhood_omitted=false unmapped_ranges=0\n".into()),
         );
         let mut offset = 0;
         let mut reconstructed = String::new();
@@ -4817,6 +6758,77 @@ fn register_dispatches() { register(); }
             ),
             ["rust:ambiguous-import:Item::go"]
         );
+    }
+
+    #[test]
+    fn imported_aliases_preserve_missing_and_ambiguous_candidates() {
+        let node = |key: &str, candidate_key: Option<&str>| NodeInput {
+            key: key.into(),
+            file_key: "src/lib.rs".into(),
+            kind: NodeKind::Function,
+            name: key.into(),
+            qualified_name: key.into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            keys: candidate_key.into_iter().map(str::to_owned).collect(),
+        };
+        let mut graph = Graph {
+            nodes: vec![
+                node("exporter", None),
+                node("missing-consumer", None),
+                node("ambiguous-consumer", None),
+                node("candidate-one", Some("candidate:multi")),
+                node("candidate-two", Some("candidate:multi")),
+            ],
+            refs: vec![
+                RefInput {
+                    source_key: "exporter".into(),
+                    kind: RefKind::Imports,
+                    line: 1,
+                    keys: vec!["candidate:missing".into()],
+                    alias_key: Some("alias:missing".into()),
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Pending,
+                },
+                RefInput {
+                    source_key: "exporter".into(),
+                    kind: RefKind::Imports,
+                    line: 2,
+                    keys: vec!["candidate:multi".into()],
+                    alias_key: Some("alias:multi".into()),
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Pending,
+                },
+                RefInput {
+                    source_key: "missing-consumer".into(),
+                    kind: RefKind::Calls,
+                    line: 1,
+                    keys: vec!["alias:missing".into()],
+                    alias_key: None,
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Pending,
+                },
+                RefInput {
+                    source_key: "ambiguous-consumer".into(),
+                    kind: RefKind::Calls,
+                    line: 1,
+                    keys: vec!["alias:multi".into()],
+                    alias_key: None,
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Pending,
+                },
+            ],
+            ..Graph::default()
+        };
+
+        resolve(&mut graph, &AtomicBool::new(false)).unwrap();
+        assert_eq!(graph.refs[0].resolution, ResolutionState::Missing);
+        assert_eq!(graph.refs[1].resolution, ResolutionState::Ambiguous);
+        assert_eq!(graph.refs[2].resolution, ResolutionState::Missing);
+        assert_eq!(graph.refs[3].resolution, ResolutionState::Ambiguous);
     }
 
     #[test]
@@ -5134,7 +7146,7 @@ fn call(job: Job) {
                     .keys
                     .iter()
                     .any(|key| key == "rust:item:api::maybe")
-                && reference.resolved_target_key.is_none()
+                && reference.resolved_target_key.as_deref() == Some(target("helper"))
         }));
         assert!(!graph.refs.iter().any(|reference| {
             reference.source_key == call.key

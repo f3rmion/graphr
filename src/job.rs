@@ -993,6 +993,8 @@ mod tests {
                 commits_base_to_head: 1,
                 changed_files: 1,
                 index_generation: 1,
+                source_snapshot_id: None,
+                evidence_manifest_digest: None,
             },
             stats: IndexStats {
                 files_total: 1,

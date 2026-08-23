@@ -53,6 +53,9 @@ struct IndexParams {
     head: String,
     target: SnapshotTarget,
     dependency_mode: DependencyMode,
+    #[serde(default)]
+    #[schemars(length(min = 1, max = 1024))]
+    evidence_manifest: Option<PathBuf>,
 }
 
 #[derive(Clone, Deserialize, rmcp::schemars::JsonSchema)]
@@ -251,7 +254,7 @@ impl ServerHandler for Graphr {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("graphr", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Graphr indexes Rust, Python, JavaScript/JSX, and TypeScript/TSX. Use inspect_root with the explicitly selected worktree_root. Use index with that worktree_root plus base, head, typed target (including include_untracked for a worktree target), and dependency_mode; verify the resolved root and OIDs. Poll index_status until completed and retain its snapshot_id; failed or cancelled is terminal. Call changes for that snapshot_id once without a cursor at depth 6 and max_nodes 50, then pass every files, diff, artifacts, and graph cursor verbatim with the same parameters until terminal completeness. Use search or view with the same snapshot_id only for named graph remediation. Stop on any structured root, job, snapshot, cursor, provenance, or completeness failure. Never fall back to another root, the default checkout, a live diff, or an older snapshot.",
+                "Graphr indexes Rust, Python, JavaScript/JSX, and TypeScript/TSX. Use inspect_root with the explicitly selected worktree_root. Use index with that worktree_root plus base, head, typed target (including include_untracked for a worktree target), and dependency_mode; verify the resolved root and OIDs. Poll index_status until completed and retain its snapshot_id; failed or cancelled is terminal. Call changes for that snapshot_id once without a cursor at depth 6 and max_nodes 50, then pass every files, diff, artifacts, graph, and evidence cursor verbatim with the same parameters until all pages are exhausted. Every changes response repeats content_complete_when_pages_exhausted, static_evidence_status, and dynamic_evidence_status; treat changed-content capture, static evidence, and dynamic evidence as independent facts. Use search or view with the same snapshot_id only for named graph remediation. Stop on any structured root, job, snapshot, cursor, provenance, or completeness failure. Never fall back to another root, the default checkout, a live diff, or an older snapshot.",
             )
     }
 }
@@ -291,6 +294,7 @@ fn queue_index(
             head_ref: params.head,
             target: params.target,
             dependency_mode: params.dependency_mode,
+            evidence_manifest: params.evidence_manifest,
         },
         cancelled,
     )?;
@@ -519,6 +523,27 @@ mod tests {
     }
 
     #[test]
+    fn index_schema_includes_evidence_manifest() {
+        let tools = Graphr::tool_router().list_all();
+        let index = tools.iter().find(|tool| tool.name == "index").unwrap();
+        let property = &index.input_schema["properties"]["evidence_manifest"];
+        assert!(
+            property["type"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "string")
+        );
+        assert!(
+            !index.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "evidence_manifest")
+        );
+    }
+
+    #[test]
     fn tool_and_server_guidance_requires_the_explicit_snapshot_workflow() {
         let root = repository("guidance");
         let jobs = JobRegistry::new();
@@ -543,8 +568,12 @@ mod tests {
             "completed",
             "snapshot_id",
             "once without a cursor",
-            "files, diff, artifacts, and graph",
+            "files, diff, artifacts, graph, and evidence",
             "verbatim",
+            "content_complete_when_pages_exhausted",
+            "static_evidence_status",
+            "dynamic_evidence_status",
+            "independent facts",
             "search or view",
             "Stop on any structured root, job, snapshot, cursor, provenance, or completeness failure",
             "Never fall back",
@@ -589,6 +618,7 @@ mod tests {
                 head: "HEAD".into(),
                 target: SnapshotTarget::Commit,
                 dependency_mode: DependencyMode::Boundary,
+                evidence_manifest: None,
             },
             &AtomicBool::new(false),
         )
@@ -707,6 +737,8 @@ mod tests {
             commits_base_to_head: 0,
             changed_files: 0,
             index_generation: 1,
+            source_snapshot_id: None,
+            evidence_manifest_digest: None,
         }
     }
 }

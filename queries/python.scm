@@ -10,5 +10,4 @@
   (assignment left: (_) @binding)
   (for_statement left: (_) @binding)
 ]
-(call
-  function: (identifier) @call)
+(call) @call

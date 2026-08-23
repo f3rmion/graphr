@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-const USAGE: &str = "Usage:\n  graphr serve --allow-root PATH [--allow-root PATH ...]\n  graphr index --worktree-root PATH --base REF --head REF --target commit|index|worktree [--include-untracked] [--dependency-mode boundary|full]\n  graphr --version\n";
+const USAGE: &str = "Usage:\n  graphr serve --allow-root PATH [--allow-root PATH ...]\n  graphr index --worktree-root PATH --base REF --head REF --target commit|index|worktree [--include-untracked] [--dependency-mode boundary|full] [--evidence-manifest RELATIVE_PATH]\n  graphr --version\n";
 
 #[test]
 fn version_is_stable() {

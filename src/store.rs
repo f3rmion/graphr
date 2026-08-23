@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -10,12 +10,13 @@ use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
+use crate::evidence::CoverageFormat;
 use crate::git::{
     ChangedFile, DependencyMode, Language, LineSpan, PathRecord, WorktreeChanges,
-    dependency_package,
+    change_content_complete, dependency_package,
 };
 
-pub(crate) const SCHEMA_VERSION: i64 = 4;
+pub(crate) const SCHEMA_VERSION: i64 = 8;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
@@ -66,6 +67,17 @@ const SECURITY_KEYWORDS: [&str; 25] = [
     "privilege",
 ];
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_REFERENCE_CANDIDATE_PASS_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_after_reference_candidate_pass_hook(hook: impl FnOnce() + 'static) {
+    AFTER_REFERENCE_CANDIDATE_PASS_HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
+}
+
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +92,176 @@ pub enum NodeKind {
 pub enum RefKind {
     Calls,
     Imports,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionState {
+    Pending,
+    Resolved,
+    Missing,
+    Ambiguous,
+}
+
+impl ResolutionState {
+    pub fn db(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Resolved => "resolved",
+            Self::Missing => "missing",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "resolved" => Some(Self::Resolved),
+            "missing" => Some(Self::Missing),
+            "ambiguous" => Some(Self::Ambiguous),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum GapCategory {
+    Source,
+    Parse,
+    Relation,
+    Macro,
+    Generated,
+    Coverage,
+    Language,
+    Boundary,
+}
+
+impl GapCategory {
+    pub fn db(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Parse => "parse",
+            Self::Relation => "relation",
+            Self::Macro => "macro",
+            Self::Generated => "generated",
+            Self::Coverage => "coverage",
+            Self::Language => "language",
+            Self::Boundary => "boundary",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "source" => Some(Self::Source),
+            "parse" => Some(Self::Parse),
+            "relation" => Some(Self::Relation),
+            "macro" => Some(Self::Macro),
+            "generated" => Some(Self::Generated),
+            "coverage" => Some(Self::Coverage),
+            "language" => Some(Self::Language),
+            "boundary" => Some(Self::Boundary),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum GapReason {
+    UnsafePath,
+    NonRegular,
+    Unmerged,
+    Oversized,
+    InvalidUtf8,
+    MissingDuringRead,
+    ParserError,
+    ParserNoTree,
+    DynamicOrUnsupportedDispatch,
+    MacroExpansionUnavailable,
+    GeneratedOutputUnobserved,
+    GeneratedOutputAmbiguous,
+    ExternalDependency,
+    DependencyCollapsed,
+    LanguageNotIndexed,
+    CoverageUnmappedFile,
+    CoverageUnmappedRegion,
+    MissingTestContext,
+    AmbiguousTestContext,
+}
+
+impl GapReason {
+    pub fn db(self) -> &'static str {
+        match self {
+            Self::UnsafePath => "unsafe-path",
+            Self::NonRegular => "non-regular",
+            Self::Unmerged => "unmerged",
+            Self::Oversized => "oversized",
+            Self::InvalidUtf8 => "invalid-utf8",
+            Self::MissingDuringRead => "missing-during-read",
+            Self::ParserError => "parser-error",
+            Self::ParserNoTree => "parser-no-tree",
+            Self::DynamicOrUnsupportedDispatch => "dynamic-or-unsupported-dispatch",
+            Self::MacroExpansionUnavailable => "macro-expansion-unavailable",
+            Self::GeneratedOutputUnobserved => "generated-output-unobserved",
+            Self::GeneratedOutputAmbiguous => "generated-output-ambiguous",
+            Self::ExternalDependency => "external-dependency",
+            Self::DependencyCollapsed => "dependency-collapsed",
+            Self::LanguageNotIndexed => "language-not-indexed",
+            Self::CoverageUnmappedFile => "coverage-unmapped-file",
+            Self::CoverageUnmappedRegion => "coverage-unmapped-region",
+            Self::MissingTestContext => "missing-test-context",
+            Self::AmbiguousTestContext => "ambiguous-test-context",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unsafe-path" => Some(Self::UnsafePath),
+            "non-regular" => Some(Self::NonRegular),
+            "unmerged" => Some(Self::Unmerged),
+            "oversized" => Some(Self::Oversized),
+            "invalid-utf8" => Some(Self::InvalidUtf8),
+            "missing-during-read" => Some(Self::MissingDuringRead),
+            "parser-error" => Some(Self::ParserError),
+            "parser-no-tree" => Some(Self::ParserNoTree),
+            "dynamic-or-unsupported-dispatch" => Some(Self::DynamicOrUnsupportedDispatch),
+            "macro-expansion-unavailable" => Some(Self::MacroExpansionUnavailable),
+            "generated-output-unobserved" => Some(Self::GeneratedOutputUnobserved),
+            "generated-output-ambiguous" => Some(Self::GeneratedOutputAmbiguous),
+            "external-dependency" => Some(Self::ExternalDependency),
+            "dependency-collapsed" => Some(Self::DependencyCollapsed),
+            "language-not-indexed" => Some(Self::LanguageNotIndexed),
+            "coverage-unmapped-file" => Some(Self::CoverageUnmappedFile),
+            "coverage-unmapped-region" => Some(Self::CoverageUnmappedRegion),
+            "missing-test-context" => Some(Self::MissingTestContext),
+            "ambiguous-test-context" => Some(Self::AmbiguousTestContext),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModeledSiteKind {
+    GeneratedInclusion,
+    TestRegistration,
+    StaticExport,
+}
+
+impl ModeledSiteKind {
+    pub fn db(self) -> &'static str {
+        match self {
+            Self::GeneratedInclusion => "generated-inclusion",
+            Self::TestRegistration => "test-registration",
+            Self::StaticExport => "static-export",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "generated-inclusion" => Some(Self::GeneratedInclusion),
+            "test-registration" => Some(Self::TestRegistration),
+            "static-export" => Some(Self::StaticExport),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -97,6 +279,7 @@ pub struct FileInput {
     pub parse_context: String,
     pub byte_size: u64,
     pub replace: bool,
+    pub observed_relation_sites: u32,
 }
 
 pub struct StoredFile {
@@ -106,6 +289,7 @@ pub struct StoredFile {
     pub content_hash: [u8; 32],
     pub parse_context: String,
     pub byte_size: u64,
+    pub observed_relation_sites: u32,
 }
 
 pub struct NodeInput {
@@ -129,6 +313,31 @@ pub struct RefInput {
     pub keys: Vec<String>,
     pub alias_key: Option<String>,
     pub resolved_target_key: Option<String>,
+    pub resolution: ResolutionState,
+}
+
+pub struct ModeledSiteInput {
+    pub file_key: String,
+    pub source_key: Option<String>,
+    pub kind: ModeledSiteKind,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub target_hint: Option<String>,
+    pub parse_context: Option<String>,
+}
+
+pub struct GapInput {
+    pub file_key: Option<String>,
+    pub source_key: Option<String>,
+    pub run_key: Option<String>,
+    pub path: Option<String>,
+    pub line_start: Option<u32>,
+    pub line_end: Option<u32>,
+    pub category: GapCategory,
+    pub reason: GapReason,
+    pub target_hint: Option<String>,
+    pub occurrences: u32,
+    pub relation_site: bool,
 }
 
 pub struct TraitImplementationInput {
@@ -146,6 +355,141 @@ pub struct EdgeInput {
     pub support_count: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ArtifactRole {
+    Manifest,
+    Input,
+    GeneratedRust,
+    CoverageReport,
+}
+
+impl ArtifactRole {
+    pub const fn db(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Input => "input",
+            Self::GeneratedRust => "generated-rust",
+            Self::CoverageReport => "coverage-report",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "manifest" => Some(Self::Manifest),
+            "input" => Some(Self::Input),
+            "generated-rust" => Some(Self::GeneratedRust),
+            "coverage-report" => Some(Self::CoverageReport),
+            _ => None,
+        }
+    }
+}
+
+pub struct ImportedArtifactInput {
+    pub key: String,
+    pub path: String,
+    pub role: ArtifactRole,
+    pub content_hash: [u8; 32],
+    pub byte_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverageBranchKind {
+    TrueOutcome,
+    FalseOutcome,
+    Arc,
+}
+
+impl CoverageBranchKind {
+    const fn db(self) -> &'static str {
+        match self {
+            Self::TrueOutcome => "true-outcome",
+            Self::FalseOutcome => "false-outcome",
+            Self::Arc => "arc",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "true-outcome" => Some(Self::TrueOutcome),
+            "false-outcome" => Some(Self::FalseOutcome),
+            "arc" => Some(Self::Arc),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvidenceLineSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+pub struct GeneratedInclusionCandidate {
+    pub parse_context: String,
+}
+
+#[derive(Clone)]
+pub struct ProvenanceInput {
+    pub input_key: String,
+    pub input_lines: EvidenceLineSpan,
+    pub generator_path: String,
+    pub generator_lines: EvidenceLineSpan,
+    pub output_key: String,
+    pub output_lines: EvidenceLineSpan,
+}
+
+pub struct CoverageRunInput {
+    pub key: String,
+    pub format: CoverageFormat,
+    pub report_key: String,
+    pub run_label: String,
+    pub test_name: Option<String>,
+}
+
+pub struct CoverageRegionInput {
+    pub run_key: String,
+    pub path: Option<String>,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub execution_count: u64,
+    pub context: Option<String>,
+}
+
+pub struct CoverageBranchInput {
+    pub run_key: String,
+    pub path: Option<String>,
+    pub start_line: i64,
+    pub start_column: u32,
+    pub end_line: i64,
+    pub end_column: u32,
+    pub target_line: Option<i64>,
+    pub kind: CoverageBranchKind,
+    pub execution_count: u64,
+}
+
+#[derive(Default)]
+pub struct EvidenceInput {
+    pub artifacts: Vec<ImportedArtifactInput>,
+    pub provenance: Vec<ProvenanceInput>,
+    pub runs: Vec<CoverageRunInput>,
+    pub regions: Vec<CoverageRegionInput>,
+    pub branches: Vec<CoverageBranchInput>,
+    pub gaps: Vec<GapInput>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvidenceStats {
+    pub generated_files: usize,
+    pub artifacts: usize,
+    pub provenance_links: usize,
+    pub runs: usize,
+    pub regions: usize,
+    pub branches: usize,
+    pub gaps: usize,
+}
+
 #[derive(Default)]
 pub struct Graph {
     pub files: Vec<FileInput>,
@@ -153,12 +497,38 @@ pub struct Graph {
     pub refs: Vec<RefInput>,
     pub trait_implementations: Vec<TraitImplementationInput>,
     pub edges: Vec<EdgeInput>,
+    pub modeled_sites: Vec<ModeledSiteInput>,
+    pub gaps: Vec<GapInput>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct State {
     pub epoch: String,
     pub generation: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletenessStatus {
+    Complete,
+    Partial,
+    NotApplicable,
+}
+
+impl CompletenessStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::NotApplicable => "not-applicable",
+        }
+    }
+}
+
+pub struct ChangeReview {
+    pub graph: String,
+    pub evidence: String,
+    pub static_status: CompletenessStatus,
+    pub dynamic_status: CompletenessStatus,
 }
 
 pub struct Store {
@@ -239,6 +609,8 @@ impl Store {
             return Err("database has uncommitted work".into());
         }
         let state = read_state_cancelled(&self.connection, cancelled)?;
+        require_graph_invariants(&self.connection, cancelled)?;
+        require_evidence_invariants(&self.connection, cancelled)?;
         let (busy, _, _): (i64, i64, i64) = retry_sqlite(cancelled, || {
             self.connection
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
@@ -320,6 +692,7 @@ impl Store {
         } else {
             apply_incremental(&tx, &graph, &existing, cancelled)?
         };
+        require_graph_invariants(&tx, cancelled)?;
         if full || changed != 0 {
             tx.execute(
                 "UPDATE state SET generation=generation+1 WHERE singleton=1",
@@ -331,6 +704,120 @@ impl Store {
         check_cancelled(cancelled)?;
         tx.commit().map_err(db_error)?;
         Ok((state, changed, value))
+    }
+
+    pub fn replace_evidence(
+        &mut self,
+        mut generated_graph: Graph,
+        evidence: &EvidenceInput,
+        cancelled: &AtomicBool,
+    ) -> Result<EvidenceStats> {
+        let tx = begin_immediate(&self.connection, cancelled)?;
+        check_cancelled(cancelled)?;
+        let version: i64 = tx
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(db_error)?;
+        if version != SCHEMA_VERSION {
+            return Err("database schema mismatch".into());
+        }
+        read_state(&tx)?;
+        let existing = load_stored_files(&tx)?;
+        generated_graph
+            .gaps
+            .extend(load_source_global_gaps(&tx, cancelled)?);
+        let old_generated = tx
+            .prepare(
+                "SELECT path FROM imported_artifacts WHERE role='generated-rust' ORDER BY path",
+            )
+            .map_err(db_error)?
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<HashSet<_>>>()
+            .map_err(db_error)?;
+        let new_generated = generated_graph
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<HashSet<_>>();
+        let generated_file_count = new_generated.len();
+        if new_generated.len() != generated_graph.files.len()
+            || new_generated
+                .iter()
+                .any(|path| existing.contains_key(path) && !old_generated.contains(path))
+        {
+            return Err("generated output conflicts with a source file".into());
+        }
+        for (path, file) in &existing {
+            if old_generated.contains(path) || new_generated.contains(path) {
+                continue;
+            }
+            generated_graph.files.push(FileInput {
+                path: path.clone(),
+                language: file.language,
+                git_oid: file.git_oid.clone(),
+                content_hash: file.content_hash,
+                parse_context: file.parse_context.clone(),
+                byte_size: file.byte_size,
+                replace: false,
+                observed_relation_sites: file.observed_relation_sites,
+            });
+        }
+        generated_graph
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        apply_incremental(&tx, &generated_graph, &existing, cancelled)?;
+
+        tx.execute("DELETE FROM imported_artifacts", [])
+            .map_err(db_error)?;
+        let stats = insert_evidence(&tx, evidence, generated_file_count, cancelled)?;
+        require_graph_invariants(&tx, cancelled)?;
+        require_evidence_invariants(&tx, cancelled)?;
+        tx.execute(
+            "UPDATE state SET generation=generation+1 WHERE singleton=1",
+            [],
+        )
+        .map_err(db_error)?;
+        check_cancelled(cancelled)?;
+        tx.commit().map_err(db_error)?;
+        Ok(stats)
+    }
+
+    pub fn generated_inclusion_candidates(
+        &self,
+        output_basename: &str,
+    ) -> Result<Vec<GeneratedInclusionCandidate>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT m.parse_context FROM modeled_sites m
+                  WHERE m.kind='generated-inclusion' AND m.target_hint=?1
+                    AND m.parse_context IS NOT NULL
+                  ORDER BY m.file_id, m.line_start, m.id LIMIT 2",
+            )
+            .map_err(db_error)?;
+        statement
+            .query_map([output_basename], |row| {
+                Ok(GeneratedInclusionCandidate {
+                    parse_context: row.get(0)?,
+                })
+            })
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)
+    }
+
+    pub fn evidence_only_paths(&self) -> Result<BTreeSet<String>> {
+        self.connection
+            .prepare(
+                "SELECT path FROM imported_artifacts
+                  WHERE role IN ('manifest','generated-rust','coverage-report')
+                  ORDER BY path",
+            )
+            .map_err(db_error)?
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .map_err(db_error)
     }
 
     pub fn search(
@@ -442,6 +929,30 @@ impl Store {
                 break;
             }
         }
+        let root_end = if root.kind == "file" {
+            u32::MAX
+        } else {
+            tx.query_row("SELECT line_end FROM nodes WHERE id=?1", [root_id], |row| {
+                row.get(0)
+            })
+            .map_err(db_error)?
+        };
+        let mut evidence_scope = CoverageScope::node(
+            root_id,
+            &root.path,
+            root.line,
+            root_end,
+            root.kind == "file",
+        );
+        evidence_scope.expand_provenance(&tx)?;
+        let static_gaps = static_gap_records(&tx, &evidence_scope)?;
+        if !static_gaps.is_empty() {
+            lines.extend(static_gaps.split_inclusive('\n').map(str::to_owned));
+        }
+        let evidence = render_evidence(&tx, Some(&evidence_scope))?;
+        if !evidence.text.is_empty() {
+            lines.extend(evidence.text.split_inclusive('\n').map(str::to_owned));
+        }
         Ok(bounded(lines, VIEW_BUDGET, omitted))
     }
 
@@ -453,13 +964,30 @@ impl Store {
         max_nodes: u32,
         dependency_mode: DependencyMode,
         cancelled: &AtomicBool,
-    ) -> Result<String> {
+    ) -> Result<ChangeReview> {
         if depth > 6 || !(1..=50).contains(&max_nodes) {
             return Err("invalid changes parameters".into());
         }
         check_cancelled(cancelled)?;
+        for file in &changes.files {
+            validate_changed_file(file)?;
+        }
+        if changes
+            .files
+            .windows(2)
+            .any(|files| files[0].path >= files[1].path)
+        {
+            return Err("changed files are not uniquely path-sorted".into());
+        }
+        let evidence_scope = CoverageScope::changes(changes, dependency_mode, &self.connection)?;
+        let evidence = render_evidence(&self.connection, Some(&evidence_scope))?;
         if changes.is_empty() && changes.files.is_empty() && changes.records.is_empty() {
-            return Ok("no changes\n".into());
+            return Ok(ChangeReview {
+                graph: "no changes\n".into(),
+                evidence: evidence.text,
+                static_status: CompletenessStatus::Complete,
+                dynamic_status: evidence.status,
+            });
         }
         let deleted_paths_unanalyzed = changes
             .records
@@ -476,34 +1004,30 @@ impl Store {
             } else {
                 "flows_discovered=0 flows_total=unknown"
             };
+            let traversal_complete = deleted_paths_unanalyzed == 0;
             let mut output = format!(
-                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} static_test_path_gaps=0 analysis_complete={} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 dependency_analysis={} {}\n",
-                deleted_paths_unanalyzed == 0,
+                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} static_test_path_gaps=0 traversal_complete={traversal_complete} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 dependency_analysis={} {}\n",
                 dependency_analysis(dependency_mode),
                 risk_metadata(None),
             );
-            output.push_str(&coverage_diagnostics(
-                0,
-                false,
-                false,
-                false,
-                0,
-                deleted_paths_unanalyzed,
-                depth,
+            let accounting = static_accounting(&self.connection, &evidence_scope)?;
+            let content_complete = change_content_complete(changes, dependency_mode);
+            output.push_str(&assurance_preamble(
+                &accounting,
+                content_complete,
+                true,
+                traversal_complete,
+                &evidence,
             ));
-            return Ok(output);
+            let static_status = accounting.overall(content_complete, true, traversal_complete);
+            let dynamic_status = evidence.status;
+            return Ok(ChangeReview {
+                graph: output,
+                evidence: ordered_evidence_text(evidence, static_status),
+                static_status,
+                dynamic_status,
+            });
         }
-        for file in &changes.files {
-            validate_changed_file(file)?;
-        }
-        if changes
-            .files
-            .windows(2)
-            .any(|files| files[0].path >= files[1].path)
-        {
-            return Err("changed files are not uniquely path-sorted".into());
-        }
-
         let untracked = changes
             .records
             .iter()
@@ -706,6 +1230,8 @@ impl Store {
                 .ok_or_else(|| "changed root line exceeds address space".to_owned())?;
             lines.push(line);
         }
+        let mut traversed_ids = roots.iter().map(|root| root.id).collect::<HashSet<_>>();
+        let mut evidence_node_ids = traversed_ids.clone();
         let neighborhood_omitted = if root_neighborhood_omitted {
             true
         } else if roots.is_empty() {
@@ -720,9 +1246,14 @@ impl Store {
                 dependency_mode,
                 cancelled,
                 &mut lines,
+                &mut traversed_ids,
             )?
         };
         for flow in &analysis.flows {
+            traversed_ids.insert(flow.entry.id);
+            traversed_ids.extend(flow.nodes.iter().map(|node| node.id));
+            evidence_node_ids.insert(flow.entry.id);
+            evidence_node_ids.extend(flow.nodes.iter().map(|node| node.id));
             lines.push(flow_line(flow, dependency_mode)?);
         }
         let overall = analysis
@@ -748,22 +1279,28 @@ impl Store {
         } else {
             format!("flows_total={}", analysis.flows.len())
         };
+        let traversal_complete =
+            !analysis_incomplete && !neighborhood_omitted && changed_symbols_omitted == 0;
+        let mapping_complete = unmapped_range_count == 0;
+        let mut evidence_scope = CoverageScope::changes(changes, dependency_mode, &tx)?;
+        evidence_scope.add_nodes(&tx, &evidence_node_ids)?;
+        let evidence = render_evidence(&tx, Some(&evidence_scope))?;
+        let accounting = static_accounting(&tx, &evidence_scope)?;
+        let content_complete = change_content_complete(changes, dependency_mode);
         lines.insert(
             0,
-            coverage_diagnostics(
-                unmapped_range_count,
-                neighborhood_omitted,
-                analysis.flow_omitted,
-                analysis.test_mapping_omitted,
-                analysis_roots_omitted,
-                deleted_paths_unanalyzed,
-                depth,
+            assurance_preamble(
+                &accounting,
+                content_complete,
+                mapping_complete,
+                traversal_complete,
+                &evidence,
             ),
         );
         lines.insert(
             0,
             format!(
-                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} static_test_path_gaps={} analysis_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} dependency_analysis={} {}\n",
+                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} static_test_path_gaps={} traversal_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} dependency_analysis={} {}\n",
                 score_text(overall),
                 changed_symbols_total,
                 analysis.risks.len(),
@@ -771,7 +1308,7 @@ impl Store {
                 changed_symbols_omitted,
                 flow_accounting,
                 static_test_path_gaps,
-                !analysis_incomplete,
+                traversal_complete,
                 analysis_roots_omitted,
                 deleted_paths_unanalyzed,
                 neighborhood_omitted,
@@ -781,7 +1318,15 @@ impl Store {
                 risk_metadata(top_risk),
             ),
         );
-        Ok(lines.concat())
+        let static_status =
+            accounting.overall(content_complete, mapping_complete, traversal_complete);
+        let dynamic_status = evidence.status;
+        Ok(ChangeReview {
+            graph: lines.concat(),
+            evidence: ordered_evidence_text(evidence, static_status),
+            static_status,
+            dynamic_status,
+        })
     }
 }
 
@@ -813,6 +1358,8 @@ pub fn validate_image(path: &Path) -> Result<State> {
     }
     let state = read_state(&connection)?;
     require_integrity(&connection)?;
+    require_graph_invariants(&connection, &AtomicBool::new(false))?;
+    require_evidence_invariants(&connection, &AtomicBool::new(false))?;
     require_no_sidecars(path)?;
     Ok(state)
 }
@@ -837,6 +1384,620 @@ fn require_integrity(connection: &Connection) -> Result<()> {
     } else {
         Err("database integrity check failed".into())
     }
+}
+
+fn require_graph_invariants(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
+    check_cancelled(cancelled)?;
+    for state in distinct_text(connection, "SELECT DISTINCT resolution_state FROM refs")? {
+        ResolutionState::parse(&state)
+            .ok_or_else(|| "database reference resolution is invalid".to_owned())?;
+    }
+    for category in distinct_text(connection, "SELECT DISTINCT category FROM graph_gaps")? {
+        GapCategory::parse(&category)
+            .ok_or_else(|| "database gap category is invalid".to_owned())?;
+    }
+    for reason in distinct_text(connection, "SELECT DISTINCT reason FROM graph_gaps")? {
+        GapReason::parse(&reason).ok_or_else(|| "database gap reason is invalid".to_owned())?;
+    }
+    for kind in distinct_text(connection, "SELECT DISTINCT kind FROM modeled_sites")? {
+        ModeledSiteKind::parse(&kind)
+            .ok_or_else(|| "database modeled-site kind is invalid".to_owned())?;
+    }
+    let pending: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM refs WHERE resolution_state='pending'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if pending != 0 {
+        return Err("database contains pending references".into());
+    }
+    let invalid: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM refs
+              WHERE (resolution_state='resolved') != (resolved_target_id IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if invalid != 0 {
+        return Err("database reference resolution is invalid".into());
+    }
+    require_reference_candidates(connection, cancelled)?;
+    check_cancelled(cancelled)?;
+    let invalid_edges: bool = connection
+        .query_row(
+            "WITH expected AS (
+                 SELECT r.source_id, r.resolved_target_id AS target_id,
+                        CASE
+                            WHEN r.kind='IMPORTS' THEN 'IMPORTS'
+                            WHEN n.kind='test' THEN 'TEST_CALLS'
+                            ELSE 'CALLS'
+                        END AS kind,
+                        count(*) AS support_count
+                   FROM refs r JOIN nodes n ON n.id=r.source_id
+                  WHERE r.resolution_state='resolved'
+                  GROUP BY r.source_id, r.resolved_target_id,
+                           CASE
+                               WHEN r.kind='IMPORTS' THEN 'IMPORTS'
+                               WHEN n.kind='test' THEN 'TEST_CALLS'
+                               ELSE 'CALLS'
+                           END
+             )
+             SELECT EXISTS(
+                 SELECT 1 FROM expected
+                 LEFT JOIN edges e
+                   ON e.source_id=expected.source_id
+                  AND e.target_id=expected.target_id
+                  AND e.kind=expected.kind
+                WHERE e.support_count IS NULL
+                   OR e.support_count!=expected.support_count
+                 UNION ALL
+                 SELECT 1 FROM edges e
+                 LEFT JOIN expected
+                   ON expected.source_id=e.source_id
+                  AND expected.target_id=e.target_id
+                  AND expected.kind=e.kind
+                WHERE expected.source_id IS NULL
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if invalid_edges {
+        return Err("database reference edges do not match resolved references".into());
+    }
+    check_cancelled(cancelled)?;
+    let mismatch = connection
+        .query_row(
+            "SELECT f.path FROM files f
+              WHERE f.observed_relation_sites !=
+                    (SELECT count(*) FROM refs r
+                       JOIN nodes n ON n.id=r.source_id WHERE n.file_id=f.id)
+                  + (SELECT count(*) FROM modeled_sites m WHERE m.file_id=f.id)
+                  + (SELECT coalesce(sum(g.occurrences),0) FROM graph_gaps g
+                       LEFT JOIN nodes n ON n.id=g.source_id
+                      WHERE g.relation_site=1 AND coalesce(g.file_id,n.file_id)=f.id)
+              ORDER BY f.path LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if let Some(path) = mismatch {
+        return Err(format!(
+            "observed relation-site accounting mismatch for {path}"
+        ));
+    }
+    check_cancelled(cancelled)
+}
+
+fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
+    check_cancelled(cancelled)?;
+    for role in distinct_text(connection, "SELECT DISTINCT role FROM imported_artifacts")? {
+        ArtifactRole::parse(&role).ok_or_else(|| "database artifact role is invalid".to_owned())?;
+    }
+    for path in distinct_text(connection, "SELECT DISTINCT path FROM imported_artifacts")? {
+        if !crate::evidence::evidence_path_is_safe(&path) {
+            return Err("database evidence artifact path is unsafe".into());
+        }
+    }
+    for format in distinct_text(connection, "SELECT DISTINCT format FROM coverage_runs")? {
+        match format.as_str() {
+            "llvm" | "coverage_py" => {}
+            _ => return Err("database coverage format is invalid".into()),
+        }
+    }
+    for kind in distinct_text(connection, "SELECT DISTINCT kind FROM coverage_branches")? {
+        CoverageBranchKind::parse(&kind)
+            .ok_or_else(|| "database coverage branch kind is invalid".to_owned())?;
+    }
+    let mut labels = connection
+        .prepare(
+            "SELECT run_label FROM coverage_runs
+              UNION ALL SELECT test_name FROM coverage_runs WHERE test_name IS NOT NULL
+              UNION ALL SELECT context FROM coverage_regions WHERE context IS NOT NULL",
+        )
+        .map_err(db_error)?;
+    for label in labels
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(db_error)?
+    {
+        validate_coverage_label(&label.map_err(db_error)?)?;
+    }
+    require_provenance_invariants(connection, cancelled)?;
+    let invalid: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM provenance_links p
+                 JOIN imported_artifacts input ON input.id=p.input_artifact_id
+                 JOIN imported_artifacts output ON output.id=p.output_artifact_id
+                 LEFT JOIN nodes generator ON generator.id=p.generator_node_id
+                 LEFT JOIN files generator_file ON generator_file.id=p.generator_file_id
+                 LEFT JOIN modeled_sites site ON site.id=p.modeled_site_id
+                 WHERE input.role!='input' OR output.role!='generated-rust'
+                    OR (p.generator_file_id IS NULL)!=(p.generator_node_id IS NULL)
+                    OR (generator.id IS NOT NULL AND (
+                        generator.file_id!=p.generator_file_id
+                        OR generator_file.path!=p.generator_path
+                        OR generator_file.language NOT IN ('rust','python')
+                        OR generator.kind NOT IN ('function','test')
+                        OR generator.line_start>p.generator_line_start
+                        OR generator.line_end<p.generator_line_end
+                    ))
+                    OR (site.id IS NOT NULL AND site.kind!='generated-inclusion')
+                 UNION ALL
+                 SELECT 1 FROM provenance_links
+                  WHERE modeled_site_id IS NOT NULL
+                  GROUP BY modeled_site_id
+                 HAVING count(DISTINCT output_artifact_id)>1
+                 UNION ALL
+                 SELECT 1 FROM provenance_links
+                  WHERE modeled_site_id IS NOT NULL
+                  GROUP BY output_artifact_id
+                 HAVING count(DISTINCT modeled_site_id)>1
+                 UNION ALL
+                 SELECT 1 FROM coverage_runs run
+                 JOIN imported_artifacts report ON report.id=run.report_artifact_id
+                 LEFT JOIN nodes test ON test.id=run.test_id
+                 WHERE report.role!='coverage-report'
+                    OR report.content_hash!=run.report_digest
+                    OR (run.test_name IS NULL AND run.test_id IS NOT NULL)
+                    OR (run.test_id IS NOT NULL AND (
+                        test.kind!='test'
+                        OR (test.name!=run.test_name AND test.qualified_name!=run.test_name)
+                    ))
+                    OR (run.test_name IS NOT NULL AND run.test_id IS NULL AND NOT EXISTS(
+                        SELECT 1 FROM graph_gaps gap
+                         WHERE gap.run_id=run.id AND gap.category='coverage'
+                           AND gap.reason IN ('missing-test-context','ambiguous-test-context')
+                           AND gap.target_hint=run.test_name
+                    ))
+                 UNION ALL
+                 SELECT 1 FROM coverage_regions region
+                 JOIN coverage_runs run ON run.id=region.run_id
+                 LEFT JOIN files file ON file.id=region.file_id
+                 LEFT JOIN nodes test ON test.id=region.test_id
+                 WHERE (region.context IS NULL AND (
+                            (run.format='llvm' AND region.test_id IS NOT run.test_id)
+                            OR (run.format='coverage_py' AND region.test_id IS NOT NULL)
+                        ))
+                    OR (region.context IS NOT NULL AND region.test_id IS NOT NULL AND (
+                        test.kind!='test'
+                        OR (test.name!=region.context AND test.qualified_name!=region.context)
+                    ))
+                    OR (region.context IS NOT NULL AND region.test_id IS NULL AND NOT EXISTS(
+                        SELECT 1 FROM graph_gaps gap
+                         WHERE gap.run_id=run.id AND gap.category='coverage'
+                           AND gap.reason IN ('missing-test-context','ambiguous-test-context')
+                           AND gap.target_hint=region.context
+                           AND gap.line_start=region.start_line AND gap.line_end=region.end_line
+                    ))
+                    OR (region.file_id IS NOT NULL AND (
+                        region.path IS NULL OR region.path!=file.path
+                    ))
+                    OR (region.file_id IS NULL AND NOT EXISTS(
+                        SELECT 1 FROM graph_gaps gap
+                         WHERE gap.run_id=run.id AND gap.category='coverage'
+                           AND gap.reason='coverage-unmapped-file'
+                           AND (
+                               (region.path IS NULL AND gap.path IS NULL
+                                AND gap.line_start IS NULL AND gap.line_end IS NULL)
+                               OR (region.path IS NOT NULL AND gap.path=region.path
+                                   AND gap.line_start=region.start_line
+                                   AND gap.line_end=region.end_line)
+                           )
+                    ))
+                    OR (region.file_id IS NOT NULL AND NOT EXISTS(
+                        SELECT 1 FROM nodes node
+                         WHERE node.file_id=region.file_id AND node.kind!='file'
+                           AND node.line_start<=region.end_line
+                           AND node.line_end>=region.start_line
+                    ) AND NOT EXISTS(
+                        SELECT 1 FROM graph_gaps gap
+                         WHERE gap.run_id=run.id AND gap.category='coverage'
+                           AND gap.reason='coverage-unmapped-region'
+                           AND gap.path=file.path
+                           AND gap.line_start=region.start_line AND gap.line_end=region.end_line
+                    ))
+                 UNION ALL
+                 SELECT 1 FROM coverage_branches branch
+                 JOIN coverage_runs run ON run.id=branch.run_id
+                 LEFT JOIN files file ON file.id=branch.file_id
+                 LEFT JOIN nodes test ON test.id=branch.test_id
+                 WHERE (run.format='llvm' AND branch.test_id IS NOT run.test_id)
+                    OR (run.format='coverage_py' AND branch.test_id IS NOT NULL)
+                    OR (branch.test_id IS NOT NULL AND test.kind!='test')
+                    OR ((branch.kind='arc') != (branch.target_line IS NOT NULL))
+                    OR branch.start_line=0
+                    OR (branch.kind='arc' AND (
+                        branch.end_line!=branch.start_line
+                        OR branch.start_column!=0 OR branch.end_column!=0
+                        OR branch.target_line=0
+                        OR (branch.start_line<0 AND branch.target_line<0)
+                    ))
+                    OR (branch.kind!='arc' AND (
+                        branch.start_line<0 OR branch.end_line<branch.start_line
+                        OR (branch.end_line=branch.start_line
+                            AND branch.end_column<branch.start_column)
+                    ))
+                    OR (branch.file_id IS NOT NULL AND (
+                        branch.path IS NULL OR branch.path!=file.path
+                    ))
+                    OR (branch.file_id IS NULL AND NOT EXISTS(
+                        SELECT 1 FROM graph_gaps gap
+                         WHERE gap.run_id=run.id AND gap.category='coverage'
+                           AND gap.reason='coverage-unmapped-file'
+                           AND (
+                               (branch.path IS NULL AND gap.path IS NULL
+                                AND gap.line_start IS NULL AND gap.line_end IS NULL)
+                               OR (branch.path IS NOT NULL AND gap.path=branch.path AND (
+                                   (branch.kind!='arc'
+                                    AND gap.line_start=branch.start_line
+                                    AND gap.line_end=branch.end_line)
+                                   OR (branch.kind='arc'
+                                    AND gap.line_start=CASE
+                                        WHEN branch.start_line>0 AND branch.target_line>0
+                                            THEN min(branch.start_line,branch.target_line)
+                                        WHEN branch.start_line>0 THEN branch.start_line
+                                        ELSE branch.target_line END
+                                    AND gap.line_end=CASE
+                                        WHEN branch.start_line>0 AND branch.target_line>0
+                                            THEN max(branch.start_line,branch.target_line)
+                                        WHEN branch.start_line>0 THEN branch.start_line
+                                        ELSE branch.target_line END)
+                               ))
+                           )
+                    ))
+                    OR (branch.file_id IS NOT NULL AND NOT EXISTS(
+                        SELECT 1 FROM nodes node
+                         WHERE node.file_id=branch.file_id AND node.kind!='file'
+                           AND node.line_start<=CASE
+                               WHEN branch.kind!='arc' THEN branch.end_line
+                               WHEN branch.start_line>0 AND branch.target_line>0
+                                   THEN max(branch.start_line,branch.target_line)
+                               WHEN branch.start_line>0 THEN branch.start_line
+                               ELSE branch.target_line END
+                           AND node.line_end>=CASE
+                               WHEN branch.kind!='arc' THEN branch.start_line
+                               WHEN branch.start_line>0 AND branch.target_line>0
+                                   THEN min(branch.start_line,branch.target_line)
+                               WHEN branch.start_line>0 THEN branch.start_line
+                               ELSE branch.target_line END
+                    ) AND NOT EXISTS(
+                        SELECT 1 FROM graph_gaps gap
+                         WHERE gap.run_id=run.id AND gap.category='coverage'
+                           AND gap.reason='coverage-unmapped-region'
+                           AND gap.path=file.path
+                           AND gap.line_start=CASE
+                               WHEN branch.kind!='arc' THEN branch.start_line
+                               WHEN branch.start_line>0 AND branch.target_line>0
+                                   THEN min(branch.start_line,branch.target_line)
+                               WHEN branch.start_line>0 THEN branch.start_line
+                               ELSE branch.target_line END
+                           AND gap.line_end=CASE
+                               WHEN branch.kind!='arc' THEN branch.end_line
+                               WHEN branch.start_line>0 AND branch.target_line>0
+                                   THEN max(branch.start_line,branch.target_line)
+                               WHEN branch.start_line>0 THEN branch.start_line
+                               ELSE branch.target_line END
+                    ))
+                 UNION ALL
+                 SELECT 1 FROM graph_gaps gap
+                 WHERE (gap.category='coverage') != (gap.run_id IS NOT NULL)
+                    OR (gap.category='coverage' AND gap.reason NOT IN (
+                        'coverage-unmapped-file','coverage-unmapped-region',
+                        'missing-test-context','ambiguous-test-context'
+                    ))
+                 UNION ALL
+                 SELECT 1 FROM files file JOIN imported_artifacts artifact
+                   ON artifact.role='generated-rust' AND artifact.path=file.path
+                 WHERE artifact.content_hash!=file.content_hash
+                    OR artifact.byte_size!=file.byte_size
+                 UNION ALL
+                 SELECT 1 FROM provenance_links link
+                 JOIN imported_artifacts output ON output.id=link.output_artifact_id
+                 LEFT JOIN files file ON file.path=output.path
+                 WHERE link.modeled_site_id IS NOT NULL AND file.id IS NULL
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if invalid {
+        return Err("database evidence relationships are invalid".into());
+    }
+    check_cancelled(cancelled)
+}
+
+struct StoredProvenance {
+    input_id: i64,
+    input_role: Option<String>,
+    input_lines: EvidenceLineSpan,
+    generator_path: String,
+    generator_file_id: Option<i64>,
+    generator_node_id: Option<i64>,
+    generator_lines: EvidenceLineSpan,
+    output_id: i64,
+    output_path: Option<String>,
+    output_role: Option<String>,
+    output_lines: EvidenceLineSpan,
+    modeled_site_id: Option<i64>,
+    mapping_state: String,
+}
+
+fn require_provenance_invariants(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
+    let rows = connection
+        .prepare(
+            "SELECT p.input_artifact_id, input.role,
+                    p.input_line_start, p.input_line_end,
+                    p.generator_path, p.generator_file_id, p.generator_node_id,
+                    p.generator_line_start, p.generator_line_end,
+                    p.output_artifact_id, output.path, output.role,
+                    p.output_line_start, p.output_line_end,
+                    p.modeled_site_id, p.mapping_state
+               FROM provenance_links p
+               LEFT JOIN imported_artifacts input ON input.id=p.input_artifact_id
+               LEFT JOIN imported_artifacts output ON output.id=p.output_artifact_id
+              ORDER BY p.id",
+        )
+        .map_err(db_error)?
+        .query_map([], |row| {
+            Ok(StoredProvenance {
+                input_id: row.get(0)?,
+                input_role: row.get(1)?,
+                input_lines: EvidenceLineSpan {
+                    start: row.get(2)?,
+                    end: row.get(3)?,
+                },
+                generator_path: row.get(4)?,
+                generator_file_id: row.get(5)?,
+                generator_node_id: row.get(6)?,
+                generator_lines: EvidenceLineSpan {
+                    start: row.get(7)?,
+                    end: row.get(8)?,
+                },
+                output_id: row.get(9)?,
+                output_path: row.get(10)?,
+                output_role: row.get(11)?,
+                output_lines: EvidenceLineSpan {
+                    start: row.get(12)?,
+                    end: row.get(13)?,
+                },
+                modeled_site_id: row.get(14)?,
+                mapping_state: row.get(15)?,
+            })
+        })
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?;
+    let mut paths_by_basename = BTreeMap::<String, BTreeSet<String>>::new();
+    for row in &rows {
+        let output_path = row
+            .output_path
+            .as_deref()
+            .ok_or_else(|| "database provenance output artifact is missing".to_owned())?;
+        let basename = Path::new(output_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "database provenance output basename is invalid".to_owned())?;
+        paths_by_basename
+            .entry(basename.to_owned())
+            .or_default()
+            .insert(output_path.to_owned());
+    }
+    let mut identities = HashSet::new();
+    for row in rows {
+        check_cancelled(cancelled)?;
+        validate_evidence_span(row.input_lines)?;
+        validate_evidence_span(row.generator_lines)?;
+        validate_evidence_span(row.output_lines)?;
+        if row.input_role.as_deref() != Some(ArtifactRole::Input.db())
+            || row.output_role.as_deref() != Some(ArtifactRole::GeneratedRust.db())
+        {
+            return Err("database provenance artifact role is invalid".into());
+        }
+        if !crate::evidence::evidence_path_is_safe(&row.generator_path) {
+            return Err("database provenance declaration path is unsafe".into());
+        }
+        if !identities.insert((
+            row.input_id,
+            row.input_lines.start,
+            row.input_lines.end,
+            row.generator_path.clone(),
+            row.generator_lines.start,
+            row.generator_lines.end,
+            row.output_id,
+            row.output_lines.start,
+            row.output_lines.end,
+        )) {
+            return Err("database provenance declaration identity is duplicated".into());
+        }
+        let output_path = row
+            .output_path
+            .as_deref()
+            .ok_or_else(|| "database provenance output artifact is missing".to_owned())?;
+        let basename = Path::new(output_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "database provenance output basename is invalid".to_owned())?;
+        let contended = paths_by_basename
+            .get(basename)
+            .is_some_and(|paths| paths.len() > 1);
+        let resolution = provenance_resolution(
+            connection,
+            &row.generator_path,
+            row.generator_lines,
+            basename,
+            contended,
+        )?;
+        if row.generator_file_id != resolution.generator_file_id
+            || row.generator_node_id != resolution.generator_node_id
+            || row.modeled_site_id != resolution.modeled_site_id
+            || row.mapping_state != resolution.mapping_state
+        {
+            return Err("database provenance declaration mapping is inconsistent".into());
+        }
+        if row.modeled_site_id.is_some() {
+            let generated_file: bool = connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM files file JOIN imported_artifacts output
+                           ON output.id=?1 AND output.path=file.path
+                          AND output.content_hash=file.content_hash
+                          AND output.byte_size=file.byte_size
+                     )",
+                    [row.output_id],
+                    |result| result.get(0),
+                )
+                .map_err(db_error)?;
+            if !generated_file {
+                return Err("database provenance generated output is missing".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
+    let mut load_references = connection
+        .prepare(
+            "SELECT id, alias_key, resolved_target_id, resolution_state
+               FROM refs ORDER BY id",
+        )
+        .map_err(db_error)?;
+    let rows = load_references
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut references = Vec::new();
+    for row in rows {
+        check_cancelled(cancelled)?;
+        references.push(row.map_err(db_error)?);
+    }
+    let mut load_keys = connection
+        .prepare("SELECT key FROM ref_keys WHERE ref_id=?1 ORDER BY rank")
+        .map_err(db_error)?;
+    let mut candidates = connection
+        .prepare("SELECT node_id FROM node_keys WHERE key=?1 ORDER BY node_id LIMIT 2")
+        .map_err(db_error)?;
+    let mut loaded = Vec::with_capacity(references.len());
+    let mut aliases = HashMap::new();
+    for (id, alias, target, state) in references {
+        check_cancelled(cancelled)?;
+        let rows = load_keys
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        let mut keys = Vec::new();
+        for row in rows {
+            check_cancelled(cancelled)?;
+            keys.push(row.map_err(db_error)?);
+        }
+        let direct = expected_reference_candidate(&keys, &mut candidates, None, cancelled)?;
+        if let Some(alias) = &alias
+            && !matches!(direct, DbCandidate::Missing)
+        {
+            aliases
+                .entry(alias.clone())
+                .and_modify(|candidate| {
+                    *candidate = match (*candidate, direct) {
+                        (DbCandidate::Unique(left), DbCandidate::Unique(right))
+                            if left == right =>
+                        {
+                            DbCandidate::Unique(left)
+                        }
+                        _ => DbCandidate::Ambiguous,
+                    };
+                })
+                .or_insert(direct);
+        }
+        loaded.push((alias, target, state, keys, direct));
+    }
+
+    #[cfg(test)]
+    AFTER_REFERENCE_CANDIDATE_PASS_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+    check_cancelled(cancelled)?;
+
+    for (alias, actual_target, actual_state, keys, direct) in loaded {
+        check_cancelled(cancelled)?;
+        let expected = if alias.is_some() {
+            direct
+        } else {
+            expected_reference_candidate(&keys, &mut candidates, Some(&aliases), cancelled)?
+        };
+        let (expected_target, expected_state) = match expected {
+            DbCandidate::Unique(target) => (Some(target), ResolutionState::Resolved),
+            DbCandidate::Missing => (None, ResolutionState::Missing),
+            DbCandidate::Ambiguous => (None, ResolutionState::Ambiguous),
+        };
+        if actual_target != expected_target || actual_state != expected_state.db() {
+            return Err("database reference resolution does not match candidates".into());
+        }
+    }
+    Ok(())
+}
+
+fn expected_reference_candidate(
+    keys: &[String],
+    candidates: &mut rusqlite::Statement<'_>,
+    aliases: Option<&HashMap<String, DbCandidate>>,
+    cancelled: &AtomicBool,
+) -> Result<DbCandidate> {
+    for key in keys {
+        check_cancelled(cancelled)?;
+        let direct = candidate(candidates, key)?;
+        let alias = aliases
+            .and_then(|aliases| aliases.get(key))
+            .copied()
+            .unwrap_or(DbCandidate::Missing);
+        match merge_candidates(direct, alias) {
+            DbCandidate::Unique(target) => return Ok(DbCandidate::Unique(target)),
+            DbCandidate::Ambiguous => return Ok(DbCandidate::Ambiguous),
+            DbCandidate::Missing => {}
+        }
+    }
+    Ok(DbCandidate::Missing)
+}
+
+fn distinct_text(connection: &Connection, sql: &str) -> Result<Vec<String>> {
+    connection
+        .prepare(sql)
+        .map_err(db_error)?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)
 }
 
 fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -1021,9 +2182,9 @@ fn traverse_changes(
     dependency_mode: DependencyMode,
     cancelled: &AtomicBool,
     lines: &mut Vec<String>,
+    visited: &mut HashSet<i64>,
 ) -> Result<bool> {
     let (depth, max_nodes) = limits;
-    let mut visited = roots.iter().map(|node| node.id).collect::<HashSet<_>>();
     let node_limit = visited.len().saturating_add(max_nodes);
     let mut current = roots
         .iter()
@@ -1808,50 +2969,1318 @@ fn risk_metadata(risk: Option<&NodeRisk>) -> String {
     )
 }
 
-fn coverage_diagnostics(
-    unmapped_ranges: usize,
-    neighborhood_omitted: bool,
-    flow_analysis_omitted: bool,
-    test_mapping_omitted: bool,
-    analysis_roots_omitted: usize,
-    deleted_paths_unanalyzed: usize,
-    depth: u32,
+struct StaticAccounting {
+    source_complete: bool,
+    syntax_complete: bool,
+    static_model_complete: bool,
+    total_gaps: u64,
+    relevant_gaps: u64,
+    gaps_by_reason: BTreeMap<GapReason, u64>,
+    gap_records: String,
+    missing: u64,
+    ambiguous: u64,
+}
+
+impl StaticAccounting {
+    fn overall(
+        &self,
+        content_complete: bool,
+        mapping_complete: bool,
+        traversal_complete: bool,
+    ) -> CompletenessStatus {
+        if content_complete
+            && self.source_complete
+            && self.syntax_complete
+            && self.static_model_complete
+            && mapping_complete
+            && traversal_complete
+        {
+            CompletenessStatus::Complete
+        } else {
+            CompletenessStatus::Partial
+        }
+    }
+}
+
+fn static_accounting(connection: &Connection, scope: &CoverageScope) -> Result<StaticAccounting> {
+    let mut accounting = StaticAccounting {
+        source_complete: true,
+        syntax_complete: true,
+        static_model_complete: true,
+        total_gaps: 0,
+        relevant_gaps: 0,
+        gaps_by_reason: BTreeMap::new(),
+        gap_records: String::new(),
+        missing: 0,
+        ambiguous: 0,
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT category, reason, sum(occurrences)
+               FROM graph_gaps
+              GROUP BY category, reason
+              ORDER BY category, reason",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(db_error)?;
+    for row in rows {
+        let (category, reason, occurrences) = row.map_err(db_error)?;
+        let occurrences = u64::try_from(occurrences)
+            .map_err(|_| "database gap occurrence count is invalid".to_owned())?;
+        let category = GapCategory::parse(&category)
+            .ok_or_else(|| "database gap category is invalid".to_owned())?;
+        let reason =
+            GapReason::parse(&reason).ok_or_else(|| "database gap reason is invalid".to_owned())?;
+        accounting.total_gaps = accounting.total_gaps.saturating_add(occurrences);
+        let reason_count = accounting.gaps_by_reason.entry(reason).or_default();
+        *reason_count = reason_count.saturating_add(occurrences);
+        match category {
+            GapCategory::Source => {
+                accounting.source_complete = false;
+                accounting.static_model_complete = false;
+                accounting.relevant_gaps = accounting.relevant_gaps.saturating_add(occurrences);
+            }
+            GapCategory::Parse => {
+                accounting.syntax_complete = false;
+                accounting.static_model_complete = false;
+                accounting.relevant_gaps = accounting.relevant_gaps.saturating_add(occurrences);
+            }
+            GapCategory::Coverage => {}
+            GapCategory::Relation
+            | GapCategory::Macro
+            | GapCategory::Generated
+            | GapCategory::Boundary => {
+                accounting.static_model_complete = false;
+                accounting.relevant_gaps = accounting.relevant_gaps.saturating_add(occurrences);
+            }
+            GapCategory::Language => {
+                accounting.source_complete = false;
+                accounting.static_model_complete = false;
+                accounting.relevant_gaps = accounting.relevant_gaps.saturating_add(occurrences);
+            }
+        }
+    }
+    accounting.gap_records = static_gap_records(connection, scope)?;
+    let (missing, ambiguous) = connection
+        .query_row(
+            "SELECT
+                sum(CASE WHEN resolution_state='missing' THEN 1 ELSE 0 END),
+                sum(CASE WHEN resolution_state='ambiguous' THEN 1 ELSE 0 END)
+               FROM refs",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or_default(),
+                    row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+                ))
+            },
+        )
+        .map_err(db_error)?;
+    accounting.missing = u64::try_from(missing)
+        .map_err(|_| "database missing reference count is invalid".to_owned())?;
+    accounting.ambiguous = u64::try_from(ambiguous)
+        .map_err(|_| "database ambiguous reference count is invalid".to_owned())?;
+    let mut relevant_keys = HashSet::new();
+    let mut load_keys = connection
+        .prepare("SELECT key FROM node_keys WHERE node_id=?1 ORDER BY key")
+        .map_err(db_error)?;
+    let mut relevant_nodes = scope.nodes.iter().copied().collect::<Vec<_>>();
+    relevant_nodes.sort_unstable();
+    for node_id in relevant_nodes {
+        for row in load_keys
+            .query_map([node_id], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+        {
+            relevant_keys.insert(row.map_err(db_error)?);
+        }
+    }
+    let relevant_unresolved = if relevant_keys.is_empty() {
+        false
+    } else {
+        let mut unresolved = connection
+            .prepare(
+                "SELECT key.key FROM refs ref JOIN ref_keys key ON key.ref_id=ref.id
+                  WHERE ref.resolution_state IN ('missing','ambiguous')
+                  ORDER BY ref.id, key.rank",
+            )
+            .map_err(db_error)?;
+        let mut rows = unresolved.query([]).map_err(db_error)?;
+        let mut relevant = false;
+        while let Some(row) = rows.next().map_err(db_error)? {
+            if relevant_keys.contains(&row.get::<_, String>(0).map_err(db_error)?) {
+                relevant = true;
+                break;
+            }
+        }
+        relevant
+    };
+    if relevant_unresolved {
+        accounting.static_model_complete = false;
+    }
+    Ok(accounting)
+}
+
+fn static_gap_records(connection: &Connection, scope: &CoverageScope) -> Result<String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT category, reason, path, line_start, line_end, target_hint,
+                    occurrences, relation_site, id, source_id
+               FROM graph_gaps
+              WHERE category NOT IN ('coverage','generated')",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<u32>>(3)?,
+                row.get::<_, Option<u32>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, bool>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut gaps = Vec::new();
+    for row in rows {
+        let (category, reason, path, start, end, target, occurrences, relation_site, id, source_id) =
+            row.map_err(db_error)?;
+        let relevant = scope.gap_relevant(path.as_deref(), start, end, source_id);
+        if !relevant {
+            continue;
+        }
+        gaps.push((
+            GapReason::parse(&reason).ok_or_else(|| "database gap reason is invalid".to_owned())?,
+            path,
+            start,
+            end,
+            GapCategory::parse(&category)
+                .ok_or_else(|| "database gap category is invalid".to_owned())?,
+            target,
+            occurrences,
+            relation_site,
+            id,
+        ));
+    }
+    gaps.sort_unstable();
+
+    let mut text = String::new();
+    for (reason, path, start, end, category, target, occurrences, relation_site, _) in gaps {
+        let line = match (start, end) {
+            (Some(start), Some(end)) => line_range(start, end),
+            (Some(start), None) => start.to_string(),
+            (None, _) => "none".into(),
+        };
+        text.push_str(&format!(
+            "gap category={} reason={} path={:?} line={line}",
+            category.db(),
+            reason.db(),
+            path.unwrap_or_default(),
+        ));
+        if let Some(target) = target {
+            text.push_str(&format!(" target={target:?}"));
+        }
+        text.push_str(&format!(
+            " occurrences={occurrences} relation_site={relation_site}\n"
+        ));
+    }
+    Ok(text)
+}
+
+#[derive(Default)]
+struct CoverageScope {
+    ranges: BTreeMap<String, Option<Vec<(u32, u32)>>>,
+    nodes: HashSet<i64>,
+}
+
+impl CoverageScope {
+    fn node(node_id: i64, path: &str, start: u32, end: u32, whole_file: bool) -> Self {
+        let mut scope = Self::default();
+        scope.nodes.insert(node_id);
+        if whole_file {
+            scope.ranges.insert(path.to_owned(), None);
+        } else {
+            scope.add_range(path, start, end);
+        }
+        scope
+    }
+
+    fn changes(
+        changes: &WorktreeChanges,
+        dependency_mode: DependencyMode,
+        connection: &Connection,
+    ) -> Result<Self> {
+        let mut scope = Self::default();
+        for file in &changes.files {
+            if dependency_mode == DependencyMode::Boundary
+                && dependency_package(&file.path).is_some()
+            {
+                continue;
+            }
+            if file.whole_file {
+                scope.ranges.insert(file.path.clone(), None);
+                continue;
+            }
+            for span in &file.spans {
+                let start = u32::try_from((span.start / 2).max(1)).unwrap_or(u32::MAX);
+                let end = u32::try_from((span.end / 2).max(u64::from(start))).unwrap_or(u32::MAX);
+                scope.add_range(&file.path, start, end);
+            }
+        }
+        for path in &changes.paths {
+            if path.language.is_none()
+                && (dependency_mode == DependencyMode::Full
+                    || dependency_package(&path.path).is_none())
+            {
+                scope.ranges.entry(path.path.clone()).or_insert(None);
+            }
+        }
+        let mut nodes = connection
+            .prepare(
+                "SELECT node.id, node.line_start, node.line_end
+                   FROM nodes node JOIN files file ON file.id=node.file_id
+                  WHERE file.path=?1
+                  ORDER BY node.line_start, node.line_end, node.id",
+            )
+            .map_err(db_error)?;
+        for file in &changes.files {
+            if dependency_mode == DependencyMode::Boundary
+                && dependency_package(&file.path).is_some()
+            {
+                continue;
+            }
+            let rows = nodes
+                .query_map([&file.path], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u32>(2)?,
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                let (id, start, end) = row.map_err(db_error)?;
+                let node_start = u64::from(start).saturating_mul(2);
+                let node_end = u64::from(end).saturating_mul(2);
+                if file.whole_file
+                    || file
+                        .spans
+                        .iter()
+                        .any(|span| span.start <= node_end && span.end >= node_start)
+                {
+                    scope.nodes.insert(id);
+                    scope.add_range(&file.path, start, end);
+                }
+            }
+        }
+        scope.expand_provenance(connection)?;
+        Ok(scope)
+    }
+
+    fn add_nodes(&mut self, connection: &Connection, node_ids: &HashSet<i64>) -> Result<()> {
+        let mut statement = connection
+            .prepare(
+                "SELECT file.path, node.line_start, node.line_end
+                   FROM nodes node JOIN files file ON file.id=node.file_id
+                  WHERE node.id=?1",
+            )
+            .map_err(db_error)?;
+        let mut node_ids = node_ids.iter().copied().collect::<Vec<_>>();
+        node_ids.sort_unstable();
+        for node_id in node_ids {
+            if let Some((path, start, end)) = statement
+                .query_row([node_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u32>(2)?,
+                    ))
+                })
+                .optional()
+                .map_err(db_error)?
+            {
+                self.nodes.insert(node_id);
+                self.add_range(&path, start, end);
+            }
+        }
+        self.expand_provenance(connection)
+    }
+
+    fn expand_provenance(&mut self, connection: &Connection) -> Result<()> {
+        type Row = (
+            String,
+            u32,
+            u32,
+            String,
+            u32,
+            u32,
+            String,
+            u32,
+            u32,
+            Option<String>,
+            Option<u32>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let rows = connection
+            .prepare(
+                "SELECT input.path, link.input_line_start, link.input_line_end,
+                        output.path, link.output_line_start, link.output_line_end,
+                        link.generator_path, link.generator_line_start, link.generator_line_end,
+                        include_file.path, site.line_start,
+                        link.generator_node_id, site.source_id
+                   FROM provenance_links link
+                   JOIN imported_artifacts input ON input.id=link.input_artifact_id
+                   JOIN imported_artifacts output ON output.id=link.output_artifact_id
+                   LEFT JOIN modeled_sites site ON site.id=link.modeled_site_id
+                   LEFT JOIN files include_file ON include_file.id=site.file_id
+                  ORDER BY link.id",
+            )
+            .map_err(db_error)?
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                ))
+            })
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<Row>>>()
+            .map_err(db_error)?;
+        loop {
+            let mut changed = false;
+            for (
+                input,
+                input_start,
+                input_end,
+                output,
+                output_start,
+                output_end,
+                generator,
+                generator_start,
+                generator_end,
+                include,
+                include_line,
+                generator_node_id,
+                include_source_id,
+            ) in &rows
+            {
+                let relevant = self.relevant(input, *input_start, *input_end)
+                    || self.relevant(output, *output_start, *output_end)
+                    || self.relevant(generator, *generator_start, *generator_end)
+                    || include
+                        .as_deref()
+                        .zip(*include_line)
+                        .is_some_and(|(path, line)| self.relevant(path, line, line));
+                if relevant {
+                    changed |= self.add_range(input, *input_start, *input_end);
+                    changed |= self.add_range(output, *output_start, *output_end);
+                    changed |= self.add_range(generator, *generator_start, *generator_end);
+                    if let Some(node_id) = generator_node_id {
+                        changed |= self.nodes.insert(*node_id);
+                    }
+                    if let Some(node_id) = include_source_id {
+                        changed |= self.nodes.insert(*node_id);
+                    }
+                    if let Some((include, line)) = include.as_deref().zip(*include_line) {
+                        changed |= self.add_range(include, line, line);
+                    }
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+
+    fn add_range(&mut self, path: &str, start: u32, end: u32) -> bool {
+        match self.ranges.entry(path.to_owned()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(vec![(start, end)]));
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if let Some(ranges) = entry.get_mut() {
+                    if ranges.contains(&(start, end)) {
+                        return false;
+                    }
+                    ranges.push((start, end));
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn whole_file(&self, path: &str) -> bool {
+        self.ranges.get(path).is_some_and(Option::is_none)
+    }
+
+    fn gap_relevant(
+        &self,
+        path: Option<&str>,
+        start: Option<u32>,
+        end: Option<u32>,
+        source_id: Option<i64>,
+    ) -> bool {
+        if path.is_some_and(|path| self.whole_file(path)) {
+            return true;
+        }
+        source_id.is_some_and(|source_id| self.nodes.contains(&source_id))
+            || path.is_some_and(|path| match start {
+                Some(start) => self.relevant(path, start, end.unwrap_or(start)),
+                None => false,
+            })
+    }
+
+    fn relevant(&self, path: &str, start: u32, end: u32) -> bool {
+        match self.ranges.get(path) {
+            Some(None) => true,
+            Some(Some(ranges)) => ranges
+                .iter()
+                .any(|(scope_start, scope_end)| *scope_start <= end && *scope_end >= start),
+            None => false,
+        }
+    }
+
+    fn relevant_branch(
+        &self,
+        path: &str,
+        start: i64,
+        end: i64,
+        target: Option<i64>,
+        kind: &str,
+    ) -> bool {
+        if kind != "arc" {
+            return match (u32::try_from(start), u32::try_from(end)) {
+                (Ok(start), Ok(end)) => self.relevant(path, start, end),
+                _ => false,
+            };
+        }
+        [Some(start), target]
+            .into_iter()
+            .flatten()
+            .filter_map(|line| u32::try_from(line).ok())
+            .any(|line| self.relevant(path, line, line))
+    }
+}
+
+struct EvidenceReview {
+    text: String,
+    status: CompletenessStatus,
+    capture_status: &'static str,
+    provenance_status: &'static str,
+    execution_status: &'static str,
+}
+
+struct CoverageOutput {
+    run: String,
+    path: String,
+    start: i64,
+    start_column: u32,
+    end: i64,
+    end_column: u32,
+    named: bool,
+    kind: String,
+    block: String,
+}
+
+fn render_evidence(
+    connection: &Connection,
+    scope: Option<&CoverageScope>,
+) -> Result<EvidenceReview> {
+    let manifest_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM imported_artifacts WHERE role='manifest'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if manifest_count == 0 {
+        return Ok(EvidenceReview {
+            text: String::new(),
+            status: CompletenessStatus::NotApplicable,
+            capture_status: "not-applicable",
+            provenance_status: "not-applicable",
+            execution_status: "not-applicable",
+        });
+    }
+    if manifest_count != 1 {
+        return Err("database manifest evidence identity is invalid".into());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT output.path,
+                    input.path, p.input_line_start, p.input_line_end,
+                    p.generator_path, p.generator_line_start, p.generator_line_end,
+                    p.output_line_start, p.output_line_end,
+                    include_file.path, site.line_start,
+                    generated_file.id, p.mapping_state
+               FROM provenance_links p
+               JOIN imported_artifacts output ON output.id=p.output_artifact_id
+               JOIN imported_artifacts input ON input.id=p.input_artifact_id
+               LEFT JOIN modeled_sites site ON site.id=p.modeled_site_id
+               LEFT JOIN files include_file ON include_file.id=site.file_id
+               LEFT JOIN files generated_file
+                 ON generated_file.path=output.path
+                AND generated_file.content_hash=output.content_hash
+                AND generated_file.byte_size=output.byte_size
+              ORDER BY output.path, p.id",
+        )
+        .map_err(db_error)?;
+    type ProvenanceRow = (
+        String,
+        String,
+        u32,
+        u32,
+        String,
+        u32,
+        u32,
+        u32,
+        u32,
+        Option<String>,
+        Option<u32>,
+        Option<i64>,
+        String,
+    );
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+            ))
+        })
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<ProvenanceRow>>>()
+        .map_err(db_error)?;
+    let rows = rows
+        .into_iter()
+        .filter(|row| {
+            scope.is_none_or(|scope| {
+                scope.relevant(&row.1, row.2, row.3)
+                    || scope.relevant(&row.4, row.5, row.6)
+                    || scope.relevant(&row.0, row.7, row.8)
+                    || row
+                        .9
+                        .as_deref()
+                        .zip(row.10)
+                        .is_some_and(|(path, line)| scope.relevant(path, line, line))
+            })
+        })
+        .collect::<Vec<_>>();
+    type GeneratedGapRow = (
+        String,
+        Option<String>,
+        Option<u32>,
+        Option<u32>,
+        Option<String>,
+        u32,
+        Option<i64>,
+    );
+    let generated_gaps = connection
+        .prepare(
+            "SELECT reason, path, line_start, line_end, target_hint, occurrences,
+                    source_id
+               FROM graph_gaps WHERE category='generated'
+              ORDER BY path, line_start, line_end, reason, id",
+        )
+        .map_err(db_error)?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<GeneratedGapRow>>>()
+        .map_err(db_error)?
+        .into_iter()
+        .filter(|(_, path, start, end, _, _, source_id)| {
+            scope.is_none_or(|scope| scope.gap_relevant(path.as_deref(), *start, *end, *source_id))
+        })
+        .collect::<Vec<_>>();
+    let provenance_applicable = !rows.is_empty();
+    let provenance_complete = provenance_applicable
+        && rows
+            .iter()
+            .all(|row| row.12 == "linked" && row.11.is_some());
+    let provenance_status = if !provenance_applicable {
+        "not-applicable"
+    } else if provenance_complete {
+        "complete"
+    } else {
+        "partial"
+    };
+    let coverage_runs: i64 = connection
+        .query_row("SELECT count(*) FROM coverage_runs", [], |row| row.get(0))
+        .map_err(db_error)?;
+    let (coverage_claims, coverage_gaps) = coverage_relevance(connection, scope)?;
+    let execution_status = if coverage_runs == 0 || coverage_claims == 0 && coverage_gaps == 0 {
+        "not-applicable"
+    } else if coverage_gaps == 0 {
+        "complete"
+    } else {
+        "partial"
+    };
+    let mut text = format!(
+        "completeness evidence_capture=complete provenance_model={} execution_mapping={execution_status}\n",
+        provenance_status
+    );
+    for row in rows {
+        let complete = row.12 == "linked" && row.11.is_some();
+        let input = format!("{}:{}-{}", row.1, row.2, row.3);
+        let generator = format!("{}:{}-{}", row.4, row.5, row.6);
+        let output = format!("{}:{}-{}", row.0, row.7, row.8);
+        text.push_str(&format!(
+            "claim kind=generated-provenance status={} result={} basis=verified-generated-manifest input={input:?} generator={generator:?} output={output:?}\n",
+            if complete { "complete" } else { "partial" },
+            if complete { "linked" } else { "unknown" },
+        ));
+        text.push_str(&format!(
+            "provenance input={input:?} generator={generator:?} output={output:?}\n"
+        ));
+        if let (Some(source), Some(line)) = (row.9, row.10) {
+            text.push_str(&format!(
+                "includes source={:?} output={:?}\n",
+                format!("{source}:{line}"),
+                row.0,
+            ));
+        }
+        if !complete {
+            let reason = if row.12 == "ambiguous" {
+                "ambiguous"
+            } else {
+                "unobserved"
+            };
+            text.push_str(&format!(
+                "gap category=generated reason=generated-output-{reason} input={input:?} generator={generator:?} output={output:?} occurrences=1\n"
+            ));
+        }
+    }
+    for (reason, path, start, end, target, occurrences, _) in generated_gaps {
+        let line = match (start, end) {
+            (Some(start), Some(end)) if start != end => format!("{start}-{end}"),
+            (Some(start), _) => start.to_string(),
+            _ => "none".into(),
+        };
+        text.push_str(&format!(
+            "gap category=generated reason={reason} path={:?} line={line}",
+            path.unwrap_or_default(),
+        ));
+        if let Some(target) = target {
+            text.push_str(&format!(" target={target:?}"));
+        }
+        text.push_str(&format!(" occurrences={occurrences}\n"));
+    }
+    render_coverage_observations(connection, scope, &mut text)?;
+    Ok(EvidenceReview {
+        text,
+        status: if provenance_status != "partial" && execution_status != "partial" {
+            CompletenessStatus::Complete
+        } else {
+            CompletenessStatus::Partial
+        },
+        capture_status: "complete",
+        provenance_status,
+        execution_status,
+    })
+}
+
+fn coverage_relevance(
+    connection: &Connection,
+    scope: Option<&CoverageScope>,
+) -> Result<(usize, usize)> {
+    let mut regions = connection
+        .prepare(
+            "SELECT region.run_id, file.path, region.start_line, region.end_line
+               FROM coverage_regions region JOIN files file ON file.id=region.file_id
+              ORDER BY region.id",
+        )
+        .map_err(db_error)?;
+    let rows = regions
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, u32>(3)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut claim_count = 0;
+    let mut relevant_runs = HashSet::new();
+    for row in rows {
+        let (run_id, path, start, end) = row.map_err(db_error)?;
+        if scope.is_none_or(|scope| scope.relevant(&path, start, end)) {
+            claim_count += 1;
+            relevant_runs.insert(run_id);
+        }
+    }
+    let mut branches = connection
+        .prepare(
+            "SELECT branch.run_id, file.path, branch.start_line, branch.end_line,
+                    branch.target_line, branch.kind
+               FROM coverage_branches branch JOIN files file ON file.id=branch.file_id
+              ORDER BY branch.id",
+        )
+        .map_err(db_error)?;
+    let rows = branches
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(db_error)?;
+    for row in rows {
+        let (run_id, path, start, end, target, kind) = row.map_err(db_error)?;
+        if scope.is_none_or(|scope| scope.relevant_branch(&path, start, end, target, &kind)) {
+            claim_count += 1;
+            relevant_runs.insert(run_id);
+        }
+    }
+    let mut gaps = connection
+        .prepare(
+            "SELECT run_id, reason, path, line_start, line_end
+               FROM graph_gaps WHERE category='coverage'",
+        )
+        .map_err(db_error)?;
+    let rows = gaps
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<u32>>(3)?,
+                row.get::<_, Option<u32>>(4)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut gap_count = 0;
+    for row in rows {
+        let (run_id, reason, path, start, end) = row.map_err(db_error)?;
+        let relevant = match scope {
+            None => true,
+            Some(scope) => match path.as_deref() {
+                Some(path) => scope.relevant(path, start.unwrap_or(1), end.unwrap_or(u32::MAX)),
+                None => reason == "coverage-unmapped-file" || relevant_runs.contains(&run_id),
+            },
+        };
+        if relevant {
+            gap_count += 1;
+        }
+    }
+    Ok((claim_count, gap_count))
+}
+
+fn render_coverage_observations(
+    connection: &Connection,
+    scope: Option<&CoverageScope>,
+    text: &mut String,
+) -> Result<()> {
+    let mut observations = Vec::new();
+    let mut relevant_runs = HashSet::new();
+    let mut regions = connection
+        .prepare(
+            "SELECT run.run_label, run.format, file.path,
+                    region.start_line, region.start_column,
+                    region.end_line, region.end_column, region.execution_count,
+                    CASE WHEN region.test_id IS NOT NULL
+                         THEN coalesce(region.context, run.test_name) END,
+                    NOT EXISTS(
+                        SELECT 1 FROM graph_gaps gap
+                         WHERE gap.run_id=run.id AND gap.category='coverage' AND (
+                            (gap.reason IN ('missing-test-context','ambiguous-test-context')
+                             AND gap.target_hint=CASE WHEN run.format='llvm'
+                                 THEN run.test_name ELSE region.context END)
+                            OR (gap.reason IN ('coverage-unmapped-file','coverage-unmapped-region')
+                                AND gap.path=file.path
+                                AND gap.line_start<=region.end_line
+                                AND gap.line_end>=region.start_line)
+                         )
+                    ), run.id
+               FROM coverage_regions region
+               JOIN coverage_runs run ON run.id=region.run_id
+               JOIN files file ON file.id=region.file_id
+              ORDER BY (region.test_id IS NULL), run.run_label, file.path,
+                       region.start_line, region.start_column, region.end_line,
+                       region.end_column, region.context, region.id",
+        )
+        .map_err(db_error)?;
+    let rows = regions
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u32>(3)?,
+                row.get::<_, u32>(4)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, bool>(9)?,
+                row.get::<_, i64>(10)?,
+            ))
+        })
+        .map_err(db_error)?;
+    for row in rows {
+        let (
+            run,
+            format,
+            path,
+            start,
+            start_column,
+            end,
+            end_column,
+            count,
+            test,
+            complete,
+            run_id,
+        ) = row.map_err(db_error)?;
+        if scope.is_some_and(|scope| !scope.relevant(&path, start, end)) {
+            continue;
+        }
+        relevant_runs.insert(run_id);
+        let count =
+            u64::try_from(count).map_err(|_| "database coverage count is invalid".to_owned())?;
+        let mut block = String::new();
+        push_execution_claim(
+            &mut block,
+            &run,
+            &format,
+            &path,
+            i64::from(start),
+            i64::from(end),
+            count,
+            test.as_deref(),
+            complete,
+        )?;
+        block.push_str(if count == 0 {
+            "not-observed run="
+        } else {
+            "observed run="
+        });
+        block.push_str(&format!("{run:?}"));
+        if let Some(test) = &test {
+            block.push_str(&format!(" test={test:?}"));
+        }
+        block.push_str(&format!(
+            " path={path:?} lines={} count={count}\n",
+            line_range(start, end),
+        ));
+        observations.push(CoverageOutput {
+            run,
+            path,
+            start: i64::from(start),
+            start_column,
+            end: i64::from(end),
+            end_column,
+            named: test.is_some(),
+            kind: String::new(),
+            block,
+        });
+    }
+
+    let mut branches = connection
+        .prepare(
+            "SELECT run.run_label, run.format, file.path,
+                    branch.start_line, branch.start_column,
+                    branch.end_line, branch.end_column, branch.target_line,
+                    branch.kind, branch.execution_count,
+                    CASE WHEN branch.test_id IS NOT NULL THEN run.test_name END,
+                    NOT EXISTS(
+                        SELECT 1 FROM graph_gaps gap
+                         WHERE gap.run_id=run.id AND gap.category='coverage' AND (
+                            (run.format='llvm'
+                             AND gap.reason IN ('missing-test-context','ambiguous-test-context')
+                             AND gap.target_hint=run.test_name)
+                            OR (gap.reason IN ('coverage-unmapped-file','coverage-unmapped-region')
+                                AND gap.path=file.path AND (
+                                    (branch.kind!='arc'
+                                     AND gap.line_start<=branch.end_line
+                                     AND gap.line_end>=branch.start_line)
+                                    OR (branch.kind='arc' AND (
+                                        (branch.start_line>0
+                                         AND gap.line_start<=branch.start_line
+                                         AND gap.line_end>=branch.start_line)
+                                        OR (branch.target_line>0
+                                            AND gap.line_start<=branch.target_line
+                                            AND gap.line_end>=branch.target_line)
+                                    ))
+                                ))
+                         )
+                    ), run.id
+               FROM coverage_branches branch
+               JOIN coverage_runs run ON run.id=branch.run_id
+               JOIN files file ON file.id=branch.file_id
+              ORDER BY (branch.test_id IS NULL), run.run_label, file.path,
+                       branch.start_line, branch.start_column, branch.end_line,
+                       branch.end_column, branch.target_line, branch.kind, branch.id",
+        )
+        .map_err(db_error)?;
+    let rows = branches
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, u32>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, bool>(11)?,
+                row.get::<_, i64>(12)?,
+            ))
+        })
+        .map_err(db_error)?;
+    for row in rows {
+        let (
+            run,
+            format,
+            path,
+            start,
+            start_column,
+            end,
+            end_column,
+            target,
+            kind,
+            count,
+            test,
+            complete,
+            run_id,
+        ) = row.map_err(db_error)?;
+        if scope.is_some_and(|scope| !scope.relevant_branch(&path, start, end, target, &kind)) {
+            continue;
+        }
+        relevant_runs.insert(run_id);
+        let count =
+            u64::try_from(count).map_err(|_| "database coverage count is invalid".to_owned())?;
+        let mut block = String::new();
+        push_execution_claim(
+            &mut block,
+            &run,
+            &format,
+            &path,
+            start,
+            end,
+            count,
+            test.as_deref(),
+            complete,
+        )?;
+        block.push_str(if count == 0 {
+            "not-observed-branch run="
+        } else {
+            "observed-branch run="
+        });
+        block.push_str(&format!("{run:?}"));
+        if let Some(test) = &test {
+            block.push_str(&format!(" test={test:?}"));
+        }
+        let arm = match kind.as_str() {
+            "true-outcome" => "true".to_owned(),
+            "false-outcome" => "false".to_owned(),
+            "arc" => format!("target:{}", target.unwrap_or_default()),
+            _ => return Err("database coverage branch kind is invalid".into()),
+        };
+        block.push_str(&format!(
+            " path={path:?} line={start} arm={arm} count={count}\n"
+        ));
+        observations.push(CoverageOutput {
+            run,
+            path,
+            start,
+            start_column,
+            end,
+            end_column,
+            named: test.is_some(),
+            kind,
+            block,
+        });
+    }
+
+    observations.sort_unstable_by(|left, right| {
+        (
+            !left.named,
+            &left.run,
+            &left.path,
+            left.start,
+            left.start_column,
+            left.end,
+            left.end_column,
+            &left.kind,
+        )
+            .cmp(&(
+                !right.named,
+                &right.run,
+                &right.path,
+                right.start,
+                right.start_column,
+                right.end,
+                right.end_column,
+                &right.kind,
+            ))
+    });
+    for observation in observations {
+        text.push_str(&observation.block);
+    }
+
+    let mut gaps = connection
+        .prepare(
+            "SELECT run.run_label, run.format, gap.reason, gap.path,
+                    gap.line_start, gap.line_end, gap.occurrences,
+                    gap.target_hint, run.id
+               FROM graph_gaps gap JOIN coverage_runs run ON run.id=gap.run_id
+              WHERE gap.category='coverage'
+              ORDER BY run.run_label, gap.path, gap.line_start, gap.line_end,
+                       gap.reason, gap.target_hint, gap.id",
+        )
+        .map_err(db_error)?;
+    let rows = gaps
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<u32>>(4)?,
+                row.get::<_, Option<u32>>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })
+        .map_err(db_error)?;
+    for row in rows {
+        let (run, format, reason, path, start, end, occurrences, target, run_id) =
+            row.map_err(db_error)?;
+        if let Some(scope) = scope {
+            let relevant = match path.as_deref() {
+                Some(path) => scope.relevant(path, start.unwrap_or(1), end.unwrap_or(u32::MAX)),
+                None => {
+                    reason == "coverage-unmapped-file"
+                        || matches!(
+                            reason.as_str(),
+                            "missing-test-context" | "ambiguous-test-context"
+                        ) && relevant_runs.contains(&run_id)
+                }
+            };
+            if !relevant {
+                continue;
+            }
+        }
+        text.push_str("claim kind=changed-execution");
+        if let Some(path) = &path {
+            text.push_str(&format!(" path={path:?}"));
+        }
+        if let Some(start) = start {
+            text.push_str(&format!(
+                " lines={}",
+                line_range(start, end.unwrap_or(start))
+            ));
+        }
+        text.push_str(&format!(
+            " status=partial result=unknown basis={} run={run:?}",
+            coverage_basis(&format)?
+        ));
+        if matches!(
+            reason.as_str(),
+            "missing-test-context" | "ambiguous-test-context"
+        ) && let Some(test) = &target
+        {
+            text.push_str(&format!(" test={test:?}"));
+        }
+        text.push('\n');
+        text.push_str(&format!(
+            "gap category=coverage reason={reason} run={run:?}"
+        ));
+        if let Some(path) = path {
+            text.push_str(&format!(" path={path:?}"));
+        }
+        if let Some(start) = start {
+            text.push_str(&format!(
+                " line={}",
+                line_range(start, end.unwrap_or(start))
+            ));
+        }
+        if let Some(target) = target {
+            text.push_str(&format!(" target={target:?}"));
+        }
+        text.push_str(&format!(" occurrences={occurrences}\n"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_execution_claim(
+    text: &mut String,
+    run: &str,
+    format: &str,
+    path: &str,
+    start: i64,
+    end: i64,
+    count: u64,
+    test: Option<&str>,
+    complete: bool,
+) -> Result<()> {
+    let basis = coverage_basis(format)?;
+    text.push_str(&format!(
+        "claim kind=changed-execution path={path:?} lines={} status={} result={} basis={} run={run:?}",
+        line_range_i64(start, end),
+        if complete { "complete" } else { "partial" },
+        if complete {
+            if count == 0 { "not-observed" } else { "observed" }
+        } else {
+            "unknown"
+        },
+        basis,
+    ));
+    if let Some(test) = test {
+        text.push_str(&format!(" test={test:?}"));
+    }
+    text.push('\n');
+    Ok(())
+}
+
+fn coverage_basis(format: &str) -> Result<&'static str> {
+    match format {
+        "llvm" => Ok("llvm-coverage-json"),
+        "coverage_py" => Ok("coverage-py-json"),
+        _ => Err("database coverage format is invalid".into()),
+    }
+}
+
+fn line_range(start: u32, end: u32) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
+}
+
+fn line_range_i64(start: i64, end: i64) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
+}
+
+fn assurance_preamble(
+    accounting: &StaticAccounting,
+    content_complete: bool,
+    mapping_complete: bool,
+    traversal_complete: bool,
+    evidence: &EvidenceReview,
 ) -> String {
-    let mut output = String::new();
-    if unmapped_ranges > 0 {
-        output.push_str(&format!(
-            "coverage category=mapping status=incomplete items={unmapped_ranges} remediation=call-index-then-restart-changes\n"
-        ));
+    let status = |complete| if complete { "complete" } else { "partial" };
+    let static_status = accounting
+        .overall(content_complete, mapping_complete, traversal_complete)
+        .as_str();
+    let mut by_reason = String::new();
+    for (index, (reason, occurrences)) in accounting.gaps_by_reason.iter().enumerate() {
+        if index > 0 {
+            by_reason.push(',');
+        }
+        by_reason.push_str(reason.db());
+        by_reason.push(':');
+        by_reason.push_str(&occurrences.to_string());
     }
-    if neighborhood_omitted {
-        output.push_str(&format!(
-            "coverage category=neighborhood status=incomplete items=unknown remediation=call-view-on-each-emitted-changed-node-ref depth={depth} max_nodes=50\n"
-        ));
+    if by_reason.is_empty() {
+        by_reason.push_str("none");
     }
-    if flow_analysis_omitted {
-        output.push_str(
-            "coverage category=flow-analysis status=incomplete items=unknown remediation=narrow-review-base-and-restart-changes\n",
-        );
+    let static_test_paths = if evidence.execution_status == "not-applicable" {
+        static_test_paths_claim(static_status)
+    } else {
+        String::new()
+    };
+    format!(
+        "languages=rust,python,javascript,typescript\n\
+completeness content_capture={} source_capture={} syntax_parse={} site_classification=complete static_model={} evidence_capture={} provenance_model={} execution_mapping={} traversal={}\n\
+gaps total={} relevant={} by_reason={}\n\
+references missing={} ambiguous={}\n\
+{}\
+claim kind=affected-callers status={static_status} basis=resolved-static-call-graph\n\
+claim kind=affected-flows status={static_status} basis=resolved-static-call-graph\n\
+{static_test_paths}",
+        status(content_complete),
+        status(accounting.source_complete),
+        status(accounting.syntax_complete),
+        status(accounting.static_model_complete && mapping_complete),
+        evidence.capture_status,
+        evidence.provenance_status,
+        evidence.execution_status,
+        status(traversal_complete),
+        accounting.total_gaps,
+        accounting.relevant_gaps,
+        by_reason,
+        accounting.missing,
+        accounting.ambiguous,
+        accounting.gap_records,
+    )
+}
+
+fn ordered_evidence_text(
+    mut evidence: EvidenceReview,
+    static_status: CompletenessStatus,
+) -> String {
+    if evidence.execution_status != "not-applicable" {
+        evidence
+            .text
+            .push_str(&static_test_paths_claim(static_status.as_str()));
     }
-    if test_mapping_omitted {
-        output.push_str(
-            "coverage category=test-mapping status=incomplete items=unknown remediation=narrow-review-base-and-restart-changes\n",
-        );
-    }
-    if analysis_roots_omitted > 0 {
-        output.push_str(&format!(
-            "coverage category=analysis-roots status=incomplete items={analysis_roots_omitted} remediation=narrow-review-base-and-restart-changes\n"
-        ));
-    }
-    if deleted_paths_unanalyzed > 0 {
-        output.push_str(&format!(
-            "coverage category=deleted-paths status=incomplete items={deleted_paths_unanalyzed} remediation=review-corresponding-diff-pages\n"
-        ));
-    }
-    if output.is_empty() {
-        output.push_str("coverage status=complete remediation=none\n");
-    }
-    output
+    evidence.text
+}
+
+fn static_test_paths_claim(status: &str) -> String {
+    format!("claim kind=static-test-paths status={status} basis=resolved-static-call-graph\n")
 }
 
 const fn dependency_analysis(mode: DependencyMode) -> &'static str {
@@ -2077,7 +4506,9 @@ fn unmapped_line(file: &ChangedFile, residual: &[LineSpan]) -> Option<String> {
 fn load_stored_files(connection: &Connection) -> Result<HashMap<String, StoredFile>> {
     let mut statement = connection
         .prepare(
-            "SELECT id, path, language, git_oid, content_hash, parse_context, byte_size FROM files",
+            "SELECT id, path, language, git_oid, content_hash, parse_context, byte_size,
+                    observed_relation_sites
+               FROM files",
         )
         .map_err(db_error)?;
     let rows = statement
@@ -2090,14 +4521,19 @@ fn load_stored_files(connection: &Connection) -> Result<HashMap<String, StoredFi
                 row.get::<_, Vec<u8>>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })
         .map_err(db_error)?;
     let mut files = HashMap::new();
     for row in rows {
-        let (id, path, language, git_oid, hash, parse_context, byte_size) =
+        let (id, path, language, git_oid, hash, parse_context, byte_size, observed_relation_sites) =
             row.map_err(db_error)?;
-        if id <= 0 || byte_size < 0 || !git_oid.as_deref().is_none_or(valid_oid) {
+        if id <= 0
+            || byte_size < 0
+            || observed_relation_sites < 0
+            || !git_oid.as_deref().is_none_or(valid_oid)
+        {
             return Err("database file metadata is invalid".into());
         }
         let language = Language::parse(&language)
@@ -2107,6 +4543,8 @@ fn load_stored_files(connection: &Connection) -> Result<HashMap<String, StoredFi
             .map_err(|_| "database content hash is invalid".to_owned())?;
         let byte_size =
             u64::try_from(byte_size).map_err(|_| "database file size is invalid".to_owned())?;
+        let observed_relation_sites = u32::try_from(observed_relation_sites)
+            .map_err(|_| "database relation-site count is invalid".to_owned())?;
         if files
             .insert(
                 path,
@@ -2117,6 +4555,7 @@ fn load_stored_files(connection: &Connection) -> Result<HashMap<String, StoredFi
                     content_hash,
                     parse_context,
                     byte_size,
+                    observed_relation_sites,
                 },
             )
             .is_some()
@@ -2127,6 +4566,58 @@ fn load_stored_files(connection: &Connection) -> Result<HashMap<String, StoredFi
     Ok(files)
 }
 
+fn load_source_global_gaps(
+    connection: &Connection,
+    cancelled: &AtomicBool,
+) -> Result<Vec<GapInput>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT path, line_start, line_end, category, reason, target_hint,
+                    occurrences, relation_site
+               FROM graph_gaps
+              WHERE file_id IS NULL AND source_id IS NULL AND run_id IS NULL
+                AND category NOT IN ('generated','coverage')
+              ORDER BY path, line_start, line_end, category, reason, target_hint, id",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<u32>>(1)?,
+                row.get::<_, Option<u32>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, bool>(7)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut gaps = Vec::new();
+    for row in rows {
+        check_cancelled(cancelled)?;
+        let (path, line_start, line_end, category, reason, target_hint, occurrences, relation_site) =
+            row.map_err(db_error)?;
+        gaps.push(GapInput {
+            file_key: None,
+            source_key: None,
+            run_key: None,
+            path,
+            line_start,
+            line_end,
+            category: GapCategory::parse(&category)
+                .ok_or_else(|| "database gap category is invalid".to_owned())?,
+            reason: GapReason::parse(&reason)
+                .ok_or_else(|| "database gap reason is invalid".to_owned())?,
+            target_hint,
+            occurrences,
+            relation_site,
+        });
+    }
+    Ok(gaps)
+}
+
 fn apply_incremental(
     tx: &Transaction<'_>,
     graph: &Graph,
@@ -2134,10 +4625,10 @@ fn apply_incremental(
     cancelled: &AtomicBool,
 ) -> Result<usize> {
     if !graph.edges.is_empty()
-        || graph
-            .refs
-            .iter()
-            .any(|reference| reference.resolved_target_key.is_some())
+        || graph.refs.iter().any(|reference| {
+            reference.resolved_target_key.is_some()
+                || reference.resolution != ResolutionState::Pending
+        })
     {
         return Err("incremental graph contains resolved edges".into());
     }
@@ -2161,16 +4652,31 @@ fn apply_incremental(
         .map(|(_, file)| file.id)
         .collect::<Vec<_>>();
     removed.sort_unstable();
+    let stored_global_gaps = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM graph_gaps
+                  WHERE file_id IS NULL AND source_id IS NULL AND run_id IS NULL
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(db_error)?;
+    let current_global_gaps = graph.gaps.iter().any(global_gap);
+    let replace_global_gaps = stored_global_gaps || current_global_gaps;
     let changed = removed.len()
         + graph
             .files
             .iter()
             .filter(|file| file.replace && !existing.contains_key(&file.path))
-            .count();
+            .count()
+        + usize::from(replace_global_gaps);
     if changed == 0
         && (!graph.nodes.is_empty()
             || !graph.refs.is_empty()
-            || !graph.trait_implementations.is_empty())
+            || !graph.trait_implementations.is_empty()
+            || !graph.modeled_sites.is_empty()
+            || graph.gaps.iter().any(|gap| !global_gap(gap)))
     {
         return Err("no-op incremental graph contains parsed rows".into());
     }
@@ -2183,13 +4689,15 @@ fn apply_incremental(
             || old.content_hash != file.content_hash
             || old.parse_context != file.parse_context
             || old.byte_size != file.byte_size
+            || old.observed_relation_sites != file.observed_relation_sites
     });
     if metadata_changed {
         let mut update = tx
             .prepare(
                 "UPDATE files
-                    SET git_oid=?1, content_hash=?2, parse_context=?3, byte_size=?4
-                  WHERE id=?5",
+                    SET git_oid=?1, content_hash=?2, parse_context=?3, byte_size=?4,
+                        observed_relation_sites=?5
+                  WHERE id=?6",
             )
             .map_err(db_error)?;
         for file in graph.files.iter().filter(|file| !file.replace) {
@@ -2201,6 +4709,7 @@ fn apply_incremental(
                 || old.content_hash != file.content_hash
                 || old.parse_context != file.parse_context
                 || old.byte_size != file.byte_size
+                || old.observed_relation_sites != file.observed_relation_sites
             {
                 update
                     .execute(params![
@@ -2209,6 +4718,7 @@ fn apply_incremental(
                         file.parse_context,
                         i64::try_from(file.byte_size)
                             .map_err(|_| "file size exceeds SQLite range".to_owned())?,
+                        file.observed_relation_sites,
                         old.id
                     ])
                     .map_err(db_error)?;
@@ -2329,6 +4839,14 @@ fn apply_incremental(
     }
 
     {
+        // ponytail: rebuilding derived reference edges keeps candidate removal atomic;
+        // narrow this to affected refs only if incremental profiling requires it.
+        tx.execute("DELETE FROM edges", []).map_err(db_error)?;
+        tx.execute(
+            "UPDATE refs SET resolved_target_id=NULL, resolution_state='pending'",
+            [],
+        )
+        .map_err(db_error)?;
         let mut delete_fts = tx
             .prepare("DELETE FROM nodes_fts WHERE rowid IN (SELECT id FROM nodes WHERE file_id=?1)")
             .map_err(db_error)?;
@@ -2342,14 +4860,681 @@ fn apply_incremental(
         }
     }
 
+    if replace_global_gaps {
+        tx.execute(
+            "DELETE FROM graph_gaps
+              WHERE file_id IS NULL AND source_id IS NULL AND run_id IS NULL",
+            [],
+        )
+        .map_err(db_error)?;
+    }
+
     let (new_refs, new_implementations) = insert_graph(tx, graph, cancelled, true)?;
     affected_refs.extend(new_refs);
+    affected_refs.extend(
+        tx.prepare("SELECT id FROM refs ORDER BY id")
+            .map_err(db_error)?
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?,
+    );
     affected_implementations.extend(new_implementations);
     resolve_references(tx, affected_refs, cancelled)?;
     refresh_script_export_methods(tx, cancelled)?;
     resolve_trait_implementations(tx, affected_implementations, cancelled)?;
     reparent_methods(tx, affected_owners, cancelled)?;
     Ok(changed)
+}
+
+fn global_gap(gap: &GapInput) -> bool {
+    gap.file_key.is_none() && gap.source_key.is_none() && gap.run_key.is_none()
+}
+
+struct ProvenanceResolution {
+    generator_file_id: Option<i64>,
+    generator_node_id: Option<i64>,
+    modeled_site_id: Option<i64>,
+    mapping_state: &'static str,
+}
+
+fn provenance_resolution(
+    connection: &Connection,
+    generator_path: &str,
+    generator_lines: EvidenceLineSpan,
+    output_basename: &str,
+    basename_contended: bool,
+) -> Result<ProvenanceResolution> {
+    let generators = connection
+        .prepare(
+            "SELECT f.id, n.id FROM files f JOIN nodes n ON n.file_id=f.id
+              WHERE f.path=?1 AND f.language IN ('rust','python')
+                AND n.kind IN ('function','test')
+                AND n.line_start<=?2 AND n.line_end>=?3
+              ORDER BY n.id LIMIT 2",
+        )
+        .map_err(db_error)?
+        .query_map(
+            params![generator_path, generator_lines.start, generator_lines.end],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?;
+    let sites = if basename_contended {
+        Vec::new()
+    } else {
+        connection
+            .prepare(
+                "SELECT m.id FROM modeled_sites m
+                  WHERE m.kind='generated-inclusion' AND m.target_hint=?1
+                    AND m.parse_context IS NOT NULL
+                  ORDER BY m.id LIMIT 2",
+            )
+            .map_err(db_error)?
+            .query_map([output_basename], |row| row.get::<_, i64>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?
+    };
+    let ambiguous = basename_contended || generators.len() > 1 || sites.len() > 1;
+    let state = if ambiguous {
+        "ambiguous"
+    } else if generators.len() == 1 && sites.len() == 1 {
+        "linked"
+    } else {
+        "unobserved"
+    };
+    let (generator_file_id, generator_node_id) = generators
+        .first()
+        .filter(|_| generators.len() == 1)
+        .copied()
+        .map_or((None, None), |(file, node)| (Some(file), Some(node)));
+    let modeled_site_id = sites.first().filter(|_| sites.len() == 1).copied();
+    Ok(ProvenanceResolution {
+        generator_file_id,
+        generator_node_id,
+        modeled_site_id,
+        mapping_state: state,
+    })
+}
+
+fn insert_evidence(
+    tx: &Transaction<'_>,
+    evidence: &EvidenceInput,
+    generated_files: usize,
+    cancelled: &AtomicBool,
+) -> Result<EvidenceStats> {
+    let mut artifacts = HashMap::<String, (i64, ArtifactRole, [u8; 32])>::new();
+    let mut artifact_paths = HashMap::<String, String>::new();
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO imported_artifacts(key, role, path, content_hash, byte_size)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(db_error)?;
+        for artifact in &evidence.artifacts {
+            check_cancelled(cancelled)?;
+            if !crate::evidence::evidence_path_is_safe(&artifact.path) {
+                return Err("evidence artifact path is unsafe".into());
+            }
+            let byte_size = i64::try_from(artifact.byte_size)
+                .map_err(|_| "artifact size exceeds SQLite range".to_owned())?;
+            insert
+                .execute(params![
+                    artifact.key,
+                    artifact.role.db(),
+                    artifact.path,
+                    artifact.content_hash.as_slice(),
+                    byte_size
+                ])
+                .map_err(db_error)?;
+            if artifacts
+                .insert(
+                    artifact.key.clone(),
+                    (tx.last_insert_rowid(), artifact.role, artifact.content_hash),
+                )
+                .is_some()
+            {
+                return Err("duplicate evidence artifact key".into());
+            }
+            artifact_paths.insert(artifact.key.clone(), artifact.path.clone());
+        }
+    }
+
+    let mut output_paths_by_basename = BTreeMap::<String, BTreeSet<String>>::new();
+    for provenance in &evidence.provenance {
+        let output_path = artifact_paths
+            .get(&provenance.output_key)
+            .ok_or_else(|| "provenance references an unknown output artifact".to_owned())?;
+        let basename = Path::new(output_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "provenance output basename is invalid".to_owned())?;
+        output_paths_by_basename
+            .entry(basename.to_owned())
+            .or_default()
+            .insert(output_path.clone());
+    }
+    let mut inserted_links = 0_usize;
+    let mut declarations = HashSet::new();
+    for provenance in &evidence.provenance {
+        check_cancelled(cancelled)?;
+        if !crate::evidence::evidence_path_is_safe(&provenance.generator_path) {
+            return Err("provenance generator path is unsafe".into());
+        }
+        validate_evidence_span(provenance.input_lines)?;
+        validate_evidence_span(provenance.generator_lines)?;
+        validate_evidence_span(provenance.output_lines)?;
+        let (input_id, input_role, _) = artifacts
+            .get(&provenance.input_key)
+            .copied()
+            .ok_or_else(|| "provenance references an unknown input artifact".to_owned())?;
+        let (output_id, output_role, _) = artifacts
+            .get(&provenance.output_key)
+            .copied()
+            .ok_or_else(|| "provenance references an unknown output artifact".to_owned())?;
+        if input_role != ArtifactRole::Input || output_role != ArtifactRole::GeneratedRust {
+            return Err("provenance artifact role is invalid".into());
+        }
+        let declaration = (
+            input_id,
+            provenance.input_lines.start,
+            provenance.input_lines.end,
+            provenance.generator_path.clone(),
+            provenance.generator_lines.start,
+            provenance.generator_lines.end,
+            output_id,
+            provenance.output_lines.start,
+            provenance.output_lines.end,
+        );
+        if !declarations.insert(declaration) {
+            return Err("duplicate provenance declaration".into());
+        }
+        let output_path = &artifact_paths[&provenance.output_key];
+        let basename = Path::new(output_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "provenance output basename is invalid".to_owned())?;
+        let basename_contended = output_paths_by_basename
+            .get(basename)
+            .is_some_and(|paths| paths.len() > 1);
+        let resolution = provenance_resolution(
+            tx,
+            &provenance.generator_path,
+            provenance.generator_lines,
+            basename,
+            basename_contended,
+        )?;
+        if let Some(site_id) = resolution.modeled_site_id {
+            tx.execute(
+                "DELETE FROM graph_gaps
+                  WHERE reason='generated-output-unobserved'
+                    AND file_id=(SELECT file_id FROM modeled_sites WHERE id=?1)
+                    AND line_start=(SELECT line_start FROM modeled_sites WHERE id=?1)
+                    AND line_end=(SELECT line_end FROM modeled_sites WHERE id=?1)
+                    AND ifnull(target_hint,'')=ifnull(
+                        (SELECT target_hint FROM modeled_sites WHERE id=?1), '')",
+                [site_id],
+            )
+            .map_err(db_error)?;
+        }
+        tx.execute(
+            "INSERT INTO provenance_links(
+                input_artifact_id, input_line_start, input_line_end,
+                generator_path, generator_file_id, generator_node_id,
+                generator_line_start, generator_line_end,
+                output_artifact_id, output_line_start, output_line_end,
+                modeled_site_id, mapping_state
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                input_id,
+                provenance.input_lines.start,
+                provenance.input_lines.end,
+                provenance.generator_path,
+                resolution.generator_file_id,
+                resolution.generator_node_id,
+                provenance.generator_lines.start,
+                provenance.generator_lines.end,
+                output_id,
+                provenance.output_lines.start,
+                provenance.output_lines.end,
+                resolution.modeled_site_id,
+                resolution.mapping_state
+            ],
+        )
+        .map_err(db_error)?;
+        inserted_links += usize::from(resolution.mapping_state == "linked");
+    }
+
+    let mut runs = HashMap::<String, (i64, CoverageFormat, Option<i64>)>::new();
+    for run in &evidence.runs {
+        check_cancelled(cancelled)?;
+        let (report_id, role, report_digest) = artifacts
+            .get(&run.report_key)
+            .copied()
+            .ok_or_else(|| "coverage run references an unknown report artifact".to_owned())?;
+        if role != ArtifactRole::CoverageReport {
+            return Err("coverage report artifact role is invalid".into());
+        }
+        validate_coverage_label(&run.run_label)?;
+        if let Some(test_name) = &run.test_name {
+            validate_coverage_label(test_name)?;
+        }
+        let (test_id, mapping) = run
+            .test_name
+            .as_deref()
+            .map(|name| coverage_test_mapping(tx, name))
+            .transpose()?
+            .unwrap_or((None, None));
+        tx.execute(
+            "INSERT INTO coverage_runs(
+                key, report_artifact_id, report_digest, format, run_label, test_name, test_id
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                run.key,
+                report_id,
+                report_digest.as_slice(),
+                run.format.db(),
+                run.run_label,
+                run.test_name,
+                test_id,
+            ],
+        )
+        .map_err(db_error)?;
+        let run_id = tx.last_insert_rowid();
+        if runs
+            .insert(run.key.clone(), (run_id, run.format, test_id))
+            .is_some()
+        {
+            return Err("duplicate coverage run key".into());
+        }
+        if let Some(reason) = mapping {
+            insert_coverage_gap(
+                tx,
+                run_id,
+                None,
+                None,
+                None,
+                reason,
+                run.test_name.as_deref(),
+                1,
+            )?;
+        }
+    }
+    for region in &evidence.regions {
+        check_cancelled(cancelled)?;
+        validate_coverage_range(
+            region.start_line,
+            region.start_column,
+            region.end_line,
+            region.end_column,
+        )?;
+        let (run_id, format, run_test_id) = runs
+            .get(&region.run_key)
+            .copied()
+            .ok_or_else(|| "coverage region run is unknown".to_owned())?;
+        let file_id = evidence_file_id(tx, region.path.as_deref())?;
+        if let Some(context) = &region.context {
+            validate_coverage_label(context)?;
+        }
+        let (context_test_id, mapping) = region
+            .context
+            .as_deref()
+            .map(|name| coverage_test_mapping(tx, name))
+            .transpose()?
+            .unwrap_or((None, None));
+        let test_id = if region.context.is_some() {
+            context_test_id
+        } else if format == CoverageFormat::Llvm {
+            run_test_id
+        } else {
+            None
+        };
+        if let Some(reason) = mapping {
+            insert_coverage_gap(
+                tx,
+                run_id,
+                region.path.as_deref(),
+                Some(region.start_line),
+                Some(region.end_line),
+                reason,
+                region.context.as_deref(),
+                1,
+            )?;
+        }
+        record_coverage_mapping_gap(
+            tx,
+            run_id,
+            file_id,
+            region.path.as_deref(),
+            region.start_line,
+            region.end_line,
+        )?;
+        tx.execute(
+            "INSERT INTO coverage_regions(
+                run_id, file_id, path, test_id, start_line, start_column, end_line, end_column,
+                execution_count, context
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                run_id,
+                file_id,
+                region.path,
+                test_id,
+                region.start_line,
+                region.start_column,
+                region.end_line,
+                region.end_column,
+                i64::try_from(region.execution_count)
+                    .map_err(|_| "coverage count exceeds SQLite range".to_owned())?,
+                region.context
+            ],
+        )
+        .map_err(db_error)?;
+    }
+    for branch in &evidence.branches {
+        check_cancelled(cancelled)?;
+        let (mapping_start, mapping_end) = validate_coverage_branch(
+            branch.start_line,
+            branch.start_column,
+            branch.end_line,
+            branch.end_column,
+            branch.target_line,
+            branch.kind,
+        )?;
+        if branch.kind == CoverageBranchKind::Arc && branch.target_line.is_none()
+            || branch.kind != CoverageBranchKind::Arc && branch.target_line.is_some()
+        {
+            return Err("coverage branch target is invalid".into());
+        }
+        let (run_id, format, run_test_id) = runs
+            .get(&branch.run_key)
+            .copied()
+            .ok_or_else(|| "coverage branch run is unknown".to_owned())?;
+        let file_id = evidence_file_id(tx, branch.path.as_deref())?;
+        let test_id = (format == CoverageFormat::Llvm)
+            .then_some(run_test_id)
+            .flatten();
+        record_coverage_mapping_gap(
+            tx,
+            run_id,
+            file_id,
+            branch.path.as_deref(),
+            mapping_start,
+            mapping_end,
+        )?;
+        tx.execute(
+            "INSERT INTO coverage_branches(
+                run_id, file_id, path, test_id, start_line, start_column, end_line, end_column,
+                target_line, kind, execution_count
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                run_id,
+                file_id,
+                branch.path,
+                test_id,
+                branch.start_line,
+                branch.start_column,
+                branch.end_line,
+                branch.end_column,
+                branch.target_line,
+                branch.kind.db(),
+                i64::try_from(branch.execution_count)
+                    .map_err(|_| "coverage count exceeds SQLite range".to_owned())?
+            ],
+        )
+        .map_err(db_error)?;
+    }
+    for gap in &evidence.gaps {
+        check_cancelled(cancelled)?;
+        if gap.file_key.is_some() || gap.source_key.is_some() {
+            return Err("evidence gap ownership is invalid".into());
+        }
+        if gap.category != GapCategory::Coverage {
+            return Err("evidence gap category is invalid".into());
+        }
+        let run_id = gap
+            .run_key
+            .as_deref()
+            .map(|key| {
+                runs.get(key)
+                    .map(|(id, _, _)| *id)
+                    .ok_or_else(|| "evidence gap run is unknown".to_owned())
+            })
+            .transpose()?;
+        if run_id.is_some() != (gap.category == GapCategory::Coverage) {
+            return Err("evidence gap ownership is invalid".into());
+        }
+        if gap.category == GapCategory::Coverage
+            && !matches!(
+                gap.reason,
+                GapReason::CoverageUnmappedFile
+                    | GapReason::CoverageUnmappedRegion
+                    | GapReason::MissingTestContext
+                    | GapReason::AmbiguousTestContext
+            )
+        {
+            return Err("coverage gap reason is invalid".into());
+        }
+        tx.execute(
+            "INSERT INTO graph_gaps(
+                file_id, source_id, run_id, path, line_start, line_end, category, reason,
+                target_hint, occurrences, relation_site
+             ) VALUES(NULL, NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT DO UPDATE
+                 SET occurrences=graph_gaps.occurrences+excluded.occurrences",
+            params![
+                run_id,
+                gap.path,
+                gap.line_start,
+                gap.line_end,
+                gap.category.db(),
+                gap.reason.db(),
+                gap.target_hint,
+                gap.occurrences,
+                gap.relation_site
+            ],
+        )
+        .map_err(db_error)?;
+    }
+    Ok(EvidenceStats {
+        generated_files,
+        artifacts: evidence.artifacts.len(),
+        provenance_links: inserted_links,
+        runs: evidence.runs.len(),
+        regions: evidence.regions.len(),
+        branches: evidence.branches.len(),
+        gaps: evidence.gaps.len(),
+    })
+}
+
+fn validate_evidence_span(span: EvidenceLineSpan) -> Result<()> {
+    if span.start == 0 || span.end < span.start {
+        Err("evidence line span is invalid".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn evidence_file_id(tx: &Transaction<'_>, path: Option<&str>) -> Result<Option<i64>> {
+    path.map(|path| {
+        tx.query_row("SELECT id FROM files WHERE path=?1", [path], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(db_error)
+    })
+    .transpose()
+    .map(Option::flatten)
+}
+
+fn coverage_test_mapping(
+    tx: &Transaction<'_>,
+    name: &str,
+) -> Result<(Option<i64>, Option<GapReason>)> {
+    let candidates = tx
+        .prepare(
+            "SELECT id FROM nodes
+              WHERE kind='test' AND (name=?1 OR qualified_name=?1)
+              ORDER BY id LIMIT 2",
+        )
+        .map_err(db_error)?
+        .query_map([name], |row| row.get::<_, i64>(0))
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?;
+    Ok(match candidates.as_slice() {
+        [id] => (Some(*id), None),
+        [] => (None, Some(GapReason::MissingTestContext)),
+        _ => (None, Some(GapReason::AmbiguousTestContext)),
+    })
+}
+
+fn validate_coverage_range(
+    start_line: u32,
+    start_column: u32,
+    end_line: u32,
+    end_column: u32,
+) -> Result<()> {
+    if start_line == 0 || end_line == 0 || (end_line, end_column) < (start_line, start_column) {
+        Err("coverage range is invalid".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_coverage_branch(
+    start_line: i64,
+    start_column: u32,
+    end_line: i64,
+    end_column: u32,
+    target_line: Option<i64>,
+    kind: CoverageBranchKind,
+) -> Result<(u32, u32)> {
+    if kind != CoverageBranchKind::Arc {
+        if target_line.is_some() {
+            return Err("coverage branch target is invalid".into());
+        }
+        let start =
+            u32::try_from(start_line).map_err(|_| "coverage branch range is invalid".to_owned())?;
+        let end =
+            u32::try_from(end_line).map_err(|_| "coverage branch range is invalid".to_owned())?;
+        validate_coverage_range(start, start_column, end, end_column)?;
+        return Ok((start, end));
+    }
+    let target = target_line.ok_or_else(|| "coverage branch target is invalid".to_owned())?;
+    if start_line == 0
+        || target == 0
+        || end_line != start_line
+        || start_column != 0
+        || end_column != 0
+    {
+        return Err("coverage branch range is invalid".into());
+    }
+    let mut lines = [start_line, target]
+        .into_iter()
+        .filter(|line| *line > 0)
+        .map(|line| {
+            u32::try_from(line).map_err(|_| "coverage branch line exceeds range".to_owned())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    lines.sort_unstable();
+    match lines.as_slice() {
+        [] => Err("coverage branch range is invalid".into()),
+        [line] => Ok((*line, *line)),
+        [start, end] => Ok((*start, *end)),
+        _ => unreachable!("an arc has exactly two endpoints"),
+    }
+}
+
+fn validate_coverage_label(value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 200 || value.chars().any(char::is_control) {
+        Err("coverage label is invalid".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn record_coverage_mapping_gap(
+    tx: &Transaction<'_>,
+    run_id: i64,
+    file_id: Option<i64>,
+    path: Option<&str>,
+    start_line: u32,
+    end_line: u32,
+) -> Result<()> {
+    let Some(file_id) = file_id else {
+        if path.is_some() {
+            insert_coverage_gap(
+                tx,
+                run_id,
+                path,
+                Some(start_line),
+                Some(end_line),
+                GapReason::CoverageUnmappedFile,
+                None,
+                1,
+            )?;
+        }
+        return Ok(());
+    };
+    let mapped: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM nodes
+                  WHERE file_id=?1 AND kind!='file'
+                    AND line_start<=?2 AND line_end>=?3
+             )",
+            params![file_id, end_line, start_line],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !mapped {
+        insert_coverage_gap(
+            tx,
+            run_id,
+            path,
+            Some(start_line),
+            Some(end_line),
+            GapReason::CoverageUnmappedRegion,
+            None,
+            1,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_coverage_gap(
+    tx: &Transaction<'_>,
+    run_id: i64,
+    path: Option<&str>,
+    line_start: Option<u32>,
+    line_end: Option<u32>,
+    reason: GapReason,
+    target_hint: Option<&str>,
+    occurrences: u32,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO graph_gaps(
+            file_id, source_id, run_id, path, line_start, line_end, category, reason,
+            target_hint, occurrences, relation_site
+         ) VALUES(NULL, NULL, ?1, ?2, ?3, ?4, 'coverage', ?5, ?6, ?7, 0)
+         ON CONFLICT DO UPDATE
+             SET occurrences=graph_gaps.occurrences+excluded.occurrences",
+        params![
+            run_id,
+            path,
+            line_start,
+            line_end,
+            reason.db(),
+            target_hint,
+            occurrences,
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
 }
 
 fn refresh_script_export_methods(tx: &Transaction<'_>, cancelled: &AtomicBool) -> Result<()> {
@@ -2379,7 +5564,7 @@ fn refresh_script_export_methods(tx: &Transaction<'_>, cancelled: &AtomicBool) -
         .map_err(db_error)?;
     let mut alias_candidates = tx
         .prepare(
-            "SELECT count(*), count(resolved_target_id),
+            "SELECT count(*), coalesce(sum(resolution_state='ambiguous'),0),
                     count(DISTINCT resolved_target_id), min(resolved_target_id)
                FROM refs WHERE alias_key=?1",
         )
@@ -2507,7 +5692,7 @@ fn resolve_references(
     references.sort_unstable();
     let mut load_ref = tx
         .prepare(
-            "SELECT r.kind, n.kind, r.alias_key, r.resolved_target_id
+            "SELECT r.kind, n.kind, r.alias_key, r.resolved_target_id, r.resolution_state
                FROM refs r JOIN nodes n ON n.id=r.source_id
               WHERE r.id=?1",
         )
@@ -2520,13 +5705,13 @@ fn resolve_references(
         .map_err(db_error)?;
     let mut alias_candidates = tx
         .prepare(
-            "SELECT count(*), count(resolved_target_id),
+            "SELECT count(*), coalesce(sum(resolution_state='ambiguous'),0),
                     count(DISTINCT resolved_target_id), min(resolved_target_id)
                FROM refs WHERE alias_key=?1",
         )
         .map_err(db_error)?;
     let mut update_ref = tx
-        .prepare("UPDATE refs SET resolved_target_id=?1 WHERE id=?2")
+        .prepare("UPDATE refs SET resolved_target_id=?1, resolution_state=?2 WHERE id=?3")
         .map_err(db_error)?;
     let mut decrement = tx
         .prepare(
@@ -2553,13 +5738,14 @@ fn resolve_references(
 
     for (_, reference_id) in references {
         check_cancelled(cancelled)?;
-        let Some((ref_kind, source_kind, alias_key, old_target)) = load_ref
+        let Some((ref_kind, source_kind, alias_key, old_target, old_state)) = load_ref
             .query_row([reference_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })
             .optional()
@@ -2567,7 +5753,7 @@ fn resolve_references(
         else {
             continue;
         };
-        let mut new_target = None;
+        let mut outcome = DbCandidate::Missing;
         for row in load_keys
             .query_map([reference_id], |row| row.get::<_, String>(0))
             .map_err(db_error)?
@@ -2581,14 +5767,22 @@ fn resolve_references(
             };
             match merge_candidates(direct, alias) {
                 DbCandidate::Unique(target) => {
-                    new_target = Some(target);
+                    outcome = DbCandidate::Unique(target);
                     break;
                 }
-                DbCandidate::Ambiguous => break,
+                DbCandidate::Ambiguous => {
+                    outcome = DbCandidate::Ambiguous;
+                    break;
+                }
                 DbCandidate::Missing => {}
             }
         }
-        if old_target == new_target {
+        let (new_target, new_state) = match outcome {
+            DbCandidate::Unique(target) => (Some(target), ResolutionState::Resolved),
+            DbCandidate::Missing => (None, ResolutionState::Missing),
+            DbCandidate::Ambiguous => (None, ResolutionState::Ambiguous),
+        };
+        if old_target == new_target && old_state == new_state.db() {
             continue;
         }
         let edge_kind = match (ref_kind.as_str(), source_kind.as_str()) {
@@ -2608,7 +5802,7 @@ fn resolve_references(
                 .map_err(db_error)?;
         }
         update_ref
-            .execute(params![new_target, reference_id])
+            .execute(params![new_target, new_state.db(), reference_id])
             .map_err(db_error)?;
         if let Some(target) = new_target {
             increment
@@ -2644,7 +5838,7 @@ fn resolve_trait_implementations(
         .map_err(db_error)?;
     let mut alias_candidates = tx
         .prepare(
-            "SELECT count(*), count(r.resolved_target_id),
+            "SELECT count(*), coalesce(sum(r.resolution_state='ambiguous'),0),
                     count(DISTINCT CASE WHEN n.kind='type' THEN r.resolved_target_id END),
                     min(CASE WHEN n.kind='type' THEN r.resolved_target_id END)
                FROM refs r LEFT JOIN nodes n ON n.id=r.resolved_target_id
@@ -2781,7 +5975,7 @@ fn valid_oid(oid: &str) -> bool {
 }
 
 fn alias_candidate(statement: &mut rusqlite::Statement<'_>, key: &str) -> Result<DbCandidate> {
-    let (total, resolved, distinct, target) = statement
+    let (_total, ambiguous, distinct, target) = statement
         .query_row([key], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -2791,9 +5985,7 @@ fn alias_candidate(statement: &mut rusqlite::Statement<'_>, key: &str) -> Result
             ))
         })
         .map_err(db_error)?;
-    Ok(if total == 0 {
-        DbCandidate::Missing
-    } else if resolved != total {
+    Ok(if ambiguous != 0 {
         DbCandidate::Ambiguous
     } else if distinct == 0 {
         DbCandidate::Missing
@@ -2820,8 +6012,9 @@ fn insert_graph(
         let mut insert = tx
             .prepare(
                 "INSERT INTO files(
-                    path, language, git_oid, content_hash, parse_context, byte_size
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    path, language, git_oid, content_hash, parse_context, byte_size,
+                    observed_relation_sites
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .map_err(db_error)?;
         for file in graph.files.iter().filter(|file| !delta || file.replace) {
@@ -2835,7 +6028,8 @@ fn insert_graph(
                     file.git_oid,
                     file.content_hash.as_slice(),
                     file.parse_context,
-                    byte_size
+                    byte_size,
+                    file.observed_relation_sites
                 ])
                 .map_err(db_error)?;
             files.insert(
@@ -2951,9 +6145,13 @@ fn insert_graph(
     {
         let mut insert_ref = tx
             .prepare(
-                "INSERT INTO refs(source_id, kind, line, alias_key, resolved_target_id)
-                 VALUES(?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO refs(
+                    source_id, kind, line, alias_key, resolved_target_id, resolution_state
+                 ) VALUES(?1, ?2, ?3, ?4, NULL, 'pending')",
             )
+            .map_err(db_error)?;
+        let mut finish_ref = tx
+            .prepare("UPDATE refs SET resolved_target_id=?1, resolution_state=?2 WHERE id=?3")
             .map_err(db_error)?;
         let mut insert_ref_key = tx
             .prepare("INSERT INTO ref_keys(ref_id, rank, key) VALUES(?1, ?2, ?3)")
@@ -2971,13 +6169,24 @@ fn insert_graph(
                     source_id,
                     reference.kind.db(),
                     reference.line,
-                    reference.alias_key,
-                    target_id
+                    reference.alias_key
                 ])
                 .map_err(db_error)?;
             let reference_id = tx.last_insert_rowid();
             if delta {
+                if reference.resolution != ResolutionState::Pending || target_id.is_some() {
+                    return Err("incremental graph contains resolved references".into());
+                }
                 reference_ids.push(reference_id);
+            } else {
+                if (reference.resolution == ResolutionState::Resolved) != target_id.is_some()
+                    || reference.resolution == ResolutionState::Pending
+                {
+                    return Err("full graph reference resolution is invalid".into());
+                }
+                finish_ref
+                    .execute(params![target_id, reference.resolution.db(), reference_id])
+                    .map_err(db_error)?;
             }
             for (rank, key) in reference.keys.iter().enumerate() {
                 let rank = i64::try_from(rank)
@@ -2986,6 +6195,97 @@ fn insert_graph(
                     .execute(params![reference_id, rank, key])
                     .map_err(db_error)?;
             }
+        }
+    }
+
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO modeled_sites(
+                    file_id, source_id, kind, line_start, line_end, target_hint, parse_context
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .map_err(db_error)?;
+        for site in &graph.modeled_sites {
+            check_cancelled(cancelled)?;
+            let (file_id, _) = files
+                .get(site.file_key.as_str())
+                .ok_or_else(|| "modeled site references an unknown file".to_owned())?;
+            let source_id = site
+                .source_key
+                .as_ref()
+                .map(|key| lookup(&nodes, key, "modeled site source"))
+                .transpose()?;
+            insert
+                .execute(params![
+                    file_id,
+                    source_id,
+                    site.kind.db(),
+                    site.line_start,
+                    site.line_end,
+                    site.target_hint,
+                    site.parse_context
+                ])
+                .map_err(db_error)?;
+        }
+    }
+
+    {
+        let mut run = tx
+            .prepare("SELECT id FROM coverage_runs WHERE key=?1")
+            .map_err(db_error)?;
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO graph_gaps(
+                    file_id, source_id, run_id, path, line_start, line_end, category, reason,
+                    target_hint, occurrences, relation_site
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT DO UPDATE
+                     SET occurrences=graph_gaps.occurrences+excluded.occurrences",
+            )
+            .map_err(db_error)?;
+        for gap in &graph.gaps {
+            check_cancelled(cancelled)?;
+            let file_id = gap
+                .file_key
+                .as_ref()
+                .map(|key| {
+                    files
+                        .get(key.as_str())
+                        .map(|(id, _)| *id)
+                        .ok_or_else(|| "gap references an unknown file".to_owned())
+                })
+                .transpose()?;
+            let source_id = gap
+                .source_key
+                .as_ref()
+                .map(|key| lookup(&nodes, key, "gap source"))
+                .transpose()?;
+            let run_id = gap
+                .run_key
+                .as_ref()
+                .map(|key| {
+                    run.query_row([key], |row| row.get::<_, i64>(0))
+                        .optional()
+                        .map_err(db_error)?
+                        .ok_or_else(|| "gap references an unknown coverage run".to_owned())
+                })
+                .transpose()?;
+            insert
+                .execute(params![
+                    file_id,
+                    source_id,
+                    run_id,
+                    gap.path,
+                    gap.line_start,
+                    gap.line_end,
+                    gap.category.db(),
+                    gap.reason.db(),
+                    gap.target_hint,
+                    gap.occurrences,
+                    gap.relation_site
+                ])
+                .map_err(db_error)?;
         }
     }
 
@@ -3026,7 +6326,8 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             git_oid TEXT,
             content_hash BLOB NOT NULL CHECK(length(content_hash)=32),
             parse_context TEXT NOT NULL,
-            byte_size INTEGER NOT NULL CHECK(byte_size>=0)
+            byte_size INTEGER NOT NULL CHECK(byte_size>=0),
+            observed_relation_sites INTEGER NOT NULL CHECK(observed_relation_sites>=0)
          );
          CREATE TABLE nodes(
             id INTEGER PRIMARY KEY,
@@ -3056,7 +6357,10 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             kind TEXT NOT NULL CHECK(kind IN ('CALLS','IMPORTS')),
             line INTEGER NOT NULL CHECK(line>0),
             alias_key TEXT CHECK(alias_key IS NULL OR length(alias_key)>0),
-            resolved_target_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL
+            resolved_target_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
+            resolution_state TEXT NOT NULL
+                CHECK(resolution_state IN ('pending','resolved','missing','ambiguous')),
+            CHECK((resolution_state='resolved') = (resolved_target_id IS NOT NULL))
          );
          CREATE INDEX refs_source_target
              ON refs(source_id, kind, resolved_target_id);
@@ -3102,9 +6406,153 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          ) WITHOUT ROWID;
          CREATE INDEX edges_source ON edges(source_id, kind, target_id);
          CREATE INDEX edges_target ON edges(target_id, kind, source_id);
+         CREATE TABLE modeled_sites(
+            id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            source_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL
+                CHECK(kind IN ('generated-inclusion','test-registration','static-export')),
+            line_start INTEGER NOT NULL CHECK(line_start>0),
+            line_end INTEGER NOT NULL CHECK(line_end>=line_start),
+            target_hint TEXT,
+            parse_context TEXT
+         );
+         CREATE INDEX modeled_sites_file_lines
+             ON modeled_sites(file_id, line_start, line_end, kind, id);
+         CREATE TABLE imported_artifacts(
+            id INTEGER PRIMARY KEY,
+            key TEXT NOT NULL UNIQUE CHECK(length(key)>0),
+            role TEXT NOT NULL CHECK(role IN (
+                'manifest','input','generated-rust','coverage-report'
+            )),
+            path TEXT NOT NULL CHECK(length(path)>0),
+            content_hash BLOB NOT NULL CHECK(length(content_hash)=32),
+            byte_size INTEGER NOT NULL CHECK(byte_size>=0),
+            UNIQUE(role, path)
+         );
+         CREATE TABLE provenance_links(
+            id INTEGER PRIMARY KEY,
+            input_artifact_id INTEGER NOT NULL
+                REFERENCES imported_artifacts(id) ON DELETE CASCADE,
+            input_line_start INTEGER NOT NULL CHECK(input_line_start>0),
+            input_line_end INTEGER NOT NULL CHECK(input_line_end>=input_line_start),
+            generator_path TEXT NOT NULL CHECK(length(generator_path)>0),
+            generator_file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+            generator_node_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+            generator_line_start INTEGER NOT NULL CHECK(generator_line_start>0),
+            generator_line_end INTEGER NOT NULL CHECK(generator_line_end>=generator_line_start),
+            output_artifact_id INTEGER NOT NULL
+                REFERENCES imported_artifacts(id) ON DELETE CASCADE,
+            output_line_start INTEGER NOT NULL CHECK(output_line_start>0),
+            output_line_end INTEGER NOT NULL CHECK(output_line_end>=output_line_start),
+            modeled_site_id INTEGER REFERENCES modeled_sites(id) ON DELETE CASCADE,
+            mapping_state TEXT NOT NULL
+                CHECK(mapping_state IN ('linked','unobserved','ambiguous')),
+            CHECK((generator_file_id IS NULL)=(generator_node_id IS NULL)),
+            CHECK((mapping_state='linked')=(
+                generator_node_id IS NOT NULL AND modeled_site_id IS NOT NULL
+            )),
+            UNIQUE(
+                input_artifact_id, input_line_start, input_line_end,
+                generator_path, generator_line_start, generator_line_end,
+                output_artifact_id, output_line_start, output_line_end
+            )
+         );
+         CREATE INDEX provenance_links_input ON provenance_links(input_artifact_id, id);
+         CREATE INDEX provenance_links_output ON provenance_links(output_artifact_id, id);
+         CREATE INDEX provenance_links_generator ON provenance_links(generator_node_id, id);
+         CREATE TABLE coverage_runs(
+            id INTEGER PRIMARY KEY,
+            key TEXT NOT NULL UNIQUE CHECK(length(key)>0),
+            report_artifact_id INTEGER NOT NULL
+                REFERENCES imported_artifacts(id) ON DELETE CASCADE,
+            report_digest BLOB NOT NULL CHECK(length(report_digest)=32),
+            format TEXT NOT NULL CHECK(format IN ('llvm','coverage_py')),
+            run_label TEXT NOT NULL CHECK(length(run_label) BETWEEN 1 AND 200),
+            test_name TEXT CHECK(test_name IS NULL OR length(test_name) BETWEEN 1 AND 200),
+            test_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE
+         );
+         CREATE UNIQUE INDEX coverage_runs_identity
+             ON coverage_runs(format, run_label, report_digest);
+         CREATE TABLE coverage_regions(
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES coverage_runs(id) ON DELETE CASCADE,
+            file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+            path TEXT CHECK(path IS NULL OR length(path)>0),
+            test_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+            start_line INTEGER NOT NULL CHECK(start_line>0),
+            start_column INTEGER NOT NULL CHECK(start_column>=0),
+            end_line INTEGER NOT NULL CHECK(end_line>=start_line),
+            end_column INTEGER NOT NULL CHECK(end_column>=0),
+            execution_count INTEGER NOT NULL CHECK(execution_count>=0),
+            context TEXT CHECK(context IS NULL OR length(context) BETWEEN 1 AND 200),
+            CHECK(end_line>start_line OR end_column>=start_column)
+         );
+         CREATE UNIQUE INDEX coverage_regions_identity ON coverage_regions(
+            run_id, ifnull(path,''), start_line, start_column, end_line, end_column,
+            ifnull(context,'')
+         );
+         CREATE INDEX coverage_regions_run_file
+             ON coverage_regions(run_id, file_id, start_line, end_line, id);
+         CREATE TABLE coverage_branches(
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES coverage_runs(id) ON DELETE CASCADE,
+            file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+            path TEXT CHECK(path IS NULL OR length(path)>0),
+            test_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+            start_line INTEGER NOT NULL CHECK(start_line!=0),
+            start_column INTEGER NOT NULL CHECK(start_column>=0),
+            end_line INTEGER NOT NULL CHECK(end_line>=start_line),
+            end_column INTEGER NOT NULL CHECK(end_column>=0),
+            target_line INTEGER CHECK(target_line IS NULL OR target_line!=0),
+            kind TEXT NOT NULL CHECK(kind IN ('true-outcome','false-outcome','arc')),
+            execution_count INTEGER NOT NULL CHECK(execution_count>=0),
+            CHECK(end_line>start_line OR end_column>=start_column),
+            CHECK((kind='arc') = (target_line IS NOT NULL)),
+            CHECK(kind='arc' OR start_line>0)
+         );
+         CREATE UNIQUE INDEX coverage_branches_identity ON coverage_branches(
+            run_id, ifnull(path,''), start_line, start_column, end_line, end_column,
+            ifnull(target_line,-1), kind
+         );
+         CREATE INDEX coverage_branches_run_file
+             ON coverage_branches(run_id, file_id, start_line, target_line, kind, id);
+         CREATE TABLE graph_gaps(
+            id INTEGER PRIMARY KEY,
+            file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+            source_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+            run_id INTEGER REFERENCES coverage_runs(id) ON DELETE CASCADE,
+            path TEXT,
+            line_start INTEGER CHECK(line_start IS NULL OR line_start>0),
+            line_end INTEGER CHECK(line_end IS NULL OR line_end>=line_start),
+            category TEXT NOT NULL CHECK(category IN (
+                'source','parse','relation','macro','generated','coverage','language','boundary'
+            )),
+            reason TEXT NOT NULL CHECK(reason IN (
+                'unsafe-path','non-regular','unmerged','oversized','invalid-utf8',
+                'missing-during-read','parser-error','parser-no-tree',
+                'dynamic-or-unsupported-dispatch','macro-expansion-unavailable',
+                'generated-output-unobserved','generated-output-ambiguous',
+                'external-dependency','dependency-collapsed','language-not-indexed',
+                'coverage-unmapped-file','coverage-unmapped-region','missing-test-context',
+                'ambiguous-test-context'
+            )),
+            target_hint TEXT,
+            occurrences INTEGER NOT NULL CHECK(occurrences>0),
+            relation_site INTEGER NOT NULL CHECK(relation_site IN (0,1)),
+            CHECK(line_end IS NULL OR line_start IS NOT NULL)
+         );
+         CREATE UNIQUE INDEX graph_gaps_identity ON graph_gaps(
+            ifnull(file_id,-1), ifnull(source_id,-1), ifnull(run_id,-1), ifnull(path,''),
+            ifnull(line_start,-1), ifnull(line_end,-1), category, reason,
+            ifnull(target_hint,''), relation_site
+         );
+         CREATE INDEX graph_gaps_order ON graph_gaps(
+            path, line_start, line_end, category, reason, target_hint, id
+         );
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=4;",
+         PRAGMA user_version=8;",
     )
     .map_err(db_error)
 }
@@ -3514,6 +6962,303 @@ mod tests {
 
     const SNAPSHOT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    fn canonical_temp_dir() -> PathBuf {
+        fs::canonicalize(std::env::temp_dir()).expect("temporary directory must resolve")
+    }
+
+    #[test]
+    fn resolution_state_resolved_missing_and_ambiguous_own_exact_edges() {
+        for (targets, state, edges) in [
+            (1, "resolved", 1_i64),
+            (0, "missing", 0),
+            (2, "ambiguous", 0),
+        ] {
+            let mut store = Store {
+                connection: Connection::open_in_memory().unwrap(),
+            };
+            store
+                .index_with(&AtomicBool::new(false), |_full, _existing| {
+                    Ok((resolution_graph(targets), ()))
+                })
+                .unwrap();
+
+            let (actual_state, target): (String, Option<i64>) = store
+                .connection
+                .query_row(
+                    "SELECT resolution_state, resolved_target_id FROM refs",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(actual_state, state);
+            assert_eq!(target.is_some(), state == "resolved");
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("SELECT count(*) FROM edges", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                edges
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_resolution_state_changes_with_candidates() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((resolution_graph(0), ())))
+            .unwrap();
+        assert_ref_state(&store, "missing", 0);
+
+        for (targets, state, edges) in [
+            (1, "resolved", 1_i64),
+            (2, "ambiguous", 0),
+            (1, "resolved", 1),
+        ] {
+            let graph = incremental_resolution_graph(targets);
+            store
+                .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+                .unwrap();
+            assert_ref_state(&store, state, edges);
+        }
+    }
+
+    #[test]
+    fn incremental_global_gaps_replace_the_complete_inventory() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((global_gap_graph(GapReason::UnsafePath, 2), ()))
+            })
+            .unwrap();
+
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((global_gap_graph(GapReason::Oversized, 1), ()))
+            })
+            .unwrap();
+        assert_eq!(stored_global_gaps(&store), [("oversized".into(), 1)]);
+
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((Graph::default(), ())))
+            .unwrap();
+        assert!(stored_global_gaps(&store).is_empty());
+    }
+
+    #[test]
+    fn resolution_state_constraints_and_seal_reject_invalid_rows() {
+        let root = canonical_temp_dir().join(format!(
+            "graphr-resolution-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((resolution_graph(1), ())))
+            .unwrap();
+
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE refs SET resolution_state='resolved', resolved_target_id=NULL",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE refs SET resolution_state='missing' WHERE resolved_target_id IS NOT NULL",
+                    [],
+                )
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE refs SET resolution_state='pending', resolved_target_id=NULL",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.seal(&cancelled).unwrap_err(),
+            "database contains pending references"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seal_recomputes_reference_candidate_resolution() {
+        let error = sealed_resolution_corruption("candidate", |connection| {
+            connection
+                .execute(
+                    "UPDATE refs SET resolved_target_id=NULL, resolution_state='missing'",
+                    [],
+                )
+                .unwrap();
+        });
+
+        assert_eq!(
+            error,
+            "database reference resolution does not match candidates"
+        );
+    }
+
+    #[test]
+    fn seal_verifies_resolved_reference_edge_ownership_and_support() {
+        for (label, sql) in [
+            ("missing-edge", "DELETE FROM edges"),
+            ("wrong-support", "UPDATE edges SET support_count=2"),
+            ("wrong-owner", "UPDATE edges SET kind='IMPORTS'"),
+        ] {
+            let error = sealed_resolution_corruption(label, |connection| {
+                connection.execute(sql, []).unwrap();
+            });
+            assert_eq!(
+                error, "database reference edges do not match resolved references",
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn seal_and_image_validation_reject_surplus_unowned_edges() {
+        let insert_surplus = "INSERT INTO edges(source_id, target_id, kind, support_count)
+                              SELECT source_id, resolved_target_id, 'IMPORTS', 1 FROM refs";
+        let seal_error = sealed_resolution_corruption("surplus-edge", |connection| {
+            connection.execute(insert_surplus, []).unwrap();
+        });
+        assert_eq!(
+            seal_error,
+            "database reference edges do not match resolved references"
+        );
+
+        let image_error = sealed_image_corruption("surplus-edge", |connection| {
+            connection.execute(insert_surplus, []).unwrap();
+        });
+        assert_eq!(
+            image_error,
+            "database reference edges do not match resolved references"
+        );
+    }
+
+    #[test]
+    fn reference_candidate_validation_observes_midpass_cancellation() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&AtomicBool::new(false), |_full, _existing| {
+                Ok((resolution_graph(1), ()))
+            })
+            .unwrap();
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = cancelled.clone();
+        set_after_reference_candidate_pass_hook(move || cancel.store(true, Ordering::Relaxed));
+
+        assert_eq!(
+            require_graph_invariants(&store.connection, &cancelled).unwrap_err(),
+            "index cancelled"
+        );
+    }
+
+    #[test]
+    fn relation_site_accounting_mismatch_rolls_back_publication() {
+        let mut graph = single_node_graph("unaccounted");
+        graph.files[0].observed_relation_sites = 1;
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+
+        assert_eq!(
+            store
+                .index_with(&AtomicBool::new(false), |_full, _existing| Ok((graph, ())))
+                .unwrap_err(),
+            "observed relation-site accounting mismatch for src/lib.rs"
+        );
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn gap_ownership_folds_identical_rows_and_cascades_on_replacement() {
+        let cancelled = AtomicBool::new(false);
+        let mut graph = single_node_graph("owned");
+        graph.modeled_sites.push(ModeledSiteInput {
+            file_key: "src/lib.rs".into(),
+            source_key: Some("owned".into()),
+            kind: ModeledSiteKind::StaticExport,
+            line_start: 1,
+            line_end: 1,
+            target_hint: Some("owned".into()),
+            parse_context: None,
+        });
+        graph.gaps.extend([2, 3].map(|occurrences| GapInput {
+            file_key: Some("src/lib.rs".into()),
+            source_key: Some("owned".into()),
+            run_key: None,
+            path: Some("src/lib.rs".into()),
+            line_start: Some(1),
+            line_end: Some(1),
+            category: GapCategory::Parse,
+            reason: GapReason::ParserError,
+            target_hint: None,
+            occurrences,
+            relation_site: false,
+        }));
+        graph.files[0].observed_relation_sites = 1;
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT occurrences FROM graph_gaps", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            5
+        );
+
+        let graph = single_node_graph("replacement");
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        for table in ["modeled_sites", "graph_gaps"] {
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
     #[test]
     fn sealed_image_is_single_file_and_read_only() {
         let root = fs::canonicalize(std::env::temp_dir())
@@ -3733,7 +7478,7 @@ mod tests {
 
     #[test]
     fn schema_mismatch_does_not_change_journal_mode() {
-        let path = std::env::temp_dir().join(format!(
+        let path = canonical_temp_dir().join(format!(
             "graphr-store-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
@@ -3762,7 +7507,7 @@ mod tests {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
         };
-        let graph = Graph {
+        let mut graph = Graph {
             files: vec![FileInput {
                 path: "src/lib.rs".into(),
                 language: Language::Rust,
@@ -3771,6 +7516,7 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 1,
                 replace: true,
+                observed_relation_sites: 0,
             }],
             nodes: vec![
                 NodeInput {
@@ -3808,6 +7554,7 @@ mod tests {
             }],
             ..Graph::default()
         };
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         let (state, _, ()) = store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -3841,6 +7588,7 @@ mod tests {
                 support_count: 1,
             });
         }
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         let (state, _, ()) = store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -3880,11 +7628,12 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
         assert!(output.contains(" n6 "), "{output}");
         assert!(!output.contains(" n7 "), "{output}");
         assert!(output.contains("neighborhood_omitted=false"), "{output}");
-        assert!(output.contains("coverage status=complete"), "{output}");
+        assert!(output.contains("static_model=complete"), "{output}");
         assert!(!output.contains(TRUNCATED.trim()), "{output}");
 
         assert!(
@@ -3924,7 +7673,7 @@ mod tests {
             NodeKind::Function,
             NodeKind::Type,
         ];
-        let graph = Graph {
+        let mut graph = Graph {
             files: vec![FileInput {
                 path: "src/lib.rs".into(),
                 language: Language::Rust,
@@ -3933,6 +7682,7 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 64,
                 replace: true,
+                observed_relation_sites: 0,
             }],
             nodes: std::iter::once(NodeInput {
                 key: "file".into(),
@@ -3989,6 +7739,7 @@ mod tests {
             ],
             ..Graph::default()
         };
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -4019,10 +7770,11 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
         assert!(
             output.contains(
-                "risk overall=0.4200 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown static_test_path_gaps=0 analysis_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
+                "risk overall=0.4200 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown static_test_path_gaps=0 traversal_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
             ),
             "{output}"
         );
@@ -4050,7 +7802,8 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
         assert!(
             depth_zero.contains("neighborhood_omitted=false"),
             "{depth_zero}"
@@ -4079,7 +7832,8 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
         assert!(output.contains(" File src/lib.rs src/lib.rs:1"), "{output}");
         assert!(
             output.contains("flow 0.1200 depth=2 nodes=3 files=1 changed=3"),
@@ -4118,7 +7872,8 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
         assert!(output.contains(" Type imported src/lib.rs:11"), "{output}");
         assert!(output.contains("flow 0.1200"), "{output}");
 
@@ -4154,7 +7909,8 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
         assert!(output.contains(" root "), "{output}");
         assert!(output.contains("test <-"), "{output}");
         assert!(output.contains("caller <-"), "{output}");
@@ -4162,9 +7918,11 @@ mod tests {
             output.contains("unmapped src/untracked-499.rs:1"),
             "{output}"
         );
+        assert!(output.contains("static_model=partial"), "{output}");
         assert!(
-            output.contains("coverage category=mapping status=incomplete items=500 remediation=call-index-then-restart-changes"),
-            "{output}"
+            output.contains(
+                "claim kind=affected-flows status=partial basis=resolved-static-call-graph"
+            )
         );
         assert!(!output.contains(TRUNCATED.trim()), "{output}");
     }
@@ -4210,6 +7968,7 @@ mod tests {
                 support_count: 1,
             });
         }
+        own_graph_edges(&mut graph);
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
         };
@@ -4228,9 +7987,6 @@ mod tests {
 
         assert!(omitted);
         assert_eq!(counts[&changed_id].0, (FLOW_QUERY_LIMIT + 1) as u32);
-        assert!(coverage_diagnostics(0, false, false, omitted, 0, 0, 1).contains(
-            "coverage category=test-mapping status=incomplete items=unknown remediation=narrow-review-base-and-restart-changes"
-        ));
     }
 
     #[test]
@@ -4299,6 +8055,7 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 7,
                 replace: true,
+                observed_relation_sites: 0,
             }],
             nodes: std::iter::once(NodeInput {
                 key: "file".into(),
@@ -4347,7 +8104,8 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
         assert!(
             output.contains("file-mapped src/lib.rs:1-4,6-7"),
             "{output}"
@@ -4380,7 +8138,8 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
         assert!(output.contains("file-mapped src/lib.rs:1\n"), "{output}");
         assert!(
             !output.contains("file-mapped src/lib.rs:1-4,6-7"),
@@ -4399,7 +8158,8 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
         assert!(output.contains("file-mapped src/lib.rs:1-7"), "{output}");
         assert!(!output.contains("file-mapped src/lib.rs:1\n"), "{output}");
     }
@@ -4409,6 +8169,11 @@ mod tests {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
         };
+        store
+            .index_with(&AtomicBool::new(false), |_full, _existing| {
+                Ok((Graph::default(), ()))
+            })
+            .unwrap();
         let output = store
             .changes(
                 SNAPSHOT,
@@ -4425,17 +8190,17 @@ mod tests {
                 DependencyMode::Boundary,
                 &AtomicBool::new(false),
             )
-            .unwrap();
+            .unwrap()
+            .graph;
         assert!(
             output.contains("flows_discovered=0 flows_total=unknown"),
             "{output}"
         );
-        assert!(output.contains("analysis_complete=false"), "{output}");
+        assert!(output.contains("traversal_complete=false"), "{output}");
         assert!(output.contains("deleted_paths_unanalyzed=1"), "{output}");
-        assert!(
-            output.contains("coverage category=deleted-paths status=incomplete items=1 remediation=review-corresponding-diff-pages"),
-            "{output}"
-        );
+        assert!(output.contains(
+            "claim kind=affected-callers status=partial basis=resolved-static-call-graph"
+        ));
     }
 
     #[test]
@@ -4453,6 +8218,7 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 9,
                 replace: true,
+                observed_relation_sites: 0,
             }],
             nodes: vec![
                 NodeInput {
@@ -4502,13 +8268,14 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
 
         assert!(output.contains(" Function first src/lib.rs:2"), "{output}");
         assert!(output.contains(" Function second src/lib.rs:6"), "{output}");
         assert!(output.contains("file-mapped src/lib.rs:1,5,9"), "{output}");
         assert!(!output.contains("file-mapped src/lib.rs:1-9"), "{output}");
-        assert!(output.contains("coverage status=complete"), "{output}");
+        assert!(output.contains("static_model=complete"), "{output}");
     }
 
     #[test]
@@ -4522,6 +8289,7 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 51,
                 replace: true,
+                observed_relation_sites: 0,
             }],
             nodes: (0_u32..50)
                 .map(|index| function_node(&format!("node_{index}"), index + 1))
@@ -4558,11 +8326,12 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
 
         assert!(
             output.contains(
-                "changed_symbols_total=51 changed_symbols_analyzed=51 changed_symbols_emitted=51 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=51 analysis_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0"
+                "changed_symbols_total=51 changed_symbols_analyzed=51 changed_symbols_emitted=51 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=51 traversal_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0"
             ),
             "{output}"
         );
@@ -4612,6 +8381,7 @@ mod tests {
                 support_count: 1,
             });
         }
+        own_graph_edges(&mut graph);
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
         };
@@ -4641,12 +8411,13 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
 
         assert!(output.contains("changed_symbols_total=43"), "{output}");
         assert!(output.contains("neighbor_7 src/lib.rs:107"), "{output}");
         assert!(output.contains("neighborhood_omitted=false"), "{output}");
-        assert!(output.contains("coverage status=complete"), "{output}");
+        assert!(output.contains("static_model=complete"), "{output}");
     }
 
     #[test]
@@ -4660,6 +8431,7 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 501,
                 replace: true,
+                observed_relation_sites: 0,
             }],
             nodes: (0_u32..=500)
                 .map(|index| {
@@ -4699,7 +8471,8 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
 
         assert!(
             output.contains(
@@ -4707,13 +8480,12 @@ mod tests {
             ),
             "{output}"
         );
-        assert!(output.contains("analysis_complete=false"), "{output}");
+        assert!(output.contains("traversal_complete=false"), "{output}");
         assert!(output.contains("analysis_roots_omitted=1"), "{output}");
         assert!(output.contains("neighborhood_omitted=true"), "{output}");
-        assert!(
-            output.contains("coverage category=analysis-roots status=incomplete items=1 remediation=narrow-review-base-and-restart-changes"),
-            "{output}"
-        );
+        assert!(output.contains(
+            "claim kind=static-test-paths status=partial basis=resolved-static-call-graph"
+        ));
     }
 
     #[test]
@@ -4730,6 +8502,7 @@ mod tests {
             parse_context: String::new(),
             byte_size: 1,
             replace,
+            observed_relation_sites: 0,
         };
         let type_node = |key: &str, path: &str, name: &str, lookup: &str| NodeInput {
             key: key.into(),
@@ -4848,7 +8621,8 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
         assert!(
             output.contains(" Cursor ") && output.contains(" Flow "),
             "{output}"
@@ -4942,6 +8716,1972 @@ mod tests {
     }
 
     #[test]
+    fn provenance_replacement_is_atomic_and_unique() {
+        let cancelled = AtomicBool::new(false);
+        let mut source = single_node_graph("generator");
+        source.modeled_sites.push(ModeledSiteInput {
+            file_key: "src/lib.rs".into(),
+            source_key: Some("generator".into()),
+            kind: ModeledSiteKind::GeneratedInclusion,
+            line_start: 1,
+            line_end: 1,
+            target_hint: Some("out.rs".into()),
+            parse_context: Some("0:".into()),
+        });
+        source.files[0].observed_relation_sites = 1;
+        source.gaps.push(GapInput {
+            file_key: None,
+            source_key: None,
+            run_key: None,
+            path: Some("schema.proto".into()),
+            line_start: None,
+            line_end: None,
+            category: GapCategory::Language,
+            reason: GapReason::LanguageNotIndexed,
+            target_hint: None,
+            occurrences: 1,
+            relation_site: false,
+        });
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        let (source_state, _, ()) = store
+            .index_with(&cancelled, |_full, _existing| Ok((source, ())))
+            .unwrap();
+        let evidence = EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                imported("input", "schema.proto", ArtifactRole::Input, 2),
+                imported("output", "target/out.rs", ArtifactRole::GeneratedRust, 3),
+            ],
+            provenance: vec![ProvenanceInput {
+                input_key: "input".into(),
+                input_lines: EvidenceLineSpan { start: 1, end: 1 },
+                generator_path: "src/lib.rs".into(),
+                generator_lines: EvidenceLineSpan { start: 1, end: 1 },
+                output_key: "output".into(),
+                output_lines: EvidenceLineSpan { start: 1, end: 1 },
+            }],
+            ..EvidenceInput::default()
+        };
+
+        let stats = store
+            .replace_evidence(generated_output_graph(), &evidence, &cancelled)
+            .unwrap();
+        assert_eq!(stats.artifacts, 3);
+        assert_eq!(stats.provenance_links, 1);
+        assert_eq!(
+            read_state(&store.connection).unwrap().generation,
+            source_state.generation + 1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT occurrences FROM graph_gaps WHERE path='schema.proto'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let rendered = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(rendered.evidence.contains(
+            "claim kind=generated-provenance status=complete result=linked basis=verified-generated-manifest"
+        ));
+        assert!(rendered
+            .evidence
+            .contains("provenance input=\"schema.proto:1-1\" generator=\"src/lib.rs:1-1\" output=\"target/out.rs:1-1\""));
+        assert!(
+            rendered
+                .evidence
+                .contains("includes source=\"src/lib.rs:1\" output=\"target/out.rs\"")
+        );
+        assert_eq!(rendered.dynamic_status, CompletenessStatus::Complete);
+
+        let collision = Graph {
+            files: vec![FileInput {
+                path: "src/lib.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [9; 32],
+                parse_context: "0:".into(),
+                byte_size: 1,
+                replace: true,
+                observed_relation_sites: 0,
+            }],
+            ..Graph::default()
+        };
+        assert!(
+            store
+                .replace_evidence(collision, &EvidenceInput::default(), &cancelled)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM provenance_links", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        let invalid = EvidenceInput {
+            artifacts: vec![
+                imported("duplicate", "one", ArtifactRole::Input, 1),
+                imported("duplicate", "two", ArtifactRole::Input, 2),
+            ],
+            ..EvidenceInput::default()
+        };
+        assert!(
+            store
+                .replace_evidence(Graph::default(), &invalid, &cancelled)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM provenance_links", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_provenance_declaration_rolls_back_the_evidence_transaction() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = provenance_source_store(None);
+        let before = read_state(&store.connection).unwrap();
+        let mut evidence = provenance_evidence();
+        evidence.provenance.push(evidence.provenance[0].clone());
+
+        assert_eq!(
+            store
+                .replace_evidence(generated_output_graph(), &evidence, &cancelled)
+                .unwrap_err(),
+            "duplicate provenance declaration"
+        );
+        assert_eq!(read_state(&store.connection).unwrap(), before);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM imported_artifacts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM provenance_links", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn seal_and_image_validation_recompute_provenance_declaration_state() {
+        let cancelled = AtomicBool::new(false);
+        let root = canonical_temp_dir().join(format!(
+            "graphr-provenance-state-validation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let mut store = provenance_source_store(Some(&path));
+        store
+            .replace_evidence(generated_output_graph(), &provenance_evidence(), &cancelled)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE provenance_links
+                    SET modeled_site_id=NULL, mapping_state='unobserved'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.seal(&cancelled).unwrap_err(),
+            "database provenance declaration mapping is inconsistent"
+        );
+
+        let store = Store::open_private_image(&path, &cancelled).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE provenance_links
+                    SET modeled_site_id=(SELECT id FROM modeled_sites), mapping_state='linked'",
+                [],
+            )
+            .unwrap();
+        store.seal(&cancelled).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE provenance_links
+                    SET modeled_site_id=NULL, mapping_state='unobserved'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            validate_image(&path).unwrap_err(),
+            "database provenance declaration mapping is inconsistent"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seal_rejects_unsafe_provenance_declaration_identity() {
+        let cancelled = AtomicBool::new(false);
+        let root = canonical_temp_dir().join(format!(
+            "graphr-provenance-path-validation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let mut store = provenance_source_store(Some(&path));
+        store
+            .replace_evidence(generated_output_graph(), &provenance_evidence(), &cancelled)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE provenance_links
+                    SET generator_path='../escape.rs',
+                        generator_file_id=NULL, generator_node_id=NULL,
+                        mapping_state='unobserved'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.seal(&cancelled).unwrap_err(),
+            "database provenance declaration path is unsafe"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn coverage_mapping_maps_exact_tests_and_owns_every_gap_by_run() {
+        let cancelled = AtomicBool::new(false);
+        let mut graph = single_node_graph("changed");
+        graph.nodes[0].line_end = 3;
+        graph.nodes.extend([
+            test_node("named-key", "named", 10),
+            test_node("ambiguous-one", "ambiguous", 11),
+            test_node("ambiguous-two", "ambiguous", 12),
+        ]);
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        store
+            .replace_evidence(Graph::default(), &coverage_mapping_evidence(), &cancelled)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM coverage_runs r JOIN nodes n ON n.id=r.test_id
+                      WHERE r.key='llvm-run' AND n.name='named'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM coverage_regions r JOIN coverage_runs run ON run.id=r.run_id
+                      JOIN nodes n ON n.id=r.test_id
+                      WHERE run.key='llvm-run' AND n.name='named'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM coverage_regions r JOIN coverage_runs run ON run.id=r.run_id
+                      JOIN nodes n ON n.id=r.test_id
+                      WHERE run.key='python-run' AND n.name='named'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM coverage_branches b JOIN coverage_runs run ON run.id=b.run_id
+                      WHERE run.key='python-run' AND b.test_id IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .prepare(
+                    "SELECT reason, count(*) FROM graph_gaps
+                      WHERE category='coverage' AND run_id IS NOT NULL
+                      GROUP BY reason ORDER BY reason",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?
+                )))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            vec![
+                ("ambiguous-test-context".into(), 1),
+                ("coverage-unmapped-file".into(), 1),
+                ("coverage-unmapped-region".into(), 1),
+                ("missing-test-context".into(), 1),
+            ]
+        );
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                1,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(review.evidence.contains(
+            "claim kind=changed-execution path=\"src/lib.rs\" lines=2 status=partial result=unknown basis=coverage-py-json run=\"python\""
+        ));
+        assert_eq!(review.dynamic_status, CompletenessStatus::Partial);
+    }
+
+    #[test]
+    fn coverage_gap_rendering_preserves_distinct_escaped_test_contexts() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((single_node_graph("changed"), ()))
+            })
+            .unwrap();
+        let contexts = ["test_a", "test_\"b"];
+        let evidence = EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                imported("report", "coverage.json", ArtifactRole::CoverageReport, 2),
+            ],
+            runs: vec![CoverageRunInput {
+                key: "run".into(),
+                format: CoverageFormat::CoveragePy,
+                report_key: "report".into(),
+                run_label: "python".into(),
+                test_name: None,
+            }],
+            regions: contexts
+                .iter()
+                .map(|context| coverage_region("run", "src/lib.rs", 1, 1, 1, Some(context)))
+                .collect(),
+            ..EvidenceInput::default()
+        };
+        store
+            .replace_evidence(Graph::default(), &evidence, &cancelled)
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                1,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        for context in contexts {
+            assert!(
+                review.evidence.contains(&format!(
+                    "claim kind=changed-execution path=\"src/lib.rs\" lines=1 status=partial result=unknown basis=coverage-py-json run=\"python\" test={context:?}"
+                )),
+                "{}",
+                review.evidence
+            );
+            assert!(
+                review.evidence.contains(&format!(
+                    "gap category=coverage reason=missing-test-context run=\"python\" path=\"src/lib.rs\" line=1 target={context:?} occurrences=1"
+                )),
+                "{}",
+                review.evidence
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_mapping_duplicate_format_run_and_report_digest_rolls_back() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((single_node_graph("changed"), ()))
+            })
+            .unwrap();
+        let evidence = EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                imported("report-one", "one.json", ArtifactRole::CoverageReport, 2),
+                imported("report-two", "two.json", ArtifactRole::CoverageReport, 2),
+            ],
+            runs: vec![
+                CoverageRunInput {
+                    key: "one".into(),
+                    format: CoverageFormat::Llvm,
+                    report_key: "report-one".into(),
+                    run_label: "same".into(),
+                    test_name: None,
+                },
+                CoverageRunInput {
+                    key: "two".into(),
+                    format: CoverageFormat::Llvm,
+                    report_key: "report-two".into(),
+                    run_label: "same".into(),
+                    test_name: Some("changed".into()),
+                },
+            ],
+            ..EvidenceInput::default()
+        };
+
+        assert!(
+            store
+                .replace_evidence(Graph::default(), &evidence, &cancelled)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM imported_artifacts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM nodes", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn coverage_mapping_preserves_distinct_unmapped_relative_path_identities() {
+        let cancelled = AtomicBool::new(false);
+        for branches in [false, true] {
+            let mut store = Store {
+                connection: Connection::open_in_memory().unwrap(),
+            };
+            store
+                .index_with(&cancelled, |_full, _existing| {
+                    Ok((single_node_graph("changed"), ()))
+                })
+                .unwrap();
+            let paths = ["missing-a.rs", "missing-b.rs"];
+            let evidence = EvidenceInput {
+                artifacts: vec![
+                    imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                    imported("report", "report.json", ArtifactRole::CoverageReport, 2),
+                ],
+                runs: vec![CoverageRunInput {
+                    key: "run".into(),
+                    format: CoverageFormat::Llvm,
+                    report_key: "report".into(),
+                    run_label: "run".into(),
+                    test_name: None,
+                }],
+                regions: if branches {
+                    Vec::new()
+                } else {
+                    paths
+                        .iter()
+                        .map(|path| coverage_region("run", path, 1, 1, 1, None))
+                        .collect()
+                },
+                branches: if branches {
+                    paths
+                        .iter()
+                        .map(|path| CoverageBranchInput {
+                            run_key: "run".into(),
+                            path: Some((*path).into()),
+                            start_line: 1,
+                            start_column: 1,
+                            end_line: 1,
+                            end_column: 2,
+                            target_line: None,
+                            kind: CoverageBranchKind::TrueOutcome,
+                            execution_count: 1,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                gaps: Vec::new(),
+                provenance: Vec::new(),
+            };
+
+            store
+                .replace_evidence(Graph::default(), &evidence, &cancelled)
+                .unwrap();
+            let table = if branches {
+                "coverage_branches"
+            } else {
+                "coverage_regions"
+            };
+            let stored = store
+                .connection
+                .prepare(&format!("SELECT path FROM {table} ORDER BY path"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(stored, paths);
+
+            let review = store
+                .changes(
+                    SNAPSHOT,
+                    &WorktreeChanges {
+                        files: paths
+                            .iter()
+                            .map(|path| ChangedFile {
+                                path: (*path).into(),
+                                whole_file: true,
+                                spans: Vec::new(),
+                                report_unmapped: true,
+                            })
+                            .collect(),
+                        records: Vec::new(),
+                        paths: Vec::new(),
+                        source_patch: String::new(),
+                        artifacts: Default::default(),
+                        skipped_paths: 0,
+                    },
+                    1,
+                    10,
+                    DependencyMode::Boundary,
+                    &cancelled,
+                )
+                .unwrap();
+            for path in paths {
+                assert!(
+                    review.evidence.contains(&format!(
+                        "claim kind=changed-execution path={path:?} lines=1 status=partial result=unknown"
+                    )),
+                    "{}",
+                    review.evidence
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_mapping_renders_relevant_pathless_manifest_test_gap_reasons() {
+        let cancelled = AtomicBool::new(false);
+        for (test_name, reason, ambiguous) in [
+            ("missing", "missing-test-context", false),
+            ("ambiguous", "ambiguous-test-context", true),
+        ] {
+            let mut graph = single_node_graph("changed");
+            if ambiguous {
+                graph.nodes.extend([
+                    test_node("ambiguous-one", "ambiguous", 10),
+                    test_node("ambiguous-two", "ambiguous", 11),
+                ]);
+            }
+            let mut store = Store {
+                connection: Connection::open_in_memory().unwrap(),
+            };
+            store
+                .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+                .unwrap();
+            let evidence = EvidenceInput {
+                artifacts: vec![
+                    imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                    imported("report", "report.json", ArtifactRole::CoverageReport, 2),
+                ],
+                runs: vec![CoverageRunInput {
+                    key: "run".into(),
+                    format: CoverageFormat::Llvm,
+                    report_key: "report".into(),
+                    run_label: "run".into(),
+                    test_name: Some(test_name.into()),
+                }],
+                regions: vec![coverage_region("run", "src/lib.rs", 1, 1, 1, None)],
+                ..EvidenceInput::default()
+            };
+            store
+                .replace_evidence(Graph::default(), &evidence, &cancelled)
+                .unwrap();
+
+            let review = store
+                .changes(
+                    SNAPSHOT,
+                    &changed_lib(),
+                    1,
+                    10,
+                    DependencyMode::Boundary,
+                    &cancelled,
+                )
+                .unwrap();
+            assert!(
+                review.evidence.contains(&format!(
+                    "claim kind=changed-execution status=partial result=unknown basis=llvm-coverage-json run=\"run\" test={test_name:?}"
+                )),
+                "{}",
+                review.evidence
+            );
+            assert!(
+                review.evidence.contains(&format!(
+                    "gap category=coverage reason={reason} run=\"run\" target={test_name:?} occurrences=1"
+                )),
+                "{}",
+                review.evidence
+            );
+        }
+    }
+
+    #[test]
+    fn changed_execution_claim_renders_scoped_counts_and_keeps_static_test_calls() {
+        let cancelled = AtomicBool::new(false);
+        let mut graph = single_node_graph("changed");
+        graph.nodes[0].line_end = 3;
+        graph.nodes.push(test_node("named-key", "named", 10));
+        graph.edges.push(EdgeInput {
+            source_key: "named-key".into(),
+            target_key: "changed".into(),
+            kind: EdgeKind::TestCalls,
+            support_count: 1,
+        });
+        own_graph_edges(&mut graph);
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        let evidence = EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                imported(
+                    "positive-report",
+                    "positive.json",
+                    ArtifactRole::CoverageReport,
+                    2,
+                ),
+                imported("zero-report", "zero.json", ArtifactRole::CoverageReport, 3),
+                imported(
+                    "aggregate-positive-report",
+                    "aggregate-positive.json",
+                    ArtifactRole::CoverageReport,
+                    4,
+                ),
+            ],
+            runs: vec![
+                CoverageRunInput {
+                    key: "positive".into(),
+                    format: CoverageFormat::Llvm,
+                    report_key: "positive-report".into(),
+                    run_label: "positive".into(),
+                    test_name: Some("named".into()),
+                },
+                CoverageRunInput {
+                    key: "zero".into(),
+                    format: CoverageFormat::Llvm,
+                    report_key: "zero-report".into(),
+                    run_label: "zero".into(),
+                    test_name: None,
+                },
+                CoverageRunInput {
+                    key: "aggregate-positive".into(),
+                    format: CoverageFormat::Llvm,
+                    report_key: "aggregate-positive-report".into(),
+                    run_label: "aggregate-positive".into(),
+                    test_name: None,
+                },
+            ],
+            regions: vec![
+                coverage_region("positive", "src/lib.rs", 1, 3, 2, None),
+                coverage_region("zero", "src/lib.rs", 1, 3, 0, None),
+                coverage_region("aggregate-positive", "src/lib.rs", 1, 3, 2, None),
+            ],
+            branches: vec![CoverageBranchInput {
+                run_key: "positive".into(),
+                path: Some("src/lib.rs".into()),
+                start_line: 2,
+                start_column: 1,
+                end_line: 2,
+                end_column: 2,
+                target_line: None,
+                kind: CoverageBranchKind::TrueOutcome,
+                execution_count: 1,
+            }],
+            ..EvidenceInput::default()
+        };
+        store
+            .replace_evidence(Graph::default(), &evidence, &cancelled)
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                1,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(review.graph.contains("execution_mapping=complete"));
+        assert!(review.evidence.contains(
+            "claim kind=changed-execution path=\"src/lib.rs\" lines=1-3 status=complete result=observed basis=llvm-coverage-json run=\"positive\" test=\"named\""
+        ));
+        assert!(review.evidence.contains(
+            "claim kind=changed-execution path=\"src/lib.rs\" lines=1-3 status=complete result=not-observed basis=llvm-coverage-json run=\"zero\""
+        ));
+        assert!(review.evidence.contains(
+            "claim kind=changed-execution path=\"src/lib.rs\" lines=1-3 status=complete result=observed basis=llvm-coverage-json run=\"aggregate-positive\""
+        ));
+        assert!(!review.evidence.contains("run=\"zero\" test="));
+        assert!(!review.evidence.contains("run=\"aggregate-positive\" test="));
+        assert!(
+            review
+                .evidence
+                .contains("not-observed run=\"zero\" path=\"src/lib.rs\" lines=1-3 count=0")
+        );
+        assert!(review.evidence.contains(
+            "observed-branch run=\"positive\" test=\"named\" path=\"src/lib.rs\" line=2 arm=true count=1"
+        ));
+        let named_branch = review
+            .evidence
+            .find("observed-branch run=\"positive\"")
+            .unwrap();
+        let run_level = review.evidence.find("not-observed run=\"zero\"").unwrap();
+        assert!(named_branch < run_level, "{}", review.evidence);
+        assert_eq!(review.dynamic_status, CompletenessStatus::Complete);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM edges WHERE kind='TEST_CALLS'",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn coverage_py_signed_arcs_round_trip_through_store_render_and_seal() {
+        let cancelled = AtomicBool::new(false);
+        let root = canonical_temp_dir().join(format!(
+            "graphr-signed-coverage-arcs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let mut graph = single_node_graph("changed");
+        graph.nodes[0].line_end = 8;
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        let evidence = EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                imported("report", "report.json", ArtifactRole::CoverageReport, 2),
+            ],
+            runs: vec![CoverageRunInput {
+                key: "run".into(),
+                format: CoverageFormat::CoveragePy,
+                report_key: "report".into(),
+                run_label: "run".into(),
+                test_name: None,
+            }],
+            branches: [(-1, 8), (8, -1)]
+                .into_iter()
+                .map(|(start, target)| CoverageBranchInput {
+                    run_key: "run".into(),
+                    path: Some("src/lib.rs".into()),
+                    start_line: start,
+                    start_column: 0,
+                    end_line: start,
+                    end_column: 0,
+                    target_line: Some(target),
+                    kind: CoverageBranchKind::Arc,
+                    execution_count: 1,
+                })
+                .collect(),
+            ..EvidenceInput::default()
+        };
+
+        store
+            .replace_evidence(Graph::default(), &evidence, &cancelled)
+            .unwrap();
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                1,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(review.evidence.contains(
+            "observed-branch run=\"run\" path=\"src/lib.rs\" line=-1 arm=target:8 count=1"
+        ));
+        assert!(review.evidence.contains(
+            "observed-branch run=\"run\" path=\"src/lib.rs\" line=8 arm=target:-1 count=1"
+        ));
+        store.seal(&cancelled).unwrap();
+        validate_image(&path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_coverage_gap_is_anonymous_partial_in_changes_and_view() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((single_node_graph("changed"), ()))
+            })
+            .unwrap();
+        let evidence = EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                imported("report", "report.json", ArtifactRole::CoverageReport, 2),
+            ],
+            runs: vec![CoverageRunInput {
+                key: "run".into(),
+                format: CoverageFormat::Llvm,
+                report_key: "report".into(),
+                run_label: "external-only".into(),
+                test_name: None,
+            }],
+            gaps: vec![GapInput {
+                file_key: None,
+                source_key: None,
+                run_key: Some("run".into()),
+                path: None,
+                line_start: None,
+                line_end: None,
+                category: GapCategory::Coverage,
+                reason: GapReason::CoverageUnmappedFile,
+                target_hint: None,
+                occurrences: 2,
+                relation_site: false,
+            }],
+            ..EvidenceInput::default()
+        };
+        store
+            .replace_evidence(Graph::default(), &evidence, &cancelled)
+            .unwrap();
+
+        let changes = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                1,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert_eq!(changes.dynamic_status, CompletenessStatus::Partial);
+        assert!(changes.evidence.contains(
+            "claim kind=changed-execution status=partial result=unknown basis=llvm-coverage-json run=\"external-only\""
+        ));
+        assert!(changes.evidence.contains(
+            "gap category=coverage reason=coverage-unmapped-file run=\"external-only\" occurrences=2"
+        ));
+        assert!(!changes.evidence.contains("secret/external.rs"));
+
+        let state = read_state(&store.connection).unwrap();
+        let node_id = store
+            .connection
+            .query_row("SELECT id FROM nodes WHERE name='changed'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let view = store
+            .view(
+                SNAPSHOT,
+                &format!(
+                    "n1:{SNAPSHOT}:{}:{}:{node_id}",
+                    state.epoch, state.generation
+                ),
+                0,
+                10,
+            )
+            .unwrap();
+        assert!(view.contains("execution_mapping=partial"), "{view}");
+        assert!(view.contains("reason=coverage-unmapped-file"), "{view}");
+        assert!(!view.contains("secret/external.rs"));
+    }
+
+    #[test]
+    fn provenance_completeness_is_per_declared_chain_for_shared_output() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = provenance_source_store(None);
+        let mut evidence = provenance_evidence();
+        evidence.artifacts.push(imported(
+            "failed-input",
+            "failed.proto",
+            ArtifactRole::Input,
+            4,
+        ));
+        evidence.provenance.push(ProvenanceInput {
+            input_key: "failed-input".into(),
+            input_lines: EvidenceLineSpan { start: 1, end: 1 },
+            generator_path: "src/missing.rs".into(),
+            generator_lines: EvidenceLineSpan { start: 7, end: 7 },
+            output_key: "output".into(),
+            output_lines: EvidenceLineSpan { start: 1, end: 1 },
+        });
+        store
+            .replace_evidence(generated_output_graph(), &evidence, &cancelled)
+            .unwrap();
+
+        let rendered = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(rendered.evidence.contains("provenance_model=partial"));
+        assert!(rendered.evidence.contains(
+            "claim kind=generated-provenance status=partial result=unknown basis=verified-generated-manifest input=\"failed.proto:1-1\" generator=\"src/missing.rs:7-7\" output=\"target/out.rs:1-1\""
+        ));
+        assert!(rendered.evidence.contains(
+            "gap category=generated reason=generated-output-unobserved input=\"failed.proto:1-1\" generator=\"src/missing.rs:7-7\" output=\"target/out.rs:1-1\" occurrences=1"
+        ));
+        assert_eq!(
+            rendered
+                .evidence
+                .matches("claim kind=generated-provenance")
+                .count(),
+            2,
+            "{}",
+            rendered.evidence
+        );
+        assert_eq!(rendered.dynamic_status, CompletenessStatus::Partial);
+    }
+
+    #[test]
+    fn static_generated_gap_does_not_masquerade_as_failed_manifest_chain() {
+        let cancelled = AtomicBool::new(false);
+        let mut graph = single_node_graph("changed");
+        graph.gaps.push(GapInput {
+            file_key: Some("src/lib.rs".into()),
+            source_key: Some("changed".into()),
+            run_key: None,
+            path: Some("src/lib.rs".into()),
+            line_start: Some(1),
+            line_end: Some(1),
+            category: GapCategory::Generated,
+            reason: GapReason::GeneratedOutputUnobserved,
+            target_hint: Some("out.rs".into()),
+            occurrences: 1,
+            relation_site: false,
+        });
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        store
+            .replace_evidence(
+                Graph::default(),
+                &EvidenceInput {
+                    artifacts: vec![imported(
+                        "manifest",
+                        "evidence.json",
+                        ArtifactRole::Manifest,
+                        1,
+                    )],
+                    ..EvidenceInput::default()
+                },
+                &cancelled,
+            )
+            .unwrap();
+
+        let rendered = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(
+            rendered
+                .evidence
+                .contains("provenance_model=not-applicable")
+        );
+        assert!(rendered.evidence.contains(
+            "gap category=generated reason=generated-output-unobserved path=\"src/lib.rs\""
+        ));
+        assert!(
+            !rendered
+                .evidence
+                .contains("claim kind=generated-provenance")
+        );
+    }
+
+    #[test]
+    fn generator_mapping_accepts_only_repository_rust_and_python_nodes() {
+        let cancelled = AtomicBool::new(false);
+        let cases = [
+            ("src/generator.rs", Language::Rust, true),
+            ("pkg/generator.py", Language::Python, true),
+            ("web/generator.js", Language::JavaScript, false),
+            ("web/generator.ts", Language::TypeScript, false),
+        ];
+        let graph = Graph {
+            files: cases
+                .iter()
+                .enumerate()
+                .map(|(index, (path, language, _))| FileInput {
+                    path: (*path).into(),
+                    language: *language,
+                    git_oid: None,
+                    content_hash: [u8::try_from(index + 1).unwrap(); 32],
+                    parse_context: String::new(),
+                    byte_size: 1,
+                    replace: true,
+                    observed_relation_sites: 0,
+                })
+                .collect(),
+            nodes: cases
+                .iter()
+                .map(|(path, _, _)| NodeInput {
+                    key: format!("generator:{path}"),
+                    file_key: (*path).into(),
+                    kind: NodeKind::Function,
+                    name: "generate".into(),
+                    qualified_name: format!("generate@{path}"),
+                    parent_key: None,
+                    owner_key: None,
+                    line_start: 1,
+                    line_end: 1,
+                    signature: String::new(),
+                    keys: Vec::new(),
+                })
+                .collect(),
+            ..Graph::default()
+        };
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        for (path, _, expected) in cases {
+            assert_eq!(
+                provenance_resolution(
+                    &store.connection,
+                    path,
+                    EvidenceLineSpan { start: 1, end: 1 },
+                    "out.rs",
+                    false,
+                )
+                .unwrap()
+                .generator_node_id
+                .is_some(),
+                expected,
+                "unexpected generator mapping for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn seal_recomputes_missing_and_ambiguous_aliases_without_conflating_them() {
+        let cancelled = AtomicBool::new(false);
+        let root = canonical_temp_dir().join(format!(
+            "graphr-alias-state-seal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let node = |key: &str, keys: Vec<String>| NodeInput {
+            key: key.into(),
+            file_key: "app.py".into(),
+            kind: NodeKind::Function,
+            name: key.into(),
+            qualified_name: key.into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            keys,
+        };
+        let graph = Graph {
+            files: vec![FileInput {
+                path: "app.py".into(),
+                language: Language::Python,
+                git_oid: None,
+                content_hash: [1; 32],
+                parse_context: "python".into(),
+                byte_size: 1,
+                replace: true,
+                observed_relation_sites: 4,
+            }],
+            nodes: vec![
+                node("exporter", Vec::new()),
+                node("missing-consumer", Vec::new()),
+                node("ambiguous-consumer", Vec::new()),
+                node("candidate-one", vec!["candidate:multi".into()]),
+                node("candidate-two", vec!["candidate:multi".into()]),
+            ],
+            refs: vec![
+                RefInput {
+                    source_key: "exporter".into(),
+                    kind: RefKind::Imports,
+                    line: 1,
+                    keys: vec!["candidate:missing".into()],
+                    alias_key: Some("alias:missing".into()),
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Missing,
+                },
+                RefInput {
+                    source_key: "exporter".into(),
+                    kind: RefKind::Imports,
+                    line: 1,
+                    keys: vec!["candidate:multi".into()],
+                    alias_key: Some("alias:multi".into()),
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Ambiguous,
+                },
+                RefInput {
+                    source_key: "missing-consumer".into(),
+                    kind: RefKind::Calls,
+                    line: 1,
+                    keys: vec!["alias:missing".into()],
+                    alias_key: None,
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Missing,
+                },
+                RefInput {
+                    source_key: "ambiguous-consumer".into(),
+                    kind: RefKind::Calls,
+                    line: 1,
+                    keys: vec!["alias:multi".into()],
+                    alias_key: None,
+                    resolved_target_key: None,
+                    resolution: ResolutionState::Ambiguous,
+                },
+            ],
+            ..Graph::default()
+        };
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        store.seal(&cancelled).unwrap();
+        validate_image(&path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changes_and_view_emit_only_relevant_exact_static_and_dynamic_records() {
+        let cancelled = AtomicBool::new(false);
+        let source_file = |path: &str, byte| FileInput {
+            path: path.into(),
+            language: Language::Rust,
+            git_oid: None,
+            content_hash: [byte; 32],
+            parse_context: "0:".into(),
+            byte_size: 1,
+            replace: true,
+            observed_relation_sites: 1,
+        };
+        let source_node = |key: &str, path: &str| NodeInput {
+            key: key.into(),
+            file_key: path.into(),
+            kind: NodeKind::Function,
+            name: key.into(),
+            qualified_name: key.into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            keys: Vec::new(),
+        };
+        let source = Graph {
+            files: vec![
+                source_file("src/changed.rs", 1),
+                source_file("src/unrelated.rs", 2),
+            ],
+            nodes: vec![
+                source_node("changed", "src/changed.rs"),
+                source_node("unrelated", "src/unrelated.rs"),
+            ],
+            modeled_sites: vec![
+                ModeledSiteInput {
+                    file_key: "src/changed.rs".into(),
+                    source_key: Some("changed".into()),
+                    kind: ModeledSiteKind::GeneratedInclusion,
+                    line_start: 1,
+                    line_end: 1,
+                    target_hint: Some("changed-out.rs".into()),
+                    parse_context: Some("0:".into()),
+                },
+                ModeledSiteInput {
+                    file_key: "src/unrelated.rs".into(),
+                    source_key: Some("unrelated".into()),
+                    kind: ModeledSiteKind::GeneratedInclusion,
+                    line_start: 1,
+                    line_end: 1,
+                    target_hint: Some("unrelated-out.rs".into()),
+                    parse_context: Some("0:".into()),
+                },
+            ],
+            gaps: vec![
+                GapInput {
+                    file_key: Some("src/changed.rs".into()),
+                    source_key: Some("changed".into()),
+                    run_key: None,
+                    path: Some("src/changed.rs".into()),
+                    line_start: Some(1),
+                    line_end: Some(1),
+                    category: GapCategory::Relation,
+                    reason: GapReason::DynamicOrUnsupportedDispatch,
+                    target_hint: Some("changed-gap".into()),
+                    occurrences: 1,
+                    relation_site: false,
+                },
+                GapInput {
+                    file_key: Some("src/unrelated.rs".into()),
+                    source_key: Some("unrelated".into()),
+                    run_key: None,
+                    path: Some("src/unrelated.rs".into()),
+                    line_start: Some(1),
+                    line_end: Some(1),
+                    category: GapCategory::Relation,
+                    reason: GapReason::DynamicOrUnsupportedDispatch,
+                    target_hint: Some("unrelated-gap".into()),
+                    occurrences: 1,
+                    relation_site: false,
+                },
+            ],
+            ..Graph::default()
+        };
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((source, ())))
+            .unwrap();
+        let evidence = EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 9),
+                imported("changed-input", "changed.proto", ArtifactRole::Input, 3),
+                imported(
+                    "changed-output",
+                    "target/changed-out.rs",
+                    ArtifactRole::GeneratedRust,
+                    4,
+                ),
+                imported("unrelated-input", "unrelated.proto", ArtifactRole::Input, 5),
+                imported(
+                    "unrelated-output",
+                    "target/unrelated-out.rs",
+                    ArtifactRole::GeneratedRust,
+                    6,
+                ),
+                imported("report", "coverage.json", ArtifactRole::CoverageReport, 7),
+            ],
+            provenance: vec![
+                ProvenanceInput {
+                    input_key: "changed-input".into(),
+                    input_lines: EvidenceLineSpan { start: 1, end: 1 },
+                    generator_path: "src/changed.rs".into(),
+                    generator_lines: EvidenceLineSpan { start: 1, end: 1 },
+                    output_key: "changed-output".into(),
+                    output_lines: EvidenceLineSpan { start: 1, end: 1 },
+                },
+                ProvenanceInput {
+                    input_key: "unrelated-input".into(),
+                    input_lines: EvidenceLineSpan { start: 1, end: 1 },
+                    generator_path: "src/unrelated.rs".into(),
+                    generator_lines: EvidenceLineSpan { start: 1, end: 1 },
+                    output_key: "unrelated-output".into(),
+                    output_lines: EvidenceLineSpan { start: 1, end: 1 },
+                },
+            ],
+            runs: vec![CoverageRunInput {
+                key: "run".into(),
+                format: CoverageFormat::Llvm,
+                report_key: "report".into(),
+                run_label: "run".into(),
+                test_name: None,
+            }],
+            regions: vec![
+                coverage_region("run", "src/changed.rs", 1, 1, 1, None),
+                coverage_region("run", "src/unrelated.rs", 1, 1, 1, None),
+            ],
+            ..EvidenceInput::default()
+        };
+        let generated = Graph {
+            files: vec![
+                FileInput {
+                    path: "target/changed-out.rs".into(),
+                    language: Language::Rust,
+                    git_oid: None,
+                    content_hash: [4; 32],
+                    parse_context: "0:".into(),
+                    byte_size: 1,
+                    replace: true,
+                    observed_relation_sites: 0,
+                },
+                FileInput {
+                    path: "target/unrelated-out.rs".into(),
+                    language: Language::Rust,
+                    git_oid: None,
+                    content_hash: [6; 32],
+                    parse_context: "0:".into(),
+                    byte_size: 1,
+                    replace: true,
+                    observed_relation_sites: 0,
+                },
+            ],
+            ..Graph::default()
+        };
+        store
+            .replace_evidence(generated, &evidence, &cancelled)
+            .unwrap();
+
+        let changes = store
+            .changes(
+                SNAPSHOT,
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/changed.rs".into(),
+                        whole_file: true,
+                        spans: Vec::new(),
+                        report_unmapped: false,
+                    }],
+                    records: Vec::new(),
+                    paths: Vec::new(),
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(changes.graph.contains("gaps total=2"), "{}", changes.graph);
+        assert!(changes.graph.contains("changed-gap"), "{}", changes.graph);
+        assert!(
+            !changes.graph.contains("unrelated-gap"),
+            "{}",
+            changes.graph
+        );
+        assert!(changes.evidence.contains("target/changed-out.rs"));
+        assert!(changes.evidence.contains("path=\"src/changed.rs\""));
+        assert!(!changes.evidence.contains("target/unrelated-out.rs"));
+        assert!(!changes.evidence.contains("path=\"src/unrelated.rs\""));
+
+        let state = read_state(&store.connection).unwrap();
+        let node_id = store
+            .connection
+            .query_row("SELECT id FROM nodes WHERE name='changed'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let unrelated_node_id = store
+            .connection
+            .query_row("SELECT id FROM nodes WHERE name='unrelated'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO edges(source_id,target_id,kind,support_count)
+                 VALUES(?1,?2,'CALLS',1)",
+                params![node_id, unrelated_node_id],
+            )
+            .unwrap();
+        let view = store
+            .view(
+                SNAPSHOT,
+                &format!(
+                    "n1:{SNAPSHOT}:{}:{}:{node_id}",
+                    state.epoch, state.generation
+                ),
+                1,
+                10,
+            )
+            .unwrap();
+        assert!(
+            view.contains(" Function unrelated src/unrelated.rs:1"),
+            "{view}"
+        );
+        assert!(view.contains("changed-gap"), "{view}");
+        assert!(!view.contains("unrelated-gap"), "{view}");
+        assert!(view.contains("target/changed-out.rs"), "{view}");
+        assert!(!view.contains("target/unrelated-out.rs"), "{view}");
+        assert!(view.contains("path=\"src/changed.rs\""), "{view}");
+        assert!(
+            !view.contains("claim kind=changed-execution path=\"src/unrelated.rs\""),
+            "{view}"
+        );
+    }
+
+    #[test]
+    fn traverse_only_neighbor_does_not_enter_exact_evidence_scope() {
+        let cancelled = AtomicBool::new(false);
+        let file = |path: &str, byte, observed_relation_sites| FileInput {
+            path: path.into(),
+            language: Language::Rust,
+            git_oid: None,
+            content_hash: [byte; 32],
+            parse_context: "0:".into(),
+            byte_size: 1,
+            replace: true,
+            observed_relation_sites,
+        };
+        let node = |key: &str, path: &str| NodeInput {
+            key: key.into(),
+            file_key: path.into(),
+            kind: NodeKind::Function,
+            name: key.into(),
+            qualified_name: key.into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            keys: Vec::new(),
+        };
+        let mut graph = Graph {
+            files: vec![file("src/root.rs", 1, 0), file("src/neighbor.rs", 2, 1)],
+            nodes: vec![
+                node("root", "src/root.rs"),
+                node("neighbor", "src/neighbor.rs"),
+            ],
+            edges: vec![EdgeInput {
+                source_key: "root".into(),
+                target_key: "neighbor".into(),
+                kind: EdgeKind::Imports,
+                support_count: 1,
+            }],
+            modeled_sites: vec![ModeledSiteInput {
+                file_key: "src/neighbor.rs".into(),
+                source_key: Some("neighbor".into()),
+                kind: ModeledSiteKind::GeneratedInclusion,
+                line_start: 1,
+                line_end: 1,
+                target_hint: Some("out.rs".into()),
+                parse_context: Some("0:".into()),
+            }],
+            gaps: vec![GapInput {
+                file_key: Some("src/neighbor.rs".into()),
+                source_key: Some("neighbor".into()),
+                run_key: None,
+                path: Some("src/neighbor.rs".into()),
+                line_start: Some(1),
+                line_end: Some(1),
+                category: GapCategory::Relation,
+                reason: GapReason::DynamicOrUnsupportedDispatch,
+                target_hint: Some("neighbor-gap".into()),
+                occurrences: 1,
+                relation_site: false,
+            }],
+            ..Graph::default()
+        };
+        own_graph_edges(&mut graph);
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        let evidence = EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 9),
+                imported("input", "schema.proto", ArtifactRole::Input, 3),
+                imported("output", "target/out.rs", ArtifactRole::GeneratedRust, 3),
+                imported("report", "coverage.json", ArtifactRole::CoverageReport, 5),
+            ],
+            provenance: vec![ProvenanceInput {
+                input_key: "input".into(),
+                input_lines: EvidenceLineSpan { start: 1, end: 1 },
+                generator_path: "src/neighbor.rs".into(),
+                generator_lines: EvidenceLineSpan { start: 1, end: 1 },
+                output_key: "output".into(),
+                output_lines: EvidenceLineSpan { start: 1, end: 1 },
+            }],
+            runs: vec![CoverageRunInput {
+                key: "run".into(),
+                format: CoverageFormat::Llvm,
+                report_key: "report".into(),
+                run_label: "neighbor-run".into(),
+                test_name: None,
+            }],
+            regions: vec![coverage_region("run", "src/neighbor.rs", 1, 1, 1, None)],
+            ..EvidenceInput::default()
+        };
+        store
+            .replace_evidence(generated_output_graph(), &evidence, &cancelled)
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &WorktreeChanges {
+                    files: vec![ChangedFile {
+                        path: "src/root.rs".into(),
+                        whole_file: false,
+                        spans: vec![LineSpan { start: 2, end: 2 }],
+                        report_unmapped: false,
+                    }],
+                    records: Vec::new(),
+                    paths: Vec::new(),
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                1,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(
+            review.graph.contains("neighbor src/neighbor.rs:1"),
+            "{}",
+            review.graph
+        );
+        assert!(review.graph.contains("gaps total=1"), "{}", review.graph);
+        assert!(!review.graph.contains("neighbor-gap"), "{}", review.graph);
+        assert!(
+            !review.evidence.contains("target/out.rs"),
+            "{}",
+            review.evidence
+        );
+        assert!(
+            !review.evidence.contains("src/neighbor.rs"),
+            "{}",
+            review.evidence
+        );
+    }
+
+    #[test]
+    fn changed_input_span_pulls_its_exact_provenance_chain() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = provenance_source_store(None);
+        let mut evidence = provenance_evidence();
+        evidence.artifacts.push(imported(
+            "report",
+            "coverage.json",
+            ArtifactRole::CoverageReport,
+            4,
+        ));
+        evidence.runs.push(CoverageRunInput {
+            key: "run".into(),
+            format: CoverageFormat::Llvm,
+            report_key: "report".into(),
+            run_label: "generated-run".into(),
+            test_name: None,
+        });
+        evidence
+            .regions
+            .push(coverage_region("run", "target/out.rs", 1, 1, 1, None));
+        let mut generated = generated_output_graph();
+        generated.nodes.push(NodeInput {
+            key: "generated".into(),
+            file_key: "target/out.rs".into(),
+            kind: NodeKind::Function,
+            name: "generated".into(),
+            qualified_name: "generated".into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            keys: Vec::new(),
+        });
+        store
+            .replace_evidence(generated, &evidence, &cancelled)
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &WorktreeChanges {
+                    files: Vec::new(),
+                    records: Vec::new(),
+                    paths: vec![crate::git::ChangedPath {
+                        status: crate::git::ChangeStatus::Modified,
+                        old_path: None,
+                        old_language: None,
+                        path: "schema.proto".into(),
+                        language: None,
+                        additions: Some(1),
+                        deletions: Some(1),
+                        layers: vec![crate::git::ChangeLayer::Unstaged],
+                    }],
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+
+        assert!(
+            review.evidence.contains(
+                "claim kind=generated-provenance status=complete result=linked basis=verified-generated-manifest input=\"schema.proto:1-1\""
+            ),
+            "{}",
+            review.evidence
+        );
+        assert!(review.evidence.contains("generator=\"src/lib.rs:1-1\""));
+        assert!(review.evidence.contains("output=\"target/out.rs:1-1\""));
+        assert!(
+            review.evidence.contains(
+                "claim kind=changed-execution path=\"target/out.rs\" lines=1 status=complete result=observed basis=llvm-coverage-json run=\"generated-run\""
+            ),
+            "{}",
+            review.evidence
+        );
+    }
+
+    #[test]
+    fn provenance_expanded_range_keeps_an_owned_gap_relevant() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = provenance_source_store(None);
+        let mut evidence = provenance_evidence();
+        evidence.provenance[0].output_lines = EvidenceLineSpan { start: 1, end: 5 };
+        let mut generated = generated_output_graph();
+        generated.nodes.push(NodeInput {
+            key: "generated".into(),
+            file_key: "target/out.rs".into(),
+            kind: NodeKind::Function,
+            name: "generated".into(),
+            qualified_name: "generated".into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: 3,
+            line_end: 3,
+            signature: String::new(),
+            keys: Vec::new(),
+        });
+        generated.gaps.push(GapInput {
+            file_key: Some("target/out.rs".into()),
+            source_key: Some("generated".into()),
+            run_key: None,
+            path: Some("target/out.rs".into()),
+            line_start: Some(3),
+            line_end: Some(3),
+            category: GapCategory::Generated,
+            reason: GapReason::GeneratedOutputUnobserved,
+            target_hint: Some("nested.rs".into()),
+            occurrences: 1,
+            relation_site: false,
+        });
+        store
+            .replace_evidence(generated, &evidence, &cancelled)
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &WorktreeChanges {
+                    files: Vec::new(),
+                    records: Vec::new(),
+                    paths: vec![crate::git::ChangedPath {
+                        status: crate::git::ChangeStatus::Modified,
+                        old_path: None,
+                        old_language: None,
+                        path: "schema.proto".into(),
+                        language: None,
+                        additions: Some(1),
+                        deletions: Some(1),
+                        layers: vec![crate::git::ChangeLayer::Unstaged],
+                    }],
+                    source_patch: String::new(),
+                    artifacts: Default::default(),
+                    skipped_paths: 0,
+                },
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+
+        assert!(
+            review.evidence.contains(
+                "gap category=generated reason=generated-output-unobserved path=\"target/out.rs\" line=3 target=\"nested.rs\" occurrences=1"
+            ),
+            "{}",
+            review.evidence
+        );
+    }
+
+    #[test]
+    fn same_file_generated_gap_is_scoped_by_owner_not_path() {
+        let cancelled = AtomicBool::new(false);
+        let mut graph = single_node_graph("selected");
+        graph.nodes[0].line_end = 2;
+        graph.nodes.push(function_node("other", 10));
+        graph.gaps.push(GapInput {
+            file_key: Some("src/lib.rs".into()),
+            source_key: Some("other".into()),
+            run_key: None,
+            path: Some("src/lib.rs".into()),
+            line_start: Some(10),
+            line_end: Some(10),
+            category: GapCategory::Generated,
+            reason: GapReason::GeneratedOutputUnobserved,
+            target_hint: Some("other-generated.rs".into()),
+            occurrences: 1,
+            relation_site: false,
+        });
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        store
+            .replace_evidence(
+                Graph::default(),
+                &EvidenceInput {
+                    artifacts: vec![imported(
+                        "manifest",
+                        "evidence.json",
+                        ArtifactRole::Manifest,
+                        1,
+                    )],
+                    ..EvidenceInput::default()
+                },
+                &cancelled,
+            )
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                0,
+                10,
+                DependencyMode::Boundary,
+                &cancelled,
+            )
+            .unwrap();
+        assert!(review.graph.contains("gaps total=1"), "{}", review.graph);
+        assert_eq!(review.static_status, CompletenessStatus::Partial);
+        assert!(
+            !review.evidence.contains("other-generated.rs"),
+            "{}",
+            review.evidence
+        );
+
+        let state = read_state(&store.connection).unwrap();
+        let selected_id = store
+            .connection
+            .query_row("SELECT id FROM nodes WHERE name='selected'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let view = store
+            .view(
+                SNAPSHOT,
+                &format!(
+                    "n1:{SNAPSHOT}:{}:{}:{selected_id}",
+                    state.epoch, state.generation
+                ),
+                1,
+                10,
+            )
+            .unwrap();
+        assert!(!view.contains("other-generated.rs"), "{view}");
+    }
+
+    #[test]
+    fn provenance_replacement_rejects_complete_link_without_generated_file() {
+        let cancelled = AtomicBool::new(false);
+        let mut store = provenance_source_store(None);
+
+        let error = store
+            .replace_evidence(Graph::default(), &provenance_evidence(), &cancelled)
+            .unwrap_err();
+
+        assert_eq!(error, "database provenance generated output is missing");
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM imported_artifacts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn seal_and_image_validation_reject_complete_link_without_generated_file() {
+        for validate_after_seal in [false, true] {
+            let root = canonical_temp_dir().join(format!(
+                "graphr-generated-provenance-invariant-{validate_after_seal}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&root).unwrap();
+            let path = root.join("graph.db");
+            let mut store = provenance_source_store(Some(&path));
+            store
+                .replace_evidence(
+                    generated_output_graph(),
+                    &provenance_evidence(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            store
+                .connection
+                .execute("DELETE FROM files WHERE path='target/out.rs'", [])
+                .unwrap();
+
+            let error = if validate_after_seal {
+                store
+                    .connection
+                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+                    .unwrap();
+                drop(store);
+                validate_image(&path).unwrap_err()
+            } else {
+                store.seal(&AtomicBool::new(false)).unwrap_err()
+            };
+
+            assert_eq!(error, "database provenance generated output is missing");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn rendering_marks_link_without_generated_file_partial() {
+        let mut store = provenance_source_store(None);
+        store
+            .replace_evidence(
+                generated_output_graph(),
+                &provenance_evidence(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute("DELETE FROM files WHERE path='target/out.rs'", [])
+            .unwrap();
+
+        let rendered = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                0,
+                10,
+                DependencyMode::Boundary,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert!(rendered.evidence.contains(
+            "claim kind=generated-provenance status=partial result=unknown basis=verified-generated-manifest"
+        ));
+        assert!(
+            !rendered
+                .evidence
+                .contains("claim kind=generated-provenance status=complete result=linked")
+        );
+        assert_eq!(rendered.dynamic_status, CompletenessStatus::Partial);
+    }
+
+    #[test]
     fn changes_do_not_truncate_on_visited_rows_with_budget_left() {
         let mut store = Store {
             connection: Connection::open_in_memory().unwrap(),
@@ -4962,6 +10702,7 @@ mod tests {
                 support_count: 1,
             },
         ]);
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -4988,7 +10729,8 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
 
         assert!(!output.contains(TRUNCATED.trim()), "{output}");
     }
@@ -5008,6 +10750,7 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 1,
                 replace: true,
+                observed_relation_sites: 0,
             },
             FileInput {
                 path: "src/other.rs".into(),
@@ -5017,6 +10760,7 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 1,
                 replace: true,
+                observed_relation_sites: 0,
             },
         ]);
         for index in 0..100 {
@@ -5040,6 +10784,7 @@ mod tests {
             kind: EdgeKind::Calls,
             support_count: 1,
         });
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -5066,7 +10811,8 @@ mod tests {
                 DependencyMode::Boundary,
                 &cancelled,
             )
-            .unwrap();
+            .unwrap()
+            .graph;
 
         assert!(output.contains("first_party src/other.rs:1"), "{output}");
         assert!(
@@ -5092,6 +10838,7 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 1,
                 replace: true,
+                observed_relation_sites: 0,
             },
             FileInput {
                 path: "src/other.rs".into(),
@@ -5101,6 +10848,7 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 1,
                 replace: true,
+                observed_relation_sites: 0,
             },
             FileInput {
                 path: ".cargo/vendor/block-buffer/src/lib.rs".into(),
@@ -5110,6 +10858,7 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 1,
                 replace: true,
+                observed_relation_sites: 0,
             },
         ]);
         for index in 0..FLOW_SCAN_LIMIT {
@@ -5142,6 +10891,7 @@ mod tests {
             kind: EdgeKind::Calls,
             support_count: 1,
         });
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -5193,6 +10943,7 @@ mod tests {
                 support_count: 1,
             });
         }
+        own_graph_edges(&mut graph);
         let cancelled = AtomicBool::new(false);
         store
             .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
@@ -5261,6 +11012,153 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completeness_direct_static_call_is_complete() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&AtomicBool::new(false), |_full, _existing| {
+                Ok((resolution_graph(1), ()))
+            })
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                6,
+                50,
+                DependencyMode::Boundary,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert_eq!(review.static_status, CompletenessStatus::Complete);
+        assert_eq!(review.dynamic_status, CompletenessStatus::NotApplicable);
+        assert!(review.graph.contains(
+            "completeness content_capture=complete source_capture=complete syntax_parse=complete site_classification=complete static_model=complete evidence_capture=not-applicable provenance_model=not-applicable execution_mapping=not-applicable traversal=complete"
+        ));
+        assert!(review.graph.contains("references missing=0 ambiguous=0"));
+        for claim in ["affected-callers", "affected-flows", "static-test-paths"] {
+            assert!(review.graph.contains(&format!(
+                "claim kind={claim} status=complete basis=resolved-static-call-graph"
+            )));
+        }
+    }
+
+    #[test]
+    fn completeness_traversal_can_finish_over_partial_static_evidence() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        let mut graph = single_node_graph("changed");
+        graph.files[0].observed_relation_sites = 2;
+        graph.gaps.extend([
+            gap(GapCategory::Parse, GapReason::ParserError, false, 1),
+            gap(
+                GapCategory::Relation,
+                GapReason::DynamicOrUnsupportedDispatch,
+                true,
+                2,
+            ),
+            gap(
+                GapCategory::Macro,
+                GapReason::MacroExpansionUnavailable,
+                true,
+                3,
+            ),
+        ]);
+        store
+            .index_with(&AtomicBool::new(false), |_full, _existing| Ok((graph, ())))
+            .unwrap();
+
+        let review = store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                6,
+                50,
+                DependencyMode::Boundary,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert_eq!(review.static_status, CompletenessStatus::Partial);
+        assert!(review.graph.contains("traversal_complete=true"));
+        assert!(review.graph.contains(
+            "completeness content_capture=complete source_capture=complete syntax_parse=partial site_classification=complete static_model=partial evidence_capture=not-applicable provenance_model=not-applicable execution_mapping=not-applicable traversal=complete"
+        ));
+        assert!(review.graph.contains(
+            "gaps total=3 relevant=3 by_reason=parser-error:1,dynamic-or-unsupported-dispatch:1,macro-expansion-unavailable:1"
+        ));
+        assert!(
+            review.graph.contains(
+                "claim kind=affected-flows status=partial basis=resolved-static-call-graph"
+            )
+        );
+        assert!(
+            review
+                .graph
+                .contains("languages=rust,python,javascript,typescript")
+        );
+    }
+
+    #[test]
+    fn completeness_only_relevant_unresolved_references_are_partial() {
+        let review = completeness_for_unresolved_reference("unrelated", false);
+        assert_eq!(review.static_status, CompletenessStatus::Complete);
+        assert!(review.graph.contains("references missing=1 ambiguous=0"));
+
+        let review = completeness_for_unresolved_reference("changed-target", true);
+        assert_eq!(review.static_status, CompletenessStatus::Partial);
+        assert!(review.graph.contains("references missing=0 ambiguous=1"));
+    }
+
+    fn completeness_for_unresolved_reference(key: &str, ambiguous: bool) -> ChangeReview {
+        let mut graph = single_node_graph("changed");
+        graph.nodes[0].keys.push("changed-target".into());
+        graph.nodes.push(NodeInput {
+            keys: vec![if ambiguous {
+                "changed-target".into()
+            } else {
+                "other-target".into()
+            }],
+            ..function_node("other", 2)
+        });
+        graph.nodes.push(function_node("source", 3));
+        graph.files[0].observed_relation_sites = 1;
+        graph.refs.push(RefInput {
+            source_key: "source".into(),
+            kind: RefKind::Calls,
+            line: 3,
+            keys: vec![key.into()],
+            alias_key: None,
+            resolved_target_key: None,
+            resolution: if ambiguous {
+                ResolutionState::Ambiguous
+            } else {
+                ResolutionState::Missing
+            },
+        });
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .index_with(&AtomicBool::new(false), |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        store
+            .changes(
+                SNAPSHOT,
+                &changed_lib(),
+                6,
+                50,
+                DependencyMode::Boundary,
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+    }
+
     fn single_node_graph(name: &str) -> Graph {
         Graph {
             files: vec![FileInput {
@@ -5271,10 +11169,356 @@ mod tests {
                 parse_context: String::new(),
                 byte_size: 1,
                 replace: true,
+                observed_relation_sites: 0,
             }],
             nodes: vec![function_node(name, 1)],
             ..Graph::default()
         }
+    }
+
+    fn own_graph_edges(graph: &mut Graph) {
+        let edges = graph
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(index, edge)| {
+                (
+                    index,
+                    edge.source_key.clone(),
+                    edge.target_key.clone(),
+                    edge.kind,
+                    edge.support_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, source_key, target_key, kind, support_count) in edges {
+            let source = graph
+                .nodes
+                .iter()
+                .find(|node| node.key == source_key)
+                .unwrap();
+            let source_kind = source.kind;
+            let source_file = source.file_key.clone();
+            let line = source.line_start;
+            match kind {
+                EdgeKind::TestCalls => assert_eq!(source_kind, NodeKind::Test),
+                EdgeKind::Calls => assert_ne!(source_kind, NodeKind::Test),
+                EdgeKind::Imports => {}
+            }
+            let candidate = format!("test:owned-edge:{index}");
+            graph
+                .nodes
+                .iter_mut()
+                .find(|node| node.key == target_key)
+                .unwrap()
+                .keys
+                .push(candidate.clone());
+            for _ in 0..support_count {
+                graph.refs.push(RefInput {
+                    source_key: source_key.clone(),
+                    kind: if kind == EdgeKind::Imports {
+                        RefKind::Imports
+                    } else {
+                        RefKind::Calls
+                    },
+                    line,
+                    keys: vec![candidate.clone()],
+                    alias_key: None,
+                    resolved_target_key: Some(target_key.clone()),
+                    resolution: ResolutionState::Resolved,
+                });
+            }
+            let file = graph
+                .files
+                .iter_mut()
+                .find(|file| file.path == source_file)
+                .unwrap();
+            file.observed_relation_sites = file
+                .observed_relation_sites
+                .checked_add(support_count)
+                .unwrap();
+        }
+    }
+
+    fn sealed_resolution_corruption(label: &str, corrupt: impl FnOnce(&Connection)) -> String {
+        let root = canonical_temp_dir().join(format!(
+            "graphr-seal-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((resolution_graph(1), ())))
+            .unwrap();
+        corrupt(&store.connection);
+
+        let error = store.seal(&cancelled).unwrap_err();
+        fs::remove_dir_all(root).unwrap();
+        error
+    }
+
+    fn sealed_image_corruption(label: &str, corrupt: impl FnOnce(&Connection)) -> String {
+        let root = canonical_temp_dir().join(format!(
+            "graphr-image-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let cancelled = AtomicBool::new(false);
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((resolution_graph(1), ())))
+            .unwrap();
+        store.seal(&cancelled).unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        corrupt(&connection);
+        connection.close().unwrap();
+        let error = validate_image(&path).unwrap_err();
+        fs::remove_dir_all(root).unwrap();
+        error
+    }
+
+    fn changed_lib() -> WorktreeChanges {
+        WorktreeChanges {
+            files: vec![ChangedFile {
+                path: "src/lib.rs".into(),
+                whole_file: false,
+                spans: vec![LineSpan { start: 2, end: 2 }],
+                report_unmapped: false,
+            }],
+            records: vec![],
+            paths: vec![],
+            source_patch: String::new(),
+            artifacts: Default::default(),
+            skipped_paths: 0,
+        }
+    }
+
+    fn gap(category: GapCategory, reason: GapReason, relation_site: bool, line: u32) -> GapInput {
+        GapInput {
+            file_key: Some("src/lib.rs".into()),
+            source_key: Some("changed".into()),
+            run_key: None,
+            path: Some("src/lib.rs".into()),
+            line_start: Some(line),
+            line_end: Some(line),
+            category,
+            reason,
+            target_hint: None,
+            occurrences: 1,
+            relation_site,
+        }
+    }
+
+    fn resolution_graph(targets: usize) -> Graph {
+        let mut graph = single_node_graph("source");
+        graph.files[0].observed_relation_sites = 1;
+        graph.nodes[0].keys.push("source".into());
+        for index in 0..targets {
+            let key = format!("target-{index}");
+            graph.nodes.push(NodeInput {
+                keys: vec!["callee".into()],
+                ..function_node(&key, u32::try_from(index + 2).unwrap())
+            });
+        }
+        let (resolution, resolved_target_key) = match targets {
+            0 => (ResolutionState::Missing, None),
+            1 => (ResolutionState::Resolved, Some("target-0".into())),
+            _ => (ResolutionState::Ambiguous, None),
+        };
+        graph.refs.push(RefInput {
+            source_key: "source".into(),
+            kind: RefKind::Calls,
+            line: 1,
+            keys: vec!["callee".into()],
+            alias_key: None,
+            resolved_target_key: resolved_target_key.clone(),
+            resolution,
+        });
+        if let Some(target_key) = resolved_target_key {
+            graph.edges.push(EdgeInput {
+                source_key: "source".into(),
+                target_key,
+                kind: EdgeKind::Calls,
+                support_count: 1,
+            });
+        }
+        graph
+    }
+
+    fn incremental_resolution_graph(targets: usize) -> Graph {
+        let mut graph = Graph::default();
+        graph.files.push(FileInput {
+            path: "src/lib.rs".into(),
+            language: Language::Rust,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: String::new(),
+            byte_size: 1,
+            replace: false,
+            observed_relation_sites: 1,
+        });
+        for index in 0..targets {
+            let path = format!("src/target-{index}.rs");
+            graph.files.push(FileInput {
+                path: path.clone(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [u8::try_from(index + 1).unwrap(); 32],
+                parse_context: String::new(),
+                byte_size: 1,
+                replace: true,
+                observed_relation_sites: 0,
+            });
+            graph.nodes.push(NodeInput {
+                key: format!("target-{index}"),
+                file_key: path,
+                kind: NodeKind::Function,
+                name: format!("target-{index}"),
+                qualified_name: format!("target-{index}"),
+                parent_key: None,
+                owner_key: None,
+                line_start: 1,
+                line_end: 1,
+                signature: String::new(),
+                keys: vec!["callee".into()],
+            });
+        }
+        graph
+    }
+
+    fn imported(key: &str, path: &str, role: ArtifactRole, byte: u8) -> ImportedArtifactInput {
+        ImportedArtifactInput {
+            key: key.into(),
+            path: path.into(),
+            role,
+            content_hash: [byte; 32],
+            byte_size: 1,
+        }
+    }
+
+    fn provenance_source_store(path: Option<&Path>) -> Store {
+        let cancelled = AtomicBool::new(false);
+        let mut source = single_node_graph("generator");
+        source.modeled_sites.push(ModeledSiteInput {
+            file_key: "src/lib.rs".into(),
+            source_key: Some("generator".into()),
+            kind: ModeledSiteKind::GeneratedInclusion,
+            line_start: 1,
+            line_end: 1,
+            target_hint: Some("out.rs".into()),
+            parse_context: Some("0:".into()),
+        });
+        source.files[0].observed_relation_sites = 1;
+        let mut store = match path {
+            Some(path) => Store::open_private_image(path, &cancelled).unwrap(),
+            None => Store {
+                connection: Connection::open_in_memory().unwrap(),
+            },
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((source, ())))
+            .unwrap();
+        store
+    }
+
+    fn generated_output_graph() -> Graph {
+        Graph {
+            files: vec![FileInput {
+                path: "target/out.rs".into(),
+                language: Language::Rust,
+                git_oid: None,
+                content_hash: [3; 32],
+                parse_context: "0:".into(),
+                byte_size: 1,
+                replace: true,
+                observed_relation_sites: 0,
+            }],
+            ..Graph::default()
+        }
+    }
+
+    fn provenance_evidence() -> EvidenceInput {
+        EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                imported("input", "schema.proto", ArtifactRole::Input, 2),
+                imported("output", "target/out.rs", ArtifactRole::GeneratedRust, 3),
+            ],
+            provenance: vec![ProvenanceInput {
+                input_key: "input".into(),
+                input_lines: EvidenceLineSpan { start: 1, end: 1 },
+                generator_path: "src/lib.rs".into(),
+                generator_lines: EvidenceLineSpan { start: 1, end: 1 },
+                output_key: "output".into(),
+                output_lines: EvidenceLineSpan { start: 1, end: 1 },
+            }],
+            ..EvidenceInput::default()
+        }
+    }
+
+    fn global_gap_graph(reason: GapReason, occurrences: u32) -> Graph {
+        Graph {
+            gaps: vec![GapInput {
+                file_key: None,
+                source_key: None,
+                run_key: None,
+                path: Some("omitted.rs".into()),
+                line_start: None,
+                line_end: None,
+                category: GapCategory::Source,
+                reason,
+                target_hint: None,
+                occurrences,
+                relation_site: false,
+            }],
+            ..Graph::default()
+        }
+    }
+
+    fn stored_global_gaps(store: &Store) -> Vec<(String, i64)> {
+        store
+            .connection
+            .prepare(
+                "SELECT reason, occurrences FROM graph_gaps
+                  WHERE file_id IS NULL AND source_id IS NULL AND run_id IS NULL
+                  ORDER BY reason",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn assert_ref_state(store: &Store, state: &str, edges: i64) {
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT resolution_state FROM refs", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            state
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM edges", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            edges
+        );
     }
 
     fn function_node(name: &str, line: u32) -> NodeInput {
@@ -5290,6 +11534,94 @@ mod tests {
             line_end: line,
             signature: String::new(),
             keys: vec![],
+        }
+    }
+
+    fn test_node(key: &str, name: &str, line: u32) -> NodeInput {
+        NodeInput {
+            key: key.into(),
+            file_key: "src/lib.rs".into(),
+            kind: NodeKind::Test,
+            name: name.into(),
+            qualified_name: key.into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: line,
+            line_end: line,
+            signature: String::new(),
+            keys: vec![],
+        }
+    }
+
+    fn coverage_region(
+        run_key: &str,
+        path: &str,
+        start_line: u32,
+        end_line: u32,
+        execution_count: u64,
+        context: Option<&str>,
+    ) -> CoverageRegionInput {
+        CoverageRegionInput {
+            run_key: run_key.into(),
+            path: Some(path.into()),
+            start_line,
+            start_column: 0,
+            end_line,
+            end_column: 0,
+            execution_count,
+            context: context.map(str::to_owned),
+        }
+    }
+
+    fn coverage_mapping_evidence() -> EvidenceInput {
+        EvidenceInput {
+            artifacts: vec![
+                imported("manifest", "evidence.json", ArtifactRole::Manifest, 1),
+                imported("llvm-report", "llvm.json", ArtifactRole::CoverageReport, 2),
+                imported(
+                    "python-report",
+                    "python.json",
+                    ArtifactRole::CoverageReport,
+                    3,
+                ),
+            ],
+            provenance: Vec::new(),
+            runs: vec![
+                CoverageRunInput {
+                    key: "llvm-run".into(),
+                    format: CoverageFormat::Llvm,
+                    report_key: "llvm-report".into(),
+                    run_label: "rust".into(),
+                    test_name: Some("named".into()),
+                },
+                CoverageRunInput {
+                    key: "python-run".into(),
+                    format: CoverageFormat::CoveragePy,
+                    report_key: "python-report".into(),
+                    run_label: "python".into(),
+                    test_name: None,
+                },
+            ],
+            regions: vec![
+                coverage_region("llvm-run", "src/lib.rs", 1, 2, 1, None),
+                coverage_region("llvm-run", "missing.rs", 1, 1, 1, None),
+                coverage_region("llvm-run", "src/lib.rs", 20, 20, 0, None),
+                coverage_region("python-run", "src/lib.rs", 1, 1, 1, Some("named")),
+                coverage_region("python-run", "src/lib.rs", 2, 2, 1, Some("missing")),
+                coverage_region("python-run", "src/lib.rs", 3, 3, 1, Some("ambiguous")),
+            ],
+            branches: vec![CoverageBranchInput {
+                run_key: "python-run".into(),
+                path: Some("src/lib.rs".into()),
+                start_line: 1,
+                start_column: 0,
+                end_line: 1,
+                end_column: 0,
+                target_line: Some(2),
+                kind: CoverageBranchKind::Arc,
+                execution_count: 1,
+            }],
+            gaps: Vec::new(),
         }
     }
 }

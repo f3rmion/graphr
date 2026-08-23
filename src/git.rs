@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
-use std::fs::{self, FileTimes, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -14,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::artifact::{AnalyzerKind, analyze, analyzer_kind};
+use crate::evidence::CapturedArtifact;
 use crate::workspace::{ErrorCode, NoChangeReason, OperationError, SnapshotTarget};
 
 const STDOUT_LIMIT: usize = 64 * 1024 * 1024;
@@ -21,6 +23,182 @@ const STDERR_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(30);
 const SOURCE_LIMIT: u64 = 2 * 1024 * 1024;
 const OVERSIZED_BLOB: &str = "Git blob exceeds the source size limit";
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_EVIDENCE_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_evidence_read_hook(hook: impl FnOnce() + 'static) {
+    AFTER_EVIDENCE_READ_HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
+}
+
+pub(crate) fn capture_evidence_file(
+    root: &Path,
+    path: &str,
+    limit: u64,
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, OperationError> {
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || path.is_empty()
+        || path.len() > 1024
+        || path.chars().any(char::is_control)
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "evidence path is unsafe",
+        ));
+    }
+    check_cancelled(cancelled)
+        .map_err(|_| OperationError::new(ErrorCode::JobCancelled, "evidence capture cancelled"))?;
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(root)
+        .map_err(|_| {
+            OperationError::new(
+                ErrorCode::CaptureChanged,
+                "evidence root cannot be opened safely",
+            )
+        })?;
+    let components = relative.components().collect::<Vec<_>>();
+    for component in &components[..components.len().saturating_sub(1)] {
+        let Component::Normal(name) = component else {
+            unreachable!("validated evidence component")
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            OperationError::new(ErrorCode::InvalidParameters, "evidence path is unsafe")
+        })?;
+        // SAFETY: openat receives a live directory descriptor and a NUL-terminated name.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+            )
+        };
+        if descriptor < 0 {
+            return Err(OperationError::new(
+                ErrorCode::CaptureChanged,
+                "evidence path cannot be opened safely",
+            ));
+        }
+        // SAFETY: a successful openat returns a newly owned descriptor.
+        directory = unsafe { File::from_raw_fd(descriptor) };
+    }
+    let Some(Component::Normal(name)) = components.last() else {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "evidence path is unsafe",
+        ));
+    };
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        OperationError::new(ErrorCode::InvalidParameters, "evidence path is unsafe")
+    })?;
+    // SAFETY: openat receives a live directory descriptor and a NUL-terminated name.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(OperationError::new(
+            ErrorCode::CaptureChanged,
+            "evidence file cannot be opened safely",
+        ));
+    }
+    // SAFETY: a successful openat returns a newly owned descriptor.
+    let mut file = unsafe { File::from_raw_fd(descriptor) };
+    let before = file.metadata().map_err(|_| {
+        OperationError::new(
+            ErrorCode::CaptureChanged,
+            "evidence file cannot be inspected",
+        )
+    })?;
+    if !before.is_file() || before.len() > limit {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "evidence file is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check_cancelled(cancelled).map_err(|_| {
+            OperationError::new(ErrorCode::JobCancelled, "evidence capture cancelled")
+        })?;
+        let read = file.read(&mut buffer).map_err(|_| {
+            OperationError::new(ErrorCode::CaptureChanged, "evidence file cannot be read")
+        })?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.len() as u64 > limit {
+            return Err(OperationError::new(
+                ErrorCode::InvalidParameters,
+                "evidence file exceeds its size limit",
+            ));
+        }
+    }
+    #[cfg(test)]
+    AFTER_EVIDENCE_READ_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+    let finished = file.metadata().map_err(|_| {
+        OperationError::new(
+            ErrorCode::CaptureChanged,
+            "evidence file cannot be rechecked",
+        )
+    })?;
+    let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstatat receives a live directory descriptor, valid name, and writable stat.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            current.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(OperationError::new(
+            ErrorCode::CaptureChanged,
+            "evidence file disappeared during capture",
+        ));
+    }
+    // SAFETY: fstatat initialized the value on success.
+    let current = unsafe { current.assume_init() };
+    if !same_file_version(&before, &finished)
+        || i128::from(before.dev()) != i128::from(current.st_dev)
+        || before.ino() != current.st_ino
+        || u64::from(before.mode()) != u64::from(current.st_mode)
+        || before.len() != current.st_size as u64
+        || before.mtime() != current.st_mtime
+        || before.mtime_nsec() != current.st_mtime_nsec
+        || before.ctime() != current.st_ctime
+        || before.ctime_nsec() != current.st_ctime_nsec
+    {
+        return Err(OperationError::new(
+            ErrorCode::CaptureChanged,
+            "evidence file changed during capture",
+        ));
+    }
+    Ok(bytes)
+}
 
 #[cfg(test)]
 type GitTestHook = Box<dyn FnMut(&Path, &[&str], Option<&Path>) + Send>;
@@ -128,7 +306,48 @@ pub struct CapturedSource {
 pub struct SourceSnapshot {
     pub capture_root: PathBuf,
     pub files: Vec<CapturedSource>,
-    pub skipped: usize,
+    pub omissions: Vec<SourceOmission>,
+}
+
+impl SourceSnapshot {
+    pub fn files_skipped(&self) -> usize {
+        self.omissions
+            .iter()
+            .map(|omission| omission.occurrences as usize)
+            .sum()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SourceOmissionReason {
+    UnsafePath,
+    NonRegular,
+    Unmerged,
+    Oversized,
+    InvalidUtf8,
+    MissingDuringRead,
+    LanguageNotIndexed,
+}
+
+impl SourceOmissionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsafePath => "unsafe-path",
+            Self::NonRegular => "non-regular",
+            Self::Unmerged => "unmerged",
+            Self::Oversized => "oversized",
+            Self::InvalidUtf8 => "invalid-utf8",
+            Self::MissingDuringRead => "missing-during-read",
+            Self::LanguageNotIndexed => "language-not-indexed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceOmission {
+    pub path: Option<String>,
+    pub reason: SourceOmissionReason,
+    pub occurrences: u32,
 }
 
 #[allow(dead_code)] // Task 4 consumes the review/provenance fields during publication.
@@ -139,6 +358,7 @@ pub struct SnapshotCapture {
     pub commits_base_to_head: u64,
     pub changed_files: usize,
     pub no_change_reason: Option<NoChangeReason>,
+    pub requested_artifacts: BTreeMap<String, CapturedArtifact>,
 }
 
 pub(crate) struct BlobReader {
@@ -159,7 +379,7 @@ struct TargetInventory {
     sources: BTreeMap<String, (Language, InventoryContent)>,
     cargo_manifests: BTreeSet<String>,
     unmerged_paths: BTreeSet<String>,
-    skipped: usize,
+    omissions: Vec<SourceOmission>,
 }
 
 enum InventoryContent {
@@ -173,6 +393,7 @@ enum InventoryContent {
 #[derive(Clone, Copy)]
 enum InventoryKind {
     Source(Language),
+    UnindexedLanguage,
     CargoManifest,
 }
 
@@ -333,10 +554,30 @@ impl ArtifactReview {
             .iter()
             .all(|file| file.diff_complete && file.analysis_complete)
     }
+}
 
-    pub fn analysis_complete(&self) -> bool {
-        self.files.iter().all(|file| file.analysis_complete)
-    }
+pub fn change_content_complete(
+    changes: &WorktreeChanges,
+    _dependency_mode: DependencyMode,
+) -> bool {
+    changes.skipped_paths == 0
+        && changes
+            .artifacts
+            .files
+            .iter()
+            .all(|file| file.diff_complete && file.omission.is_none())
+        && changes.paths.iter().all(|path| {
+            if path.language.is_none() {
+                changes
+                    .artifacts
+                    .file(&path.path)
+                    .is_some_and(|file| file.diff_complete && file.omission.is_none())
+            } else {
+                (path.status != ChangeStatus::Renamed || path.old_language.is_some())
+                    && path.additions.is_some()
+                    && path.deletions.is_some()
+            }
+        })
 }
 
 #[derive(Default)]
@@ -596,6 +837,7 @@ impl Repository {
                         *include_untracked,
                         capture_root,
                         &mut inventory,
+                        &BTreeSet::new(),
                         cancelled,
                     )?;
                 }
@@ -629,6 +871,8 @@ impl Repository {
         head_oid: &str,
         target: &SnapshotTarget,
         dependency_mode: DependencyMode,
+        requested_artifact_paths: &BTreeSet<String>,
+        evidence_only_paths: &BTreeSet<String>,
         capture_root: &Path,
         cancelled: &AtomicBool,
     ) -> Result<SnapshotCapture, OperationError> {
@@ -659,6 +903,12 @@ impl Repository {
 
         let (sources, mut changes, dirty_digest) = match target {
             SnapshotTarget::Commit => {
+                self.reject_tracked_evidence_paths(
+                    evidence_only_paths,
+                    Some(head_oid),
+                    None,
+                    cancelled,
+                )?;
                 let sources = self.capture_sources(head_oid, target, capture_root, cancelled)?;
                 let changes = capture_target_changes(
                     self,
@@ -667,12 +917,13 @@ impl Repository {
                     target,
                     None,
                     dependency_mode,
+                    evidence_only_paths,
                     cancelled,
                 )?;
                 (
                     sources,
                     changes,
-                    target_dirty_digest(self, target, None, &[], cancelled)?,
+                    target_dirty_digest(self, target, None, &[], evidence_only_paths, cancelled)?,
                 )
             }
             SnapshotTarget::Index | SnapshotTarget::Worktree { .. } => {
@@ -696,11 +947,18 @@ impl Repository {
                     cancelled,
                 )
                 .map_err(capture_error)?;
+                self.reject_tracked_evidence_paths(
+                    evidence_only_paths,
+                    None,
+                    Some(&copied_index),
+                    cancelled,
+                )?;
                 let first_digest = target_dirty_digest(
                     self,
                     target,
                     Some(&copied_index),
                     &index_signature,
+                    evidence_only_paths,
                     cancelled,
                 )?;
                 let mut inventory =
@@ -712,6 +970,7 @@ impl Repository {
                         *include_untracked,
                         capture_root,
                         &mut inventory,
+                        evidence_only_paths,
                         cancelled,
                     )?;
                 }
@@ -723,6 +982,7 @@ impl Repository {
                     target,
                     Some(&copied_index),
                     dependency_mode,
+                    evidence_only_paths,
                     cancelled,
                 )?;
                 let second_digest = target_dirty_digest(
@@ -730,6 +990,7 @@ impl Repository {
                     target,
                     Some(&copied_index),
                     &index_signature,
+                    evidence_only_paths,
                     cancelled,
                 )?;
                 let current_index =
@@ -747,6 +1008,14 @@ impl Repository {
                 (sources, changes, first_digest)
             }
         };
+        let requested_artifacts = capture_requested_artifacts(
+            self,
+            head_oid,
+            target,
+            mutable.then(|| capture_root.join("index")),
+            requested_artifact_paths,
+            cancelled,
+        )?;
         assign_change_layers(
             self,
             base_oid,
@@ -770,6 +1039,7 @@ impl Repository {
                 target,
                 Some(&copied_index),
                 &index_signature,
+                evidence_only_paths,
                 cancelled,
             )?;
             if final_digest != dirty_digest
@@ -803,6 +1073,7 @@ impl Repository {
             commits_base_to_head,
             changed_files,
             no_change_reason,
+            requested_artifacts,
         };
         capture_guard.retain();
         Ok(capture)
@@ -811,11 +1082,263 @@ impl Repository {
     pub(crate) fn blob_reader(&self) -> Result<BlobReader, String> {
         BlobReader::spawn(&self.root)
     }
+
+    pub fn reject_tracked_evidence_paths(
+        &self,
+        paths: &BTreeSet<String>,
+        commit_oid: Option<&str>,
+        index_file: Option<&Path>,
+        cancelled: &AtomicBool,
+    ) -> Result<(), OperationError> {
+        for path in paths {
+            let pathspec = format!(":(literal){path}");
+            let tracked = if let Some(commit_oid) = commit_oid {
+                run(
+                    &self.root,
+                    &[
+                        "ls-tree",
+                        "-z",
+                        "--full-tree",
+                        "--name-only",
+                        commit_oid,
+                        "--",
+                        &pathspec,
+                    ],
+                    cancelled,
+                )
+            } else {
+                run_with_index(
+                    &self.root,
+                    &["ls-files", "-z", "--", &pathspec],
+                    index_file.unwrap_or(&self.index_path),
+                    cancelled,
+                )
+            }
+            .map_err(capture_error)?;
+            if !tracked.is_empty() {
+                return Err(OperationError::new(
+                    ErrorCode::InvalidParameters,
+                    "evidence files must not be tracked",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn capture_requested_artifacts(
+    repository: &Repository,
+    head_oid: &str,
+    target: &SnapshotTarget,
+    index_file: Option<PathBuf>,
+    paths: &BTreeSet<String>,
+    cancelled: &AtomicBool,
+) -> Result<BTreeMap<String, CapturedArtifact>, OperationError> {
+    let mut artifacts = BTreeMap::new();
+    let mut blobs = repository.blob_reader().map_err(capture_error)?;
+    for path in paths {
+        check_cancelled(cancelled).map_err(capture_error)?;
+        let content = match target {
+            SnapshotTarget::Commit => {
+                let oid = tree_artifact_oid(repository, head_oid, path, cancelled)?;
+                blobs
+                    .read(&oid, cancelled)
+                    .map_err(capture_error)?
+                    .ok_or_else(|| {
+                        OperationError::new(
+                            ErrorCode::InvalidParameters,
+                            "requested input artifact exceeds its size limit",
+                        )
+                    })?
+            }
+            SnapshotTarget::Index => {
+                let oid = index_artifact_oid(
+                    repository,
+                    index_file
+                        .as_deref()
+                        .expect("index target has captured index"),
+                    path,
+                    cancelled,
+                )?;
+                blobs
+                    .read(&oid, cancelled)
+                    .map_err(capture_error)?
+                    .ok_or_else(|| {
+                        OperationError::new(
+                            ErrorCode::InvalidParameters,
+                            "requested input artifact exceeds its size limit",
+                        )
+                    })?
+            }
+            SnapshotTarget::Worktree { include_untracked } => {
+                let index_file = index_file
+                    .as_deref()
+                    .expect("worktree target has captured index");
+                if worktree_selects_path(
+                    repository,
+                    index_file,
+                    path,
+                    *include_untracked,
+                    cancelled,
+                )? {
+                    capture_evidence_file(&repository.root, path, SOURCE_LIMIT, cancelled)?
+                } else {
+                    let oid = index_artifact_oid(repository, index_file, path, cancelled)?;
+                    blobs
+                        .read(&oid, cancelled)
+                        .map_err(capture_error)?
+                        .ok_or_else(|| {
+                            OperationError::new(
+                                ErrorCode::InvalidParameters,
+                                "requested input artifact exceeds its size limit",
+                            )
+                        })?
+                }
+            }
+        };
+        artifacts.insert(
+            path.clone(),
+            CapturedArtifact {
+                path: path.clone(),
+                content_hash: *blake3::hash(&content).as_bytes(),
+                bytes: content,
+            },
+        );
+    }
+    Ok(artifacts)
+}
+
+fn tree_artifact_oid(
+    repository: &Repository,
+    head_oid: &str,
+    path: &str,
+    cancelled: &AtomicBool,
+) -> Result<String, OperationError> {
+    let pathspec = format!(":(literal){path}");
+    let output = run(
+        &repository.root,
+        &["ls-tree", "-z", "--full-tree", head_oid, "--", &pathspec],
+        cancelled,
+    )
+    .map_err(capture_error)?;
+    parse_artifact_entry(&output, path, "tree")
+}
+
+fn index_artifact_oid(
+    repository: &Repository,
+    index_file: &Path,
+    path: &str,
+    cancelled: &AtomicBool,
+) -> Result<String, OperationError> {
+    let pathspec = format!(":(literal){path}");
+    let output = run_with_index(
+        &repository.root,
+        &["ls-files", "--stage", "-z", "--", &pathspec],
+        index_file,
+        cancelled,
+    )
+    .map_err(capture_error)?;
+    parse_artifact_entry(&output, path, "index")
+}
+
+fn parse_artifact_entry(
+    output: &[u8],
+    expected_path: &str,
+    source: &str,
+) -> Result<String, OperationError> {
+    let records = nul_records(output).collect::<Vec<_>>();
+    if records.len() != 1 {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            format!("requested input artifact is absent or ambiguous in selected {source}"),
+        ));
+    }
+    let tab = records[0]
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .ok_or_else(|| {
+            OperationError::new(
+                ErrorCode::GitMetadataInvalid,
+                "Git returned malformed requested artifact metadata",
+            )
+        })?;
+    let metadata = &records[0][..tab];
+    let path = &records[0][tab + 1..];
+    if path != expected_path.as_bytes() {
+        return Err(OperationError::new(
+            ErrorCode::GitMetadataInvalid,
+            "Git returned the wrong requested artifact path",
+        ));
+    }
+    let fields = metadata
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let valid_tree =
+        fields.len() == 3 && matches!(fields[0], b"100644" | b"100755") && fields[1] == b"blob";
+    let valid_index =
+        fields.len() == 3 && matches!(fields[0], b"100644" | b"100755") && fields[2] == b"0";
+    let oid = if valid_tree {
+        fields[2]
+    } else if valid_index {
+        fields[1]
+    } else {
+        &[]
+    };
+    if !valid_lower_oid(oid) {
+        return Err(OperationError::new(
+            ErrorCode::InvalidParameters,
+            "requested input artifact is not a regular file",
+        ));
+    }
+    Ok(std::str::from_utf8(oid)
+        .expect("validated lowercase object ID")
+        .to_owned())
+}
+
+fn worktree_selects_path(
+    repository: &Repository,
+    index_file: &Path,
+    path: &str,
+    include_untracked: bool,
+    cancelled: &AtomicBool,
+) -> Result<bool, OperationError> {
+    let pathspec = format!(":(literal){path}");
+    let dirty = run_with_index(
+        &repository.root,
+        &["ls-files", "--modified", "--deleted", "-z", "--", &pathspec],
+        index_file,
+        cancelled,
+    )
+    .map_err(capture_error)?;
+    if !dirty.is_empty() || !include_untracked {
+        return Ok(!dirty.is_empty());
+    }
+    let untracked = run_with_index(
+        &repository.root,
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            &pathspec,
+        ],
+        index_file,
+        cancelled,
+    )
+    .map_err(capture_error)?;
+    Ok(!untracked.is_empty())
 }
 
 fn source_snapshot(inventory: TargetInventory, capture_root: &Path) -> SourceSnapshot {
-    let mut files = inventory
-        .sources
+    let TargetInventory {
+        sources,
+        cargo_manifests,
+        unmerged_paths: _,
+        mut omissions,
+    } = inventory;
+    let mut files = sources
         .into_iter()
         .map(|(path, (language, content))| {
             let (git_oid, content_key, content) = match content {
@@ -844,13 +1367,48 @@ fn source_snapshot(inventory: TargetInventory, capture_root: &Path) -> SourceSna
             }
         })
         .collect::<Vec<_>>();
-    crate::index::assign_parse_contexts(&mut files, &inventory.cargo_manifests);
+    crate::index::assign_parse_contexts(&mut files, &cargo_manifests);
     debug_assert!(files.windows(2).all(|pair| pair[0].path < pair[1].path));
+    fold_source_omissions(&mut omissions);
     SourceSnapshot {
         capture_root: capture_root.to_owned(),
         files,
-        skipped: inventory.skipped,
+        omissions,
     }
+}
+
+fn fold_source_omissions(omissions: &mut Vec<SourceOmission>) {
+    omissions.sort_unstable_by(|left, right| {
+        (&left.path, left.reason).cmp(&(&right.path, right.reason))
+    });
+    let mut folded = Vec::<SourceOmission>::with_capacity(omissions.len());
+    for omission in omissions.drain(..) {
+        if let Some(previous) = folded.last_mut()
+            && previous.path == omission.path
+            && previous.reason == omission.reason
+        {
+            previous.occurrences = previous.occurrences.saturating_add(omission.occurrences);
+        } else {
+            folded.push(omission);
+        }
+    }
+    *omissions = folded;
+}
+
+fn omit(inventory: &mut TargetInventory, path: Option<String>, reason: SourceOmissionReason) {
+    if path.is_some()
+        && inventory
+            .omissions
+            .iter()
+            .any(|omission| omission.path == path && omission.reason == reason)
+    {
+        return;
+    }
+    inventory.omissions.push(SourceOmission {
+        path,
+        reason,
+        occurrences: 1,
+    });
 }
 
 impl BlobReader {
@@ -1138,6 +1696,7 @@ fn overlay_worktree(
     include_untracked: bool,
     capture_root: &Path,
     inventory: &mut TargetInventory,
+    evidence_only_paths: &BTreeSet<String>,
     cancelled: &AtomicBool,
 ) -> Result<(), OperationError> {
     let dirty = run_with_index(
@@ -1147,10 +1706,11 @@ fn overlay_worktree(
         cancelled,
     )
     .map_err(capture_error)?;
-    let (dirty, dirty_skipped) = parse_inventory_paths(&dirty).map_err(capture_error)?;
-    inventory.skipped += dirty_skipped;
+    let (mut dirty, dirty_omissions) = parse_inventory_paths(&dirty).map_err(capture_error)?;
+    dirty.retain(|path| !evidence_only_paths.contains(path));
+    inventory.omissions.extend(dirty_omissions);
     let untracked = if include_untracked {
-        let (paths, skipped) = parse_inventory_paths(
+        let (mut paths, omissions) = parse_inventory_paths(
             &run_with_index(
                 &repository.root,
                 &["ls-files", "--others", "--exclude-standard", "-z"],
@@ -1160,7 +1720,8 @@ fn overlay_worktree(
             .map_err(capture_error)?,
         )
         .map_err(capture_error)?;
-        inventory.skipped += skipped;
+        paths.retain(|path| !evidence_only_paths.contains(path));
+        inventory.omissions.extend(omissions);
         paths
     } else {
         BTreeSet::new()
@@ -1198,10 +1759,8 @@ fn overlay_worktree(
             }
             InventoryKind::Source(language) => {
                 inventory.sources.remove(path);
-                match read_regular_file(&repository.root, path, SOURCE_LIMIT, cancelled)
-                    .map_err(capture_error)?
-                {
-                    Some(content) => {
+                match read_source_file(&repository.root, path, cancelled).map_err(capture_error)? {
+                    SourceRead::Content(content) => {
                         let digest = *blake3::hash(&content).as_bytes();
                         let relative_path =
                             PathBuf::from("sources").join(format!("{ordinal:016x}"));
@@ -1218,13 +1777,14 @@ fn overlay_worktree(
                             ),
                         );
                     }
-                    None => {
-                        if fs::symlink_metadata(repository.root.join(path)).is_ok() {
-                            inventory.skipped += 1;
-                        }
-                    }
+                    SourceRead::Omitted(reason) => omit(inventory, Some(path.clone()), reason),
                 }
             }
+            InventoryKind::UnindexedLanguage => omit(
+                inventory,
+                Some(path.clone()),
+                SourceOmissionReason::LanguageNotIndexed,
+            ),
         }
     }
 
@@ -1283,6 +1843,7 @@ fn capture_target_changes(
     target: &SnapshotTarget,
     index_file: Option<&Path>,
     dependency_mode: DependencyMode,
+    evidence_only_paths: &BTreeSet<String>,
     cancelled: &AtomicBool,
 ) -> Result<WorktreeChanges, OperationError> {
     let inventory = run_final_diff(
@@ -1393,13 +1954,16 @@ fn capture_target_changes(
             include_untracked: true
         }
     ) {
-        run_with_index(
-            &repository.root,
-            &["ls-files", "--others", "--exclude-standard", "-z"],
-            index_file.expect("worktree target has a captured index"),
-            cancelled,
+        filter_nul_paths(
+            run_with_index(
+                &repository.root,
+                &["ls-files", "--others", "--exclude-standard", "-z"],
+                index_file.expect("worktree target has a captured index"),
+                cancelled,
+            )
+            .map_err(capture_error)?,
+            evidence_only_paths,
         )
-        .map_err(capture_error)?
     } else {
         Vec::new()
     };
@@ -1606,6 +2170,7 @@ fn target_dirty_digest(
     target: &SnapshotTarget,
     index_file: Option<&Path>,
     index_signature: &[u8],
+    evidence_only_paths: &BTreeSet<String>,
     cancelled: &AtomicBool,
 ) -> Result<String, OperationError> {
     let mut hash = blake3::Hasher::new();
@@ -1660,11 +2225,31 @@ fn target_dirty_digest(
                 );
             }
             for path in selected {
+                if std::str::from_utf8(&path)
+                    .ok()
+                    .is_some_and(|path| evidence_only_paths.contains(path))
+                {
+                    continue;
+                }
                 hash_dirty_path(&mut hash, &repository.root, &path, cancelled)?;
             }
         }
     }
     Ok(hash.finalize().to_hex().to_string())
+}
+
+fn filter_nul_paths(input: Vec<u8>, excluded: &BTreeSet<String>) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    for path in nul_records(&input) {
+        if std::str::from_utf8(path)
+            .ok()
+            .is_none_or(|path| !excluded.contains(path))
+        {
+            output.extend_from_slice(path);
+            output.push(0);
+        }
+    }
+    output
 }
 
 fn hash_dirty_path(
@@ -1786,6 +2371,44 @@ fn hash_field(hash: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
     hash.update(label);
     hash.update(&(value.len() as u64).to_le_bytes());
     hash.update(value);
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SourceRead {
+    Content(Vec<u8>),
+    Omitted(SourceOmissionReason),
+}
+
+fn read_source_file(root: &Path, path: &str, cancelled: &AtomicBool) -> Result<SourceRead, String> {
+    let metadata = match fs::symlink_metadata(root.join(path)) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SourceRead::Omitted(SourceOmissionReason::MissingDuringRead));
+        }
+        Err(_) => return Ok(SourceRead::Omitted(SourceOmissionReason::NonRegular)),
+    };
+    if !metadata.is_file() {
+        return Ok(SourceRead::Omitted(SourceOmissionReason::NonRegular));
+    }
+    if metadata.len() > SOURCE_LIMIT {
+        return Ok(SourceRead::Omitted(SourceOmissionReason::Oversized));
+    }
+    let Some(content) = read_regular_file(root, path, SOURCE_LIMIT, cancelled)? else {
+        return Ok(SourceRead::Omitted(
+            match fs::symlink_metadata(root.join(path)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    SourceOmissionReason::MissingDuringRead
+                }
+                Ok(metadata) if metadata.len() > SOURCE_LIMIT => SourceOmissionReason::Oversized,
+                _ => SourceOmissionReason::NonRegular,
+            },
+        ));
+    };
+    if std::str::from_utf8(&content).is_err() {
+        Ok(SourceRead::Omitted(SourceOmissionReason::InvalidUtf8))
+    } else {
+        Ok(SourceRead::Content(content))
+    }
 }
 
 fn read_regular_file(
@@ -3389,7 +4012,7 @@ fn parse_tree_inventory(output: &[u8]) -> Result<TargetInventory, String> {
         sources: BTreeMap::new(),
         cargo_manifests: BTreeSet::new(),
         unmerged_paths: BTreeSet::new(),
-        skipped: 0,
+        omissions: Vec::new(),
     };
     for record in nul_records(output) {
         let tab = record
@@ -3408,7 +4031,8 @@ fn parse_tree_inventory(output: &[u8]) -> Result<TargetInventory, String> {
         {
             return Err("Git returned malformed tree metadata".into());
         }
-        let Some((path, kind)) = parse_inventory_path(&record[tab + 1..], &mut inventory.skipped)?
+        let Some((path, kind)) =
+            parse_inventory_path(&record[tab + 1..], &mut inventory.omissions)?
         else {
             continue;
         };
@@ -3426,20 +4050,28 @@ fn parse_tree_inventory(output: &[u8]) -> Result<TargetInventory, String> {
                     return Err("Git returned duplicate tree paths".into());
                 }
             }
-            InventoryKind::Source(_) => inventory.skipped += 1,
+            InventoryKind::Source(_) => {
+                omit(&mut inventory, Some(path), SourceOmissionReason::NonRegular)
+            }
+            InventoryKind::UnindexedLanguage => omit(
+                &mut inventory,
+                Some(path),
+                SourceOmissionReason::LanguageNotIndexed,
+            ),
             InventoryKind::CargoManifest if regular => {
                 inventory.cargo_manifests.insert(path);
             }
             InventoryKind::CargoManifest => {}
         }
     }
+    fold_source_omissions(&mut inventory.omissions);
     Ok(inventory)
 }
 
 fn parse_index_inventory(output: &[u8]) -> Result<TargetInventory, String> {
     validate_nul_inventory(output)?;
     let mut entries = BTreeMap::<String, (InventoryKind, Vec<(u8, Vec<u8>, String)>)>::new();
-    let mut skipped = 0;
+    let mut omissions = Vec::new();
     for record in nul_records(output) {
         let tab = record
             .iter()
@@ -3457,7 +4089,7 @@ fn parse_index_inventory(output: &[u8]) -> Result<TargetInventory, String> {
         {
             return Err("Git returned malformed index metadata".into());
         }
-        let Some((path, kind)) = parse_inventory_path(&record[tab + 1..], &mut skipped)? else {
+        let Some((path, kind)) = parse_inventory_path(&record[tab + 1..], &mut omissions)? else {
             continue;
         };
         let stage = fields[2][0] - b'0';
@@ -3475,7 +4107,7 @@ fn parse_index_inventory(output: &[u8]) -> Result<TargetInventory, String> {
         sources: BTreeMap::new(),
         cargo_manifests: BTreeSet::new(),
         unmerged_paths: BTreeSet::new(),
-        skipped,
+        omissions,
     };
     for (path, (kind, entries)) in entries {
         let Some((_, mode, oid)) = entries
@@ -3483,8 +4115,18 @@ fn parse_index_inventory(output: &[u8]) -> Result<TargetInventory, String> {
             .first()
             .filter(|(stage, _, _)| entries.len() == 1 && *stage == 0)
         else {
-            if matches!(kind, InventoryKind::Source(_)) {
-                inventory.skipped += 1;
+            match kind {
+                InventoryKind::Source(_) => omit(
+                    &mut inventory,
+                    Some(path.clone()),
+                    SourceOmissionReason::Unmerged,
+                ),
+                InventoryKind::UnindexedLanguage => omit(
+                    &mut inventory,
+                    Some(path.clone()),
+                    SourceOmissionReason::LanguageNotIndexed,
+                ),
+                InventoryKind::CargoManifest => {}
             }
             inventory.unmerged_paths.insert(path);
             continue;
@@ -3496,31 +4138,40 @@ fn parse_index_inventory(output: &[u8]) -> Result<TargetInventory, String> {
                     .sources
                     .insert(path, (language, InventoryContent::GitBlob(oid.clone())));
             }
-            InventoryKind::Source(_) => inventory.skipped += 1,
+            InventoryKind::Source(_) => {
+                omit(&mut inventory, Some(path), SourceOmissionReason::NonRegular)
+            }
+            InventoryKind::UnindexedLanguage => omit(
+                &mut inventory,
+                Some(path),
+                SourceOmissionReason::LanguageNotIndexed,
+            ),
             InventoryKind::CargoManifest if regular => {
                 inventory.cargo_manifests.insert(path);
             }
             InventoryKind::CargoManifest => {}
         }
     }
+    fold_source_omissions(&mut inventory.omissions);
     Ok(inventory)
 }
 
-fn parse_inventory_paths(output: &[u8]) -> Result<(BTreeSet<String>, usize), String> {
+fn parse_inventory_paths(output: &[u8]) -> Result<(BTreeSet<String>, Vec<SourceOmission>), String> {
     validate_nul_inventory(output)?;
     let mut paths = BTreeSet::new();
-    let mut skipped = 0;
+    let mut omissions = Vec::new();
     for record in nul_records(output) {
-        if let Some((path, _)) = parse_inventory_path(record, &mut skipped)? {
+        if let Some((path, _)) = parse_inventory_path(record, &mut omissions)? {
             paths.insert(path);
         }
     }
-    Ok((paths, skipped))
+    fold_source_omissions(&mut omissions);
+    Ok((paths, omissions))
 }
 
 fn parse_inventory_path(
     raw_path: &[u8],
-    skipped: &mut usize,
+    omissions: &mut Vec<SourceOmission>,
 ) -> Result<Option<(String, InventoryKind)>, String> {
     let supported_source_suffix = [
         b".rs".as_slice(),
@@ -3534,18 +4185,27 @@ fn parse_inventory_path(
         b".mts",
         b".cts",
         b".d.ts",
+        b".go",
     ]
     .iter()
     .any(|suffix| raw_path.ends_with(suffix));
     let Ok(path) = std::str::from_utf8(raw_path) else {
         if supported_source_suffix {
-            *skipped += 1;
+            omissions.push(SourceOmission {
+                path: None,
+                reason: SourceOmissionReason::UnsafePath,
+                occurrences: 1,
+            });
         }
         return Ok(None);
     };
     let Some(path) = parse_change_path(path.as_bytes())? else {
         if supported_source_suffix {
-            *skipped += 1;
+            omissions.push(SourceOmission {
+                path: None,
+                reason: SourceOmissionReason::UnsafePath,
+                occurrences: 1,
+            });
         }
         return Ok(None);
     };
@@ -3555,6 +4215,10 @@ fn parse_inventory_path(
 fn inventory_kind(path: &str) -> Option<InventoryKind> {
     language_for_path(path)
         .map(InventoryKind::Source)
+        .or_else(|| {
+            path.ends_with(".go")
+                .then_some(InventoryKind::UnindexedLanguage)
+        })
         .or_else(|| {
             (path == "Cargo.toml" || path.ends_with("/Cargo.toml"))
                 .then_some(InventoryKind::CargoManifest)
@@ -4099,6 +4763,8 @@ mod tests {
                 &head,
                 &SnapshotTarget::Commit,
                 DependencyMode::Boundary,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
                 &commit_root,
                 &AtomicBool::new(false),
             )
@@ -4109,6 +4775,8 @@ mod tests {
                 &head,
                 &SnapshotTarget::Index,
                 DependencyMode::Boundary,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
                 &index_root,
                 &AtomicBool::new(false),
             )
@@ -4121,6 +4789,8 @@ mod tests {
                     include_untracked: true,
                 },
                 DependencyMode::Boundary,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
                 &worktree_root,
                 &AtomicBool::new(false),
             )
@@ -4308,6 +4978,8 @@ mod tests {
             &base,
             &SnapshotTarget::Index,
             DependencyMode::Boundary,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &index_root,
             &AtomicBool::new(false),
         ) {
@@ -4340,6 +5012,8 @@ mod tests {
                 include_untracked: false,
             },
             DependencyMode::Boundary,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &worktree_root,
             &AtomicBool::new(false),
         ) {
@@ -4386,6 +5060,8 @@ mod tests {
                 include_untracked: false,
             },
             DependencyMode::Boundary,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &capture_root,
             &AtomicBool::new(false),
         );
@@ -4433,6 +5109,8 @@ mod tests {
             &base,
             &SnapshotTarget::Index,
             DependencyMode::Boundary,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &capture_root,
             &AtomicBool::new(false),
         );
@@ -4480,6 +5158,8 @@ mod tests {
                         include_untracked: true,
                     },
                     DependencyMode::Boundary,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
                     &capture_root,
                     &AtomicBool::new(false),
                 )
@@ -4587,6 +5267,8 @@ mod tests {
                     case_head,
                     &target,
                     DependencyMode::Boundary,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
                     &capture_root,
                     &AtomicBool::new(false),
                 )
@@ -4657,7 +5339,84 @@ mod tests {
         let inventory = parse_index_inventory(output.as_bytes()).unwrap();
 
         assert!(inventory.sources.is_empty());
-        assert_eq!(inventory.skipped, 1);
+        assert_eq!(inventory.omissions.len(), 1);
+    }
+
+    #[test]
+    fn source_omission_inventory_retains_safe_reasons_and_folds_unsafe_paths() {
+        let tree = [
+            format!("120000 blob {OID}\tlinked.rs\0").into_bytes(),
+            format!("100644 blob {OID}\tcmd/main.go\0").into_bytes(),
+            format!("100644 blob {OID}\tREADME.txt\0").into_bytes(),
+            {
+                let mut value = format!("100644 blob {OID}\t").into_bytes();
+                value.extend_from_slice(b"bad-\xff.rs\0");
+                value
+            },
+            {
+                let mut value = format!("100644 blob {OID}\t").into_bytes();
+                value.extend_from_slice(b"other-\xfe.rs\0");
+                value
+            },
+        ]
+        .concat();
+        let inventory = parse_tree_inventory(&tree).unwrap();
+        assert_eq!(
+            inventory.omissions,
+            [
+                SourceOmission {
+                    path: None,
+                    reason: SourceOmissionReason::UnsafePath,
+                    occurrences: 2,
+                },
+                SourceOmission {
+                    path: Some("cmd/main.go".into()),
+                    reason: SourceOmissionReason::LanguageNotIndexed,
+                    occurrences: 1,
+                },
+                SourceOmission {
+                    path: Some("linked.rs".into()),
+                    reason: SourceOmissionReason::NonRegular,
+                    occurrences: 1,
+                },
+            ]
+        );
+
+        let index = format!(
+            "100644 {OID} 1\tconflict.py\0\
+             100644 {OID} 2\tconflict.py\0\
+             100644 {OID} 3\tconflict.py\0"
+        );
+        assert_eq!(
+            parse_index_inventory(index.as_bytes()).unwrap().omissions,
+            [SourceOmission {
+                path: Some("conflict.py".into()),
+                reason: SourceOmissionReason::Unmerged,
+                occurrences: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn source_omission_read_classifies_expected_safe_failures() {
+        let root = private_dir("source-omission-read");
+        fs::write(root.join("large.rs"), vec![b'x'; SOURCE_LIMIT as usize + 1]).unwrap();
+        fs::write(root.join("invalid.py"), [0xff]).unwrap();
+        fs::create_dir(root.join("directory.ts")).unwrap();
+
+        for (path, reason) in [
+            ("large.rs", SourceOmissionReason::Oversized),
+            ("invalid.py", SourceOmissionReason::InvalidUtf8),
+            ("directory.ts", SourceOmissionReason::NonRegular),
+            ("gone.js", SourceOmissionReason::MissingDuringRead),
+        ] {
+            assert_eq!(
+                read_source_file(&root, path, &AtomicBool::new(false)).unwrap(),
+                SourceRead::Omitted(reason),
+                "{path}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4693,7 +5452,7 @@ mod tests {
             .unwrap();
 
         assert!(snapshot.files.is_empty());
-        assert_eq!(snapshot.skipped, 1);
+        assert_eq!(snapshot.files_skipped(), 1);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(capture_root).unwrap();
     }
@@ -4709,7 +5468,7 @@ mod tests {
 
         assert_eq!(inventory.sources.len(), 1);
         assert!(inventory.sources.contains_key("src/lib.rs"));
-        assert_eq!(inventory.skipped, 0);
+        assert!(inventory.omissions.is_empty());
     }
 
     #[test]
@@ -4819,32 +5578,32 @@ mod tests {
         ] {
             let mut invalid = vec![0xff];
             invalid.extend_from_slice(suffix);
-            let mut skipped = 0;
+            let mut omissions = Vec::new();
             assert!(
-                parse_inventory_path(&invalid, &mut skipped)
+                parse_inventory_path(&invalid, &mut omissions)
                     .unwrap()
                     .is_none()
             );
-            assert_eq!(skipped, 1);
+            assert_eq!(omissions.len(), 1);
 
-            let mut skipped = 0;
+            let mut omissions = Vec::new();
             let control = format!("src/a\n{}", String::from_utf8_lossy(suffix));
             assert!(
-                parse_inventory_path(control.as_bytes(), &mut skipped)
+                parse_inventory_path(control.as_bytes(), &mut omissions)
                     .unwrap()
                     .is_none()
             );
-            assert_eq!(skipped, 1);
+            assert_eq!(omissions.len(), 1);
         }
         for path in ["/tmp/a.js", "../a.ts"] {
-            let mut skipped = 0;
+            let mut omissions = Vec::new();
             assert_eq!(
-                parse_inventory_path(path.as_bytes(), &mut skipped)
+                parse_inventory_path(path.as_bytes(), &mut omissions)
                     .err()
                     .unwrap(),
                 "Git returned an unsafe changed path"
             );
-            assert_eq!(skipped, 0);
+            assert!(omissions.is_empty());
         }
 
         fs::remove_dir_all(capture_root).unwrap();
@@ -5591,6 +6350,32 @@ mod tests {
     }
 
     #[test]
+    fn boundary_dependency_changes_require_exact_content() {
+        let mut changes = WorktreeChanges {
+            files: Vec::new(),
+            records: Vec::new(),
+            paths: vec![ChangedPath {
+                status: ChangeStatus::Modified,
+                old_path: None,
+                old_language: None,
+                path: ".cargo/vendor/example/src/lib.rs".into(),
+                language: Some(Language::Rust),
+                additions: None,
+                deletions: None,
+                layers: vec![ChangeLayer::Unstaged],
+            }],
+            source_patch: String::new(),
+            artifacts: ArtifactReview::default(),
+            skipped_paths: 0,
+        };
+
+        assert!(!change_content_complete(&changes, DependencyMode::Boundary));
+        changes.paths[0].additions = Some(1);
+        changes.paths[0].deletions = Some(1);
+        assert!(change_content_complete(&changes, DependencyMode::Boundary));
+    }
+
+    #[test]
     fn parses_changed_files_and_rejects_malformed_streams() {
         let cancelled = AtomicBool::new(false);
         let zero = "0".repeat(OID.len());
@@ -6079,6 +6864,266 @@ mod tests {
     }
 
     #[test]
+    fn requested_artifact_commit_state_is_exact() {
+        let root = initialized_repository("requested-artifact-commit");
+        fs::write(root.join("schema.proto"), "committed\n").unwrap();
+        test_git(&root, &["add", "--", "schema.proto"]);
+        test_git(&root, &["commit", "--quiet", "-m", "schema"]);
+        let oid = git_output(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("schema.proto"), "live worktree\n").unwrap();
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let capture_root = private_dir("requested-artifact-commit-capture");
+
+        let capture = repository
+            .capture_snapshot(
+                &oid,
+                &oid,
+                &SnapshotTarget::Commit,
+                DependencyMode::Boundary,
+                &BTreeSet::from(["schema.proto".to_owned()]),
+                &BTreeSet::new(),
+                &capture_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert_eq!(
+            capture.requested_artifacts["schema.proto"].bytes,
+            b"committed\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(capture_root).unwrap();
+    }
+
+    #[test]
+    fn requested_artifact_index_and_worktree_state_is_exact() {
+        let root = initialized_repository("requested-artifact-mutable");
+        fs::write(root.join("schema.proto"), "committed\n").unwrap();
+        test_git(&root, &["add", "--", "schema.proto"]);
+        test_git(&root, &["commit", "--quiet", "-m", "schema"]);
+        fs::write(root.join("schema.proto"), "staged\n").unwrap();
+        test_git(&root, &["add", "--", "schema.proto"]);
+        fs::write(root.join("schema.proto"), "live worktree\n").unwrap();
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let paths = BTreeSet::from(["schema.proto".to_owned()]);
+        let index_root = private_dir("requested-artifact-index-capture");
+        let index = repository
+            .capture_snapshot(
+                &repository.head_oid,
+                &repository.head_oid,
+                &SnapshotTarget::Index,
+                DependencyMode::Boundary,
+                &paths,
+                &BTreeSet::new(),
+                &index_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let worktree_root = private_dir("requested-artifact-worktree-capture");
+        let worktree = repository
+            .capture_snapshot(
+                &repository.head_oid,
+                &repository.head_oid,
+                &SnapshotTarget::Worktree {
+                    include_untracked: true,
+                },
+                DependencyMode::Boundary,
+                &paths,
+                &BTreeSet::new(),
+                &worktree_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert_eq!(index.requested_artifacts["schema.proto"].bytes, b"staged\n");
+        assert_eq!(
+            worktree.requested_artifacts["schema.proto"].bytes,
+            b"live worktree\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(index_root).unwrap();
+        fs::remove_dir_all(worktree_root).unwrap();
+    }
+
+    #[test]
+    fn requested_artifact_untracked_state_obeys_worktree_selection() {
+        let root = initialized_repository("requested-artifact-untracked");
+        fs::write(root.join("tracked.rs"), "fn tracked() {}\n").unwrap();
+        test_git(&root, &["add", "--", "tracked.rs"]);
+        test_git(&root, &["commit", "--quiet", "-m", "source"]);
+        fs::write(root.join("schema.proto"), "untracked\n").unwrap();
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let paths = BTreeSet::from(["schema.proto".to_owned()]);
+        let excluded_root = private_dir("requested-artifact-untracked-excluded");
+        let result = repository.capture_snapshot(
+            &repository.head_oid,
+            &repository.head_oid,
+            &SnapshotTarget::Worktree {
+                include_untracked: false,
+            },
+            DependencyMode::Boundary,
+            &paths,
+            &BTreeSet::new(),
+            &excluded_root,
+            &AtomicBool::new(false),
+        );
+        let error = match result {
+            Ok(_) => panic!("untracked input was captured from an excluded worktree state"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::InvalidParameters);
+
+        let included_root = private_dir("requested-artifact-untracked-included");
+        let capture = repository
+            .capture_snapshot(
+                &repository.head_oid,
+                &repository.head_oid,
+                &SnapshotTarget::Worktree {
+                    include_untracked: true,
+                },
+                DependencyMode::Boundary,
+                &paths,
+                &BTreeSet::new(),
+                &included_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            capture.requested_artifacts["schema.proto"].bytes,
+            b"untracked\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        assert!(!excluded_root.exists());
+        fs::remove_dir_all(included_root).unwrap();
+    }
+
+    #[test]
+    fn evidence_exclusion_keeps_generated_files_out_of_source_state() {
+        let root = initialized_repository("evidence-exclusion-source");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn source() {}\n").unwrap();
+        test_git(&root, &["add", "--", "src/lib.rs"]);
+        test_git(&root, &["commit", "--quiet", "-m", "source"]);
+        let oid = git_output(&root, &["rev-parse", "HEAD"]);
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let first_root = private_dir("evidence-exclusion-first");
+        let first = repository
+            .capture_snapshot(
+                &oid,
+                &oid,
+                &SnapshotTarget::Worktree {
+                    include_untracked: true,
+                },
+                DependencyMode::Boundary,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &first_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        fs::write(root.join("evidence.json"), "{}\n").unwrap();
+        fs::write(root.join("generated.rs"), "pub fn generated() {}\n").unwrap();
+        let second_root = private_dir("evidence-exclusion-second");
+        let second = repository
+            .capture_snapshot(
+                &oid,
+                &oid,
+                &SnapshotTarget::Worktree {
+                    include_untracked: true,
+                },
+                DependencyMode::Boundary,
+                &BTreeSet::new(),
+                &BTreeSet::from(["evidence.json".to_owned(), "generated.rs".to_owned()]),
+                &second_root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert_eq!(second.dirty_digest, first.dirty_digest);
+        assert_eq!(second.sources.files.len(), first.sources.files.len());
+        assert!(
+            second
+                .changes
+                .paths
+                .iter()
+                .all(|path| { !matches!(path.path.as_str(), "evidence.json" | "generated.rs") })
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(first_root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn evidence_exclusion_rejects_tracked_paths_and_allows_ignored_paths() {
+        let root = initialized_repository("evidence-exclusion-tracked");
+        fs::write(root.join("evidence.json"), "{}\n").unwrap();
+        fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+        test_git(&root, &["add", "--", "evidence.json", ".gitignore"]);
+        test_git(&root, &["commit", "--quiet", "-m", "tracked evidence"]);
+        fs::write(root.join("ignored.rs"), "fn ignored() {}\n").unwrap();
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+
+        assert!(
+            repository
+                .reject_tracked_evidence_paths(
+                    &BTreeSet::from(["evidence.json".to_owned()]),
+                    None,
+                    None,
+                    &AtomicBool::new(false),
+                )
+                .is_err()
+        );
+        repository
+            .reject_tracked_evidence_paths(
+                &BTreeSet::from(["ignored.rs".to_owned()]),
+                None,
+                None,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commit_evidence_tracking_uses_the_selected_tree_not_the_live_index() {
+        let root = initialized_repository("commit-evidence-selected-tree");
+        fs::write(root.join("src.rs"), "fn source() {}\n").unwrap();
+        fs::write(root.join("evidence.json"), "{}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "tracked evidence"]);
+        let selected = git_output(&root, &["rev-parse", "HEAD"]);
+        test_git(&root, &["rm", "--quiet", "--", "evidence.json"]);
+        test_git(&root, &["commit", "--quiet", "-m", "remove evidence"]);
+        assert!(
+            git_output(&root, &["ls-files", "--", "evidence.json"]).is_empty(),
+            "live index must disagree with the selected commit"
+        );
+        let repository = Repository::discover_cancelled(&root, &AtomicBool::new(false)).unwrap();
+        let capture_root = private_dir("commit-evidence-selected-tree-capture");
+
+        let result = repository.capture_snapshot(
+            &selected,
+            &selected,
+            &SnapshotTarget::Commit,
+            DependencyMode::Boundary,
+            &BTreeSet::new(),
+            &BTreeSet::from(["evidence.json".to_owned()]),
+            &capture_root,
+            &AtomicBool::new(false),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("selected commit accepted a tracked evidence path"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::InvalidParameters);
+        assert_eq!(error.message, "evidence files must not be tracked");
+        assert!(!capture_root.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn tracked_text_marker_phrases_remain_text() {
         let root = temp_root("text-binary-markers");
         fs::create_dir_all(&root).unwrap();
@@ -6276,6 +7321,8 @@ mod tests {
                     include_untracked: true,
                 },
                 dependency_mode,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
                 &capture_root,
                 &AtomicBool::new(false),
             )
