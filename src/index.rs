@@ -11,6 +11,7 @@ use std::sync::{
 use std::thread;
 
 use crate::coverage::{BranchObservationKind, parse_coverage};
+use crate::cpp::CppParser;
 use crate::evidence::{CapturedArtifact, CapturedEvidence, capture_manifest};
 use crate::git::{
     ArtifactReview, CapturedSource, ChangeStatus, ChangedPath, DependencyMode, Language,
@@ -2112,6 +2113,7 @@ fn build_index(
     if workers == 1 {
         let mut rust_parser = None;
         let mut python_parser = None;
+        let mut cpp_parser = None;
         let mut script_parsers = ScriptParsers::default();
         let mut blob_reader = None;
         let mut completed = stats.files_reused;
@@ -2121,7 +2123,12 @@ fn build_index(
                 sources,
                 cancelled,
                 work,
-                (&mut rust_parser, &mut python_parser, &mut script_parsers),
+                (
+                    &mut rust_parser,
+                    &mut python_parser,
+                    &mut cpp_parser,
+                    &mut script_parsers,
+                ),
                 &mut blob_reader,
             )? {
                 Some(graph) => {
@@ -2147,6 +2154,7 @@ fn build_index(
                     scope.spawn(|| {
                         let mut rust_parser = None;
                         let mut python_parser = None;
+                        let mut cpp_parser = None;
                         let mut script_parsers = ScriptParsers::default();
                         let mut blob_reader = None;
                         let mut parts = Vec::new();
@@ -2156,7 +2164,12 @@ fn build_index(
                                 sources,
                                 cancelled,
                                 work,
-                                (&mut rust_parser, &mut python_parser, &mut script_parsers),
+                                (
+                                    &mut rust_parser,
+                                    &mut python_parser,
+                                    &mut cpp_parser,
+                                    &mut script_parsers,
+                                ),
                                 &mut blob_reader,
                             )?;
                             parts.push((work.index, part));
@@ -2257,11 +2270,12 @@ fn build_file(
     parsers: (
         &mut Option<RustParser>,
         &mut Option<PythonParser>,
+        &mut Option<CppParser>,
         &mut ScriptParsers,
     ),
     blob_reader: &mut Option<crate::git::BlobReader>,
 ) -> Result<Option<Graph>, String> {
-    let (rust_parser, python_parser, script_parsers) = parsers;
+    let (rust_parser, python_parser, cpp_parser, script_parsers) = parsers;
     let content = match &work.file.content {
         SourceContent::GitBlob(oid) => {
             if work.file.git_oid.as_deref() != Some(oid) || work.file.content_key != *oid {
@@ -2336,6 +2350,16 @@ fn build_file(
         }
         Language::JavaScript | Language::TypeScript => {
             crate::javascript::add_file(&mut graph, &source, work.file.language, script_parsers)?;
+        }
+        Language::Cpp => {
+            if cpp_parser.is_none() {
+                *cpp_parser = Some(CppParser::new()?);
+            }
+            crate::cpp::add_file(
+                &mut graph,
+                &source,
+                cpp_parser.as_mut().expect("initialized above"),
+            )?;
         }
     }
     Ok(Some(graph))
@@ -3603,6 +3627,7 @@ pub(crate) fn assign_parse_contexts(
                     .expect("script language requires a supported path")
                     .to_owned()
             }
+            Language::Cpp => String::new(),
         };
     }
 }

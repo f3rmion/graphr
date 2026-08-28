@@ -3,7 +3,7 @@
 ## Product boundaries
 
 - Build one Rust binary for Codex and Claude over MCP stdio.
-- Support Rust and Python; JavaScript/TypeScript/TSX and Go follow.
+- Support Rust, Python, JavaScript/TypeScript/TSX, and C++; Go follows.
 - Do not add Java, VS Code/editor code, HTTP, UI, embeddings, plugins, or
   migrations.
 - Keep tool output deterministic and compact.
