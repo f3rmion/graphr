@@ -902,6 +902,8 @@ mod tests {
     }
 
     fn fixture(label: &str) -> PathBuf {
+        // Test-only fixture names include the process ID and nanosecond timestamp.
+        // nosemgrep: rust.lang.security.temp-dir.temp-dir
         let root = std::env::temp_dir().join(format!(
             "graphr-evidence-{label}-{}-{}",
             std::process::id(),

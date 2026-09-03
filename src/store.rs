@@ -7369,6 +7369,8 @@ mod tests {
     const SNAPSHOT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn canonical_temp_dir() -> PathBuf {
+        // Test-only helper creates no shared temporary entry.
+        // nosemgrep: rust.lang.security.temp-dir.temp-dir
         fs::canonicalize(std::env::temp_dir()).expect("temporary directory must resolve")
     }
 
