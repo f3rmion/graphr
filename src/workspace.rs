@@ -279,8 +279,10 @@ impl SnapshotEntry {
     /// time: renaming `graph_path` afterwards cannot redirect the read to
     /// another inode.
     pub(crate) fn open_graph(&self) -> std::result::Result<store::Store, String> {
-        let _pin = crate::pinned::pin(&self.graph_path, &self.graph_file)?;
-        store::Store::open_reader(&self.graph_path)
+        let pin = crate::pinned::pin(&self.graph_path, &self.graph_file)?;
+        let store = store::Store::open_reader(&self.graph_path)?;
+        pin.require_used()?;
+        Ok(store)
     }
 }
 
@@ -1087,6 +1089,14 @@ impl SnapshotCatalog {
     }
 }
 
+/// Resolves the cache directories for a root, creating them when asked.
+///
+/// The canonicalisation clause below is load-bearing beyond this function:
+/// `store` sends `SQLITE_OPEN_NOFOLLOW` unconditionally, and that flag rejects
+/// a symlinked *ancestor* rather than only a symlinked final component. A
+/// `common_git_dir` that is not already its own canonicalisation would
+/// therefore be accepted here and then fail every database open deep inside
+/// SQLite. `cache_paths_rejects_a_non_canonical_common_git_dir` pins it.
 fn cache_paths(root: &RootIdentity, create: bool) -> Result<Option<CachePaths>, OperationError> {
     let metadata = fs::symlink_metadata(&root.common_git_dir)
         .map_err(|error| cache_internal("cannot inspect common Git directory", error))?;
@@ -1732,8 +1742,10 @@ fn validate_pinned_image(file: &File, path: &Path) -> Result<crate::store::State
     if !metadata.is_file() || metadata.permissions().mode() & 0o222 != 0 {
         return Err(cache_corrupt("published graph image is not read-only"));
     }
-    let _pin = crate::pinned::pin(path, file).map_err(cache_corrupt)?;
-    store::validate_image(path).map_err(cache_corrupt)
+    let pin = crate::pinned::pin(path, file).map_err(cache_corrupt)?;
+    let state = store::validate_image(path).map_err(cache_corrupt)?;
+    pin.require_used().map_err(cache_corrupt)?;
+    Ok(state)
 }
 
 fn same_file(left: &File, right: &File) -> Result<bool, OperationError> {
@@ -2915,6 +2927,39 @@ mod tests {
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
         fs::remove_file(root.join(".git/graphr")).unwrap();
         fs::remove_dir_all(outside).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Pins the coupling that makes unconditional `SQLITE_OPEN_NOFOLLOW` safe.
+    ///
+    /// That flag rejects a symlinked *ancestor*, not merely a symlinked final
+    /// component, so every database open would fail deep inside SQLite if the
+    /// cache were ever rooted at a path that is not already its own
+    /// canonicalisation. `cache_paths` is what guarantees it is, and this test
+    /// fails if that clause is relaxed.
+    #[test]
+    fn cache_paths_rejects_a_non_canonical_common_git_dir() {
+        let root = repository_with_source("cache-noncanonical", "fn source() {}\n");
+        let roots = AllowedRoots::new(vec![root.clone()]).unwrap();
+        let identity = roots.inspect(&root, &AtomicBool::new(false)).unwrap();
+        // Control: the canonical identity is accepted, so the only difference
+        // below is the symlinked ancestor.
+        assert!(super::cache_paths(&identity, false).is_ok());
+
+        let link = temp_root("cache-noncanonical-link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let mut aliased = identity.clone();
+        // Both fields move together, so `git_dir.starts_with(common_git_dir)`
+        // still holds and only the canonicalisation clause can reject this.
+        aliased.common_git_dir = link.join(".git");
+        aliased.git_dir = link.join(".git");
+
+        let Err(error) = super::cache_paths(&aliased, false) else {
+            panic!("a common Git directory reached through a symlink must be rejected");
+        };
+
+        assert_eq!(error.code, ErrorCode::GitMetadataInvalid);
+        fs::remove_file(&link).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
