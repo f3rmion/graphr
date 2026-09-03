@@ -11651,6 +11651,29 @@ mod tests {
     }
 
     #[test]
+    fn dot_change_impact_prunes_low_priority_paths_before_direct_roots() {
+        let (roots, analysis, accounting) = oversized_path_fixture(24);
+        let dot = change_dot(
+            SNAPSHOT,
+            &roots,
+            &analysis,
+            &ChangeCalls::default(),
+            (6, 50),
+            DependencyMode::Boundary,
+            accounting,
+        )
+        .unwrap();
+
+        assert!(dot.len() <= DOT_BUDGET, "{}", dot.len());
+        assert!(dot.contains("changed_emitted=1"));
+        assert!(dot.contains("paths_discovered=24"));
+        assert!(!dot.contains("paths_emitted=24"));
+        assert!(dot.contains("changed_root"));
+        assert!(dot.contains("caller_00_") && dot.contains("n2 -> n1;"));
+        assert!(!dot.contains("caller_23_") && !dot.contains("n25 -> n1;"));
+    }
+
+    #[test]
     fn dot_change_impact_marks_derived_and_dependency_nodes() {
         let root = RowNode {
             id: 1,
@@ -11822,6 +11845,74 @@ mod tests {
             calls,
             DotAccounting {
                 changed_total: count,
+                analysis_roots_omitted: 0,
+                deleted_paths_unanalyzed: 0,
+                unmapped_ranges: 0,
+                file_mapped_ranges: 0,
+                traversal_complete: true,
+            },
+        )
+    }
+
+    fn oversized_path_fixture(count: usize) -> (Vec<RowNode>, ChangeAnalysis, DotAccounting) {
+        let root = RowNode {
+            id: 1,
+            kind: "function".into(),
+            name: format!("changed_root_{}", "x".repeat(320)),
+            path: format!("src/{}/changed.rs", "p".repeat(320)),
+            line: 1,
+        };
+        let target = FlowNode {
+            id: root.id,
+            kind: root.kind.clone(),
+            name: root.name.clone(),
+            qualified_name: root.name.clone(),
+            path: root.path.clone(),
+            line: root.line,
+        };
+        let flows = (0..count)
+            .map(|index| {
+                let caller = FlowNode {
+                    id: i64::try_from(index + 2).unwrap(),
+                    kind: "function".into(),
+                    name: format!("caller_{index:02}_{}", "y".repeat(320)),
+                    qualified_name: format!("caller_{index:02}"),
+                    path: format!("src/{}/caller_{index:02}.rs", "q".repeat(320)),
+                    line: 2,
+                };
+                AffectedFlow {
+                    entry: caller.clone(),
+                    nodes: vec![caller.clone(), target.clone()],
+                    parents: HashMap::from([(target.id, caller.id)]),
+                    changed: vec![target.id],
+                    depth: 1,
+                    file_count: 2,
+                    criticality: u32::try_from(count - index).unwrap(),
+                }
+            })
+            .collect();
+        (
+            vec![root],
+            ChangeAnalysis {
+                risks: HashMap::from([(
+                    target.id,
+                    NodeRisk {
+                        score: 1_000,
+                        flow_component: 1_000,
+                        test_component: 0,
+                        security_component: 0,
+                        caller_component: 0,
+                        test_node: false,
+                        test_gap: false,
+                        indirect_test_covered: false,
+                    },
+                )]),
+                flows,
+                flow_omitted: false,
+                test_mapping_omitted: false,
+            },
+            DotAccounting {
+                changed_total: 1,
                 analysis_roots_omitted: 0,
                 deleted_paths_unanalyzed: 0,
                 unmapped_ranges: 0,
