@@ -363,7 +363,7 @@ fn parse_digest(value: &str) -> Result<[u8; 32], OperationError> {
         return Err(invalid("evidence digest is invalid"));
     }
     let mut digest = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         digest[index] = (hex(pair[0]) << 4) | hex(pair[1]);
     }
     Ok(digest)

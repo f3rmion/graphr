@@ -4734,7 +4734,7 @@ fn apply_incremental(
     {
         let mut keys = tx
             .prepare(
-                "SELECT nk.key FROM node_keys nk
+                "SELECT nk.key, n.kind FROM node_keys nk
                    JOIN nodes n ON n.id=nk.node_id
                   WHERE n.file_id=?1",
             )
@@ -4752,11 +4752,13 @@ fn apply_incremental(
         for file_id in &removed {
             check_cancelled(cancelled)?;
             for row in keys
-                .query_map([file_id], |row| row.get::<_, String>(0))
+                .query_map([file_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(db_error)?
             {
-                let key = row.map_err(db_error)?;
-                if key.starts_with("rust:type:") {
+                let (key, kind) = row.map_err(db_error)?;
+                if kind == "type" {
                     affected_owners.insert(key.clone());
                 }
                 affected_keys.insert(key);
@@ -4777,7 +4779,7 @@ fn apply_incremental(
     }
     for node in &graph.nodes {
         for key in &node.keys {
-            if key.starts_with("rust:type:") {
+            if node.kind == NodeKind::Type {
                 affected_owners.insert(key.clone());
             }
             affected_keys.insert(key.clone());
@@ -8486,6 +8488,107 @@ mod tests {
         assert!(output.contains(
             "claim kind=static-test-paths status=partial basis=resolved-static-call-graph"
         ));
+    }
+
+    #[test]
+    fn reparents_cpp_methods_when_the_owner_type_is_added_incrementally() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        let cancelled = AtomicBool::new(false);
+        let file = |path: &str, replace| FileInput {
+            path: path.into(),
+            language: Language::Cpp,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: String::new(),
+            byte_size: 1,
+            replace,
+            observed_relation_sites: 0,
+        };
+        let file_node = |key: &str, path: &str| NodeInput {
+            key: key.into(),
+            file_key: path.into(),
+            kind: NodeKind::File,
+            name: path.into(),
+            qualified_name: key.into(),
+            parent_key: None,
+            owner_key: None,
+            line_start: 1,
+            line_end: 1,
+            signature: String::new(),
+            keys: vec![],
+        };
+
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((
+                    Graph {
+                        files: vec![file("src/method.cpp", true)],
+                        nodes: vec![
+                            file_node("method-file", "src/method.cpp"),
+                            NodeInput {
+                                key: "run".into(),
+                                file_key: "src/method.cpp".into(),
+                                kind: NodeKind::Function,
+                                name: "run".into(),
+                                qualified_name: "run".into(),
+                                parent_key: Some("method-file".into()),
+                                owner_key: Some("cpp:item:Worker".into()),
+                                line_start: 1,
+                                line_end: 1,
+                                signature: String::new(),
+                                keys: vec!["cpp:item:Worker::run".into()],
+                            },
+                        ],
+                        ..Graph::default()
+                    },
+                    (),
+                ))
+            })
+            .unwrap();
+
+        store
+            .index_with(&cancelled, |_full, _existing| {
+                Ok((
+                    Graph {
+                        files: vec![file("src/method.cpp", false), file("src/worker.h", true)],
+                        nodes: vec![
+                            file_node("worker-file", "src/worker.h"),
+                            NodeInput {
+                                key: "worker".into(),
+                                file_key: "src/worker.h".into(),
+                                kind: NodeKind::Type,
+                                name: "Worker".into(),
+                                qualified_name: "Worker".into(),
+                                parent_key: Some("worker-file".into()),
+                                owner_key: None,
+                                line_start: 1,
+                                line_end: 1,
+                                signature: String::new(),
+                                keys: vec!["cpp:item:Worker".into()],
+                            },
+                        ],
+                        ..Graph::default()
+                    },
+                    (),
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT parent.kind, parent.name FROM nodes method
+                       JOIN nodes parent ON parent.id=method.parent_id
+                      WHERE method.name='run'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            ("type".into(), "Worker".into())
+        );
     }
 
     #[test]

@@ -230,6 +230,7 @@ pub enum Language {
     Python,
     JavaScript,
     TypeScript,
+    Cpp,
 }
 
 #[derive(
@@ -272,6 +273,7 @@ impl Language {
             Self::Python => "python",
             Self::JavaScript => "javascript",
             Self::TypeScript => "typescript",
+            Self::Cpp => "cpp",
         }
     }
 
@@ -281,6 +283,7 @@ impl Language {
             "python" => Some(Self::Python),
             "javascript" => Some(Self::JavaScript),
             "typescript" => Some(Self::TypeScript),
+            "cpp" => Some(Self::Cpp),
             _ => None,
         }
     }
@@ -1868,7 +1871,7 @@ fn capture_target_changes(
     )?;
     let mut source_paths = vec![
         "*.rs", "*.py", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.mts", "*.cts",
-        "*.d.ts",
+        "*.d.ts", "*.cpp", "*.cc", "*.cxx", "*.hpp", "*.hh", "*.hxx", "*.h",
     ];
     if dependency_mode == DependencyMode::Boundary {
         source_paths.push(":(glob,exclude).cargo/vendor/*/**");
@@ -1915,6 +1918,13 @@ fn capture_target_changes(
         ":(exclude)*.mts",
         ":(exclude)*.cts",
         ":(exclude)*.d.ts",
+        ":(exclude)*.cpp",
+        ":(exclude)*.cc",
+        ":(exclude)*.cxx",
+        ":(exclude)*.hpp",
+        ":(exclude)*.hh",
+        ":(exclude)*.hxx",
+        ":(exclude)*.h",
     ];
     if dependency_mode == DependencyMode::Boundary {
         artifact_paths.push(":(glob,exclude).cargo/vendor/*/**");
@@ -4186,6 +4196,13 @@ fn parse_inventory_path(
         b".cts",
         b".d.ts",
         b".go",
+        b".cpp",
+        b".cc",
+        b".cxx",
+        b".hpp",
+        b".hh",
+        b".hxx",
+        b".h",
     ]
     .iter()
     .any(|suffix| raw_path.ends_with(suffix));
@@ -4257,6 +4274,7 @@ fn language_for_path(path: &str) -> Option<Language> {
         Some("py") => Some(Language::Python),
         Some("js" | "jsx" | "mjs" | "cjs") => Some(Language::JavaScript),
         Some("ts" | "tsx" | "mts" | "cts") => Some(Language::TypeScript),
+        Some("cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "h") => Some(Language::Cpp),
         _ => None,
     }
 }
@@ -5472,7 +5490,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_every_script_extension_case_sensitively() {
+    fn classifies_supported_extensions_case_sensitively() {
         let cases = [
             ("src/a.js", Language::JavaScript),
             ("src/a.jsx", Language::JavaScript),
@@ -5483,12 +5501,45 @@ mod tests {
             ("src/a.mts", Language::TypeScript),
             ("src/a.cts", Language::TypeScript),
             ("src/a.d.ts", Language::TypeScript),
+            ("src/a.cpp", Language::Cpp),
+            ("src/a.cc", Language::Cpp),
+            ("src/a.cxx", Language::Cpp),
+            ("src/a.hpp", Language::Cpp),
+            ("src/a.hh", Language::Cpp),
+            ("src/a.hxx", Language::Cpp),
+            ("src/a.h", Language::Cpp),
         ];
         for (path, expected) in cases {
             assert_eq!(language_for_path(path), Some(expected), "{path}");
         }
         assert_eq!(language_for_path("src/a.JS"), None);
         assert_eq!(language_for_path("src/a.TS"), None);
+        assert_eq!(language_for_path("src/a.CPP"), None);
+        assert_eq!(language_for_path("src/a.c"), None);
+    }
+
+    #[test]
+    fn counts_invalid_cpp_source_paths_as_skipped() {
+        for suffix in [
+            b".cpp".as_slice(),
+            b".cc",
+            b".cxx",
+            b".hpp",
+            b".hh",
+            b".hxx",
+            b".h",
+        ] {
+            let mut path = vec![0xff];
+            path.extend_from_slice(suffix);
+            let mut omissions = Vec::new();
+
+            assert!(
+                parse_inventory_path(&path, &mut omissions)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(omissions.len(), 1);
+        }
     }
 
     #[test]

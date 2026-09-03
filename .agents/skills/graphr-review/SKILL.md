@@ -38,7 +38,7 @@ Ask for a missing target branch. Stop if a required base does not exist, includi
 ## Review the immutable snapshot
 
 1. Call `changes({"snapshot_id": SNAPSHOT_ID, "depth": 6, "max_nodes": 50})` exactly once without `cursor`.
-2. Exhaust every `files_next_cursor`, `diff_next_cursor`, `artifacts_next_cursor`, and `graph_next_cursor` returned by any page. A cursor line is `name=value`: split only on the first `=` and pass the entire value, including every later `=`, verbatim:
+2. Exhaust every `files_next_cursor`, `diff_next_cursor`, `artifacts_next_cursor`, `graph_next_cursor`, and `evidence_next_cursor` returned by any page. A cursor line is `name=value`: split only on the first `=` and pass the entire value, including every later `=`, verbatim:
 
    ```text
    changes({"snapshot_id": SNAPSHOT_ID, "depth": 6,
@@ -46,10 +46,10 @@ Ask for a missing target branch. Stop if a required base does not exist, includi
    ```
 
    Keep the same snapshot, depth, and max-nodes. Never make a second cursorless `changes` call. Increasing `max_nodes` changes page size, not coverage.
-3. Review only returned manifest, source diff, artifact, and graph pages. Artifact pages include bounded generic text plus Markdown requirement/link/fence and TSV schema/key/row/duplicate/width semantics; do not re-read captured files. Treat each `flow` as a possible static path, not a runtime stack, and support findings with `file:line` evidence.
+3. Review only returned manifest, source diff, artifact, graph, and evidence pages. Artifact pages include bounded generic text plus Markdown requirement/link/fence and TSV schema/key/row/duplicate/width semantics; do not re-read captured files. Treat each `flow` as a possible static path, not a runtime stack, and support findings with `file:line` evidence.
 4. Use `search` or `view` only when an emitted graph `coverage` line names that exact remediation. Pass the same `snapshot_id`; pass returned `node_ref` values verbatim. `file-mapped` ranges need no remediation. Do not search unrelated names or read the repository.
 
-`analysis_complete` is analyzer-local. Conclude only after all four cursor streams and named remediation terminate, no explicit omission or failure occurred, and `review_complete_when_pages_exhausted=true`. Binary, oversized, unsafe, non-regular, type-changed, unmerged, cursor, and remediation failures make coverage incomplete. Complete artifact coverage does not add indexed source languages: Graphr indexes Rust, Python, JavaScript/JSX, and TypeScript/TSX.
+`analysis_complete` is analyzer-local. Conclude only after all five cursor streams and named remediation terminate, no explicit omission or failure occurred, and `content_complete_when_pages_exhausted=true`. Treat `static_evidence_status` and `dynamic_evidence_status` as independent facts. Binary, oversized, unsafe, non-regular, type-changed, unmerged, cursor, and remediation failures make content coverage incomplete. Complete artifact coverage does not add indexed source languages: Graphr indexes Rust, Python, JavaScript/JSX, TypeScript/TSX, and C++.
 
 If `inspect_root` reports `snapshot_matches_worktree=false`, the snapshot remains historical and immutable but no longer proves the selected live worktree was reviewed. Explicitly queue a fresh `index` for the same selected root/range/target and restart from its completed snapshot. If divergence repeats, stop; never fall back to a live diff or default checkout.
 

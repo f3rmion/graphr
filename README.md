@@ -1,7 +1,7 @@
 # Graphr
 
-Fast, compact Rust, Python, JavaScript/JSX, and TypeScript/TSX code-graph views
-for Codex and Claude over MCP stdio.
+Fast, compact Rust, Python, JavaScript/JSX, TypeScript/TSX, and C++ code-graph
+views for Codex and Claude over MCP stdio.
 
 Graphr is inspired by [code-review-graph](https://github.com/tirth8205/code-review-graph)'s approach to focusing AI review context. Thanks to @tirth8205 and its contributors for originating that work.
 
@@ -195,12 +195,12 @@ or normative citation mapping.
 
 ## Review output
 
-Graphr detects Rust, Python, JavaScript/JSX, and TypeScript/TSX sources
-automatically. Rust uses `.rs`, Python uses `.py`, and the nine JavaScript and
-TypeScript script extensions are `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`,
-`.mts`, `.cts`, and `.d.ts`. `changes` returns bounded 8 KiB review pages with
-every safe changed path, an aggregate count of unsafe paths, supported source
-diffs, bounded non-source text diffs,
+Graphr detects Rust, Python, JavaScript/JSX, TypeScript/TSX, and C++ sources
+automatically. Rust uses `.rs`, Python uses `.py`, JavaScript and TypeScript use
+`.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`, `.cts`, and `.d.ts`, and
+C++ uses `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, and `.h`. `changes`
+returns bounded 8 KiB review pages with every safe changed path, an aggregate
+count of unsafe paths, supported source diffs, bounded non-source text diffs,
 Markdown/TSV semantics, explicit artifact omissions, risk-ranked changed
 symbols, affected static execution paths, and graph impact. `.cargo/vendor`
 changes collapse to deterministic package boundaries by default; select
@@ -212,6 +212,12 @@ JSX component calls. Module resolution is limited to relative repository-local
 specifiers. There is no package or `tsconfig` resolution and no type checker;
 ambiguous module aliases produce no edge.
 
+For C++, graph semantics include type and function definitions, repository-local
+quoted includes, inheritance, direct and qualified calls, `this` calls, and
+GoogleTest or Catch2/doctest test cases. Graphr does not preprocess source, read
+`compile_commands.json`, resolve system headers, instantiate templates, infer
+receiver types, or choose between overloads; ambiguous targets produce no edge.
+
 Affected-flow discovery follows `CALLS` edges up to 15 hops. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale. `test_path_confidence=heuristic` and `test_path_provenance=resolved-static-call-graph` describe bounded static evidence, not runtime test proof; community and churn factors are not used.
 
 Artifact text and semantics belong to the immutable snapshot. Non-symbol source
@@ -221,7 +227,7 @@ Binary, oversized, unsafe, non-regular, type-changed, unmerged, and other
 explicit artifact omissions keep `content_complete_when_pages_exhausted=false`.
 This is complete artifact coverage for every supported source language.
 
-JavaScript and TypeScript use the existing incremental indexing and rename
+JavaScript, TypeScript, and C++ use the existing incremental indexing and rename
 detection pipeline. Rename detection runs independently within regular source
 diffs and within non-source artifact diffs. Renames crossing those streams are
 conservatively represented as a deletion plus an addition.

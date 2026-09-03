@@ -1478,6 +1478,116 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
     client.close();
 }
 
+#[test]
+fn cpp_index_search_view_and_changes_over_mcp() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::create_dir_all(fixture.path.join("tests")).unwrap();
+    fs::write(
+        fixture.path.join("src/worker.h"),
+        "namespace app { struct Base {}; class Worker : public Base { public: void run() { helper(); } }; void helper() {} }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/main.cpp"),
+        "#include \"worker.h\"\nnamespace app { int execute() { Worker::run(); return 0; } }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("tests/worker_test.cc"),
+        "TEST(WorkerTest, Runs) { app::execute(); }\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "src/main.cpp"]);
+    git_commit(&fixture.path, "C++ baseline");
+    fs::write(
+        fixture.path.join("src/main.cpp"),
+        "#include \"worker.h\"\nnamespace app { int execute() { Worker::run(); return 1; } }\n",
+    )
+    .unwrap();
+
+    index_repository(&fixture.path);
+    assert_eq!(language_file_count(&fixture.path, "cpp"), 3);
+    assert_eq!(
+        named_edge_kind_count(
+            &fixture.path,
+            "src/worker.h",
+            "run",
+            "src/worker.h",
+            "helper",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &fixture.path,
+            "src/main.cpp",
+            "execute",
+            "src/worker.h",
+            "run",
+            "CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &fixture.path,
+            "tests/worker_test.cc",
+            "WorkerTest.Runs",
+            "src/main.cpp",
+            "execute",
+            "TEST_CALLS",
+        ),
+        1
+    );
+    assert_eq!(
+        named_edge_kind_count(
+            &fixture.path,
+            "src/main.cpp",
+            "src/main.cpp",
+            "src/worker.h",
+            "src/worker.h",
+            "IMPORTS",
+        ),
+        1
+    );
+    assert_eq!(
+        trait_implementation_count(&fixture.path, "Worker", "Base"),
+        1
+    );
+
+    let mut client = Client::start(&fixture.path);
+    let search = response_text(&client.search("Worker", Some("type")));
+    let node_ref = search
+        .lines()
+        .find(|line| line.contains(" Type Worker "))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let view = client.view(node_ref, 2, 30);
+    assert!(view.contains("implements ->"), "{view}");
+    assert!(view.contains("Base"), "{view}");
+    assert!(view.contains("run"), "{view}");
+    let snapshot_id = client.snapshot_id.clone().unwrap();
+    let captured = capture_changes(&mut client, &snapshot_id, 2, 50);
+    let changes = captured
+        .queries()
+        .map(|capture| capture.text.as_str())
+        .collect::<String>();
+    for expected in [
+        "changed source cpp src/main.cpp",
+        "untracked source cpp src/worker.h",
+        "untracked source cpp tests/worker_test.cc",
+        "WorkerTest.Runs",
+    ] {
+        assert!(changes.contains(expected), "missing {expected}: {changes}");
+    }
+    client.close();
+}
+
 const TYPES: &str = r#"
     export interface Config { value: string }
 "#;
