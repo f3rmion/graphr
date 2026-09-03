@@ -1407,6 +1407,7 @@ pub fn validate_image(path: &Path) -> Result<State> {
     }
     let state = read_state(&connection)?;
     require_integrity(&connection)?;
+    load_stored_files(&connection)?;
     require_graph_invariants(&connection, &AtomicBool::new(false))?;
     require_evidence_invariants(&connection, &AtomicBool::new(false))?;
     require_no_sidecars(path)?;
@@ -7773,6 +7774,17 @@ mod tests {
 
         assert_eq!(rejected, [true, true, true]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_image_rejects_invalid_file_language() {
+        let error = sealed_image_corruption("file-language", |connection| {
+            connection
+                .execute("UPDATE files SET language='go'", [])
+                .unwrap();
+        });
+
+        assert_eq!(error, "database file language is invalid");
     }
 
     #[test]
