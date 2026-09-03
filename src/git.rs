@@ -79,6 +79,7 @@ pub(crate) fn capture_evidence_file(
             OperationError::new(ErrorCode::InvalidParameters, "evidence path is unsafe")
         })?;
         // SAFETY: openat receives a live directory descriptor and a NUL-terminated name.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let descriptor = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -93,6 +94,7 @@ pub(crate) fn capture_evidence_file(
             ));
         }
         // SAFETY: a successful openat returns a newly owned descriptor.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         directory = unsafe { File::from_raw_fd(descriptor) };
     }
     let Some(Component::Normal(name)) = components.last() else {
@@ -105,6 +107,7 @@ pub(crate) fn capture_evidence_file(
         OperationError::new(ErrorCode::InvalidParameters, "evidence path is unsafe")
     })?;
     // SAFETY: openat receives a live directory descriptor and a NUL-terminated name.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let descriptor = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -119,6 +122,7 @@ pub(crate) fn capture_evidence_file(
         ));
     }
     // SAFETY: a successful openat returns a newly owned descriptor.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut file = unsafe { File::from_raw_fd(descriptor) };
     let before = file.metadata().map_err(|_| {
         OperationError::new(
@@ -166,6 +170,7 @@ pub(crate) fn capture_evidence_file(
     })?;
     let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: fstatat receives a live directory descriptor, valid name, and writable stat.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let result = unsafe {
         libc::fstatat(
             directory.as_raw_fd(),
@@ -181,6 +186,7 @@ pub(crate) fn capture_evidence_file(
         ));
     }
     // SAFETY: fstatat initialized the value on success.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let current = unsafe { current.assume_init() };
     if !same_file_version(&before, &finished)
         || i128::from(before.dev()) != i128::from(current.st_dev)
