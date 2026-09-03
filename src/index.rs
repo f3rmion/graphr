@@ -26,7 +26,7 @@ use crate::store::{
     CoverageRegionInput, CoverageRunInput, EdgeInput, EdgeKind, EvidenceInput, EvidenceLineSpan,
     FileInput, GapCategory, GapInput, GapReason, Graph, ImportedArtifactInput, ModeledSiteInput,
     ModeledSiteKind, NodeInput, NodeKind, ProvenanceInput, RefInput, RefKind, ResolutionState,
-    Store, TraitImplementationInput,
+    Store, TraitImplementationInput, no_change_dot,
 };
 use crate::workspace::{
     BuildProgress, BuildStage, CACHE_FORMAT_VERSION, ErrorCode, GRAPH_ANALYZER_VERSION,
@@ -54,6 +54,17 @@ pub struct IndexStats {
     pub files_reused: usize,
     pub files_parsed: usize,
     pub files_skipped: usize,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, rmcp::schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum ChangesFormat {
+    #[default]
+    Review,
+    Dot,
 }
 
 pub struct Engine {
@@ -615,6 +626,7 @@ impl Engine {
         snapshot_id: &str,
         depth: u32,
         max_nodes: u32,
+        format: ChangesFormat,
         cursor: Option<&str>,
         cancelled: &AtomicBool,
     ) -> Result<QueryOutput, OperationError> {
@@ -625,6 +637,12 @@ impl Engine {
                 "invalid changes parameters",
             ));
         }
+        if format == ChangesFormat::Dot && cursor.is_some() {
+            return Err(OperationError::new(
+                ErrorCode::InvalidParameters,
+                "DOT changes do not accept a cursor",
+            ));
+        }
         if let Some(reason) = snapshot.no_change_reason {
             if cursor.is_some() {
                 return Err(OperationError::new(
@@ -633,13 +651,16 @@ impl Engine {
                 ));
             }
             return Ok(QueryOutput {
-                text: format!(
-                    "no changes reason={}\n\
-                     content_complete_when_pages_exhausted=true\n\
-                     static_evidence_status=complete\n\
-                     dynamic_evidence_status=not-applicable\n",
-                    reason.as_str()
-                ),
+                text: match format {
+                    ChangesFormat::Review => format!(
+                        "no changes reason={}\n\
+                         content_complete_when_pages_exhausted=true\n\
+                         static_evidence_status=complete\n\
+                         dynamic_evidence_status=not-applicable\n",
+                        reason.as_str()
+                    ),
+                    ChangesFormat::Dot => no_change_dot(snapshot_id, reason.as_str()),
+                },
                 provenance: snapshot.provenance.clone(),
                 no_change_reason: Some(reason),
             });
@@ -683,14 +704,18 @@ impl Engine {
                     .clone()
             }
         };
-        let text = match cursor {
-            Some(cursor) => render_section(
+        let text = match (format, cursor) {
+            (ChangesFormat::Review, Some(cursor)) => render_section(
                 &review,
                 &parse_review_cursor(cursor, snapshot_id, depth, max_nodes)
                     .map_err(query_operation_error)?,
             )
             .map_err(query_operation_error)?,
-            None => review_context(&review).map_err(query_operation_error)?,
+            (ChangesFormat::Review, None) => {
+                review_context(&review).map_err(query_operation_error)?
+            }
+            (ChangesFormat::Dot, None) => review.dot.clone(),
+            (ChangesFormat::Dot, Some(_)) => unreachable!("DOT cursors rejected before rendering"),
         };
         Ok(query_output(&snapshot, text))
     }
@@ -1278,6 +1303,7 @@ struct ReviewSnapshot {
     artifacts: String,
     changes: Arc<WorktreeChanges>,
     graph: String,
+    dot: String,
     evidence: String,
     checksum: String,
     file_ranges: Vec<Range<usize>>,
@@ -1308,6 +1334,7 @@ impl ReviewSnapshot {
     ) -> Self {
         let ChangeReview {
             graph,
+            dot,
             evidence,
             static_status,
             dynamic_status,
@@ -1373,6 +1400,7 @@ impl ReviewSnapshot {
             artifacts,
             changes,
             graph,
+            dot,
             evidence,
             checksum,
             file_ranges,
@@ -3896,8 +3924,8 @@ mod tests {
         LineSpan, PathRecord, SourceOmission,
     };
     use crate::workspace::{
-        AllowedRoots, ErrorCode, IndexRequest, SnapshotCatalog, SnapshotTarget, resolve_request,
-        set_before_seed_open_hook_for_test,
+        AllowedRoots, ErrorCode, IndexRequest, NoChangeReason, SnapshotCatalog, SnapshotTarget,
+        resolve_request, set_before_seed_open_hook_for_test,
     };
     use std::fs;
     use std::process::Command;
@@ -3919,6 +3947,7 @@ mod tests {
     fn complete_review(graph: String) -> ChangeReview {
         ChangeReview {
             graph,
+            dot: String::new(),
             evidence: String::new(),
             static_status: CompletenessStatus::Complete,
             dynamic_status: CompletenessStatus::NotApplicable,
@@ -3929,6 +3958,26 @@ mod tests {
         ChangeReview {
             static_status: CompletenessStatus::Partial,
             ..complete_review(graph)
+        }
+    }
+
+    #[test]
+    fn changes_format_defaults_to_review() {
+        assert_eq!(ChangesFormat::default(), ChangesFormat::Review);
+    }
+
+    #[test]
+    fn every_no_change_reason_renders_empty_dot() {
+        for reason in [
+            NoChangeReason::IdenticalCommitOids,
+            NoChangeReason::IdenticalTrees,
+            NoChangeReason::EmptyIndexDelta,
+            NoChangeReason::EmptyWorktreeDelta,
+        ] {
+            let dot = no_change_dot(REVIEW_SNAPSHOT_ID, reason.as_str());
+            assert!(dot.starts_with("digraph graphr_changes {\n"));
+            assert!(dot.contains(&format!("no_changes_reason={}", reason.as_str())));
+            assert!(dot.ends_with("}\n"));
         }
     }
 
@@ -4362,6 +4411,7 @@ mod tests {
             },
             ChangeReview {
                 graph: "risk traversal_complete=true\n".into(),
+                dot: String::new(),
                 evidence: String::new(),
                 static_status: CompletenessStatus::Complete,
                 dynamic_status: CompletenessStatus::NotApplicable,
@@ -4773,7 +4823,14 @@ fn run() {
         assert!(view.text.contains("original"), "{}", view.text);
         assert!(!view.text.contains("replacement"), "{}", view.text);
         let changes = engine
-            .changes(&original.snapshot_id, 1, 50, None, &AtomicBool::new(false))
+            .changes(
+                &original.snapshot_id,
+                1,
+                50,
+                ChangesFormat::Review,
+                None,
+                &AtomicBool::new(false),
+            )
             .unwrap();
         assert!(changes.text.contains("original"), "{}", changes.text);
         assert!(!changes.text.contains("replacement"), "{}", changes.text);
@@ -5274,7 +5331,14 @@ fn run() {
             .unwrap();
         assert!(generated.text.contains("generated"), "{}", generated.text);
         let review = engine
-            .changes(&first.snapshot_id, 0, 10, None, &AtomicBool::new(false))
+            .changes(
+                &first.snapshot_id,
+                0,
+                10,
+                ChangesFormat::Review,
+                None,
+                &AtomicBool::new(false),
+            )
             .unwrap();
         assert!(!review.text.contains("basis=verified-generated-manifest"));
         assert!(review.text.contains("provenance_model=not-applicable"));
@@ -5926,6 +5990,7 @@ fn run() {
             },
             ChangeReview {
                 graph: "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n".into(),
+                dot: String::new(),
                 evidence: evidence.clone(),
                 static_status: CompletenessStatus::Partial,
                 dynamic_status: CompletenessStatus::Partial,
@@ -6005,6 +6070,7 @@ fn run() {
         let review = |suffix: &str| {
             ChangeReview {
             graph: "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n".into(),
+            dot: String::new(),
             evidence: format!("{}sentinel-{suffix}\n", "evidence-record\n".repeat(600)),
             static_status: CompletenessStatus::Complete,
             dynamic_status: CompletenessStatus::Partial,
