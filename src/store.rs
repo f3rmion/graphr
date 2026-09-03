@@ -4503,7 +4503,11 @@ fn change_dot(
 ) -> Result<String> {
     let (_, max_nodes) = limits;
     let max_nodes = max_nodes as usize;
-    let direct_ids = roots.iter().map(|root| root.id).collect::<Vec<_>>();
+    let direct_ids = roots
+        .iter()
+        .filter(|root| root.kind != "file" && analysis.risks.contains_key(&root.id))
+        .map(|root| root.id)
+        .collect::<Vec<_>>();
     let mut catalog = HashMap::new();
     for root in roots {
         catalog.insert(root.id, root.clone());
@@ -4552,6 +4556,7 @@ fn change_dot(
     }
 
     let mut budget_pruned = false;
+    let mut include_call_context = true;
     loop {
         let (dot, _) = render_change_dot(
             snapshot_id,
@@ -4559,6 +4564,7 @@ fn change_dot(
             &direct_ids[..direct_count],
             &selected_paths,
             calls,
+            include_call_context,
             dependency_mode,
             accounting,
             paths_discovered,
@@ -4575,6 +4581,10 @@ fn change_dot(
         if selected_paths.pop().is_some() {
             continue;
         }
+        if include_call_context && !calls.edges.is_empty() {
+            include_call_context = false;
+            continue;
+        }
         if direct_count == 0 {
             return Ok(dot);
         }
@@ -4589,6 +4599,7 @@ fn render_change_dot(
     direct_ids: &[i64],
     paths: &[Vec<i64>],
     calls: &ChangeCalls,
+    include_call_context: bool,
     dependency_mode: DependencyMode,
     accounting: DotAccounting,
     paths_discovered: usize,
@@ -4625,42 +4636,44 @@ fn render_change_dot(
         .chain(impact_order)
         .collect::<VecDeque<_>>();
     let mut searched = HashSet::new();
-    let mut calls_complete = true;
-    while let Some(callee) = pending.pop_front() {
-        if !searched.insert(callee) {
-            continue;
-        }
-        for &(caller, _, is_test_call) in calls
-            .edges
-            .iter()
-            .filter(|(_, target, _)| *target == callee)
-        {
-            if selected_set.insert(caller) {
-                if selected.len() == max_nodes {
-                    selected_set.remove(&caller);
-                    calls_complete = false;
-                    continue;
+    let mut calls_complete = include_call_context || calls.edges.is_empty();
+    if include_call_context {
+        while let Some(callee) = pending.pop_front() {
+            if !searched.insert(callee) {
+                continue;
+            }
+            for &(caller, _, is_test_call) in calls
+                .edges
+                .iter()
+                .filter(|(_, target, _)| *target == callee)
+            {
+                if selected_set.insert(caller) {
+                    if selected.len() == max_nodes {
+                        selected_set.remove(&caller);
+                        calls_complete = false;
+                        continue;
+                    }
+                    selected.push(caller);
                 }
-                selected.push(caller);
+                if selected_set.contains(&caller) {
+                    pending.push_back(caller);
+                }
+                edges
+                    .entry((caller, callee))
+                    .and_modify(|dashed| *dashed |= is_test_call)
+                    .or_insert(is_test_call);
             }
-            if selected_set.contains(&caller) {
-                pending.push_back(caller);
+        }
+        for &(caller, callee, is_test_call) in &calls.edges {
+            if selected_set.contains(&caller) && selected_set.contains(&callee) {
+                edges
+                    .entry((caller, callee))
+                    .and_modify(|dashed| *dashed |= is_test_call)
+                    .or_insert(is_test_call);
             }
-            edges
-                .entry((caller, callee))
-                .and_modify(|dashed| *dashed |= is_test_call)
-                .or_insert(is_test_call);
         }
     }
     render_complete &= calls_complete;
-    for &(caller, callee, is_test_call) in &calls.edges {
-        if selected_set.contains(&caller) && selected_set.contains(&callee) {
-            edges
-                .entry((caller, callee))
-                .and_modify(|dashed| *dashed |= is_test_call)
-                .or_insert(is_test_call);
-        }
-    }
 
     let flow_discovery = if analysis.flow_omitted
         || accounting.analysis_roots_omitted > 0
@@ -11501,41 +11514,22 @@ mod tests {
     }
 
     #[test]
-    fn dot_change_impact_is_layered_and_deduplicated() {
-        let changed = RowNode {
-            id: 3,
-            kind: "function".into(),
-            name: "changed".into(),
-            path: "src/lib.rs".into(),
-            line: 30,
+    fn dot_change_impact_exactly_renders_branched_merged_paths() {
+        let flow_node = |id, kind: &str, name: &str, path: &str, line| FlowNode {
+            id,
+            kind: kind.into(),
+            name: name.into(),
+            qualified_name: name.into(),
+            path: path.into(),
+            line,
         };
-        let test = FlowNode {
-            id: 1,
-            kind: "test".into(),
-            name: "covers_changed".into(),
-            qualified_name: "covers_changed".into(),
-            path: "tests/change.rs".into(),
-            line: 10,
-        };
-        let caller = FlowNode {
-            id: 2,
-            kind: "function".into(),
-            name: "caller".into(),
-            qualified_name: "caller".into(),
-            path: "src/lib.rs".into(),
-            line: 20,
-        };
-        let target = FlowNode {
-            id: 3,
-            kind: "function".into(),
-            name: "changed".into(),
-            qualified_name: "changed".into(),
-            path: "src/lib.rs".into(),
-            line: 30,
-        };
+        let left = flow_node(1, "test", "left_test", "tests/change.rs", 10);
+        let right = flow_node(2, "function", "right", "src/lib.rs", 20);
+        let merged = flow_node(3, "function", "merged", "src/lib.rs", 30);
+        let target = flow_node(5, "function", "changed", "src/lib.rs", 50);
         let analysis = ChangeAnalysis {
             risks: HashMap::from([(
-                3,
+                5,
                 NodeRisk {
                     score: 4_200,
                     flow_component: 4_200,
@@ -11547,76 +11541,62 @@ mod tests {
                     indirect_test_covered: false,
                 },
             )]),
-            flows: vec![AffectedFlow {
-                entry: caller.clone(),
-                nodes: vec![caller.clone(), target.clone()],
-                parents: HashMap::from([(3, 2)]),
-                changed: vec![3],
-                depth: 1,
-                file_count: 1,
-                criticality: 4_200,
-            }],
+            flows: vec![
+                AffectedFlow {
+                    entry: left.clone(),
+                    nodes: vec![left.clone(), merged.clone(), target.clone()],
+                    parents: HashMap::from([(3, 1), (5, 3)]),
+                    changed: vec![5],
+                    depth: 2,
+                    file_count: 2,
+                    criticality: 4_200,
+                },
+                AffectedFlow {
+                    entry: right.clone(),
+                    nodes: vec![right, merged, target.clone()],
+                    parents: HashMap::from([(3, 2), (5, 3)]),
+                    changed: vec![5],
+                    depth: 2,
+                    file_count: 1,
+                    criticality: 4_100,
+                },
+            ],
             flow_omitted: false,
             test_mapping_omitted: false,
         };
-        let row = |node: &FlowNode| RowNode {
-            id: node.id,
-            kind: node.kind.clone(),
-            name: node.name.clone(),
-            path: node.path.clone(),
-            line: node.line,
-        };
-        let calls = ChangeCalls {
-            nodes: HashMap::from([(1, row(&test)), (2, row(&caller)), (3, row(&target))]),
-            edges: BTreeSet::from([(1, 2, true), (2, 3, false)]),
-        };
-        let accounting = DotAccounting {
-            changed_total: 1,
-            analysis_roots_omitted: 0,
-            deleted_paths_unanalyzed: 0,
-            unmapped_ranges: 0,
-            file_mapped_ranges: 0,
-            traversal_complete: true,
-        };
-
         let dot = change_dot(
             SNAPSHOT,
-            &[changed],
+            &[RowNode {
+                id: target.id,
+                kind: target.kind,
+                name: target.name,
+                path: target.path,
+                line: target.line,
+            }],
             &analysis,
-            &calls,
+            &ChangeCalls {
+                nodes: HashMap::new(),
+                edges: BTreeSet::from([(1, 3, true), (2, 3, false), (3, 5, false)]),
+            },
             (6, 50),
             DependencyMode::Boundary,
-            accounting,
+            DotAccounting {
+                changed_total: 1,
+                analysis_roots_omitted: 0,
+                deleted_paths_unanalyzed: 0,
+                unmapped_ranges: 0,
+                file_mapped_ranges: 0,
+                traversal_complete: true,
+            },
         )
         .unwrap();
 
-        assert!(dot.starts_with("digraph graphr_changes {\n"));
-        assert!(dot.ends_with("}\n"));
-        for id in [1, 2, 3] {
-            assert_eq!(
-                dot.lines()
-                    .filter(|line| line.trim_start().starts_with(&format!("n{id} [")))
-                    .count(),
-                1,
-                "{dot}"
-            );
-        }
-        assert!(dot.contains("n1 -> n2 [style=dashed];"));
-        assert!(dot.contains("n2 -> n3;"));
-        assert!(dot.contains("changed risk=0.4200"));
-        assert!(
-            dot.lines()
-                .find(|line| line.trim_start().starts_with("n1 ["))
-                .unwrap()
-                .contains("shape=ellipse")
+        assert_eq!(
+            dot,
+            format!(
+                "digraph graphr_changes {{\n  graph [rankdir=LR, label=\"snapshot={SNAPSHOT} changed_emitted=1 changed_total=1 paths_emitted=2 paths_discovered=2 flow_discovery=complete render_complete=true analysis_roots_omitted=0 deleted_paths_unanalyzed=0 unmapped_ranges=0 file_mapped_ranges=0 traversal_complete=true\"];\n  n5 [style=filled, fillcolor=\"#fed7aa\", color=\"#c2410c\", penwidth=2, label=\"changed\\nsrc/lib.rs:50\\nchanged risk=0.4200\"];\n  n1 [style=filled, shape=ellipse, fillcolor=\"#dbeafe\", color=\"#2563eb\", label=\"left_test\\ntests/change.rs:10\"];\n  n3 [style=filled, label=\"merged\\nsrc/lib.rs:30\"];\n  n2 [style=filled, label=\"right\\nsrc/lib.rs:20\"];\n  n1 -> n3 [style=dashed];\n  n2 -> n3;\n  n3 -> n5;\n}}\n"
+            )
         );
-        assert!(
-            dot.lines()
-                .find(|line| line.trim_start().starts_with("n3 ["))
-                .unwrap()
-                .contains("fillcolor=\"#fed7aa\"")
-        );
-        assert!(dot.contains("rankdir=LR"));
     }
 
     #[test]
@@ -11651,6 +11631,40 @@ mod tests {
     }
 
     #[test]
+    fn dot_change_impact_prunes_retained_context_before_changed_roots() {
+        let (roots, analysis, calls, accounting) = oversized_dot_fixture(50);
+        let without_context = change_dot(
+            SNAPSHOT,
+            &roots,
+            &analysis,
+            &ChangeCalls::default(),
+            (6, 50),
+            DependencyMode::Boundary,
+            accounting,
+        )
+        .unwrap();
+        let with_context = change_dot(
+            SNAPSHOT,
+            &roots,
+            &analysis,
+            &calls,
+            (6, 50),
+            DependencyMode::Boundary,
+            accounting,
+        )
+        .unwrap();
+
+        assert!(
+            without_context.contains("changed_emitted=18"),
+            "{without_context}"
+        );
+        assert!(
+            with_context.contains("changed_emitted=18"),
+            "{with_context}"
+        );
+    }
+
+    #[test]
     fn dot_change_impact_prunes_low_priority_paths_before_direct_roots() {
         let (roots, analysis, accounting) = oversized_path_fixture(24);
         let dot = change_dot(
@@ -11671,6 +11685,36 @@ mod tests {
         assert!(dot.contains("changed_root"));
         assert!(dot.contains("caller_00_") && dot.contains("n2 -> n1;"));
         assert!(!dot.contains("caller_23_") && !dot.contains("n25 -> n1;"));
+    }
+
+    #[test]
+    fn dot_change_impact_honors_zero_depth_and_one_node_boundaries() {
+        let (roots, analysis, accounting) = oversized_path_fixture(1);
+        let render = |depth, max_nodes| {
+            change_dot(
+                SNAPSHOT,
+                &roots,
+                &analysis,
+                &ChangeCalls::default(),
+                (depth, max_nodes),
+                DependencyMode::Boundary,
+                accounting,
+            )
+            .unwrap()
+        };
+
+        let depth_zero = render(0, 50);
+        assert!(depth_zero.contains("changed_emitted=1"), "{depth_zero}");
+        assert!(depth_zero.contains("  n1 ["), "{depth_zero}");
+        assert!(!depth_zero.contains("  n2 [") && !depth_zero.contains(" -> "));
+
+        let depth_one = render(1, 50);
+        assert!(depth_one.contains("  n2 [") && depth_one.contains("n2 -> n1;"));
+
+        let one_node = render(1, 1);
+        assert!(one_node.contains("paths_emitted=0"), "{one_node}");
+        assert!(one_node.contains("  n1 ["), "{one_node}");
+        assert!(!one_node.contains("  n2 [") && !one_node.contains(" -> "));
     }
 
     #[test]
@@ -11746,6 +11790,64 @@ mod tests {
         let dependency_line = dot.lines().find(|line| line.starts_with("  n2 [")).unwrap();
         assert!(affected_line.contains("affected") && affected_line.contains("#fef3c7"));
         assert!(dependency_line.contains("#e5e7eb"));
+    }
+
+    #[test]
+    fn dot_change_impact_keeps_file_roots_as_analysis_only() {
+        let affected = FlowNode {
+            id: 2,
+            kind: "function".into(),
+            name: "affected".into(),
+            qualified_name: "affected".into(),
+            path: "src/lib.rs".into(),
+            line: 2,
+        };
+        let analysis = ChangeAnalysis {
+            flows: vec![AffectedFlow {
+                entry: affected.clone(),
+                nodes: vec![affected],
+                parents: HashMap::new(),
+                changed: vec![2],
+                depth: 0,
+                file_count: 1,
+                criticality: 1_000,
+            }],
+            ..ChangeAnalysis::default()
+        };
+        let dot = change_dot(
+            SNAPSHOT,
+            &[RowNode {
+                id: 1,
+                kind: "file".into(),
+                name: "src/lib.rs".into(),
+                path: "src/lib.rs".into(),
+                line: 1,
+            }],
+            &analysis,
+            &ChangeCalls::default(),
+            (6, 50),
+            DependencyMode::Boundary,
+            DotAccounting {
+                changed_total: 0,
+                analysis_roots_omitted: 0,
+                deleted_paths_unanalyzed: 0,
+                unmapped_ranges: 0,
+                file_mapped_ranges: 1,
+                traversal_complete: true,
+            },
+        )
+        .unwrap();
+
+        assert!(dot.contains("changed_emitted=0 changed_total=0"), "{dot}");
+        assert!(dot.contains("file_mapped_ranges=1"), "{dot}");
+        assert!(!dot.contains("  n1 ["), "{dot}");
+        assert!(
+            dot.lines().any(|line| {
+                line.starts_with("  n2 [") && line.contains("affected") && line.contains("#fef3c7")
+            }),
+            "{dot}"
+        );
+        assert!(!dot.contains("changed risk="), "{dot}");
     }
 
     #[test]

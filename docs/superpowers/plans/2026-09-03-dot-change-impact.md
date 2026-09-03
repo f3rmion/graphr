@@ -243,7 +243,9 @@ The existing traversal queries, text lines, visit order, limits, and omission re
 
 Implement `change_dot` with this exact selection order:
 
-1. Copy direct changed roots from `roots` in their existing risk order.
+1. Copy only risk-bearing, non-file roots from `roots` as direct changed IDs in
+   their existing risk order. File roots remain analysis-only: they may derive
+   affected callable targets through flows, but are never direct changed IDs.
 2. Build one ID-to-node catalog from roots, flow nodes, and `ChangeCalls`; direct-root metadata wins on duplicate IDs.
 3. Build candidate paths by iterating the already criticality-sorted flows, then each flow's sorted `changed` IDs, and calling `flow_path`.
 4. Admit direct changed roots until `max_nodes`, then admit affected-flow paths that fit.
@@ -497,7 +499,10 @@ fn dot_escape(value: &str) -> String {
 }
 ```
 
-Render the selected roots and paths, and if the result exceeds `DOT_BUDGET`, pop the last selected path and re-render. Once no paths remain, pop the lowest-priority changed root and re-render. The graph label must include these exact machine-readable fields:
+Render the selected roots and paths, and if the result exceeds `DOT_BUDGET`, pop
+the last selected path and re-render. Once no paths remain, prune retained
+caller/test context and re-render before popping the lowest-priority direct
+changed root. The graph label must include these exact machine-readable fields:
 
 ```text
 snapshot=<id> changed_emitted=<n> changed_total=<n> paths_emitted=<n> paths_discovered=<n> flow_discovery=complete|partial render_complete=true|false analysis_roots_omitted=<n> deleted_paths_unanalyzed=<n> unmapped_ranges=<n> file_mapped_ranges=<n> traversal_complete=true|false
