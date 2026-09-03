@@ -74,6 +74,28 @@ search({"snapshot_id": "<digest>", "query": "AuditRecord", "limit": 10})
 view({"snapshot_id": "<digest>", "node_ref": "<opaque>", "depth": 6, "max_nodes": 50})
 ```
 
+Review is the default. For one complete bounded DOT change-impact graph, opt in:
+
+```text
+changes({
+  "snapshot_id": "<digest>",
+  "depth": 6,
+  "max_nodes": 50,
+  "format": "dot"
+})
+```
+
+DOT mode has no cursor; its bounds apply to the whole visual graph, and
+omissions and completeness remain explicit. Save the returned text and render
+it outside Graphr, for example:
+
+```bash
+dot -Tsvg impact.dot -o impact.svg
+```
+
+Graphr neither invokes nor depends on Graphviz. The graph is static
+resolved-call evidence, not runtime execution.
+
 Call `changes` once without a cursor. Every continuation is a standalone
 `name=value` line: split on the first `=`, pass the complete remaining value
 verbatim with the same snapshot, depth, and max-nodes, and continue until all

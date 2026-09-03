@@ -5615,6 +5615,83 @@ fn commit_target_reviews_a_branch_without_checking_it_out() {
 }
 
 #[test]
+fn changes_dot_returns_bounded_affected_callgraph() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn changed() -> u32 { 1 }\n\
+         pub fn caller() -> u32 { changed() }\n\
+         #[test]\nfn covers_changed() { let _ = caller(); }\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "src/lib.rs"]);
+    git_commit(&fixture.path, "baseline");
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn changed() -> u32 { 2 }\n\
+         pub fn caller() -> u32 { changed() }\n\
+         #[test]\nfn covers_changed() { let _ = caller(); }\n",
+    )
+    .unwrap();
+    let mut client = Client::start(&fixture.path);
+
+    let review = response_text(&client.changes(6, 50, None));
+    assert!(review.starts_with("files\n"));
+
+    let response = client.changes_dot(6, 50);
+    let value = response_json(&response);
+    let dot = response_text(&response);
+    let node_id = |needle: &str| {
+        dot.lines()
+            .find(|line| line.contains(needle))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let test = node_id("label=\"covers_changed\\n");
+    let caller = node_id("label=\"caller\\n");
+    let changed = node_id("label=\"changed\\n");
+    assert!(dot.contains(&format!("{test} -> {caller} [style=dashed];")));
+    assert!(dot.contains(&format!("{caller} -> {changed};")));
+    assert!(dot.contains("changed risk="));
+    assert!(dot.len() <= 8 * 1024);
+    assert_eq!(
+        value["result"]["structuredContent"]["provenance"]["snapshot_id"],
+        client.snapshot_id(),
+    );
+
+    let cursor = client.call(
+        "changes",
+        rmcp::serde_json::json!({
+            "snapshot_id": client.snapshot_id(),
+            "depth": 6,
+            "max_nodes": 50,
+            "format": "dot",
+            "cursor": "not-a-review-cursor",
+        }),
+    );
+    assert_tool_error_code(&cursor, "invalid_parameters");
+    assert_eq!(
+        response_json(&cursor)["result"]["structuredContent"]["message"],
+        "DOT changes do not accept a cursor",
+    );
+    let invalid = client.call(
+        "changes",
+        rmcp::serde_json::json!({
+            "snapshot_id": client.snapshot_id(),
+            "format": "svg",
+        }),
+    );
+    let invalid = response_json(&invalid);
+    assert!(invalid["error"].is_object() || invalid["result"]["isError"] == true);
+    client.close();
+}
+
+#[test]
 fn identical_clean_oids_return_explained_no_changes() {
     let fixture = Fixture::new();
     let repository = fixture.path.join("repository");
@@ -5657,6 +5734,15 @@ fn identical_clean_oids_return_explained_no_changes() {
     );
     assert_eq!(
         structured["result"]["structuredContent"]["no_change_reason"],
+        "identical_commit_oids"
+    );
+    let dot = client.changes_dot(1, 50);
+    assert!(
+        response_text(&dot).contains("no_changes_reason=identical_commit_oids"),
+        "{dot}"
+    );
+    assert_eq!(
+        response_json(&dot)["result"]["structuredContent"]["no_change_reason"],
         "identical_commit_oids"
     );
     assert_eq!(
@@ -7345,6 +7431,18 @@ impl Client {
             arguments["cursor"] = cursor.into();
         }
         self.call("changes", arguments)
+    }
+
+    fn changes_dot(&mut self, depth: u32, max_nodes: u32) -> String {
+        self.call(
+            "changes",
+            rmcp::serde_json::json!({
+                "snapshot_id": self.snapshot_id(),
+                "depth": depth,
+                "max_nodes": max_nodes,
+                "format": "dot",
+            }),
+        )
     }
 
     fn call(&mut self, name: &str, arguments: rmcp::serde_json::Value) -> String {

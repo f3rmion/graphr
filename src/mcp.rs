@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::git::DependencyMode;
-use crate::index::Engine;
+use crate::index::{ChangesFormat, Engine};
 use crate::job::{JobRegistry, JobRequestSummary, JobStatus};
 use crate::workspace::{
     ErrorCode, IndexRequest, OperationError, QueryOutput, RootInspection, SnapshotTarget,
@@ -130,6 +130,8 @@ struct ChangesParams {
     #[schemars(range(min = 1, max = 50))]
     max_nodes: u32,
     #[serde(default)]
+    format: ChangesFormat,
+    #[serde(default)]
     #[schemars(length(min = 1, max = 160))]
     cursor: Option<String>,
 }
@@ -226,7 +228,9 @@ impl Graphr {
         )))
     }
 
-    #[tool(description = "Return an independently paged review for one explicit snapshot_id")]
+    #[tool(
+        description = "Return a paged review or one bounded DOT change-impact graph for an explicit snapshot_id"
+    )]
     async fn changes(
         &self,
         Parameters(params): Parameters<ChangesParams>,
@@ -239,6 +243,7 @@ impl Graphr {
                     &params.snapshot_id,
                     params.depth,
                     params.max_nodes,
+                    params.format,
                     params.cursor.as_deref(),
                     &cancelled,
                 )
@@ -506,6 +511,20 @@ mod tests {
             }
         }
         let index = by_name("index");
+        let changes = by_name("changes");
+        let format = &changes.input_schema["properties"]["format"];
+        let definition = format["$ref"].as_str().unwrap().rsplit('/').next().unwrap();
+        assert_eq!(
+            changes.input_schema["$defs"][definition]["enum"],
+            rmcp::serde_json::json!(["review", "dot"]),
+        );
+        assert!(
+            !changes.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "format")
+        );
         let reference = index.input_schema["properties"]["target"]["$ref"]
             .as_str()
             .unwrap();
