@@ -1308,10 +1308,12 @@ impl ReviewSnapshot {
     ) -> Self {
         let ChangeReview {
             graph,
+            dot,
             evidence,
             static_status,
             dynamic_status,
         } = review;
+        drop(dot);
         let changes = changes.into();
         let manifest = change_manifest(&changes, dependency_mode);
         let artifacts = artifact_text(&changes.artifacts);
@@ -3919,6 +3921,7 @@ mod tests {
     fn complete_review(graph: String) -> ChangeReview {
         ChangeReview {
             graph,
+            dot: String::new(),
             evidence: String::new(),
             static_status: CompletenessStatus::Complete,
             dynamic_status: CompletenessStatus::NotApplicable,
@@ -4362,6 +4365,7 @@ mod tests {
             },
             ChangeReview {
                 graph: "risk traversal_complete=true\n".into(),
+                dot: String::new(),
                 evidence: String::new(),
                 static_status: CompletenessStatus::Complete,
                 dynamic_status: CompletenessStatus::NotApplicable,
@@ -5926,6 +5930,7 @@ fn run() {
             },
             ChangeReview {
                 graph: "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n".into(),
+                dot: String::new(),
                 evidence: evidence.clone(),
                 static_status: CompletenessStatus::Partial,
                 dynamic_status: CompletenessStatus::Partial,
@@ -6005,6 +6010,7 @@ fn run() {
         let review = |suffix: &str| {
             ChangeReview {
             graph: "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 flows_total=0 static_test_path_gaps=0 traversal_complete=true neighborhood_omitted=false unmapped_ranges=0\n".into(),
+            dot: String::new(),
             evidence: format!("{}sentinel-{suffix}\n", "evidence-record\n".repeat(600)),
             static_status: CompletenessStatus::Complete,
             dynamic_status: CompletenessStatus::Partial,

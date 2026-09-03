@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -27,6 +28,8 @@ const DEPENDENCY_NEIGHBOR_SCAN_LIMIT: usize = 256;
 const FLOW_DEPTH: u32 = 15;
 const FLOW_SCAN_LIMIT: usize = 500;
 const FLOW_QUERY_LIMIT: usize = 5_000;
+const DOT_BUDGET: usize = 8 * 1024;
+const DOT_LABEL_PART_LIMIT: usize = 160;
 const TRUNCATED: &str = "[truncated]\n";
 const BUSY_LIMIT: Duration = Duration::from_secs(5);
 const BUSY_POLL: Duration = Duration::from_millis(5);
@@ -526,6 +529,7 @@ impl CompletenessStatus {
 
 pub struct ChangeReview {
     pub graph: String,
+    pub dot: String,
     pub evidence: String,
     pub static_status: CompletenessStatus,
     pub dynamic_status: CompletenessStatus,
@@ -984,6 +988,7 @@ impl Store {
         if changes.is_empty() && changes.files.is_empty() && changes.records.is_empty() {
             return Ok(ChangeReview {
                 graph: "no changes\n".into(),
+                dot: no_change_dot(snapshot_id, "empty worktree"),
                 evidence: evidence.text,
                 static_status: CompletenessStatus::Complete,
                 dynamic_status: evidence.status,
@@ -1023,6 +1028,22 @@ impl Store {
             let dynamic_status = evidence.status;
             return Ok(ChangeReview {
                 graph: output,
+                dot: change_dot(
+                    snapshot_id,
+                    &[],
+                    &ChangeAnalysis::default(),
+                    &ChangeCalls::default(),
+                    (depth, max_nodes),
+                    dependency_mode,
+                    DotAccounting {
+                        changed_total: 0,
+                        analysis_roots_omitted: 0,
+                        deleted_paths_unanalyzed,
+                        unmapped_ranges: 0,
+                        file_mapped_ranges: 0,
+                        traversal_complete,
+                    },
+                )?,
                 evidence: ordered_evidence_text(evidence, static_status),
                 static_status,
                 dynamic_status,
@@ -1231,6 +1252,10 @@ impl Store {
             lines.push(line);
         }
         let mut traversed_ids = roots.iter().map(|root| root.id).collect::<HashSet<_>>();
+        let mut calls = ChangeCalls {
+            nodes: roots.iter().cloned().map(|node| (node.id, node)).collect(),
+            ..ChangeCalls::default()
+        };
         let mut evidence_node_ids = traversed_ids.clone();
         let neighborhood_omitted = if root_neighborhood_omitted {
             true
@@ -1247,6 +1272,7 @@ impl Store {
                 cancelled,
                 &mut lines,
                 &mut traversed_ids,
+                &mut calls,
             )?
         };
         for flow in &analysis.flows {
@@ -1321,8 +1347,25 @@ impl Store {
         let static_status =
             accounting.overall(content_complete, mapping_complete, traversal_complete);
         let dynamic_status = evidence.status;
+        let dot = change_dot(
+            snapshot_id,
+            &roots,
+            &analysis,
+            &calls,
+            (depth, max_nodes),
+            dependency_mode,
+            DotAccounting {
+                changed_total: changed_symbols_total,
+                analysis_roots_omitted,
+                deleted_paths_unanalyzed,
+                unmapped_ranges: unmapped_range_count,
+                file_mapped_ranges: file_mapped_range_count,
+                traversal_complete,
+            },
+        )?;
         Ok(ChangeReview {
             graph: lines.concat(),
+            dot,
             evidence: ordered_evidence_text(evidence, static_status),
             static_status,
             dynamic_status,
@@ -2036,6 +2079,7 @@ impl EdgeKind {
     }
 }
 
+#[derive(Clone)]
 struct RowNode {
     id: i64,
     kind: String,
@@ -2084,6 +2128,23 @@ struct ChangeAnalysis {
     flows: Vec<AffectedFlow>,
     flow_omitted: bool,
     test_mapping_omitted: bool,
+}
+
+#[derive(Default)]
+struct ChangeCalls {
+    nodes: HashMap<i64, RowNode>,
+    // (caller, callee, is_test_call)
+    edges: BTreeSet<(i64, i64, bool)>,
+}
+
+#[derive(Clone, Copy)]
+struct DotAccounting {
+    changed_total: usize,
+    analysis_roots_omitted: usize,
+    deleted_paths_unanalyzed: usize,
+    unmapped_ranges: usize,
+    file_mapped_ranges: usize,
+    traversal_complete: bool,
 }
 
 impl RowNode {
@@ -2183,6 +2244,7 @@ fn traverse_changes(
     cancelled: &AtomicBool,
     lines: &mut Vec<String>,
     visited: &mut HashSet<i64>,
+    calls: &mut ChangeCalls,
 ) -> Result<bool> {
     let (depth, max_nodes) = limits;
     let node_limit = visited.len().saturating_add(max_nodes);
@@ -2245,6 +2307,17 @@ fn traverse_changes(
                             "  {relation} dependency-boundary package={package}\n"
                         ));
                         continue;
+                    }
+                    match relation {
+                        "test <-" => {
+                            calls.nodes.entry(node.id).or_insert_with(|| node.clone());
+                            calls.edges.insert((node.id, source, true));
+                        }
+                        "caller <-" => {
+                            calls.nodes.entry(node.id).or_insert_with(|| node.clone());
+                            calls.edges.insert((node.id, source, false));
+                        }
+                        _ => {}
                     }
                     if visited.contains(&node.id) {
                         continue;
@@ -4387,6 +4460,318 @@ fn flow_line(flow: &AffectedFlow, dependency_mode: DependencyMode) -> Result<Str
     }
     output.push('\n');
     Ok(output)
+}
+
+fn flow_path(flow: &AffectedFlow, target: i64, depth: u32) -> Result<Vec<i64>> {
+    let mut path = vec![target];
+    while path.last().copied() != Some(flow.entry.id) {
+        let current = *path.last().expect("path starts at its target");
+        let parent = flow
+            .parents
+            .get(&current)
+            .copied()
+            .ok_or_else(|| "affected flow path is incomplete".to_owned())?;
+        if path.contains(&parent) || path.len() > FLOW_DEPTH as usize {
+            return Err("affected flow path is cyclic".into());
+        }
+        path.push(parent);
+    }
+    path.reverse();
+    let keep = depth as usize + 1;
+    if path.len() > keep {
+        path.drain(..path.len() - keep);
+    }
+    Ok(path)
+}
+
+pub(crate) fn no_change_dot(snapshot_id: &str, reason: &str) -> String {
+    format!(
+        "digraph graphr_changes {{\n  graph [rankdir=LR, label=\"snapshot={} no_changes_reason={}\"];\n}}\n",
+        dot_escape(&shorten(snapshot_id, DOT_LABEL_PART_LIMIT)),
+        dot_escape(&shorten(reason, DOT_LABEL_PART_LIMIT)),
+    )
+}
+
+fn change_dot(
+    snapshot_id: &str,
+    roots: &[RowNode],
+    analysis: &ChangeAnalysis,
+    calls: &ChangeCalls,
+    limits: (u32, u32),
+    dependency_mode: DependencyMode,
+    accounting: DotAccounting,
+) -> Result<String> {
+    let (_, max_nodes) = limits;
+    let max_nodes = max_nodes as usize;
+    let direct_ids = roots.iter().map(|root| root.id).collect::<Vec<_>>();
+    let mut catalog = HashMap::new();
+    for root in roots {
+        catalog.insert(root.id, root.clone());
+    }
+    for flow in &analysis.flows {
+        for node in std::iter::once(&flow.entry).chain(&flow.nodes) {
+            catalog.entry(node.id).or_insert_with(|| RowNode {
+                id: node.id,
+                kind: node.kind.clone(),
+                name: node.name.clone(),
+                path: node.path.clone(),
+                line: node.line,
+            });
+        }
+    }
+    for node in calls.nodes.values() {
+        catalog.entry(node.id).or_insert_with(|| node.clone());
+    }
+
+    let mut paths = Vec::new();
+    for flow in &analysis.flows {
+        let mut targets = flow.changed.clone();
+        targets.sort_unstable();
+        for target in targets {
+            paths.push(flow_path(flow, target, limits.0)?);
+        }
+    }
+    let paths_discovered = paths.len();
+    let mut direct_count = direct_ids.len().min(max_nodes);
+    let mut selected_ids = direct_ids[..direct_count].to_vec();
+    let mut selected_set = selected_ids.iter().copied().collect::<HashSet<_>>();
+    let mut selected_paths = Vec::new();
+    for path in paths {
+        if path.iter().any(|id| !catalog.contains_key(id)) {
+            return Err("affected flow node is missing".into());
+        }
+        let additions = path.iter().filter(|id| !selected_set.contains(id)).count();
+        if selected_ids.len().saturating_add(additions) <= max_nodes {
+            for id in &path {
+                if selected_set.insert(*id) {
+                    selected_ids.push(*id);
+                }
+            }
+            selected_paths.push(path);
+        }
+    }
+
+    let mut budget_pruned = false;
+    loop {
+        let (dot, _) = render_change_dot(
+            snapshot_id,
+            &catalog,
+            &direct_ids[..direct_count],
+            &selected_paths,
+            calls,
+            dependency_mode,
+            accounting,
+            paths_discovered,
+            direct_count == direct_ids.len()
+                && selected_paths.len() == paths_discovered
+                && !budget_pruned,
+            max_nodes,
+            analysis,
+        );
+        if dot.len() <= DOT_BUDGET {
+            return Ok(dot);
+        }
+        budget_pruned = true;
+        if selected_paths.pop().is_some() {
+            continue;
+        }
+        if direct_count == 0 {
+            return Ok(dot);
+        }
+        direct_count -= 1;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_change_dot(
+    snapshot_id: &str,
+    catalog: &HashMap<i64, RowNode>,
+    direct_ids: &[i64],
+    paths: &[Vec<i64>],
+    calls: &ChangeCalls,
+    dependency_mode: DependencyMode,
+    accounting: DotAccounting,
+    paths_discovered: usize,
+    mut render_complete: bool,
+    max_nodes: usize,
+    analysis: &ChangeAnalysis,
+) -> (String, bool) {
+    let changed_ids = direct_ids.iter().copied().collect::<HashSet<_>>();
+    let mut selected = direct_ids.to_vec();
+    let mut selected_set = changed_ids.clone();
+    let mut impact_ids = HashSet::new();
+    let mut impact_order = Vec::new();
+    let mut edges = BTreeMap::<(i64, i64), bool>::new();
+    for path in paths {
+        for id in path {
+            if selected_set.insert(*id) {
+                selected.push(*id);
+            }
+        }
+        if let Some(target) = path.last()
+            && !analysis.risks.contains_key(target)
+            && impact_ids.insert(*target)
+        {
+            impact_order.push(*target);
+        }
+        for edge in path.windows(2) {
+            edges.insert((edge[0], edge[1]), false);
+        }
+    }
+
+    let mut pending = direct_ids
+        .iter()
+        .copied()
+        .chain(impact_order)
+        .collect::<VecDeque<_>>();
+    let mut searched = HashSet::new();
+    let mut calls_complete = true;
+    while let Some(callee) = pending.pop_front() {
+        if !searched.insert(callee) {
+            continue;
+        }
+        for &(caller, _, is_test_call) in calls
+            .edges
+            .iter()
+            .filter(|(_, target, _)| *target == callee)
+        {
+            if selected_set.insert(caller) {
+                if selected.len() == max_nodes {
+                    selected_set.remove(&caller);
+                    calls_complete = false;
+                    continue;
+                }
+                selected.push(caller);
+            }
+            if selected_set.contains(&caller) {
+                pending.push_back(caller);
+            }
+            edges
+                .entry((caller, callee))
+                .and_modify(|dashed| *dashed |= is_test_call)
+                .or_insert(is_test_call);
+        }
+    }
+    render_complete &= calls_complete;
+    for &(caller, callee, is_test_call) in &calls.edges {
+        if selected_set.contains(&caller) && selected_set.contains(&callee) {
+            edges
+                .entry((caller, callee))
+                .and_modify(|dashed| *dashed |= is_test_call)
+                .or_insert(is_test_call);
+        }
+    }
+
+    let flow_discovery = if analysis.flow_omitted
+        || accounting.analysis_roots_omitted > 0
+        || accounting.deleted_paths_unanalyzed > 0
+    {
+        "partial"
+    } else {
+        "complete"
+    };
+    let mut output = format!(
+        "digraph graphr_changes {{\n  graph [rankdir=LR, label=\"snapshot={} changed_emitted={} changed_total={} paths_emitted={} paths_discovered={} flow_discovery={} render_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} unmapped_ranges={} file_mapped_ranges={} traversal_complete={}\"];\n",
+        dot_escape(&shorten(snapshot_id, DOT_LABEL_PART_LIMIT)),
+        direct_ids.len(),
+        accounting.changed_total,
+        paths.len(),
+        paths_discovered,
+        flow_discovery,
+        render_complete,
+        accounting.analysis_roots_omitted,
+        accounting.deleted_paths_unanalyzed,
+        accounting.unmapped_ranges,
+        accounting.file_mapped_ranges,
+        accounting.traversal_complete,
+    );
+    for id in selected {
+        let node = &catalog[&id];
+        let test_shape = if node.kind == "test" {
+            "shape=ellipse, "
+        } else {
+            ""
+        };
+        let attributes = if changed_ids.contains(&node.id) {
+            format!(
+                "{}fillcolor=\"#fed7aa\", color=\"#c2410c\", penwidth=2, label=\"{}\\n{}:{}\\nchanged risk={}\"",
+                test_shape,
+                dot_escape(&shorten(&node.name, DOT_LABEL_PART_LIMIT)),
+                dot_escape(&shorten(&node.path, DOT_LABEL_PART_LIMIT)),
+                node.line,
+                score_text(analysis.risks.get(&node.id).map_or(0, |risk| risk.score)),
+            )
+        } else if impact_ids.contains(&node.id) {
+            format!(
+                "{}fillcolor=\"#fef3c7\", color=\"#a16207\", label=\"{}\\n{}:{}\\naffected\"",
+                test_shape,
+                dot_escape(&shorten(&node.name, DOT_LABEL_PART_LIMIT)),
+                dot_escape(&shorten(&node.path, DOT_LABEL_PART_LIMIT)),
+                node.line,
+            )
+        } else if dependency_mode == DependencyMode::Boundary
+            && dependency_package(&node.path).is_some()
+        {
+            format!(
+                "{}fillcolor=\"#e5e7eb\", color=\"#4b5563\", label=\"{}\\n{}:{}\"",
+                test_shape,
+                dot_escape(&shorten(&node.name, DOT_LABEL_PART_LIMIT)),
+                dot_escape(&shorten(&node.path, DOT_LABEL_PART_LIMIT)),
+                node.line,
+            )
+        } else if node.kind == "test" {
+            format!(
+                "shape=ellipse, fillcolor=\"#dbeafe\", color=\"#2563eb\", label=\"{}\\n{}:{}\"",
+                dot_escape(&shorten(&node.name, DOT_LABEL_PART_LIMIT)),
+                dot_escape(&shorten(&node.path, DOT_LABEL_PART_LIMIT)),
+                node.line,
+            )
+        } else {
+            format!(
+                "label=\"{}\\n{}:{}\"",
+                dot_escape(&shorten(&node.name, DOT_LABEL_PART_LIMIT)),
+                dot_escape(&shorten(&node.path, DOT_LABEL_PART_LIMIT)),
+                node.line,
+            )
+        };
+        output.push_str(&format!("  n{} [style=filled, {}];\n", node.id, attributes));
+    }
+    for ((caller, callee), dashed) in edges {
+        if dashed {
+            output.push_str(&format!("  n{caller} -> n{callee} [style=dashed];\n"));
+        } else {
+            output.push_str(&format!("  n{caller} -> n{callee};\n"));
+        }
+    }
+    output.push_str("}\n");
+    // ponytail: re-rendering is bounded to 50 nodes; stream with reserved bytes only if that cap grows.
+    (output, calls_complete)
+}
+
+fn shorten(value: &str, limit: usize) -> Cow<'_, str> {
+    if value.len() <= limit {
+        return Cow::Borrowed(value);
+    }
+    let mut end = limit.saturating_sub('…'.len_utf8()).min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}…", &value[..end]))
+}
+
+fn dot_escape(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => output.push_str("\\\\"),
+            '"' => output.push_str("\\\""),
+            '\n' | '\r' => output.push_str("\\n"),
+            '\t' => output.push_str("\\t"),
+            value if value.is_control() => output.push('�'),
+            value => output.push(value),
+        }
+    }
+    output
 }
 
 fn validate_changed_file(file: &ChangedFile) -> Result<()> {
@@ -11113,6 +11498,337 @@ mod tests {
             flow_line(&flow, DependencyMode::Boundary).unwrap(),
             "flow 0.1000 depth=4 nodes=5 files=4 changed=1 entry@src/lib.rs:1 -> digest@src/canonical.rs:2 -> helper@src/canonical.rs:3 -> dependency-boundary[sha2]\n"
         );
+    }
+
+    #[test]
+    fn dot_change_impact_is_layered_and_deduplicated() {
+        let changed = RowNode {
+            id: 3,
+            kind: "function".into(),
+            name: "changed".into(),
+            path: "src/lib.rs".into(),
+            line: 30,
+        };
+        let test = FlowNode {
+            id: 1,
+            kind: "test".into(),
+            name: "covers_changed".into(),
+            qualified_name: "covers_changed".into(),
+            path: "tests/change.rs".into(),
+            line: 10,
+        };
+        let caller = FlowNode {
+            id: 2,
+            kind: "function".into(),
+            name: "caller".into(),
+            qualified_name: "caller".into(),
+            path: "src/lib.rs".into(),
+            line: 20,
+        };
+        let target = FlowNode {
+            id: 3,
+            kind: "function".into(),
+            name: "changed".into(),
+            qualified_name: "changed".into(),
+            path: "src/lib.rs".into(),
+            line: 30,
+        };
+        let analysis = ChangeAnalysis {
+            risks: HashMap::from([(
+                3,
+                NodeRisk {
+                    score: 4_200,
+                    flow_component: 4_200,
+                    test_component: 0,
+                    security_component: 0,
+                    caller_component: 0,
+                    test_node: false,
+                    test_gap: false,
+                    indirect_test_covered: false,
+                },
+            )]),
+            flows: vec![AffectedFlow {
+                entry: caller.clone(),
+                nodes: vec![caller.clone(), target.clone()],
+                parents: HashMap::from([(3, 2)]),
+                changed: vec![3],
+                depth: 1,
+                file_count: 1,
+                criticality: 4_200,
+            }],
+            flow_omitted: false,
+            test_mapping_omitted: false,
+        };
+        let row = |node: &FlowNode| RowNode {
+            id: node.id,
+            kind: node.kind.clone(),
+            name: node.name.clone(),
+            path: node.path.clone(),
+            line: node.line,
+        };
+        let calls = ChangeCalls {
+            nodes: HashMap::from([(1, row(&test)), (2, row(&caller)), (3, row(&target))]),
+            edges: BTreeSet::from([(1, 2, true), (2, 3, false)]),
+        };
+        let accounting = DotAccounting {
+            changed_total: 1,
+            analysis_roots_omitted: 0,
+            deleted_paths_unanalyzed: 0,
+            unmapped_ranges: 0,
+            file_mapped_ranges: 0,
+            traversal_complete: true,
+        };
+
+        let dot = change_dot(
+            SNAPSHOT,
+            &[changed],
+            &analysis,
+            &calls,
+            (6, 50),
+            DependencyMode::Boundary,
+            accounting,
+        )
+        .unwrap();
+
+        assert!(dot.starts_with("digraph graphr_changes {\n"));
+        assert!(dot.ends_with("}\n"));
+        for id in [1, 2, 3] {
+            assert_eq!(
+                dot.lines()
+                    .filter(|line| line.trim_start().starts_with(&format!("n{id} [")))
+                    .count(),
+                1,
+                "{dot}"
+            );
+        }
+        assert!(dot.contains("n1 -> n2 [style=dashed];"));
+        assert!(dot.contains("n2 -> n3;"));
+        assert!(dot.contains("changed risk=0.4200"));
+        assert!(
+            dot.lines()
+                .find(|line| line.trim_start().starts_with("n1 ["))
+                .unwrap()
+                .contains("shape=ellipse")
+        );
+        assert!(
+            dot.lines()
+                .find(|line| line.trim_start().starts_with("n3 ["))
+                .unwrap()
+                .contains("fillcolor=\"#fed7aa\"")
+        );
+        assert!(dot.contains("rankdir=LR"));
+    }
+
+    #[test]
+    fn dot_change_impact_escapes_labels_and_preserves_framing() {
+        assert_eq!(
+            dot_escape("quote\" slash\\ line\nreturn\rtab\té"),
+            "quote\\\" slash\\\\ line\\nreturn\\ntab\\té"
+        );
+        let long = "é".repeat(200);
+        let shortened = shorten(&long, DOT_LABEL_PART_LIMIT);
+        assert!(shortened.len() <= DOT_LABEL_PART_LIMIT);
+        assert!(shortened.ends_with('…'));
+    }
+
+    #[test]
+    fn dot_change_impact_is_one_bounded_document() {
+        let (roots, analysis, calls, accounting) = oversized_dot_fixture(50);
+        let dot = change_dot(
+            SNAPSHOT,
+            &roots,
+            &analysis,
+            &calls,
+            (6, 50),
+            DependencyMode::Boundary,
+            accounting,
+        )
+        .unwrap();
+        assert!(dot.len() <= DOT_BUDGET, "{}", dot.len());
+        assert!(dot.starts_with("digraph graphr_changes {\n"));
+        assert!(dot.ends_with("}\n"));
+        assert!(dot.contains("render_complete=false"));
+    }
+
+    #[test]
+    fn dot_change_impact_marks_derived_and_dependency_nodes() {
+        let root = RowNode {
+            id: 1,
+            kind: "type".into(),
+            name: "changed_type".into(),
+            path: "src/lib.rs".into(),
+            line: 1,
+        };
+        let caller = FlowNode {
+            id: 2,
+            kind: "function".into(),
+            name: "dependency".into(),
+            qualified_name: "dependency".into(),
+            path: ".cargo/vendor/example/src/lib.rs".into(),
+            line: 2,
+        };
+        let affected = FlowNode {
+            id: 3,
+            kind: "function".into(),
+            name: "affected".into(),
+            qualified_name: "affected".into(),
+            path: "src/lib.rs".into(),
+            line: 3,
+        };
+        let analysis = ChangeAnalysis {
+            risks: HashMap::from([(
+                1,
+                NodeRisk {
+                    score: 1_000,
+                    flow_component: 1_000,
+                    test_component: 0,
+                    security_component: 0,
+                    caller_component: 0,
+                    test_node: false,
+                    test_gap: false,
+                    indirect_test_covered: false,
+                },
+            )]),
+            flows: vec![AffectedFlow {
+                entry: caller.clone(),
+                nodes: vec![caller, affected],
+                parents: HashMap::from([(3, 2)]),
+                changed: vec![3],
+                depth: 1,
+                file_count: 2,
+                criticality: 1_000,
+            }],
+            flow_omitted: false,
+            test_mapping_omitted: false,
+        };
+        let dot = change_dot(
+            SNAPSHOT,
+            &[root],
+            &analysis,
+            &ChangeCalls::default(),
+            (6, 50),
+            DependencyMode::Boundary,
+            DotAccounting {
+                changed_total: 1,
+                analysis_roots_omitted: 0,
+                deleted_paths_unanalyzed: 0,
+                unmapped_ranges: 0,
+                file_mapped_ranges: 0,
+                traversal_complete: true,
+            },
+        )
+        .unwrap();
+
+        let affected_line = dot.lines().find(|line| line.starts_with("  n3 [")).unwrap();
+        let dependency_line = dot.lines().find(|line| line.starts_with("  n2 [")).unwrap();
+        assert!(affected_line.contains("affected") && affected_line.contains("#fef3c7"));
+        assert!(dependency_line.contains("#e5e7eb"));
+    }
+
+    #[test]
+    fn no_change_dot_is_valid_and_escaped() {
+        let dot = no_change_dot(SNAPSHOT, "empty_\"worktree\\delta");
+        assert!(dot.starts_with("digraph graphr_changes {\n"));
+        assert!(dot.contains("no_changes_reason=empty_\\\"worktree\\\\delta"));
+        assert!(!dot.contains("  n"));
+        assert!(dot.ends_with("}\n"));
+        assert!(dot.len() <= DOT_BUDGET);
+    }
+
+    fn oversized_dot_fixture(
+        count: usize,
+    ) -> (Vec<RowNode>, ChangeAnalysis, ChangeCalls, DotAccounting) {
+        let mut roots = Vec::with_capacity(count);
+        let mut risks = HashMap::with_capacity(count);
+        let mut flows = Vec::with_capacity(count);
+        let mut calls = ChangeCalls::default();
+        for index in 0..count {
+            let caller_id = i64::try_from(index * 2 + 1).unwrap();
+            let target_id = caller_id + 1;
+            let score = u32::try_from((count - index) * 100).unwrap();
+            let target = RowNode {
+                id: target_id,
+                kind: "function".into(),
+                name: format!("changed_{index}_{}", "x".repeat(320)),
+                path: format!("src/{}/changed_{index}.rs", "p".repeat(320)),
+                line: 2,
+            };
+            let caller = RowNode {
+                id: caller_id,
+                kind: "function".into(),
+                name: format!("caller_{index}_{}", "y".repeat(320)),
+                path: format!("src/{}/caller_{index}.rs", "q".repeat(320)),
+                line: 1,
+            };
+            roots.push(target.clone());
+            risks.insert(
+                target_id,
+                NodeRisk {
+                    score,
+                    flow_component: score,
+                    test_component: 0,
+                    security_component: 0,
+                    caller_component: 0,
+                    test_node: false,
+                    test_gap: false,
+                    indirect_test_covered: false,
+                },
+            );
+            flows.push(AffectedFlow {
+                entry: FlowNode {
+                    id: caller.id,
+                    kind: caller.kind.clone(),
+                    name: caller.name.clone(),
+                    qualified_name: caller.name.clone(),
+                    path: caller.path.clone(),
+                    line: caller.line,
+                },
+                nodes: vec![
+                    FlowNode {
+                        id: caller.id,
+                        kind: caller.kind.clone(),
+                        name: caller.name.clone(),
+                        qualified_name: caller.name.clone(),
+                        path: caller.path.clone(),
+                        line: caller.line,
+                    },
+                    FlowNode {
+                        id: target.id,
+                        kind: target.kind.clone(),
+                        name: target.name.clone(),
+                        qualified_name: target.name.clone(),
+                        path: target.path.clone(),
+                        line: target.line,
+                    },
+                ],
+                parents: HashMap::from([(target_id, caller_id)]),
+                changed: vec![target_id],
+                depth: 1,
+                file_count: 2,
+                criticality: score,
+            });
+            calls.nodes.insert(caller_id, caller);
+            calls.nodes.insert(target_id, target);
+            calls.edges.insert((caller_id, target_id, false));
+        }
+        (
+            roots,
+            ChangeAnalysis {
+                risks,
+                flows,
+                flow_omitted: false,
+                test_mapping_omitted: false,
+            },
+            calls,
+            DotAccounting {
+                changed_total: count,
+                analysis_roots_omitted: 0,
+                deleted_paths_unanalyzed: 0,
+                unmapped_ranges: 0,
+                file_mapped_ranges: 0,
+                traversal_complete: true,
+            },
+        )
     }
 
     #[test]
