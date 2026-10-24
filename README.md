@@ -38,13 +38,8 @@ Graphr exposes seven MCP tools:
 
 ## Snapshot workflow
 
-Inspect the selected root first:
-
-```text
-inspect_root({"worktree_root": "/tmp/project-feature"})
-```
-
-Then queue the exact review selection. This example captures committed,
+Queue the exact review selection. The `index` call authorizes the selected
+root and returns its canonical identity. This example captures committed,
 staged, unstaged, and untracked changes:
 
 ```text
@@ -96,13 +91,14 @@ dot -Tsvg impact.dot -o impact.svg
 Graphr neither invokes nor depends on Graphviz. The graph is static
 resolved-call evidence, not runtime execution.
 
-Call `changes` once without a cursor. Every continuation is a standalone
-`name=value` line: split on the first `=`, pass the complete remaining value
-verbatim with the same snapshot, depth, and max-nodes, and continue until all
-`files_next_cursor`, `diff_next_cursor`, `artifacts_next_cursor`, and
-`graph_next_cursor` and `evidence_next_cursor` values are exhausted. `max_nodes`
-changes graph page size, not snapshot coverage. Every initial and continuation
-page repeats three independent terminal facts:
+Call `changes` once without a cursor. Each response emits one
+`review_next_cursor` when any section has remaining content. Split its line on
+the first `=`, pass the complete remaining value verbatim with the same
+snapshot, depth, and max-nodes, and continue until that cursor is exhausted.
+Each continuation packs the next page for every unfinished section in fixed
+files, diff, artifacts, graph, evidence order under the 8 KiB review budget.
+`max_nodes` changes graph page size, not snapshot coverage. Every initial and
+continuation page repeats three independent terminal facts:
 `content_complete_when_pages_exhausted`, `static_evidence_status`, and
 `dynamic_evidence_status`.
 
@@ -140,7 +136,7 @@ validated common Git directory's `graphr/v6` namespace and isolated by
 repository, worktree, resolved revisions, target state, dependency mode, dirty
 digest, and format versions. Linked worktrees may reuse immutable Git-object
 analysis but keep distinct workspace and snapshot identities. Published
-snapshots are immutable. Graphr 0.6.0 performs no automatic cache garbage
+snapshots are immutable. Graphr performs no automatic cache garbage
 collection.
 
 ## External execution evidence
@@ -254,15 +250,28 @@ detection pipeline. Rename detection runs independently within regular source
 diffs and within non-source artifact diffs. Renames crossing those streams are
 conservatively represented as a deletion plus an addition.
 
-## Codex review skill
+## Codex and Claude review skill
 
-Install the skill globally by entering this prompt in Codex:
+The review skill is source-repository content, not part of the Cargo package.
+Codex discovers `.agents/skills` in this repository. Install it globally:
 
 ```text
 $skill-installer Install the graphr-review skill from https://github.com/f3rmion/graphr/tree/main/.agents/skills/graphr-review
 ```
 
-The skill selects the review base, exhausts every bounded `changes` continuation page, follows targeted graph remediation, and keeps the final review under 220 words.
+Claude Code discovers the same skill from `.claude/skills` in a project. This
+repository links `.claude/skills/graphr-review` to the canonical skill. For a
+personal install from a checkout:
+
+```bash
+mkdir -p ~/.claude/skills
+cp -R .agents/skills/graphr-review ~/.claude/skills/
+```
+
+Both clients need the separately registered Graphr MCP server. The skill
+selects the review base, exhausts every bounded `changes` continuation page,
+checks snapshot freshness, follows targeted graph remediation, and keeps the
+final review under 220 words.
 
 ## Token benchmark
 

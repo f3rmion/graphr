@@ -315,10 +315,10 @@ fn coverage_evidence_imports_scoped_rust_observations_without_dynamic_edges() {
     );
     assert!(!tool_failed(&inspection), "{inspection}");
     let mut changes = response_text(&client.changes(6, 50, None));
-    let mut cursor = page_cursor(&changes, "evidence_next_cursor");
+    let mut cursor = page_cursor(&changes, "review_next_cursor");
     while let Some(token) = cursor {
         let page = changes_page(&mut client, &token);
-        cursor = page_cursor(&page, "evidence_next_cursor");
+        cursor = page_cursor(&page, "review_next_cursor");
         changes.push_str(&page);
     }
     for expected in [
@@ -438,10 +438,10 @@ fn coverage_evidence_imports_python_contexts_with_run_scoped_arcs() {
     );
     assert!(!tool_failed(&inspection), "{inspection}");
     let mut changes = response_text(&client.changes(6, 50, None));
-    let mut cursor = page_cursor(&changes, "evidence_next_cursor");
+    let mut cursor = page_cursor(&changes, "review_next_cursor");
     while let Some(token) = cursor {
         let page = changes_page(&mut client, &token);
-        cursor = page_cursor(&page, "evidence_next_cursor");
+        cursor = page_cursor(&page, "review_next_cursor");
         changes.push_str(&page);
     }
     assert!(
@@ -591,7 +591,7 @@ fn evidence_pagination_is_independent_bounded_and_exhaustive() {
                     "prior_records",
                     "remaining_records",
                 ],
-                "evidence_next_cursor",
+                "review_next_cursor",
             )
         })
         .collect::<BTreeSet<_>>();
@@ -988,22 +988,15 @@ fn mixed_evidence_gaps_keep_completed_transport_distinct_from_partial_static_evi
     for query in changes.queries() {
         assert!(query.text.len() <= 8192, "{}", query.text.len());
     }
-    for (section, cursor) in [
-        ("files", "files_next_cursor"),
-        ("diff", "diff_next_cursor"),
-        ("artifacts", "artifacts_next_cursor"),
-        ("graph", "graph_next_cursor"),
-        ("evidence", "evidence_next_cursor"),
-    ] {
-        let terminal = changes.pages[section]
-            .last()
-            .map_or(&changes.initial, |(_, page)| page);
-        assert!(
-            page_cursor(&terminal.text, cursor).is_none(),
-            "{}",
-            terminal.text
-        );
-    }
+    let terminal = changes
+        .continuations
+        .last()
+        .map_or(&changes.initial, |(_, page)| page);
+    assert!(
+        page_cursor(&terminal.text, "review_next_cursor").is_none(),
+        "{}",
+        terminal.text
+    );
     for expected in [
         "Function resolved src/lib.rs:4",
         "references missing=0 ambiguous=1",
@@ -1073,7 +1066,7 @@ fn completeness_reports_direct_static_calls_without_legacy_fields() {
     let output = complete_graph_pages(&mut client, output, 6, 50);
 
     for expected in [
-        "languages=rust,python,javascript,typescript",
+        "languages=rust,python,javascript,typescript,cpp",
         "completeness content_capture=complete source_capture=complete syntax_parse=complete site_classification=complete static_model=complete evidence_capture=not-applicable provenance_model=not-applicable execution_mapping=not-applicable traversal=complete",
         "claim kind=affected-callers status=complete basis=resolved-static-call-graph",
         "claim kind=affected-flows status=complete basis=resolved-static-call-graph",
@@ -2721,11 +2714,11 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     let changed = client.changes(6, 50, None);
     let text = response_text(&changed);
     let mut complete = text.clone();
-    let mut graph_cursor = page_cursor(&text, "graph_next_cursor");
+    let mut graph_cursor = page_cursor(&text, "review_next_cursor");
     while let Some(token) = graph_cursor {
         let page = changes_page(&mut client, &token);
         assert!(page.len() <= 8192, "{}", page.len());
-        graph_cursor = page_cursor(&page, "graph_next_cursor");
+        graph_cursor = page_cursor(&page, "review_next_cursor");
         complete.push_str(&page);
     }
     for expected in [
@@ -2814,7 +2807,7 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     let bounded = client.changes(0, 1, None);
     assert!(bounded.contains("changed_symbols_omitted=0"), "{bounded}");
     assert!(bounded.contains("neighborhood_omitted=false"), "{bounded}");
-    assert!(bounded.contains("graph_next_cursor="), "{bounded}");
+    assert!(bounded.contains("review_next_cursor="), "{bounded}");
     assert!(!bounded.contains("[truncated]"), "{bounded}");
     assert!(bounded.len() <= 8192, "{bounded}");
     client.close();
@@ -3266,18 +3259,11 @@ fn commit_index_and_worktree_targets_preserve_status_layers_and_artifacts() {
         )
     }));
     assert_semantic_records(&worktree_changes, &semantic_records);
-    for label in [
-        "files_next_cursor",
-        "diff_next_cursor",
-        "artifacts_next_cursor",
-        "graph_next_cursor",
-    ] {
-        assert!(
-            page_cursor(&worktree_changes.initial.text, label).is_some(),
-            "{label} unexpectedly terminal: {}",
-            worktree_changes.initial.text
-        );
-    }
+    assert!(
+        page_cursor(&worktree_changes.initial.text, "review_next_cursor").is_some(),
+        "review unexpectedly terminal: {}",
+        worktree_changes.initial.text
+    );
     assert_ne!(commit_snapshot, index_snapshot);
     assert_ne!(index_snapshot, worktree_snapshot);
     client.close();
@@ -3305,18 +3291,11 @@ fn editing_after_publication_never_mutates_existing_queries_or_cursors() {
         .to_owned();
     let old_view = capture_query(&client.view(&old_node, 6, 50));
     let old_changes = capture_changes(&mut client, &old_snapshot, 6, 50);
-    for label in [
-        "files_next_cursor",
-        "diff_next_cursor",
-        "artifacts_next_cursor",
-        "graph_next_cursor",
-    ] {
-        assert!(
-            page_cursor(&old_changes.initial.text, label).is_some(),
-            "{label} unexpectedly terminal: {}",
-            old_changes.initial.text
-        );
-    }
+    assert!(
+        page_cursor(&old_changes.initial.text, "review_next_cursor").is_some(),
+        "review unexpectedly terminal: {}",
+        old_changes.initial.text
+    );
 
     fs::write(
         fixture.path.join(LAYERED_PATH),
@@ -3760,17 +3739,17 @@ struct QueryCapture {
 struct ChangesCapture {
     initial: QueryCapture,
     pages: BTreeMap<&'static str, Vec<(String, QueryCapture)>>,
+    continuations: Vec<(String, QueryCapture)>,
 }
 
 impl ChangesCapture {
     fn queries(&self) -> impl Iterator<Item = &QueryCapture> {
-        std::iter::once(&self.initial).chain(self.pages.values().flatten().map(|(_, page)| page))
+        std::iter::once(&self.initial).chain(self.continuations.iter().map(|(_, page)| page))
     }
 
     fn cursor_queries(&self) -> impl Iterator<Item = (&str, &QueryCapture)> {
-        self.pages
-            .values()
-            .flatten()
+        self.continuations
+            .iter()
             .map(|(cursor, capture)| (cursor.as_str(), capture))
     }
 }
@@ -3796,11 +3775,11 @@ fn capture_changes(
         depth,
         max_nodes,
         [
-            ("files", "files_next_cursor"),
-            ("diff", "diff_next_cursor"),
-            ("artifacts", "artifacts_next_cursor"),
-            ("graph", "graph_next_cursor"),
-            ("evidence", "evidence_next_cursor"),
+            ("files", "review_next_cursor"),
+            ("diff", "review_next_cursor"),
+            ("artifacts", "review_next_cursor"),
+            ("graph", "review_next_cursor"),
+            ("evidence", "review_next_cursor"),
         ],
     )
 }
@@ -3810,7 +3789,7 @@ fn capture_changes_in_order<const N: usize>(
     snapshot_id: &str,
     depth: u32,
     max_nodes: u32,
-    sections: [(&'static str, &'static str); N],
+    _sections: [(&'static str, &'static str); N],
 ) -> ChangesCapture {
     let initial = capture_query(&client.call(
         "changes",
@@ -3823,50 +3802,68 @@ fn capture_changes_in_order<const N: usize>(
     assert_eq!(initial.provenance["snapshot_id"], snapshot_id);
     let status = terminal_status(&initial.text);
     let mut pages = BTreeMap::new();
-    for (section, cursor_label) in sections {
-        let mut section_pages = Vec::new();
-        let mut cursor = page_cursor(&initial.text, cursor_label);
-        assert_eq!(
-            page_field(page_metadata_line(&initial.text, section), "page_complete") == "true",
-            cursor.is_none(),
-            "{}",
-            initial.text
-        );
-        while let Some(token) = cursor {
-            let page = capture_query(&client.call(
-                "changes",
-                rmcp::serde_json::json!({
-                    "snapshot_id": snapshot_id,
-                    "depth": depth,
-                    "max_nodes": max_nodes,
-                    "cursor": &token,
-                }),
-            ));
-            assert_eq!(page.provenance, initial.provenance);
-            assert!(
-                page.text.starts_with(&format!("{section}\n")),
-                "{}",
-                page.text
-            );
-            assert_eq!(
-                terminal_status(&page.text),
-                status,
-                "completion changed between pages: {}",
-                page.text,
-            );
-            let next = page_cursor(&page.text, cursor_label);
-            assert_eq!(
-                page_field(page_metadata_line(&page.text, section), "page_complete") == "true",
-                next.is_none(),
-                "{}",
-                page.text
-            );
-            section_pages.push((token, page));
-            cursor = next;
-        }
-        pages.insert(section, section_pages);
+    for section in ["files", "diff", "artifacts", "graph", "evidence"] {
+        pages.insert(section, Vec::new());
     }
-    ChangesCapture { initial, pages }
+    let mut continuations = Vec::new();
+    let mut cursor = page_cursor(&initial.text, "review_next_cursor");
+    while let Some(token) = cursor {
+        let page = capture_query(&client.call(
+            "changes",
+            rmcp::serde_json::json!({
+                "snapshot_id": snapshot_id,
+                "depth": depth,
+                "max_nodes": max_nodes,
+                "cursor": &token,
+            }),
+        ));
+        assert_eq!(page.provenance, initial.provenance);
+        assert_eq!(
+            terminal_status(&page.text),
+            status,
+            "completion changed between pages: {}",
+            page.text,
+        );
+        for section in ["files", "diff", "artifacts", "graph", "evidence"] {
+            if let Some(text) = section_page_text(&page.text, section) {
+                pages.get_mut(section).unwrap().push((
+                    token.clone(),
+                    QueryCapture {
+                        text,
+                        provenance: page.provenance.clone(),
+                    },
+                ));
+            }
+        }
+        continuations.push((token, page.clone()));
+        cursor = page_cursor(&page.text, "review_next_cursor");
+    }
+    ChangesCapture {
+        initial,
+        pages,
+        continuations,
+    }
+}
+
+fn section_page_text(output: &str, section: &str) -> Option<String> {
+    let header = format!("{section}\n");
+    let start = output.find(&header)?;
+    let content_start = start + header.len();
+    let mut end = output.len();
+    for candidate in ["files", "diff", "artifacts", "graph", "evidence"] {
+        if candidate == section {
+            continue;
+        }
+        let marker = format!("\n{candidate}\n");
+        if let Some(relative) = output[content_start..].find(&marker) {
+            end = end.min(content_start + relative + 1);
+        }
+    }
+    if let Some(relative) = output[content_start..].find("\ncontent_complete_when_pages_exhausted=")
+    {
+        end = end.min(content_start + relative + 1);
+    }
+    Some(output[start..end].to_owned())
 }
 
 fn terminal_status(output: &str) -> (bool, String, String) {
@@ -4143,7 +4140,7 @@ fn is_graph_non_node(line: &str) -> bool {
             .split_once(' ')
             .is_some_and(|(score, fields)| valid_score(score) && fields.starts_with("depth="));
     }
-    line.strip_prefix("graph_next_cursor=")
+    line.strip_prefix("review_next_cursor=")
         .is_some_and(|cursor| !cursor.is_empty() && !cursor.contains(char::is_whitespace))
         || matches!(
             line,
@@ -4387,8 +4384,7 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         "changed artifact text README.md analyzer=markdown",
         "changed artifact text settings.toml analyzer=generic",
         "untracked artifact omitted image.bin analyzer=generic reason=binary",
-        "files_next_cursor=",
-        "artifacts_next_cursor=",
+        "review_next_cursor=",
         "content_complete_when_pages_exhausted=false",
         "static_evidence_status=partial",
         "dynamic_evidence_status=not-applicable",
@@ -4399,7 +4395,7 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         assert!(initial.contains(expected), "missing {expected}: {initial}");
     }
     let file_pages =
-        complete_section_pages(&mut client, initial.clone(), 6, 50, "files_next_cursor");
+        complete_section_pages(&mut client, initial.clone(), 6, 50, "review_next_cursor");
     assert!(
         file_pages
             .contains("untracked artifact text tests/fixtures/alias-registry.v1.tsv analyzer=tsv"),
@@ -4418,7 +4414,7 @@ fn changes_pages_complete_inventory_diff_and_flows() {
             "prior_hunks",
             "remaining_hunks",
         ],
-        "diff_next_cursor",
+        "review_next_cursor",
     );
     let graph_totals = assert_page_accounting(
         &initial,
@@ -4430,7 +4426,7 @@ fn changes_pages_complete_inventory_diff_and_flows() {
             "prior_flows",
             "remaining_discovered_flows",
         ],
-        "graph_next_cursor",
+        "review_next_cursor",
     );
     let artifact_totals = assert_page_accounting(
         &initial,
@@ -4442,19 +4438,19 @@ fn changes_pages_complete_inventory_diff_and_flows() {
             "prior_records",
             "remaining_records",
         ],
-        "artifacts_next_cursor",
+        "review_next_cursor",
     );
     assert_eq!(page_metric(&initial, "graph", "total_flows"), 3);
 
-    let first_diff_cursor = page_cursor(&initial, "diff_next_cursor").unwrap();
-    let repeated_a = changes_page(&mut client, &first_diff_cursor);
-    let repeated_b = changes_page(&mut client, &first_diff_cursor);
+    let first_cursor = page_cursor(&initial, "review_next_cursor").unwrap();
+    let repeated_a = changes_page(&mut client, &first_cursor);
+    let repeated_b = changes_page(&mut client, &first_cursor);
     assert_eq!(repeated_a, repeated_b);
-    assert!(repeated_a.starts_with("diff\n"), "{repeated_a}");
-    assert!(!repeated_a.contains("\ngraph\n"), "{repeated_a}");
-    assert_eq!(
-        assert_page_accounting(
-            &repeated_a,
+    assert!(repeated_a.contains("\ndiff\n"), "{repeated_a}");
+    assert!(repeated_a.contains("\nartifacts\n"), "{repeated_a}");
+    assert!(repeated_a.contains("\ngraph\n"), "{repeated_a}");
+    for (section, keys, totals) in [
+        (
             "diff",
             [
                 "emitted_hunks",
@@ -4463,117 +4459,84 @@ fn changes_pages_complete_inventory_diff_and_flows() {
                 "prior_hunks",
                 "remaining_hunks",
             ],
-            "diff_next_cursor",
+            diff_totals,
         ),
-        diff_totals
-    );
+        (
+            "artifacts",
+            [
+                "emitted_records",
+                "partial_records",
+                "total_records",
+                "prior_records",
+                "remaining_records",
+            ],
+            artifact_totals,
+        ),
+        (
+            "graph",
+            [
+                "emitted_flows",
+                "partial_flows",
+                "discovered_flows",
+                "prior_flows",
+                "remaining_discovered_flows",
+            ],
+            graph_totals,
+        ),
+    ] {
+        assert_eq!(
+            assert_page_accounting(&repeated_a, section, keys, "review_next_cursor"),
+            totals
+        );
+    }
 
-    let mut diff_pages = initial.clone();
-    let mut cursor = Some(first_diff_cursor.clone());
+    let mut complete = initial.clone();
+    let mut cursor = Some(first_cursor.clone());
     while let Some(token) = cursor {
         let page = changes_page(&mut client, &token);
         assert!(page.len() <= 8192, "{}", page.len());
         assert!(!page.contains("[truncated]"), "{page}");
-        assert_eq!(
-            assert_page_accounting(
-                &page,
-                "diff",
-                [
-                    "emitted_hunks",
-                    "partial_hunks",
-                    "total_hunks",
-                    "prior_hunks",
-                    "remaining_hunks",
-                ],
-                "diff_next_cursor",
-            ),
-            diff_totals
-        );
-        cursor = page_cursor(&page, "diff_next_cursor");
-        diff_pages.push_str(&page);
+        cursor = page_cursor(&page, "review_next_cursor");
+        complete.push_str(&page);
     }
-    assert!(diff_pages.contains("LAST_PAGE_SENTINEL"), "{diff_pages}");
-    assert_eq!(
-        diff_pages
-            .lines()
-            .filter(|line| line.starts_with("@@ "))
-            .count(),
-        14,
-        "{diff_pages}"
-    );
-
-    let mut artifact_pages = initial.clone();
-    let mut cursor = page_cursor(&initial, "artifacts_next_cursor");
-    while let Some(token) = cursor {
-        let page = changes_page(&mut client, &token);
-        assert!(page.len() <= 8192, "{}", page.len());
-        assert!(page.starts_with("artifacts\n"), "{page}");
-        assert!(
-            page.contains("content_complete_when_pages_exhausted=false"),
-            "{page}"
-        );
-        assert_eq!(
-            assert_page_accounting(
-                &page,
-                "artifacts",
-                [
-                    "emitted_records",
-                    "partial_records",
-                    "total_records",
-                    "prior_records",
-                    "remaining_records",
-                ],
-                "artifacts_next_cursor",
-            ),
-            artifact_totals
-        );
-        cursor = page_cursor(&page, "artifacts_next_cursor");
-        artifact_pages.push_str(&page);
-    }
-    assert!(artifact_pages.contains("key_basis=first-column"));
-    assert!(artifact_pages.contains("markdown path=\"README.md\""));
-    assert!(artifact_pages.contains("LAST_ARTIFACT_SENTINEL"));
-    assert!(artifact_pages.contains("diff --git a/README.md b/README.md"));
-    assert!(artifact_pages.contains("diff --git a/settings.toml b/settings.toml"));
-
-    let mut graph_pages = initial.clone();
-    let mut cursor = page_cursor(&initial, "graph_next_cursor");
+    assert!(complete.contains("LAST_PAGE_SENTINEL"), "{complete}");
+    let mut in_source_diff = false;
+    let source_hunks = complete
+        .lines()
+        .filter(|line| match *line {
+            "diff" => {
+                in_source_diff = true;
+                false
+            }
+            "artifacts" | "graph" | "files" | "evidence" => {
+                in_source_diff = false;
+                false
+            }
+            line => in_source_diff && line.starts_with("@@ "),
+        })
+        .count();
+    assert_eq!(source_hunks, 14, "{complete}");
+    assert!(complete.contains("key_basis=first-column"), "{complete}");
     assert!(
-        cursor.is_some(),
-        "graph unexpectedly fit on one page: {initial}"
+        complete.contains("markdown path=\"README.md\""),
+        "{complete}"
     );
-    while let Some(token) = cursor {
-        let page = changes_page(&mut client, &token);
-        assert!(page.len() <= 8192, "{}", page.len());
-        assert!(!page.contains("[truncated]"), "{page}");
-        assert!(page.starts_with("graph\n"), "{page}");
-        assert!(!page.contains("\ndiff\n"), "{page}");
-        assert_eq!(
-            assert_page_accounting(
-                &page,
-                "graph",
-                [
-                    "emitted_flows",
-                    "partial_flows",
-                    "discovered_flows",
-                    "prior_flows",
-                    "remaining_discovered_flows",
-                ],
-                "graph_next_cursor",
-            ),
-            graph_totals
-        );
-        assert_eq!(page_metric(&page, "graph", "total_flows"), 3);
-        cursor = page_cursor(&page, "graph_next_cursor");
-        graph_pages.push_str(&page);
-    }
+    assert!(complete.contains("LAST_ARTIFACT_SENTINEL"), "{complete}");
+    assert!(
+        complete.contains("diff --git a/README.md b/README.md"),
+        "{complete}"
+    );
+    assert!(
+        complete.contains("diff --git a/settings.toml b/settings.toml"),
+        "{complete}"
+    );
     assert_eq!(
-        graph_pages
+        complete
             .lines()
             .filter(|line| line.starts_with("flow "))
             .count(),
         3,
-        "{graph_pages}"
+        "{complete}"
     );
 
     fs::write(
@@ -4581,15 +4544,15 @@ fn changes_pages_complete_inventory_diff_and_flows() {
         format!("{}// cursor is now stale\n", review_fixture_source(true)),
     )
     .unwrap();
-    let cached = changes_page(&mut client, &first_diff_cursor);
+    let cached = changes_page(&mut client, &first_cursor);
     assert_eq!(cached, repeated_a, "cursor did not retain its snapshot");
     client.index_and_wait("boundary");
     let refreshed = response_text(&client.changes(6, 50, None));
     assert!(
-        refreshed.contains("diff_next_cursor="),
-        "refreshed diff unexpectedly fit one page: {refreshed}"
+        refreshed.contains("review_next_cursor="),
+        "refreshed review unexpectedly fit one page: {refreshed}"
     );
-    let stale = client.changes(6, 50, Some(&first_diff_cursor));
+    let stale = client.changes(6, 50, Some(&first_cursor));
     assert!(tool_failed(&stale), "{stale}");
     assert!(stale.contains("cursor_snapshot_mismatch"), "{stale}");
     client.close();
@@ -4697,25 +4660,16 @@ fn complete_graph_pages(
     depth: u32,
     max_nodes: u32,
 ) -> String {
-    complete_section_pages(client, initial, depth, max_nodes, "graph_next_cursor")
+    complete_section_pages(client, initial, depth, max_nodes, "review_next_cursor")
 }
 
 fn complete_review_pages(
     client: &mut Client,
-    mut output: String,
+    output: String,
     depth: u32,
     max_nodes: u32,
 ) -> String {
-    for cursor in [
-        "files_next_cursor",
-        "diff_next_cursor",
-        "artifacts_next_cursor",
-        "graph_next_cursor",
-        "evidence_next_cursor",
-    ] {
-        output = complete_section_pages(client, output, depth, max_nodes, cursor);
-    }
-    output
+    complete_section_pages(client, output, depth, max_nodes, "review_next_cursor")
 }
 
 fn complete_section_pages(
@@ -4744,7 +4698,7 @@ fn assert_page_accounting(
         prior_key,
         remaining_key,
     ]: [&str; 5],
-    cursor_label: &str,
+    _cursor_label: &str,
 ) -> (usize, usize) {
     let emitted = page_metric(output, section, "emitted_bytes");
     let total = page_metric(output, section, "total_bytes");
@@ -4765,11 +4719,6 @@ fn assert_page_accounting(
     assert_eq!(
         prior_records + emitted_records + partial_records + remaining_records,
         total_records,
-        "{output}"
-    );
-    assert_eq!(
-        page_field(line, "page_complete") == "true",
-        page_cursor(output, cursor_label).is_none(),
         "{output}"
     );
     (total, total_records)
@@ -5515,11 +5464,11 @@ fn two_linked_worktrees_index_concurrently_without_cross_contamination() {
         6,
         50,
         [
-            ("graph", "graph_next_cursor"),
-            ("artifacts", "artifacts_next_cursor"),
-            ("diff", "diff_next_cursor"),
-            ("files", "files_next_cursor"),
-            ("evidence", "evidence_next_cursor"),
+            ("graph", "review_next_cursor"),
+            ("artifacts", "review_next_cursor"),
+            ("diff", "review_next_cursor"),
+            ("files", "review_next_cursor"),
+            ("evidence", "review_next_cursor"),
         ],
     );
     assert_change_manifest(
@@ -5849,11 +5798,11 @@ fn long_indexing_keeps_status_inspect_and_existing_snapshot_queries_responsive()
         6,
         50,
         [
-            ("artifacts", "artifacts_next_cursor"),
-            ("graph", "graph_next_cursor"),
-            ("files", "files_next_cursor"),
-            ("diff", "diff_next_cursor"),
-            ("evidence", "evidence_next_cursor"),
+            ("artifacts", "review_next_cursor"),
+            ("graph", "review_next_cursor"),
+            ("files", "review_next_cursor"),
+            ("diff", "review_next_cursor"),
+            ("evidence", "review_next_cursor"),
         ],
     );
     assert_eq!(blocked_search, old_search);
@@ -6023,18 +5972,11 @@ fn linked_feature_with_ten_commits_and_twelve_files_returns_replay_symbols() {
 
     let first_changes = capture_changes(&mut client, &snapshot_id, 6, 50);
     assert!(!first_changes.initial.text.starts_with("no changes"));
-    for label in [
-        "files_next_cursor",
-        "diff_next_cursor",
-        "artifacts_next_cursor",
-        "graph_next_cursor",
-    ] {
-        assert!(
-            page_cursor(&first_changes.initial.text, label).is_some(),
-            "{label} missing: {}",
-            first_changes.initial.text
-        );
-    }
+    assert!(
+        page_cursor(&first_changes.initial.text, "review_next_cursor").is_some(),
+        "review unexpectedly terminal: {}",
+        first_changes.initial.text
+    );
     assert_eq!(
         change_section_text(&first_changes, "files")
             .lines()
@@ -6119,11 +6061,11 @@ fn linked_feature_with_ten_commits_and_twelve_files_returns_replay_symbols() {
         6,
         50,
         [
-            ("diff", "diff_next_cursor"),
-            ("files", "files_next_cursor"),
-            ("graph", "graph_next_cursor"),
-            ("artifacts", "artifacts_next_cursor"),
-            ("evidence", "evidence_next_cursor"),
+            ("diff", "review_next_cursor"),
+            ("files", "review_next_cursor"),
+            ("graph", "review_next_cursor"),
+            ("artifacts", "review_next_cursor"),
+            ("evidence", "review_next_cursor"),
         ],
     );
     assert_eq!(reused_changes, first_changes);

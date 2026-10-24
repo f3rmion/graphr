@@ -24,8 +24,7 @@ Choose the root, range, and target before reading source:
 
 Ask for a missing target branch. Stop if a required base does not exist, including a root commit.
 
-1. Call `inspect_root({"worktree_root": ROOT})`. Require the returned canonical `worktree_root` to equal the selected root.
-2. Call exactly:
+1. Call exactly:
 
    ```text
    index({"worktree_root": ROOT, "base": BASE, "head": HEAD,
@@ -33,23 +32,49 @@ Ask for a missing target branch. Stop if a required base does not exist, includi
    ```
 
    Use `dependency_mode: "full"` only when dependency internals are explicitly requested. Require the queued job to report the selected root and resolved `base_oid`/`head_oid`; a mismatch is terminal.
-3. Poll `index_status({"job_id": JOB_ID})` while the state is `queued`, `capturing`, `selecting_seed`, `indexing`, `resolving_graph`, or `publishing`. Continue until `completed`, then retain `completion.snapshot_id`. On `failed`, `cancelled`, missing, or malformed status, stop and report incomplete coverage.
+2. Poll `index_status({"job_id": JOB_ID})` while the state is `queued`,
+   `capturing`, `selecting_seed`, `indexing`, `resolving_graph`, or
+   `publishing`. Continue until `completed`, then retain
+   `completion.snapshot_id`. On `failed`, `cancelled`, missing, or malformed
+   status, stop and report incomplete coverage.
 
 ## Review the immutable snapshot
 
 1. Call `changes({"snapshot_id": SNAPSHOT_ID, "depth": 6, "max_nodes": 50})` exactly once without `cursor`.
-2. Exhaust every `files_next_cursor`, `diff_next_cursor`, `artifacts_next_cursor`, `graph_next_cursor`, and `evidence_next_cursor` returned by any page. A cursor line is `name=value`: split only on the first `=` and pass the entire value, including every later `=`, verbatim:
+2. Exhaust each returned `review_next_cursor`. One cursor advances every
+   unfinished files, diff, artifacts, graph, and evidence section in fixed
+   order. A cursor line is `name=value`: split only on the first `=` and pass
+   the complete remaining value, including every later `=`, verbatim:
 
    ```text
    changes({"snapshot_id": SNAPSHOT_ID, "depth": 6,
             "max_nodes": 50, "cursor": TOKEN})
    ```
 
-   Keep the same snapshot, depth, and max-nodes. Never make a second cursorless `changes` call. Increasing `max_nodes` changes page size, not coverage.
-3. Review only returned manifest, source diff, artifact, graph, and evidence pages. Artifact pages include bounded generic text plus Markdown requirement/link/fence and TSV schema/key/row/duplicate/width semantics; do not re-read captured files. Treat each `flow` as a possible static path, not a runtime stack, and support findings with `file:line` evidence.
-4. Use `search` or `view` only when an emitted graph `coverage` line names that exact remediation. Pass the same `snapshot_id`; pass returned `node_ref` values verbatim. `file-mapped` ranges need no remediation. Do not search unrelated names or read the repository.
+   Keep the same snapshot, depth, and max-nodes. Never make a second cursorless
+   `changes` call. Increasing `max_nodes` changes page size, not coverage.
+3. Review only returned manifest, source diff, artifact, graph, and evidence
+   pages. Artifact pages include bounded generic text plus Markdown
+   requirement/link/fence and TSV schema/key/row/duplicate/width semantics; do
+   not re-read captured files. Treat each `flow` as a possible static path,
+   not a runtime stack, and support findings with `file:line` evidence.
+4. Use `search` or `view` only when an emitted graph `coverage` line names that
+   exact remediation. Pass the same `snapshot_id`; pass returned `node_ref`
+   values verbatim. `file-mapped` ranges need no remediation. Do not search
+   unrelated names or read the repository.
+5. Before concluding, call `inspect_root({"worktree_root": ROOT,
+   "snapshot_id": SNAPSHOT_ID})`. Require its canonical `worktree_root` to
+   equal `ROOT` and `snapshot_matches_worktree=true`. On a mismatch, queue a
+   fresh index for the same selection and restart. On any error, stop.
 
-`analysis_complete` is analyzer-local. Conclude only after all five cursor streams and named remediation terminate, no explicit omission or failure occurred, and `content_complete_when_pages_exhausted=true`. Treat `static_evidence_status` and `dynamic_evidence_status` as independent facts. Binary, oversized, unsafe, non-regular, type-changed, unmerged, cursor, and remediation failures make content coverage incomplete. Complete artifact coverage does not add indexed source languages: Graphr indexes Rust, Python, JavaScript/JSX, TypeScript/TSX, and C++.
+`analysis_complete` is analyzer-local. Conclude only after the combined
+`review_next_cursor` terminates and named remediation terminates, no explicit
+omission or failure occurred, and `content_complete_when_pages_exhausted=true`.
+Treat `static_evidence_status` and `dynamic_evidence_status` as independent
+facts. Binary, oversized, unsafe, non-regular, type-changed, unmerged, cursor,
+and remediation failures make content coverage incomplete. Complete artifact
+coverage does not add indexed source languages: Graphr indexes Rust, Python,
+JavaScript/JSX, TypeScript/TSX, and C++.
 
 If `inspect_root` reports `snapshot_matches_worktree=false`, the snapshot remains historical and immutable but no longer proves the selected live worktree was reviewed. Explicitly queue a fresh `index` for the same selected root/range/target and restart from its completed snapshot. If divergence repeats, stop; never fall back to a live diff or default checkout.
 

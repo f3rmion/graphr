@@ -22,7 +22,7 @@ pub use crate::index::Engine;
 
 pub(crate) const CACHE_FORMAT_VERSION: u32 = 10;
 pub(crate) const GRAPH_ANALYZER_VERSION: u32 = 7;
-pub(crate) const REVIEW_FORMAT_VERSION: u32 = 6;
+pub(crate) const REVIEW_FORMAT_VERSION: u32 = 8;
 const MANIFEST_SIZE_LIMIT: u64 = 64 * 1024;
 const REVIEW_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 static PRIVATE_ID: AtomicU64 = AtomicU64::new(0);
@@ -155,8 +155,11 @@ impl NoChangeReason {
 #[schemars(crate = "rmcp::schemars")]
 pub struct RootInspection {
     pub identity: RootIdentity,
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     pub staged_paths: usize,
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     pub unstaged_paths: usize,
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     pub untracked_paths: usize,
     pub snapshot_id: Option<String>,
     pub snapshot_matches_worktree: Option<bool>,
@@ -205,7 +208,9 @@ pub struct Provenance {
     pub target_state: SnapshotTarget,
     pub selected_layers: Vec<ChangeLayer>,
     pub dirty_digest: String,
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     pub commits_base_to_head: u64,
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     pub changed_files: usize,
     pub index_generation: i64,
     pub source_snapshot_id: Option<String>,
