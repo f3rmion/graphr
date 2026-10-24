@@ -48,3 +48,6 @@ jobs:
 
       - name: cargo build --locked --release
         run: cargo build --locked --release
+
+      - name: cargo package --locked
+        run: cargo package --locked

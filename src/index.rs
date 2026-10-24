@@ -44,15 +44,25 @@ const INITIAL_ARTIFACTS_BUDGET: usize = 1200;
 const INITIAL_GRAPH_BUDGET: usize = 1600;
 const INITIAL_EVIDENCE_BUDGET: usize = 1400;
 const SECTION_OVERHEAD: usize = 704;
+const REVIEW_CURSOR_MAX_LEN: usize = 256;
+const REVIEW_CURSOR_RESERVE: usize = REVIEW_CURSOR_MAX_LEN + 32;
+
+const REVIEW_CURSOR_LABEL: &str = "review_next_cursor";
+// ponytail: retain four rendered reviews; raise only after measuring memory and recomputation.
+const RENDERED_CACHE_LIMIT: usize = 4;
 
 #[derive(
     Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema,
 )]
 #[schemars(crate = "rmcp::schemars")]
 pub struct IndexStats {
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     pub files_total: usize,
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     pub files_reused: usize,
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     pub files_parsed: usize,
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     pub files_skipped: usize,
 }
 
@@ -505,7 +515,9 @@ impl Engine {
         cancelled: &AtomicBool,
     ) -> Result<RootInspection, OperationError> {
         let identity = self.roots.inspect(root, cancelled)?;
-        self.catalog.attach(&identity, cancelled)?;
+        if snapshot_id.is_some_and(|snapshot_id| self.catalog.get(snapshot_id).is_err()) {
+            self.catalog.attach(&identity, cancelled)?;
+        }
         let repository = repository_from_identity(&identity);
         let (staged_paths, unstaged_paths, untracked_paths) =
             repository.status_counts(cancelled)?;
@@ -696,16 +708,21 @@ impl Engine {
                     snapshot.changes.clone(),
                     graph,
                 ));
-                self.rendered
+                let mut rendered = self
+                    .rendered
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .entry(key)
-                    .or_insert(review)
-                    .clone()
+                    .unwrap_or_else(|error| error.into_inner());
+                if !rendered.contains_key(&key)
+                    && rendered.len() >= RENDERED_CACHE_LIMIT
+                    && let Some(evicted) = rendered.keys().next().cloned()
+                {
+                    rendered.remove(&evicted);
+                }
+                rendered.entry(key).or_insert(review).clone()
             }
         };
         let text = match (format, cursor) {
-            (ChangesFormat::Review, Some(cursor)) => render_section(
+            (ChangesFormat::Review, Some(cursor)) => render_review_page(
                 &review,
                 &parse_review_cursor(cursor, snapshot_id, depth, max_nodes)
                     .map_err(query_operation_error)?,
@@ -1253,17 +1270,15 @@ enum ReviewSection {
     Evidence,
 }
 
-impl ReviewSection {
-    const fn code(self) -> char {
-        match self {
-            Self::Files => 'f',
-            Self::Diff => 'd',
-            Self::Artifacts => 'a',
-            Self::Graph => 'g',
-            Self::Evidence => 'e',
-        }
-    }
+const REVIEW_SECTIONS: [ReviewSection; 5] = [
+    ReviewSection::Files,
+    ReviewSection::Diff,
+    ReviewSection::Artifacts,
+    ReviewSection::Graph,
+    ReviewSection::Evidence,
+];
 
+impl ReviewSection {
     const fn header(self) -> &'static str {
         match self {
             Self::Files => "files",
@@ -1273,21 +1288,10 @@ impl ReviewSection {
             Self::Evidence => "evidence",
         }
     }
-
-    const fn cursor_label(self) -> &'static str {
-        match self {
-            Self::Files => "files_next_cursor",
-            Self::Diff => "diff_next_cursor",
-            Self::Artifacts => "artifacts_next_cursor",
-            Self::Graph => "graph_next_cursor",
-            Self::Evidence => "evidence_next_cursor",
-        }
-    }
 }
 
 struct ReviewCursor {
-    section: ReviewSection,
-    offset: usize,
+    offsets: [usize; 5],
     depth: u32,
     max_nodes: u32,
     snapshot_id: String,
@@ -1472,37 +1476,32 @@ struct Page<'a> {
 }
 
 fn review_context(snapshot: &ReviewSnapshot) -> Result<String, String> {
-    let (files, _) = render_section_page(snapshot, ReviewSection::Files, 0, INITIAL_FILES_BUDGET)?;
-    let (diff, _) = render_section_page(snapshot, ReviewSection::Diff, 0, INITIAL_DIFF_BUDGET)?;
-    let (artifacts, _) = render_section_page(
-        snapshot,
-        ReviewSection::Artifacts,
-        0,
-        INITIAL_ARTIFACTS_BUDGET,
-    )?;
-    let (graph_page, _) =
-        render_section_page(snapshot, ReviewSection::Graph, 0, INITIAL_GRAPH_BUDGET)?;
-    let (evidence, _) = render_section_page(
-        snapshot,
-        ReviewSection::Evidence,
-        0,
-        INITIAL_EVIDENCE_BUDGET,
-    )?;
-    let output = format!(
-        "{files}{diff}{artifacts}{graph_page}{evidence}{}",
-        terminal_status(snapshot),
-    );
+    let sections = [
+        (ReviewSection::Files, INITIAL_FILES_BUDGET),
+        (ReviewSection::Diff, INITIAL_DIFF_BUDGET),
+        (ReviewSection::Artifacts, INITIAL_ARTIFACTS_BUDGET),
+        (ReviewSection::Graph, INITIAL_GRAPH_BUDGET),
+        (ReviewSection::Evidence, INITIAL_EVIDENCE_BUDGET),
+    ];
+    let mut offsets = [0_usize; 5];
+    let mut output = String::new();
+    for (index, (section, budget)) in sections.into_iter().enumerate() {
+        let (page, next_offset) = render_section_page(snapshot, section, 0, budget)?;
+        offsets[index] = next_offset;
+        output.push_str(&page);
+    }
+    output.push_str(&terminal_status(snapshot));
+    append_review_cursor(&mut output, snapshot, offsets);
     if output.len() > REVIEW_CONTEXT_BUDGET {
         return Err("review context exceeds output budget".into());
     }
     Ok(output)
 }
 
-fn render_section(snapshot: &ReviewSnapshot, cursor: &ReviewCursor) -> Result<String, String> {
+fn render_review_page(snapshot: &ReviewSnapshot, cursor: &ReviewCursor) -> Result<String, String> {
     let expected = cursor_checksum(
         &snapshot.checksum,
-        cursor.section,
-        cursor.offset,
+        &cursor.offsets,
         cursor.depth,
         cursor.max_nodes,
         &cursor.snapshot_id,
@@ -1510,17 +1509,68 @@ fn render_section(snapshot: &ReviewSnapshot, cursor: &ReviewCursor) -> Result<St
     if cursor.checksum != expected {
         return Err("invalid changes cursor".into());
     }
+    for (index, section) in REVIEW_SECTIONS.into_iter().enumerate() {
+        let value = snapshot.value(section);
+        let offset = cursor.offsets[index];
+        if offset > value.len() || !value.is_char_boundary(offset) {
+            return Err("invalid changes cursor".into());
+        }
+    }
+    let active = REVIEW_SECTIONS
+        .into_iter()
+        .enumerate()
+        .filter(|(index, section)| cursor.offsets[*index] < snapshot.value(*section).len())
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return Err("invalid changes cursor".into());
+    }
     let completion = terminal_status(snapshot);
-    let page_budget = REVIEW_CONTEXT_BUDGET
+    let available = REVIEW_CONTEXT_BUDGET
         .checked_sub(completion.len())
+        .and_then(|remaining| remaining.checked_sub(REVIEW_CURSOR_RESERVE))
         .ok_or_else(|| "review completion metadata exceeds output budget".to_owned())?;
-    let (mut output, _) =
-        render_section_page(snapshot, cursor.section, cursor.offset, page_budget)?;
+    let overhead = active
+        .len()
+        .checked_mul(SECTION_OVERHEAD)
+        .ok_or_else(|| "review section budget exceeds output budget".to_owned())?;
+    let payload = available
+        .checked_sub(overhead)
+        .ok_or_else(|| "review sections exceed output budget".to_owned())?;
+    let share = payload / active.len();
+    let remainder = payload % active.len();
+    let mut offsets = cursor.offsets;
+    let mut output = String::new();
+    for (rank, (index, section)) in active.into_iter().enumerate() {
+        let budget = SECTION_OVERHEAD + share + usize::from(rank < remainder);
+        let (page, next_offset) = render_section_page(snapshot, section, offsets[index], budget)?;
+        if next_offset <= offsets[index] {
+            return Err("review cursor cannot make progress".into());
+        }
+        offsets[index] = next_offset;
+        output.push_str(&page);
+    }
     output.push_str(&completion);
+    append_review_cursor(&mut output, snapshot, offsets);
     if output.len() > REVIEW_CONTEXT_BUDGET {
-        return Err("review section exceeds output budget".into());
+        return Err("review page exceeds output budget".into());
     }
     Ok(output)
+}
+
+fn append_review_cursor(output: &mut String, snapshot: &ReviewSnapshot, offsets: [usize; 5]) {
+    if review_has_remaining(snapshot, &offsets) {
+        output.push_str(REVIEW_CURSOR_LABEL);
+        output.push('=');
+        output.push_str(&cursor_token(snapshot, offsets));
+        output.push('\n');
+    }
+}
+
+fn review_has_remaining(snapshot: &ReviewSnapshot, offsets: &[usize; 5]) -> bool {
+    REVIEW_SECTIONS
+        .into_iter()
+        .enumerate()
+        .any(|(index, section)| offsets[index] < snapshot.value(section).len())
 }
 
 fn terminal_status(snapshot: &ReviewSnapshot) -> String {
@@ -1537,7 +1587,7 @@ fn render_section_page(
     section: ReviewSection,
     offset: usize,
     budget: usize,
-) -> Result<(String, bool), String> {
+) -> Result<(String, usize), String> {
     let value = snapshot.value(section);
     let content_budget = budget
         .checked_sub(SECTION_OVERHEAD)
@@ -1708,16 +1758,10 @@ fn render_section_page(
     if !page.text.is_empty() && !page.text.ends_with('\n') {
         output.push('\n');
     }
-    if more {
-        output.push_str(section.cursor_label());
-        output.push('=');
-        output.push_str(&cursor_token(snapshot, section, page.end));
-        output.push('\n');
-    }
     if output.len() > budget {
         return Err("review section exceeds output budget".into());
     }
-    Ok((output, more))
+    Ok((output, page.end))
 }
 
 fn page(value: &str, offset: usize, budget: usize) -> Result<Page<'_>, String> {
@@ -1800,17 +1844,15 @@ fn review_snapshot(
 
 fn cursor_checksum(
     review_checksum: &str,
-    section: ReviewSection,
-    offset: usize,
+    offsets: &[usize; 5],
     depth: u32,
     max_nodes: u32,
     snapshot_id: &str,
 ) -> String {
     let mut hash = blake3::Hasher::new();
     for value in [
+        b"graphr changes cursor v3".as_slice(),
         review_checksum.as_bytes(),
-        &[section.code() as u8],
-        &offset.to_le_bytes(),
         &depth.to_le_bytes(),
         &max_nodes.to_le_bytes(),
         snapshot_id.as_bytes(),
@@ -1818,20 +1860,28 @@ fn cursor_checksum(
         hash.update(&(value.len() as u64).to_le_bytes());
         hash.update(value);
     }
+    for offset in offsets {
+        let bytes = offset.to_le_bytes();
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(&bytes);
+    }
     hash.finalize().to_hex().to_string()
 }
 
-fn cursor_token(snapshot: &ReviewSnapshot, section: ReviewSection, offset: usize) -> String {
+fn cursor_token(snapshot: &ReviewSnapshot, offsets: [usize; 5]) -> String {
     format!(
-        "v2:{}:{offset}:{}:{}:{}:{}",
-        section.code(),
+        "v3:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        offsets[0],
+        offsets[1],
+        offsets[2],
+        offsets[3],
+        offsets[4],
         snapshot.depth,
         snapshot.max_nodes,
         snapshot.snapshot_id,
         cursor_checksum(
             &snapshot.checksum,
-            section,
-            offset,
+            &offsets,
             snapshot.depth,
             snapshot.max_nodes,
             &snapshot.snapshot_id,
@@ -1845,28 +1895,25 @@ fn parse_review_cursor(
     depth: u32,
     max_nodes: u32,
 ) -> Result<ReviewCursor, String> {
-    if value.len() > 160 {
+    if value.len() > REVIEW_CURSOR_MAX_LEN {
         return Err("invalid changes cursor".into());
     }
     let mut parts = value.split(':');
-    let version = parts.next();
-    let section = match parts.next() {
-        Some("f") => ReviewSection::Files,
-        Some("d") => ReviewSection::Diff,
-        Some("a") => ReviewSection::Artifacts,
-        Some("g") => ReviewSection::Graph,
-        Some("e") => ReviewSection::Evidence,
-        _ => return Err("invalid changes cursor".into()),
-    };
-    let raw_offset = parts
-        .next()
-        .filter(|offset| !offset.is_empty() && offset.bytes().all(|byte| byte.is_ascii_digit()))
-        .ok_or_else(|| "invalid changes cursor".to_owned())?;
-    let offset = raw_offset
-        .parse::<usize>()
-        .ok()
-        .filter(|offset| raw_offset == offset.to_string())
-        .ok_or_else(|| "invalid changes cursor".to_owned())?;
+    if parts.next() != Some("v3") {
+        return Err("invalid changes cursor".into());
+    }
+    let mut offsets = [0_usize; 5];
+    for offset in &mut offsets {
+        let raw_offset = parts
+            .next()
+            .filter(|offset| !offset.is_empty() && offset.bytes().all(|byte| byte.is_ascii_digit()))
+            .ok_or_else(|| "invalid changes cursor".to_owned())?;
+        *offset = raw_offset
+            .parse::<usize>()
+            .ok()
+            .filter(|offset| raw_offset == offset.to_string())
+            .ok_or_else(|| "invalid changes cursor".to_owned())?;
+    }
     let raw_depth = parts
         .next()
         .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
@@ -1903,7 +1950,7 @@ fn parse_review_cursor(
                     .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
         })
         .ok_or_else(|| "invalid changes cursor".to_owned())?;
-    if version != Some("v2") || parts.next().is_some() {
+    if parts.next().is_some() {
         return Err("invalid changes cursor".into());
     }
     if embedded_snapshot != snapshot_id {
@@ -1913,8 +1960,7 @@ fn parse_review_cursor(
         return Err("cursor_parameters_mismatch".into());
     }
     Ok(ReviewCursor {
-        section,
-        offset,
+        offsets,
         depth: embedded_depth,
         max_nodes: embedded_max_nodes,
         snapshot_id: embedded_snapshot.into(),
@@ -4463,6 +4509,43 @@ mod tests {
         assert_eq!(second.stats.files_parsed, 0);
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn rendered_review_cache_stays_bounded() {
+        let root = snapshot_repository("rendered-cache-bound");
+        let base = test_git_line(&root, &["rev-parse", "HEAD"]);
+        fs::write(root.join("src/a.rs"), "fn changed() {}\n").unwrap();
+        test_git(&root, &["add", "--", "."]);
+        test_git(&root, &["commit", "--quiet", "-m", "changed"]);
+        let head = test_git_line(&root, &["rev-parse", "HEAD"]);
+        let engine = Engine::new(Arc::new(AllowedRoots::new(vec![root.clone()]).unwrap()));
+        let completion = engine
+            .build_snapshot(
+                snapshot_request(&engine, &root, &base, &head),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+
+        for depth in 0..=6 {
+            engine
+                .changes(
+                    &completion.snapshot_id,
+                    depth,
+                    1,
+                    ChangesFormat::Review,
+                    None,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+        }
+
+        let rendered = engine
+            .rendered
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(rendered.len(), RENDERED_CACHE_LIMIT);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn source_gap_preserves_omission_inventory() {
@@ -5652,14 +5735,14 @@ fn run() {
 
         let initial = review_context(&snapshot).unwrap();
         assert!(initial.contains("\nartifacts\n"), "{initial}");
-        assert!(initial.contains("artifacts_next_cursor="), "{initial}");
+        assert!(initial.contains("review_next_cursor="), "{initial}");
         assert!(initial.contains("content_complete_when_pages_exhausted=true"));
         assert!(initial.contains("static_evidence_status=complete"));
-        let mut stale = next_cursor(&initial, "artifacts_next_cursor").unwrap();
+        let mut stale = next_cursor(&initial, REVIEW_CURSOR_LABEL).unwrap();
         let replacement = if stale.ends_with('0') { "1" } else { "0" };
         stale.replace_range(stale.len() - 1.., replacement);
         assert_eq!(
-            render_section(
+            render_review_page(
                 &snapshot,
                 &parse_review_cursor(
                     &stale,
@@ -5680,7 +5763,7 @@ fn run() {
         let mut reconstructed = String::new();
         let mut offset = 0;
         loop {
-            let (page, more) = render_section_page(
+            let (page, next_offset) = render_section_page(
                 &snapshot,
                 ReviewSection::Artifacts,
                 offset,
@@ -5697,8 +5780,8 @@ fn run() {
                 .unwrap();
             let content_start = page.match_indices('\n').nth(1).unwrap().0 + 1;
             reconstructed.push_str(&page[content_start..content_start + emitted]);
-            offset += emitted;
-            if !more {
+            offset = next_offset;
+            if offset == expected.len() {
                 break;
             }
         }
@@ -5872,37 +5955,40 @@ fn run() {
         assert!(!initial.contains("review_complete"));
         assert!(!initial.contains("[truncated]"));
 
+        assert_eq!(
+            initial
+                .lines()
+                .filter(|line| line.starts_with("review_next_cursor="))
+                .count(),
+            1
+        );
         let mut pages = initial.clone();
-        for label in [
-            "diff_next_cursor",
-            "artifacts_next_cursor",
-            "graph_next_cursor",
-        ] {
-            let mut cursor = next_cursor(&initial, label);
-            for _ in 0..100 {
-                let Some(token) = cursor else { break };
-                let output = render_section(
-                    &snapshot,
-                    &parse_review_cursor(
-                        &token,
-                        REVIEW_SNAPSHOT_ID,
-                        snapshot.depth,
-                        snapshot.max_nodes,
-                    )
-                    .unwrap(),
+        let mut cursor = next_cursor(&initial, REVIEW_CURSOR_LABEL);
+        let mut rounds = 0;
+        while let Some(token) = cursor {
+            let output = render_review_page(
+                &snapshot,
+                &parse_review_cursor(
+                    &token,
+                    REVIEW_SNAPSHOT_ID,
+                    snapshot.depth,
+                    snapshot.max_nodes,
                 )
-                .unwrap();
-                assert!(output.len() <= REVIEW_CONTEXT_BUDGET);
-                assert!(output.is_char_boundary(output.len()));
-                assert!(!output.contains("[truncated]"));
-                assert!(output.contains("content_complete_when_pages_exhausted=true"));
-                assert!(output.contains("static_evidence_status=complete"));
-                assert!(output.contains("dynamic_evidence_status=not-applicable"));
-                cursor = next_cursor(&output, label);
-                pages.push_str(&output);
-            }
-            assert!(cursor.is_none(), "pagination did not finish");
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(output.len() <= REVIEW_CONTEXT_BUDGET);
+            assert!(output.is_char_boundary(output.len()));
+            assert!(!output.contains("[truncated]"));
+            assert!(output.contains("content_complete_when_pages_exhausted=true"));
+            assert!(output.contains("static_evidence_status=complete"));
+            assert!(output.contains("dynamic_evidence_status=not-applicable"));
+            cursor = next_cursor(&output, REVIEW_CURSOR_LABEL);
+            pages.push_str(&output);
+            rounds += 1;
+            assert!(rounds < 100, "pagination did not finish");
         }
+        assert!(cursor.is_none(), "pagination did not finish");
         assert!(pages.contains("sentinel-last-hunk"));
         assert_eq!(
             pages
@@ -5912,11 +5998,11 @@ fn run() {
             300
         );
 
-        let mut stale = next_cursor(&initial, "diff_next_cursor").unwrap();
+        let mut stale = next_cursor(&initial, REVIEW_CURSOR_LABEL).unwrap();
         let replacement = if stale.ends_with('0') { "1" } else { "0" };
         stale.replace_range(stale.len() - 1.., replacement);
         assert_eq!(
-            render_section(
+            render_review_page(
                 &snapshot,
                 &parse_review_cursor(
                     &stale,
@@ -5999,7 +6085,7 @@ fn run() {
             },
         );
         let initial = review_context(&snapshot).unwrap();
-        assert!(initial.contains("evidence_next_cursor="), "{initial}");
+        assert!(initial.contains("review_next_cursor="), "{initial}");
         assert_eq!(
             initial.lines().filter(|line| line == &"files").count(),
             1,
@@ -6011,7 +6097,7 @@ fn run() {
         let mut offset = 0;
         let mut saw_mid_line_continuation = false;
         loop {
-            let (rendered, more) = render_section_page(
+            let (rendered, next_offset) = render_section_page(
                 &snapshot,
                 ReviewSection::Evidence,
                 offset,
@@ -6052,9 +6138,8 @@ fn run() {
             let content_end = content_start + emitted;
             assert!(rendered.is_char_boundary(content_end), "{rendered}");
             reconstructed.push_str(&rendered[content_start..content_end]);
-            offset += emitted;
-            assert_eq!(more, offset < evidence.len(), "{rendered}");
-            if !more {
+            offset = next_offset;
+            if offset >= evidence.len() {
                 assert!(field("page_complete") == "true", "{rendered}");
                 break;
             }
@@ -6095,7 +6180,7 @@ fn run() {
             review("original"),
         );
         let initial = review_context(&snapshot).unwrap();
-        let cursor = next_cursor(&initial, "evidence_next_cursor").unwrap();
+        let cursor = next_cursor(&initial, REVIEW_CURSOR_LABEL).unwrap();
 
         assert_eq!(
             parse_review_cursor(&cursor, &"b".repeat(64), 6, 1)
@@ -6119,7 +6204,7 @@ fn run() {
         let replacement = if tampered.ends_with('0') { "1" } else { "0" };
         tampered.replace_range(tampered.len() - 1.., replacement);
         assert_eq!(
-            render_section(
+            render_review_page(
                 &snapshot,
                 &parse_review_cursor(&tampered, REVIEW_SNAPSHOT_ID, 6, 1).unwrap(),
             )
@@ -6135,7 +6220,7 @@ fn run() {
             review("changed"),
         );
         assert_eq!(
-            render_section(
+            render_review_page(
                 &changed,
                 &parse_review_cursor(&cursor, REVIEW_SNAPSHOT_ID, 6, 1).unwrap(),
             )
@@ -6144,9 +6229,9 @@ fn run() {
         );
 
         let mut output = initial;
-        let mut cursor = next_cursor(&output, "evidence_next_cursor");
+        let mut cursor = next_cursor(&output, REVIEW_CURSOR_LABEL);
         while let Some(token) = cursor {
-            output = render_section(
+            output = render_review_page(
                 &snapshot,
                 &parse_review_cursor(&token, REVIEW_SNAPSHOT_ID, 6, 1).unwrap(),
             )
@@ -6155,7 +6240,7 @@ fn run() {
             assert!(output.contains("content_complete_when_pages_exhausted=true"));
             assert!(output.contains("static_evidence_status=complete"));
             assert!(output.contains("dynamic_evidence_status=partial"));
-            cursor = next_cursor(&output, "evidence_next_cursor");
+            cursor = next_cursor(&output, REVIEW_CURSOR_LABEL);
         }
         assert!(output.contains("sentinel-original"), "{output}");
         assert!(output.contains("page_complete=true"), "{output}");
@@ -6203,9 +6288,9 @@ fn run() {
         assert!(!initial.contains("node-1"), "{initial}");
 
         let mut pages = initial.clone();
-        let mut cursor = next_cursor(&initial, "graph_next_cursor");
+        let mut cursor = next_cursor(&initial, REVIEW_CURSOR_LABEL);
         while let Some(token) = cursor {
-            let output = render_section(
+            let output = render_review_page(
                 &snapshot,
                 &parse_review_cursor(
                     &token,
@@ -6220,7 +6305,7 @@ fn run() {
                 output.lines().filter(|line| line.contains("node-")).count() <= 2,
                 "{output}"
             );
-            cursor = next_cursor(&output, "graph_next_cursor");
+            cursor = next_cursor(&output, REVIEW_CURSOR_LABEL);
             pages.push_str(&output);
         }
         for index in 0..6 {
@@ -6245,7 +6330,7 @@ fn run() {
             },
             complete_review(String::new()),
         );
-        let cursor = cursor_token(&snapshot, ReviewSection::Files, 0);
+        let cursor = cursor_token(&snapshot, [0; 5]);
 
         assert_eq!(
             parse_review_cursor(&cursor, &"b".repeat(64), 6, 50)
@@ -6699,7 +6784,7 @@ fn run() {
         let mut offset = 0;
         let mut reconstructed = String::new();
         while offset < source.len() {
-            let (rendered, more) = render_section_page(
+            let (rendered, next_offset) = render_section_page(
                 &snapshot,
                 ReviewSection::Diff,
                 offset,
@@ -6730,8 +6815,7 @@ fn run() {
                 assert_eq!(rendered.as_bytes().get(content_end), Some(&b'\n'));
             }
             reconstructed.push_str(content);
-            offset = end;
-            assert_eq!(more, offset < source.len());
+            offset = next_offset;
         }
         assert_eq!(reconstructed, source);
     }

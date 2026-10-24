@@ -273,7 +273,25 @@ pub fn dependency_package(path: &str) -> Option<&str> {
 }
 
 impl Language {
-    pub fn as_str(self) -> &'static str {
+    pub const ALL: [Self; 5] = [
+        Self::Rust,
+        Self::Python,
+        Self::JavaScript,
+        Self::TypeScript,
+        Self::Cpp,
+    ];
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Rust => "Rust",
+            Self::Python => "Python",
+            Self::JavaScript => "JavaScript/JSX",
+            Self::TypeScript => "TypeScript/TSX",
+            Self::Cpp => "C++",
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Rust => "rust",
             Self::Python => "python",
@@ -5493,6 +5511,18 @@ mod tests {
         assert_eq!(inventory.sources.len(), 1);
         assert!(inventory.sources.contains_key("src/lib.rs"));
         assert!(inventory.omissions.is_empty());
+    }
+
+    #[test]
+    fn supported_language_registry_is_complete_and_ordered() {
+        assert_eq!(
+            Language::ALL.map(Language::as_str),
+            ["rust", "python", "javascript", "typescript", "cpp"]
+        );
+        assert_eq!(
+            Language::ALL.map(Language::display_name),
+            ["Rust", "Python", "JavaScript/JSX", "TypeScript/TSX", "C++"]
+        );
     }
 
     #[test]

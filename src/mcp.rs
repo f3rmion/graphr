@@ -16,7 +16,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::git::DependencyMode;
+use crate::git::{DependencyMode, Language};
 use crate::index::{ChangesFormat, Engine};
 use crate::job::{JobRegistry, JobRequestSummary, JobStatus};
 use crate::workspace::{
@@ -25,6 +25,22 @@ use crate::workspace::{
 };
 
 const MCP_LINE_LIMIT: usize = 3 * 1024;
+
+fn server_instructions() -> String {
+    let mut names = Language::ALL
+        .into_iter()
+        .map(Language::display_name)
+        .collect::<Vec<_>>();
+    let last = names.pop().unwrap_or_default();
+    let languages = if names.is_empty() {
+        last.to_owned()
+    } else {
+        format!("{}, and {last}", names.join(", "))
+    };
+    format!(
+        "Graphr indexes {languages}. Use index with the explicitly selected worktree_root, base, head, typed target (including include_untracked for a worktree target), and dependency_mode; verify the queued root and resolved OIDs. Poll index_status until completed and retain its snapshot_id; failed or cancelled is terminal. Call changes for that snapshot_id once without a cursor at depth 6 and max_nodes 50, then pass each review_next_cursor verbatim with the same parameters until all pages are exhausted. Each page contains files, diff, artifacts, graph, and evidence sections that still have content. Every changes response repeats content_complete_when_pages_exhausted, static_evidence_status, and dynamic_evidence_status; treat changed-content capture, static evidence, and dynamic evidence as independent facts. Use search or view with the same snapshot_id only for named graph remediation. Stop on any structured root, job, snapshot, cursor, provenance, or completeness failure. Never fall back to another root, the default checkout, a live diff, or an older snapshot.",
+    )
+}
 
 #[derive(Clone)]
 struct Graphr {
@@ -77,6 +93,7 @@ struct SearchParams {
     kind: Option<SearchKind>,
     #[serde(default = "default_search_limit")]
     #[schemars(range(min = 1, max = 20))]
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     limit: u32,
 }
 
@@ -111,9 +128,11 @@ struct ViewParams {
     node_ref: String,
     #[serde(default = "default_depth")]
     #[schemars(range(min = 0, max = 6))]
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     depth: u32,
     #[serde(default = "default_max_nodes")]
     #[schemars(range(min = 1, max = 50))]
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     max_nodes: u32,
 }
 
@@ -125,14 +144,16 @@ struct ChangesParams {
     snapshot_id: String,
     #[serde(default = "default_changes_depth")]
     #[schemars(range(min = 0, max = 6))]
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     depth: u32,
     #[serde(default = "default_changes_max_nodes")]
     #[schemars(range(min = 1, max = 50))]
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
     max_nodes: u32,
     #[serde(default)]
     format: ChangesFormat,
     #[serde(default)]
-    #[schemars(length(min = 1, max = 160))]
+    #[schemars(length(min = 1, max = 256))]
     cursor: Option<String>,
 }
 
@@ -229,7 +250,7 @@ impl Graphr {
     }
 
     #[tool(
-        description = "Return a paged review or one bounded DOT change-impact graph for an explicit snapshot_id"
+        description = "Return a bounded review with one combined continuation cursor or one bounded DOT change-impact graph for an explicit snapshot_id"
     )]
     async fn changes(
         &self,
@@ -258,9 +279,7 @@ impl ServerHandler for Graphr {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("graphr", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "Graphr indexes Rust, Python, JavaScript/JSX, TypeScript/TSX, and C++. Use inspect_root with the explicitly selected worktree_root. Use index with that worktree_root plus base, head, typed target (including include_untracked for a worktree target), and dependency_mode; verify the resolved root and OIDs. Poll index_status until completed and retain its snapshot_id; failed or cancelled is terminal. Call changes for that snapshot_id once without a cursor at depth 6 and max_nodes 50, then pass every files, diff, artifacts, graph, and evidence cursor verbatim with the same parameters until all pages are exhausted. Every changes response repeats content_complete_when_pages_exhausted, static_evidence_status, and dynamic_evidence_status; treat changed-content capture, static evidence, and dynamic evidence as independent facts. Use search or view with the same snapshot_id only for named graph remediation. Stop on any structured root, job, snapshot, cursor, provenance, or completeness failure. Never fall back to another root, the default checkout, a live diff, or an older snapshot.",
-            )
+            .with_instructions(server_instructions())
     }
 }
 
@@ -560,6 +579,58 @@ mod tests {
                 .iter()
                 .any(|value| value == "evidence_manifest")
         );
+    }
+
+    #[test]
+    fn tool_schemas_omit_non_standard_unsigned_formats() {
+        let tools = Graphr::tool_router().list_all();
+
+        for tool in &tools {
+            for (label, schema) in [
+                ("input", Some(&tool.input_schema)),
+                ("output", tool.output_schema.as_ref()),
+            ] {
+                let Some(schema) = schema else {
+                    continue;
+                };
+                let schema = rmcp::serde_json::Value::Object(schema.as_ref().clone());
+                for format in schema_formats(&schema) {
+                    assert!(
+                        !format.starts_with("uint"),
+                        "{} {label} schema carries non-standard format {format:?}",
+                        tool.name
+                    );
+                }
+            }
+        }
+
+        let search = tools.iter().find(|tool| tool.name == "search").unwrap();
+        let limit = &search.input_schema["properties"]["limit"];
+        assert_eq!(limit["type"], "integer");
+        assert_eq!(limit["minimum"], 1);
+        assert_eq!(limit["maximum"], 20);
+        assert!(limit.get("format").is_none());
+    }
+
+    fn schema_formats(value: &rmcp::serde_json::Value) -> Vec<String> {
+        let mut formats = Vec::new();
+        match value {
+            rmcp::serde_json::Value::Object(object) => {
+                if let Some(rmcp::serde_json::Value::String(format)) = object.get("format") {
+                    formats.push(format.clone());
+                }
+                for value in object.values() {
+                    formats.extend(schema_formats(value));
+                }
+            }
+            rmcp::serde_json::Value::Array(values) => {
+                for value in values {
+                    formats.extend(schema_formats(value));
+                }
+            }
+            _ => {}
+        }
+        formats
     }
 
     #[test]

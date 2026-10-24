@@ -10,6 +10,7 @@ mod mcp;
 mod parse;
 mod pinned;
 mod python;
+mod schema;
 mod store;
 pub mod workspace;
 

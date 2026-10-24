@@ -74,11 +74,18 @@ const SECURITY_KEYWORDS: [&str; 25] = [
 thread_local! {
     static AFTER_REFERENCE_CANDIDATE_PASS_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static EVIDENCE_RENDER_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 fn set_after_reference_candidate_pass_hook(hook: impl FnOnce() + 'static) {
     AFTER_REFERENCE_CANDIDATE_PASS_HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
+}
+
+#[cfg(test)]
+fn evidence_render_count() -> usize {
+    EVIDENCE_RENDER_COUNT.with(std::cell::Cell::get)
 }
 
 type Result<T> = std::result::Result<T, String>;
@@ -989,9 +996,10 @@ impl Store {
         {
             return Err("changed files are not uniquely path-sorted".into());
         }
-        let evidence_scope = CoverageScope::changes(changes, dependency_mode, &self.connection)?;
-        let evidence = render_evidence(&self.connection, Some(&evidence_scope))?;
         if changes.is_empty() && changes.files.is_empty() && changes.records.is_empty() {
+            let evidence_scope =
+                CoverageScope::changes(changes, dependency_mode, &self.connection)?;
+            let evidence = render_evidence(&self.connection, Some(&evidence_scope))?;
             return Ok(ChangeReview {
                 graph: "no changes\n".into(),
                 dot: no_change_dot(snapshot_id, "empty worktree"),
@@ -1010,6 +1018,9 @@ impl Store {
             })
             .count();
         if changes.files.is_empty() {
+            let evidence_scope =
+                CoverageScope::changes(changes, dependency_mode, &self.connection)?;
+            let evidence = render_evidence(&self.connection, Some(&evidence_scope))?;
             let flow_accounting = if deleted_paths_unanalyzed == 0 {
                 "flows_total=0"
             } else {
@@ -3592,6 +3603,8 @@ fn render_evidence(
     connection: &Connection,
     scope: Option<&CoverageScope>,
 ) -> Result<EvidenceReview> {
+    #[cfg(test)]
+    EVIDENCE_RENDER_COUNT.with(|count| count.set(count.get() + 1));
     let manifest_count: i64 = connection
         .query_row(
             "SELECT count(*) FROM imported_artifacts WHERE role='manifest'",
@@ -4321,8 +4334,13 @@ fn assurance_preamble(
     } else {
         String::new()
     };
+    let languages = Language::ALL
+        .into_iter()
+        .map(Language::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "languages=rust,python,javascript,typescript\n\
+        "languages={languages}\n\
 completeness content_capture={} source_capture={} syntax_parse={} site_classification=complete static_model={} evidence_capture={} provenance_model={} execution_mapping={} traversal={}\n\
 gaps total={} relevant={} by_reason={}\n\
 references missing={} ambiguous={}\n\
@@ -8181,6 +8199,7 @@ mod tests {
             artifacts: Default::default(),
             skipped_paths: 0,
         };
+        let renders_before = evidence_render_count();
         let output = store
             .changes(
                 SNAPSHOT,
@@ -8192,6 +8211,7 @@ mod tests {
             )
             .unwrap()
             .graph;
+        assert_eq!(evidence_render_count(), renders_before + 1);
         assert!(
             output.contains(
                 "risk overall=0.4200 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown static_test_path_gaps=0 traversal_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"

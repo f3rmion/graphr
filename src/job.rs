@@ -31,9 +31,13 @@ pub enum JobState {
     Capturing,
     SelectingSeed,
     Indexing {
+        #[schemars(schema_with = "crate::schema::unsigned_integer")]
         files_done: usize,
+        #[schemars(schema_with = "crate::schema::unsigned_integer")]
         files_total: usize,
+        #[schemars(schema_with = "crate::schema::unsigned_integer")]
         files_reused: usize,
+        #[schemars(schema_with = "crate::schema::unsigned_integer")]
         files_parsed: usize,
     },
     ResolvingGraph,
