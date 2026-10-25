@@ -20,9 +20,9 @@ use crate::store;
 
 pub use crate::index::Engine;
 
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 10;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 11;
 pub(crate) const GRAPH_ANALYZER_VERSION: u32 = 8;
-pub(crate) const REVIEW_FORMAT_VERSION: u32 = 9;
+pub(crate) const REVIEW_FORMAT_VERSION: u32 = 10;
 const MANIFEST_SIZE_LIMIT: u64 = 64 * 1024;
 const REVIEW_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 static PRIVATE_ID: AtomicU64 = AtomicU64::new(0);
@@ -215,6 +215,9 @@ pub struct Provenance {
     pub index_generation: i64,
     pub source_snapshot_id: Option<String>,
     pub evidence_manifest_digest: Option<String>,
+    /// Graph image of the base commit's supported sources; absent when they
+    /// hash to the head image.
+    pub base_graph_image_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -245,6 +248,7 @@ pub struct IndexCompletion {
     pub graph_image_id: String,
     pub provenance: Provenance,
     pub stats: IndexStats,
+    pub base_stats: Option<IndexStats>,
 }
 
 #[derive(Debug)]
@@ -259,6 +263,7 @@ struct SnapshotManifest {
     format_version: u32,
     graph_image_id: String,
     graph_checksum: String,
+    base_graph_checksum: Option<String>,
     review_id: String,
     review_format_version: u32,
     dependency_mode: DependencyMode,
@@ -276,6 +281,13 @@ pub struct SnapshotEntry {
     pub provenance: Provenance,
     graph_file: Arc<File>,
     graph_checksum: String,
+    base_graph: Option<BaseGraph>,
+}
+
+#[derive(Debug)]
+struct BaseGraph {
+    path: PathBuf,
+    file: Arc<File>,
 }
 
 impl SnapshotEntry {
@@ -284,11 +296,23 @@ impl SnapshotEntry {
     /// time: renaming `graph_path` afterwards cannot redirect the read to
     /// another inode.
     pub(crate) fn open_graph(&self) -> std::result::Result<store::Store, String> {
-        let pin = crate::pinned::pin(&self.graph_path, &self.graph_file)?;
-        let store = store::Store::open_reader(&self.graph_path)?;
-        pin.require_used()?;
-        Ok(store)
+        open_pinned(&self.graph_path, &self.graph_file)
     }
+
+    /// Opens the validated base graph image, pinned like `open_graph`.
+    pub(crate) fn open_base_graph(&self) -> std::result::Result<Option<store::Store>, String> {
+        self.base_graph
+            .as_ref()
+            .map(|base| open_pinned(&base.path, &base.file))
+            .transpose()
+    }
+}
+
+fn open_pinned(path: &Path, file: &File) -> std::result::Result<store::Store, String> {
+    let pin = crate::pinned::pin(path, file)?;
+    let store = store::Store::open_reader(path)?;
+    pin.require_used()?;
+    Ok(store)
 }
 
 pub(crate) struct PinnedGraph {
@@ -447,6 +471,7 @@ pub(crate) struct PrivateJob {
     name: String,
     capture_root: PathBuf,
     graph_temp: PathBuf,
+    base_graph_temp: PathBuf,
 }
 
 impl PrivateJob {
@@ -458,15 +483,22 @@ impl PrivateJob {
         &self.graph_temp
     }
 
+    pub(crate) fn base_graph_temp(&self) -> &Path {
+        &self.base_graph_temp
+    }
+
     pub(crate) fn graph_path(&self, graph_image_id: &str) -> PathBuf {
         self.cache
             .graphs
             .child_path(OsStr::new(&format!("{graph_image_id}.db")))
     }
 
+    /// Copies a verified seed image into `target`, one of this job's private
+    /// graph names (`graph_temp` or `base_graph_temp`).
     pub(crate) fn copy_seed(
         &self,
         seed: &SnapshotEntry,
+        target: &Path,
         cancelled: &AtomicBool,
     ) -> Result<(), OperationError> {
         #[cfg(test)]
@@ -476,23 +508,52 @@ impl PrivateJob {
             }
         });
         let result = (|| {
-            let mut target = create_file_at(&self.directory, OsStr::new("graph.db"), 0o600)
+            let name = private_graph_name(self, target)?;
+            let mut copy = create_file_at(&self.directory, name, 0o600)
                 .map_err(|error| cache_internal("cannot create private graph image", error))?;
-            copy_descriptor(&seed.graph_file, &mut target)?;
-            target
-                .sync_all()
+            copy_descriptor(&seed.graph_file, &mut copy)?;
+            copy.sync_all()
                 .map_err(|error| cache_internal("cannot sync graph seed", error))?;
-            let copied = open_regular(&self.graph_temp, None).map_err(cache_corrupt)?;
+            let copied = open_regular(target, None).map_err(cache_corrupt)?;
             if hash_file(&copied, cancelled)? != seed.graph_checksum {
                 return Err(cache_corrupt("copied graph seed checksum is invalid"));
             }
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&self.graph_temp);
+            let _ = fs::remove_file(target);
         }
         result
     }
+}
+
+fn private_graph_name<'a>(job: &PrivateJob, target: &'a Path) -> Result<&'a OsStr, OperationError> {
+    if target != job.graph_temp && target != job.base_graph_temp {
+        return Err(OperationError::new(
+            ErrorCode::Internal,
+            "graph target is not a private job image",
+        ));
+    }
+    target
+        .file_name()
+        .ok_or_else(|| OperationError::new(ErrorCode::Internal, "private graph image has no name"))
+}
+
+/// Makes a sealed private image read-only and links it into the graph cache
+/// without replacing a concurrent winner.
+fn publish_private_graph(
+    job: &PrivateJob,
+    temp: &Path,
+    graph_name: &OsStr,
+) -> Result<(), OperationError> {
+    let name = private_graph_name(job, temp)?;
+    fs::set_permissions(temp, fs::Permissions::from_mode(0o444))
+        .map_err(|error| cache_internal("cannot make graph image read-only", error))?;
+    open_regular(temp, None)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| cache_internal("cannot sync read-only graph image", error))?;
+    publish_no_replace(&job.directory, name, &job.cache.graphs, graph_name)?;
+    Ok(())
 }
 
 impl Drop for PrivateJob {
@@ -667,6 +728,7 @@ impl SnapshotCatalog {
             root: root.clone(),
             cache,
             graph_temp: directory.child_path(OsStr::new("graph.db")),
+            base_graph_temp: directory.child_path(OsStr::new("base.db")),
             directory,
             _capture_directory: capture,
             name,
@@ -784,12 +846,21 @@ impl SnapshotCatalog {
         review_bytes: &[u8],
         graph_temp: Option<&Path>,
         trusted_graph: Option<&PinnedGraph>,
+        base_graph: Option<&PinnedGraph>,
         dependency_mode: DependencyMode,
         no_change_reason: Option<NoChangeReason>,
         mut provenance: Provenance,
         cancelled: &AtomicBool,
     ) -> Result<Arc<SnapshotEntry>, OperationError> {
-        if !valid_id(graph_image_id) || !valid_id(review_id) || !valid_id(&provenance.snapshot_id) {
+        if !valid_id(graph_image_id)
+            || !valid_id(review_id)
+            || !valid_id(&provenance.snapshot_id)
+            || provenance.base_graph_image_id.is_some() != base_graph.is_some()
+            || provenance
+                .base_graph_image_id
+                .as_deref()
+                .is_some_and(|id| !valid_id(id))
+        {
             return Err(OperationError::new(
                 ErrorCode::Internal,
                 "generated cache identifier is invalid",
@@ -825,18 +896,7 @@ impl SnapshotCatalog {
 
         let graph_name = format!("{graph_image_id}.db");
         if let Some(graph_temp) = graph_temp {
-            fs::set_permissions(graph_temp, fs::Permissions::from_mode(0o444))
-                .map_err(|error| cache_internal("cannot make graph image read-only", error))?;
-            open_regular(graph_temp, None)
-                .and_then(|file| file.sync_all())
-                .map_err(|error| cache_internal("cannot sync read-only graph image", error))?;
-            let _ = graph_temp;
-            publish_no_replace(
-                &job.directory,
-                OsStr::new("graph.db"),
-                &job.cache.graphs,
-                OsStr::new(&graph_name),
-            )?;
+            publish_private_graph(job, graph_temp, OsStr::new(&graph_name))?;
         }
         let graph_file = open_regular_at(&job.cache.graphs, OsStr::new(&graph_name), None)
             .map_err(cache_corrupt)?;
@@ -859,10 +919,30 @@ impl SnapshotCatalog {
             ),
         };
         provenance.index_generation = state.generation;
+        let base_graph_checksum = match (&provenance.base_graph_image_id, base_graph) {
+            (Some(id), Some(base)) => {
+                let name = format!("{id}.db");
+                let file = open_regular_at(&job.cache.graphs, OsStr::new(&name), None)
+                    .map_err(cache_corrupt)?;
+                if !same_file(&file, &base.file)? {
+                    return Err(cache_corrupt(
+                        "published base graph name changed after validation",
+                    ));
+                }
+                validate_pinned_graph(
+                    base,
+                    &job.cache.graphs.child_path(OsStr::new(&name)),
+                    cancelled,
+                )?;
+                Some(base.checksum.clone())
+            }
+            _ => None,
+        };
         let manifest = SnapshotManifest {
             format_version: CACHE_FORMAT_VERSION,
             graph_image_id: graph_image_id.into(),
             graph_checksum,
+            base_graph_checksum,
             review_id: review_id.into(),
             review_format_version: REVIEW_FORMAT_VERSION,
             dependency_mode,
@@ -909,6 +989,31 @@ impl SnapshotCatalog {
         Ok(entry)
     }
 
+    /// Publishes a sealed private image under its content key and pins the
+    /// published file, whether this job or a concurrent one won the name.
+    pub(crate) fn publish_graph(
+        &self,
+        job: &PrivateJob,
+        graph_temp: &Path,
+        graph_image_id: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<PinnedGraph, OperationError> {
+        if !valid_id(graph_image_id) {
+            return Err(OperationError::new(
+                ErrorCode::Internal,
+                "generated cache identifier is invalid",
+            ));
+        }
+        let name = format!("{graph_image_id}.db");
+        publish_private_graph(job, graph_temp, OsStr::new(&name))?;
+        let file = Arc::new(
+            open_regular_at(&job.cache.graphs, OsStr::new(&name), None).map_err(cache_corrupt)?,
+        );
+        validate_pinned_image(&file, &job.cache.graphs.child_path(OsStr::new(&name)))?;
+        let checksum = hash_file(&file, cancelled)?;
+        Ok(PinnedGraph { file, checksum })
+    }
+
     pub(crate) fn quarantine_graph(
         &self,
         root: &RootIdentity,
@@ -920,7 +1025,9 @@ impl SnapshotCatalog {
         quarantine_name(&cache, &cache.graphs, OsStr::new(&graph_name))?;
         let mut snapshot_ids = BTreeSet::from([requested_snapshot_id.to_owned()]);
         for entry in read_lock(&self.loaded).values() {
-            if entry.graph_image_id == graph_image_id {
+            if entry.graph_image_id == graph_image_id
+                || entry.provenance.base_graph_image_id.as_deref() == Some(graph_image_id)
+            {
                 snapshot_ids.insert(entry.provenance.snapshot_id.clone());
             }
         }
@@ -931,7 +1038,10 @@ impl SnapshotCatalog {
                 OsStr::new(&format!("{snapshot_id}.json")),
             )?;
         }
-        write_lock(&self.loaded).retain(|_, entry| entry.graph_image_id != graph_image_id);
+        write_lock(&self.loaded).retain(|_, entry| {
+            entry.graph_image_id != graph_image_id
+                && entry.provenance.base_graph_image_id.as_deref() != Some(graph_image_id)
+        });
         let mut rejected = write_lock(&self.rejected);
         for snapshot_id in snapshot_ids {
             rejected.remove(&snapshot_id);
@@ -978,6 +1088,17 @@ impl SnapshotCatalog {
                 .is_some_and(|id| !valid_id(id))
             || manifest.provenance.source_snapshot_id.is_some()
                 != manifest.provenance.evidence_manifest_digest.is_some()
+            || manifest
+                .provenance
+                .base_graph_image_id
+                .as_deref()
+                .is_some_and(|id| !valid_id(id))
+            || manifest
+                .base_graph_checksum
+                .as_deref()
+                .is_some_and(|checksum| !valid_id(checksum))
+            || manifest.provenance.base_graph_image_id.is_some()
+                != manifest.base_graph_checksum.is_some()
             || manifest.provenance.snapshot_id != snapshot_id
             || !valid_git_oid(&manifest.provenance.base_oid)
             || !valid_git_oid(&manifest.provenance.head_oid)
@@ -1047,6 +1168,7 @@ impl SnapshotCatalog {
                 review_id: &manifest.review_id,
                 source_snapshot_id: manifest.provenance.source_snapshot_id.as_deref(),
                 evidence_manifest_digest: manifest.provenance.evidence_manifest_digest.as_deref(),
+                base_graph_image_id: manifest.provenance.base_graph_image_id.as_deref(),
             },
             CACHE_FORMAT_VERSION,
             REVIEW_FORMAT_VERSION,
@@ -1081,6 +1203,31 @@ impl SnapshotCatalog {
         {
             return Err(cache_corrupt("snapshot graph checksum or state is invalid"));
         }
+        let base_graph = match (
+            &manifest.provenance.base_graph_image_id,
+            &manifest.base_graph_checksum,
+        ) {
+            (Some(id), Some(checksum)) => {
+                let name = format!("{id}.db");
+                let file = match open_regular_at(&cache.graphs, OsStr::new(&name), None) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(OperationError::new(
+                            ErrorCode::SnapshotIncomplete,
+                            "snapshot base graph is not published",
+                        ));
+                    }
+                    Err(error) => return Err(cache_corrupt(error)),
+                    Ok(file) => Arc::new(file),
+                };
+                let path = cache.graphs.child_path(OsStr::new(&name));
+                if hash_file(&file, cancelled)? != *checksum {
+                    return Err(cache_corrupt("snapshot base graph checksum is invalid"));
+                }
+                validate_pinned_image(&file, &path)?;
+                Some(BaseGraph { path, file })
+            }
+            _ => None,
+        };
         Ok(Arc::new(SnapshotEntry {
             graph_image_id: manifest.graph_image_id,
             graph_path,
@@ -1090,6 +1237,7 @@ impl SnapshotCatalog {
             provenance: manifest.provenance,
             graph_file: Arc::new(graph_file),
             graph_checksum: manifest.graph_checksum,
+            base_graph,
         }))
     }
 }
@@ -2136,6 +2284,7 @@ pub(crate) struct SnapshotKeyInput<'a> {
     pub(crate) review_id: &'a str,
     pub(crate) source_snapshot_id: Option<&'a str>,
     pub(crate) evidence_manifest_digest: Option<&'a str>,
+    pub(crate) base_graph_image_id: Option<&'a str>,
 }
 
 pub(crate) fn snapshot_key(
@@ -2173,6 +2322,12 @@ pub(crate) fn snapshot_key(
         .hash_field(&mut hasher);
     input
         .evidence_manifest_digest
+        .unwrap_or_default()
+        .as_bytes()
+        .hash_field(&mut hasher);
+    u32::from(input.base_graph_image_id.is_some()).hash_field(&mut hasher);
+    input
+        .base_graph_image_id
         .unwrap_or_default()
         .as_bytes()
         .hash_field(&mut hasher);
@@ -2430,6 +2585,7 @@ mod tests {
             review_id: "review",
             source_snapshot_id: None,
             evidence_manifest_digest: None,
+            base_graph_image_id: None,
         };
         let key = snapshot_key(&input, 6, 2);
         for changed in [
@@ -2459,6 +2615,14 @@ mod tests {
             },
             SnapshotKeyInput {
                 review_id: "other",
+                ..input
+            },
+            SnapshotKeyInput {
+                base_graph_image_id: Some("base-graph"),
+                ..input
+            },
+            SnapshotKeyInput {
+                base_graph_image_id: Some(""),
                 ..input
             },
         ] {
@@ -2795,6 +2959,7 @@ mod tests {
                 &completion.graph_image_id,
                 &review_id,
                 &oversized,
+                None,
                 None,
                 None,
                 DependencyMode::Boundary,

@@ -975,6 +975,7 @@ impl Store {
         Ok(bounded(lines, VIEW_BUDGET, omitted))
     }
 
+    #[allow(clippy::too_many_arguments)] // One call binds one review request and its base image.
     pub fn changes(
         &mut self,
         snapshot_id: &str,
@@ -982,6 +983,7 @@ impl Store {
         depth: u32,
         max_nodes: u32,
         dependency_mode: DependencyMode,
+        base: Option<&Store>,
         cancelled: &AtomicBool,
     ) -> Result<ChangeReview> {
         if depth > 6 || !(1..=50).contains(&max_nodes) {
@@ -1010,6 +1012,7 @@ impl Store {
                 dynamic_status: evidence.status,
             });
         }
+        let diff = graph_diff(&self.connection, base, dependency_mode, cancelled)?;
         let deleted_paths_unanalyzed = changes
             .records
             .iter()
@@ -1030,9 +1033,10 @@ impl Store {
             };
             let traversal_complete = deleted_paths_unanalyzed == 0;
             let mut output = format!(
-                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} static_test_path_gaps=0 traversal_complete={traversal_complete} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 dependency_analysis={} {}\n",
+                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} static_test_path_gaps=0 traversal_complete={traversal_complete} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 dependency_analysis={} {}{}\n",
                 dependency_analysis(dependency_mode),
                 risk_metadata(None),
+                diff.summary,
             );
             let accounting = static_accounting(&self.connection, &evidence_scope)?;
             let content_complete = change_content_complete(changes, dependency_mode);
@@ -1043,6 +1047,7 @@ impl Store {
                 traversal_complete,
                 &evidence,
             ));
+            output.extend(diff.records);
             let static_status = accounting.overall(content_complete, true, traversal_complete);
             let dynamic_status = evidence.status;
             return Ok(ChangeReview {
@@ -1301,6 +1306,7 @@ impl Store {
             evidence_node_ids.extend(flow.nodes.iter().map(|node| node.id));
             lines.push(flow_line(flow, dependency_mode)?);
         }
+        lines.extend(diff.records);
         let overall = analysis
             .risks
             .values()
@@ -1345,7 +1351,7 @@ impl Store {
         lines.insert(
             0,
             format!(
-                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} static_test_path_gaps={} traversal_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} dependency_analysis={} {}\n",
+                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} static_test_path_gaps={} traversal_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} dependency_analysis={} {}{}\n",
                 score_text(overall),
                 changed_symbols_total,
                 analysis.risks.len(),
@@ -1361,6 +1367,7 @@ impl Store {
                 file_mapped_range_count,
                 dependency_analysis(dependency_mode),
                 risk_metadata(top_risk),
+                diff.summary,
             ),
         );
         let static_status =
@@ -1390,6 +1397,276 @@ impl Store {
             dynamic_status,
         })
     }
+}
+
+/// Reason rendered when a snapshot carries no base graph image: the base
+/// tree's supported sources hash to the head image.
+const BASE_GRAPH_ABSENT: &str = "identical_sources";
+const API_RECORD_LIMIT: usize = 32;
+const API_SIGNATURE_LIMIT: usize = 120;
+const API_FIELD_LIMIT: usize = 256;
+
+#[derive(Debug)]
+struct ApiSymbol {
+    id: i64,
+    identity: String,
+    name: String,
+    kind: String,
+    path: String,
+    line: u32,
+    signature: String,
+}
+
+#[derive(Debug, Default)]
+struct ApiDiff<'a> {
+    removed: Vec<&'a ApiSymbol>,
+    changed: Vec<(&'a ApiSymbol, &'a ApiSymbol)>,
+    added: Vec<&'a ApiSymbol>,
+}
+
+struct GraphDiff {
+    summary: String,
+    records: Vec<String>,
+}
+
+/// Node identity that is stable across images: the qualified name
+/// (`lang:len#path:len#kind:len#scope:line:ordinal`) without its trailing
+/// `:line:ordinal`, i.e. language, path, kind and scope-qualified name.
+fn stable_identity(qualified_name: &str) -> &str {
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    let mut parts = qualified_name.rsplitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(ordinal), Some(line), Some(identity)) if digits(ordinal) && digits(line) => identity,
+        _ => qualified_name,
+    }
+}
+
+fn load_api_symbols(
+    connection: &Connection,
+    dependency_mode: DependencyMode,
+    cancelled: &AtomicBool,
+) -> Result<Vec<ApiSymbol>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start, n.signature
+               FROM nodes n JOIN files f ON f.id=n.file_id
+              WHERE n.kind!='file'
+                AND NOT EXISTS(SELECT 1 FROM imported_artifacts a
+                                WHERE a.role='generated-rust' AND a.path=f.path)
+              ORDER BY f.path, n.line_start, n.id",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut symbols = Vec::new();
+    for row in rows {
+        check_cancelled(cancelled)?;
+        let (id, kind, name, qualified_name, path, line, signature) = row.map_err(db_error)?;
+        if dependency_mode == DependencyMode::Boundary && dependency_package(&path).is_some() {
+            continue;
+        }
+        symbols.push(ApiSymbol {
+            id,
+            identity: stable_identity(&qualified_name).to_owned(),
+            name,
+            kind,
+            path,
+            line,
+            signature,
+        });
+    }
+    Ok(symbols)
+}
+
+/// Matches symbols by stable identity. Within one identity (overloads, cfg
+/// variants) equal signatures pair first; leftovers pair in line order as
+/// signature changes and the remainder is removed or added.
+fn classify_api<'a>(base: &'a [ApiSymbol], head: &'a [ApiSymbol]) -> ApiDiff<'a> {
+    fn group(symbols: &[ApiSymbol]) -> BTreeMap<&str, Vec<&ApiSymbol>> {
+        let mut groups = BTreeMap::<&str, Vec<&ApiSymbol>>::new();
+        for symbol in symbols {
+            groups.entry(&symbol.identity).or_default().push(symbol);
+        }
+        groups
+    }
+    let mut head = group(head);
+    let mut diff = ApiDiff::default();
+    for (identity, mut before) in group(base) {
+        let mut after = head.remove(identity).unwrap_or_default();
+        before.retain(
+            |old| match after.iter().position(|new| new.signature == old.signature) {
+                Some(index) => {
+                    after.remove(index);
+                    false
+                }
+                None => true,
+            },
+        );
+        let paired = before.len().min(after.len());
+        diff.changed
+            .extend(before.iter().copied().zip(after.iter().copied()));
+        diff.removed.extend(&before[paired..]);
+        diff.added.extend(&after[paired..]);
+    }
+    diff.added.extend(head.into_values().flatten());
+    fn order(left: &ApiSymbol, right: &ApiSymbol) -> std::cmp::Ordering {
+        (&left.path, left.line, &left.name).cmp(&(&right.path, right.line, &right.name))
+    }
+    diff.removed.sort_by(|left, right| order(left, right));
+    diff.added.sort_by(|left, right| order(left, right));
+    diff.changed
+        .sort_by(|(_, left), (_, right)| order(left, right));
+    diff
+}
+
+fn push_api_field(output: &mut String, label: &str, value: &str) {
+    output.push(' ');
+    output.push_str(label);
+    output.push('=');
+    push_escaped(output, &shorten(value, API_FIELD_LIMIT), usize::MAX);
+}
+
+fn api_symbol_line(record: &str, symbol: &ApiSymbol, kind: bool) -> String {
+    let mut output = String::from(record);
+    if kind {
+        push_api_field(&mut output, "kind", &symbol.kind);
+    }
+    push_api_field(&mut output, "symbol", &symbol.name);
+    push_api_field(&mut output, "path", &symbol.path);
+    output.push_str(&format!(" line={}", symbol.line));
+    output
+}
+
+/// Compares the head image with the base image: removed and added symbols,
+/// signature changes, and head references left dangling by removals.
+fn graph_diff(
+    head: &Connection,
+    base: Option<&Store>,
+    dependency_mode: DependencyMode,
+    cancelled: &AtomicBool,
+) -> Result<GraphDiff> {
+    let Some(base) = base else {
+        return Ok(GraphDiff {
+            summary: format!(
+                " api_removed=0 api_signature_changed=0 broken_references=0 base_graph=absent:{BASE_GRAPH_ABSENT}"
+            ),
+            records: Vec::new(),
+        });
+    };
+    let before = load_api_symbols(&base.connection, dependency_mode, cancelled)?;
+    let after = load_api_symbols(head, dependency_mode, cancelled)?;
+    let diff = classify_api(&before, &after);
+    let mut node_keys = base
+        .connection
+        .prepare("SELECT key FROM node_keys WHERE node_id=?1 ORDER BY key")
+        .map_err(db_error)?;
+    let mut dangling = head
+        .prepare(
+            "SELECT r.id, n.name, f.path, r.line
+               FROM ref_keys k
+               JOIN refs r ON r.id=k.ref_id
+               JOIN nodes n ON n.id=r.source_id
+               JOIN files f ON f.id=n.file_id
+              WHERE k.key=?1 AND r.resolution_state IN ('missing','ambiguous')
+              ORDER BY r.id",
+        )
+        .map_err(db_error)?;
+    let mut broken = BTreeMap::<i64, (String, u32, String, String)>::new();
+    let mut records = Vec::new();
+    for symbol in &diff.removed {
+        let keys = node_keys
+            .query_map([symbol.id], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        let mut callers = BTreeSet::new();
+        for key in keys {
+            check_cancelled(cancelled)?;
+            let rows = dangling
+                .query_map([&key], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u32>(3)?,
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                let (id, name, path, line) = row.map_err(db_error)?;
+                if dependency_mode == DependencyMode::Boundary
+                    && dependency_package(&path).is_some()
+                {
+                    continue;
+                }
+                callers.insert(id);
+                broken
+                    .entry(id)
+                    .or_insert_with(|| (path, line, name, key.clone()));
+            }
+        }
+        let mut line = api_symbol_line("api_removed", symbol, true);
+        line.push_str(&format!(" head_callers={}\n", callers.len()));
+        records.push(line);
+    }
+    let mut broken = broken.into_values().collect::<Vec<_>>();
+    broken.sort();
+    for (path, line, name, key) in broken.iter().take(API_RECORD_LIMIT) {
+        let mut output = String::from("broken_reference source=");
+        push_escaped(&mut output, &shorten(name, API_FIELD_LIMIT), usize::MAX);
+        output.push('@');
+        push_escaped(&mut output, &shorten(path, API_FIELD_LIMIT), usize::MAX);
+        output.push_str(&format!(":{line}"));
+        push_api_field(&mut output, "target", key);
+        output.push('\n');
+        records.push(output);
+    }
+    if broken.len() > API_RECORD_LIMIT {
+        records.push(format!(
+            "broken_references_omitted={}\n",
+            broken.len() - API_RECORD_LIMIT
+        ));
+    }
+    for (old, new) in &diff.changed {
+        let mut line = api_symbol_line("api_signature_changed", new, false);
+        line.push_str(&format!(
+            " before={:?} after={:?}\n",
+            shorten(&old.signature, API_SIGNATURE_LIMIT),
+            shorten(&new.signature, API_SIGNATURE_LIMIT)
+        ));
+        records.push(line);
+    }
+    for symbol in diff.added.iter().take(API_RECORD_LIMIT) {
+        let mut line = api_symbol_line("api_added", symbol, true);
+        line.push('\n');
+        records.push(line);
+    }
+    if diff.added.len() > API_RECORD_LIMIT {
+        records.push(format!(
+            "api_added_omitted={}\n",
+            diff.added.len() - API_RECORD_LIMIT
+        ));
+    }
+    Ok(GraphDiff {
+        summary: format!(
+            " api_removed={} api_signature_changed={} broken_references={} base_graph=present",
+            diff.removed.len(),
+            diff.changed.len(),
+            broken.len()
+        ),
+        records,
+    })
 }
 
 pub fn validate_image(path: &Path) -> Result<State> {
@@ -8179,6 +8456,7 @@ mod tests {
                 6,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8207,6 +8485,7 @@ mod tests {
                     7,
                     50,
                     DependencyMode::Boundary,
+                    None,
                     &cancelled
                 )
                 .is_err()
@@ -8322,6 +8601,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8355,6 +8635,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8385,6 +8666,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8425,6 +8707,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8462,6 +8745,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8583,6 +8867,77 @@ mod tests {
     }
 
     #[test]
+    fn stable_identity_drops_only_the_line_and_ordinal_suffix() {
+        assert_eq!(
+            stable_identity("rust:10#src/lib.rs:8#function:7#Db::get:4:3"),
+            "rust:10#src/lib.rs:8#function:7#Db::get"
+        );
+        assert_eq!(
+            stable_identity("script-node:10#typescript:8#src/a.ts:4#type:3#Box:12:0"),
+            "script-node:10#typescript:8#src/a.ts:4#type:3#Box"
+        );
+        // Only the final two numeric fields are position; earlier ones stay.
+        assert_eq!(
+            stable_identity("cpp:7#src/a.cc:8#function:3#a:1:12:0"),
+            "cpp:7#src/a.cc:8#function:3#a:1"
+        );
+        assert_eq!(stable_identity("generated"), "generated");
+        assert_eq!(stable_identity("x:1:y"), "x:1:y");
+    }
+
+    #[test]
+    fn classify_api_pairs_identities_overloads_and_signatures() {
+        let symbol = |identity: &str, line: u32, signature: &str| ApiSymbol {
+            id: 0,
+            identity: identity.into(),
+            name: identity.into(),
+            kind: "function".into(),
+            path: "src/lib.rs".into(),
+            line,
+            signature: signature.into(),
+        };
+        let base = [
+            symbol("kept", 1, "fn kept()"),
+            symbol("changed", 2, "fn changed(a: u8)"),
+            symbol("removed", 3, "fn removed()"),
+            symbol("overload", 4, "void f(int)"),
+            symbol("overload", 5, "void f(char)"),
+        ];
+        let head = [
+            symbol("kept", 9, "fn kept()"),
+            symbol("changed", 2, "fn changed(a: u16)"),
+            symbol("added", 3, "fn added()"),
+            symbol("overload", 4, "void f(char)"),
+        ];
+        let diff = classify_api(&base, &head);
+        let view = |symbols: &[&ApiSymbol]| {
+            symbols
+                .iter()
+                .map(|symbol| (symbol.name.clone(), symbol.line, symbol.signature.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            view(&diff.removed),
+            [
+                ("removed".into(), 3, "fn removed()".into()),
+                ("overload".into(), 4, "void f(int)".into()),
+            ]
+        );
+        assert_eq!(
+            diff.changed
+                .iter()
+                .map(|(before, after)| (before.signature.as_str(), after.signature.as_str()))
+                .collect::<Vec<_>>(),
+            [("fn changed(a: u8)", "fn changed(a: u16)")]
+        );
+        assert_eq!(
+            view(&diff.added),
+            [("added".into(), 3, "fn added()".into())]
+        );
+    }
+
+    #[test]
     fn adjacent_symbol_coverage_has_no_phantom_gap_and_deletions_keep_anchors() {
         assert!(
             unmapped_spans(
@@ -8665,6 +9020,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8699,6 +9055,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8719,6 +9076,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8751,6 +9109,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap()
@@ -8829,6 +9188,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8887,6 +9247,7 @@ mod tests {
                 0,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8972,6 +9333,7 @@ mod tests {
                 1,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -9032,6 +9394,7 @@ mod tests {
                 0,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -9283,6 +9646,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -9456,6 +9820,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -9748,6 +10113,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -9798,6 +10164,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -9973,6 +10340,7 @@ mod tests {
                     1,
                     10,
                     DependencyMode::Boundary,
+                    None,
                     &cancelled,
                 )
                 .unwrap();
@@ -10034,6 +10402,7 @@ mod tests {
                     1,
                     10,
                     DependencyMode::Boundary,
+                    None,
                     &cancelled,
                 )
                 .unwrap();
@@ -10142,6 +10511,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10243,6 +10613,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10306,6 +10677,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10371,6 +10743,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10439,6 +10812,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10807,6 +11181,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10986,6 +11361,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -11070,6 +11446,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -11152,6 +11529,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -11213,6 +11591,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -11330,6 +11709,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -11391,6 +11771,7 @@ mod tests {
                 1,
                 3,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -11473,6 +11854,7 @@ mod tests {
                 1,
                 3,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -12212,6 +12594,7 @@ mod tests {
                 6,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -12262,6 +12645,7 @@ mod tests {
                 6,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -12336,6 +12720,7 @@ mod tests {
                 6,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap()

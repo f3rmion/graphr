@@ -30,10 +30,10 @@ use crate::store::{
 };
 use crate::workspace::{
     BuildProgress, BuildStage, CACHE_FORMAT_VERSION, ErrorCode, GRAPH_ANALYZER_VERSION,
-    IndexCompletion, OperationError, Provenance, QueryOutput, REVIEW_FORMAT_VERSION,
-    ResolvedIndexRequest, RootInspection, SnapshotCatalog, SnapshotEntry, SnapshotKeyInput,
-    SnapshotTarget, evidence_graph_image_key, graph_image_key, selected_layers, snapshot_key,
-    validate_entry_graph,
+    IndexCompletion, OperationError, PinnedGraph, PrivateJob, Provenance, QueryOutput,
+    REVIEW_FORMAT_VERSION, ResolvedIndexRequest, RootInspection, SnapshotCatalog, SnapshotEntry,
+    SnapshotKeyInput, SnapshotTarget, evidence_graph_image_key, graph_image_key, selected_layers,
+    snapshot_key, validate_entry_graph,
 };
 
 const QUALIFIED_PATH_LIMIT: usize = 1024;
@@ -159,6 +159,29 @@ impl Engine {
             GRAPH_ANALYZER_VERSION,
             crate::store::SCHEMA_VERSION,
         );
+        let base_sources = if capture.no_change_reason.is_none() {
+            Some(repository.capture_sources(
+                &request.base_oid,
+                &SnapshotTarget::Commit,
+                job.capture_root(),
+                cancelled,
+            )?)
+        } else {
+            None
+        };
+        let base_graph_image_id = base_sources
+            .as_ref()
+            .map(|sources| {
+                graph_image_key(
+                    &request.root.repository_id,
+                    &sources.files,
+                    &sources.omissions,
+                    CACHE_FORMAT_VERSION,
+                    GRAPH_ANALYZER_VERSION,
+                    crate::store::SCHEMA_VERSION,
+                )
+            })
+            .filter(|id| *id != source_graph_image_id);
         let review_bytes = rmcp::serde_json::to_vec(&capture.changes).map_err(|error| {
             OperationError::new(
                 crate::workspace::ErrorCode::Internal,
@@ -178,6 +201,7 @@ impl Engine {
                 review_id: &review_id,
                 source_snapshot_id: None,
                 evidence_manifest_digest: None,
+                base_graph_image_id: base_graph_image_id.as_deref(),
             },
             CACHE_FORMAT_VERSION,
             REVIEW_FORMAT_VERSION,
@@ -238,6 +262,7 @@ impl Engine {
                     .as_ref()
                     .map(|evidence| evidence.source_snapshot_id.as_str()),
                 evidence_manifest_digest: manifest_digest.as_deref(),
+                base_graph_image_id: base_graph_image_id.as_deref(),
             },
             CACHE_FORMAT_VERSION,
             REVIEW_FORMAT_VERSION,
@@ -265,6 +290,7 @@ impl Engine {
                 .as_ref()
                 .map(|evidence| evidence.source_snapshot_id.clone()),
             evidence_manifest_digest: manifest_digest,
+            base_graph_image_id: base_graph_image_id.clone(),
         };
 
         let mut rejected_cache =
@@ -316,7 +342,7 @@ impl Engine {
             }
         };
 
-        let (stats, graph_temp) = if exact.is_some() {
+        let (stats, head_store) = if exact.is_some() {
             let stats = IndexStats {
                 files_total: total,
                 files_reused: total,
@@ -334,23 +360,7 @@ impl Engine {
             (stats, None)
         } else {
             candidates.retain(|entry| entry.graph_image_id != graph_image_id);
-            candidates.sort_by(|left, right| {
-                let left_base = left.provenance.head_oid == request.base_oid;
-                let right_base = right.provenance.head_oid == request.base_oid;
-                right_base
-                    .cmp(&left_base)
-                    .then_with(|| {
-                        right
-                            .provenance
-                            .index_generation
-                            .cmp(&left.provenance.index_generation)
-                    })
-                    .then_with(|| {
-                        left.provenance
-                            .snapshot_id
-                            .cmp(&right.provenance.snapshot_id)
-                    })
-            });
+            sort_seed_candidates(&mut candidates, &request.base_oid);
             let candidates = source_entry.into_iter().chain(
                 evidence
                     .is_none()
@@ -358,36 +368,24 @@ impl Engine {
                     .into_iter()
                     .flatten(),
             );
-            let mut seeded = false;
-            for candidate in candidates {
-                match validate_entry_graph(&candidate, cancelled)
-                    .and_then(|_| job.copy_seed(&candidate, cancelled))
-                {
-                    Ok(_) => {
-                        seeded = true;
-                        break;
-                    }
-                    Err(error) if error.code == crate::workspace::ErrorCode::JobCancelled => {
-                        return Err(error);
-                    }
-                    Err(_) => {
-                        rejected_cache = Some(candidate.graph_path.display().to_string());
-                        self.catalog.quarantine_graph(
-                            &request.root,
-                            &candidate.graph_image_id,
-                            &candidate.provenance.snapshot_id,
-                        )?;
-                        report(
-                            BuildStage::SelectingSeed,
-                            0,
-                            total,
-                            0,
-                            0,
-                            rejected_cache.clone(),
-                        );
-                    }
-                }
-            }
+            let seeded = self.copy_first_seed(
+                &job,
+                &request.root,
+                job.graph_temp(),
+                candidates,
+                cancelled,
+                |rejected| {
+                    rejected_cache = Some(rejected);
+                    report(
+                        BuildStage::SelectingSeed,
+                        0,
+                        total,
+                        0,
+                        0,
+                        rejected_cache.clone(),
+                    );
+                },
+            )?;
             if evidence.is_some() && !seeded {
                 return Err(OperationError::new(
                     ErrorCode::CacheCorrupt,
@@ -449,40 +447,59 @@ impl Engine {
                 stats.files_parsed,
                 rejected_cache.clone(),
             );
-            report(
-                BuildStage::ResolvingGraph,
-                total,
-                total,
-                stats.files_reused,
-                stats.files_parsed,
-                rejected_cache.clone(),
-            );
-            store.seal(cancelled).map_err(index_operation_error)?;
-            crate::store::validate_image(job.graph_temp()).map_err(|error| {
-                OperationError::new(
-                    crate::workspace::ErrorCode::CacheCorrupt,
-                    format!("private graph image is invalid: {error}"),
-                )
-            })?;
-            (stats, Some(job.graph_temp()))
+            (stats, Some(store))
         };
-        if exact.is_some() {
-            report(
-                BuildStage::ResolvingGraph,
-                total,
-                total,
-                stats.files_reused,
-                stats.files_parsed,
-                rejected_cache.clone(),
-            );
-        }
+        let base = match (&base_graph_image_id, &base_sources) {
+            (Some(base_graph_image_id), Some(base_sources)) => Some(self.base_graph(
+                &job,
+                &request,
+                &repository,
+                base_sources,
+                base_graph_image_id,
+                &snapshot_id,
+                (total, stats.files_reused, stats.files_parsed),
+                &mut rejected_cache,
+                cancelled,
+                &report,
+            )?),
+            _ => None,
+        };
+        let (files_total, files_reused, files_parsed) = match &base {
+            Some((_, base_stats)) => (
+                total + base_stats.files_total,
+                stats.files_reused + base_stats.files_reused,
+                stats.files_parsed + base_stats.files_parsed,
+            ),
+            None => (total, stats.files_reused, stats.files_parsed),
+        };
+        report(
+            BuildStage::ResolvingGraph,
+            files_total,
+            files_total,
+            files_reused,
+            files_parsed,
+            rejected_cache.clone(),
+        );
+        let graph_temp = match head_store {
+            Some(store) => {
+                store.seal(cancelled).map_err(index_operation_error)?;
+                crate::store::validate_image(job.graph_temp()).map_err(|error| {
+                    OperationError::new(
+                        crate::workspace::ErrorCode::CacheCorrupt,
+                        format!("private graph image is invalid: {error}"),
+                    )
+                })?;
+                Some(job.graph_temp())
+            }
+            None => None,
+        };
         check_cancelled(cancelled).map_err(index_operation_error)?;
         report(
             BuildStage::Publishing,
-            total,
-            total,
-            stats.files_reused,
-            stats.files_parsed,
+            files_total,
+            files_total,
+            files_reused,
+            files_parsed,
             rejected_cache,
         );
         let entry = self.catalog.publish(
@@ -492,6 +509,7 @@ impl Engine {
             &review_bytes,
             graph_temp,
             exact.as_ref(),
+            base.as_ref().map(|(graph, _)| graph),
             request.dependency_mode,
             evidence
                 .is_none()
@@ -505,7 +523,151 @@ impl Engine {
             graph_image_id,
             provenance: entry.provenance.clone(),
             stats,
+            base_stats: base.map(|(_, base_stats)| base_stats),
         })
+    }
+
+    /// Seeds `target` from the first candidate whose verified image copies;
+    /// candidates that fail verification are quarantined and reported.
+    fn copy_first_seed(
+        &self,
+        job: &PrivateJob,
+        root: &crate::workspace::RootIdentity,
+        target: &Path,
+        candidates: impl IntoIterator<Item = Arc<SnapshotEntry>>,
+        cancelled: &AtomicBool,
+        mut rejected: impl FnMut(String),
+    ) -> Result<bool, OperationError> {
+        for candidate in candidates {
+            match validate_entry_graph(&candidate, cancelled)
+                .and_then(|_| job.copy_seed(&candidate, target, cancelled))
+            {
+                Ok(_) => return Ok(true),
+                Err(error) if error.code == ErrorCode::JobCancelled => return Err(error),
+                Err(_) => {
+                    self.catalog.quarantine_graph(
+                        root,
+                        &candidate.graph_image_id,
+                        &candidate.provenance.snapshot_id,
+                    )?;
+                    rejected(candidate.graph_path.display().to_string());
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Builds or reuses the graph image of the base commit's supported sources
+    /// and publishes it under its content key. Progress continues the head's
+    /// indexing counters `(files_done, files_reused, files_parsed)`.
+    #[allow(clippy::too_many_arguments)] // One call binds one base image build.
+    fn base_graph(
+        &self,
+        job: &PrivateJob,
+        request: &ResolvedIndexRequest,
+        repository: &Repository,
+        sources: &SourceSnapshot,
+        graph_image_id: &str,
+        snapshot_id: &str,
+        head: (usize, usize, usize),
+        rejected_cache: &mut Option<String>,
+        cancelled: &AtomicBool,
+        report: &(dyn Fn(BuildStage, usize, usize, usize, usize, Option<String>) + Sync),
+    ) -> Result<(PinnedGraph, IndexStats), OperationError> {
+        let total = sources.files.len();
+        let (head_done, head_reused, head_parsed) = head;
+        let progress = |done: usize, reused: usize, parsed: usize, rejected: Option<String>| {
+            report(
+                BuildStage::Indexing,
+                head_done + done,
+                head_done + total,
+                head_reused + reused,
+                head_parsed + parsed,
+                rejected,
+            );
+        };
+        let mut candidates = self.catalog.entries(&request.root.repository_id);
+        let trusted = candidates
+            .iter()
+            .find(|entry| entry.graph_image_id == graph_image_id)
+            .cloned();
+        match self
+            .catalog
+            .pin_exact_graph(job, graph_image_id, trusted.as_deref(), cancelled)
+        {
+            Ok(Some(graph)) => {
+                progress(total, total, 0, rejected_cache.clone());
+                return Ok((
+                    graph,
+                    IndexStats {
+                        files_total: total,
+                        files_reused: total,
+                        files_parsed: 0,
+                        files_skipped: sources.files_skipped(),
+                    },
+                ));
+            }
+            Ok(None) => {}
+            Err(error) if error.code == ErrorCode::JobCancelled => return Err(error),
+            Err(_) => {
+                *rejected_cache = Some(job.graph_path(graph_image_id).display().to_string());
+                self.catalog
+                    .quarantine_graph(&request.root, graph_image_id, snapshot_id)?;
+                progress(0, 0, 0, rejected_cache.clone());
+            }
+        }
+        candidates.retain(|entry| entry.graph_image_id != graph_image_id);
+        sort_seed_candidates(&mut candidates, &request.base_oid);
+        self.copy_first_seed(
+            job,
+            &request.root,
+            job.base_graph_temp(),
+            candidates,
+            cancelled,
+            |rejected| {
+                *rejected_cache = Some(rejected);
+                progress(0, 0, 0, rejected_cache.clone());
+            },
+        )?;
+        let mut store = Store::open_private_image(job.base_graph_temp(), cancelled)
+            .map_err(index_operation_error)?;
+        let stats = store
+            .index_with(cancelled, |full, existing| {
+                build_index(
+                    repository,
+                    sources,
+                    cancelled,
+                    full,
+                    existing,
+                    |done, _, reused| {
+                        progress(
+                            done,
+                            reused,
+                            done.saturating_sub(reused),
+                            rejected_cache.clone(),
+                        );
+                    },
+                )
+            })
+            .map(|(_, _, stats)| stats)
+            .map_err(index_operation_error)?;
+        progress(
+            total,
+            stats.files_reused,
+            stats.files_parsed,
+            rejected_cache.clone(),
+        );
+        store.seal(cancelled).map_err(index_operation_error)?;
+        crate::store::validate_image(job.base_graph_temp()).map_err(|error| {
+            OperationError::new(
+                ErrorCode::CacheCorrupt,
+                format!("private base graph image is invalid: {error}"),
+            )
+        })?;
+        let graph =
+            self.catalog
+                .publish_graph(job, job.base_graph_temp(), graph_image_id, cancelled)?;
+        Ok((graph, stats))
     }
 
     pub fn inspect_root(
@@ -690,12 +852,14 @@ impl Engine {
                 let graph = snapshot
                     .open_graph()
                     .and_then(|mut store| {
+                        let base = snapshot.open_base_graph()?;
                         store.changes(
                             snapshot_id,
                             &snapshot.changes,
                             depth,
                             max_nodes,
                             snapshot.dependency_mode,
+                            base.as_ref(),
                             cancelled,
                         )
                     })
@@ -1101,6 +1265,28 @@ fn captured_artifact_key(role: ArtifactRole, artifact: &CapturedArtifact) -> Str
         artifact.path,
         blake3::Hash::from_bytes(artifact.content_hash).to_hex()
     )
+}
+
+/// Orders seed candidates: images whose head is the review base first, then
+/// the newest generation, then snapshot ID for determinism.
+fn sort_seed_candidates(candidates: &mut [Arc<SnapshotEntry>], base_oid: &str) {
+    candidates.sort_by(|left, right| {
+        let left_base = left.provenance.head_oid == base_oid;
+        let right_base = right.provenance.head_oid == base_oid;
+        right_base
+            .cmp(&left_base)
+            .then_with(|| {
+                right
+                    .provenance
+                    .index_generation
+                    .cmp(&left.provenance.index_generation)
+            })
+            .then_with(|| {
+                left.provenance
+                    .snapshot_id
+                    .cmp(&right.provenance.snapshot_id)
+            })
+    });
 }
 
 fn repository_from_identity(root: &crate::workspace::RootIdentity) -> Repository {
@@ -4211,6 +4397,7 @@ mod tests {
                 0,
                 20,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -4338,6 +4525,7 @@ mod tests {
                 0,
                 20,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -4614,6 +4802,7 @@ mod tests {
                     0,
                     1,
                     DependencyMode::Boundary,
+                    None,
                     &cancelled,
                 )
                 .unwrap();
@@ -5309,7 +5498,24 @@ fn run() {
 
         assert_eq!(completion.stats.files_reused, 1);
         assert_eq!(completion.stats.files_parsed, 1);
-        assert!(rejected.into_inner().unwrap().is_empty());
+        // The head seed copied the validated descriptor. The base commit's
+        // image is the same content key, and its name now holds the
+        // replacement, so the base image is rejected and rebuilt in full.
+        assert_eq!(
+            completion
+                .base_stats
+                .as_ref()
+                .map(|stats| (stats.files_reused, stats.files_parsed)),
+            Some((0, 2))
+        );
+        let rejected = rejected.into_inner().unwrap();
+        assert!(!rejected.is_empty());
+        assert!(
+            rejected
+                .iter()
+                .all(|path| path.ends_with(&format!("{}.db", first.graph_image_id))),
+            "{rejected:?}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

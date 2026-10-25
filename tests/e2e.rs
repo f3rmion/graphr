@@ -2967,7 +2967,17 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     let graph = complete.split_once("graph\n").unwrap().1;
     assert!(graph.contains("file-mapped src/lib.rs"), "{changed}");
     assert!(graph.contains("unmapped_ranges=0"), "{changed}");
-    assert!(!graph.contains("removed_symbol"), "{changed}");
+    // The deleted symbol is no head node; only the base-vs-head diff names it.
+    assert!(
+        graph.contains("api_removed kind=function symbol=removed_symbol path=src/removed.rs"),
+        "{changed}"
+    );
+    assert!(
+        !graph
+            .lines()
+            .any(|line| line.contains("removed_symbol") && !line.starts_with("api_removed ")),
+        "{changed}"
+    );
     assert!(!graph.contains("ignored_symbol"), "{changed}");
     assert!(text.len() <= 8192, "{}", text.len());
     assert_eq!(database_generation(&graph_path(&fixture.path)), generation);
@@ -4308,6 +4318,12 @@ fn is_graph_non_node(line: &str) -> bool {
         "claim ",
         "file-mapped ",
         "unmapped ",
+        "api_removed ",
+        "api_signature_changed ",
+        "api_added ",
+        "api_added_omitted=",
+        "broken_reference ",
+        "broken_references_omitted=",
     ]
     .iter()
     .any(|prefix| line.starts_with(prefix) && line.len() > prefix.len())
