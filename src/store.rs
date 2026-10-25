@@ -2054,16 +2054,24 @@ fn require_graph_invariants(connection: &Connection, cancelled: &AtomicBool) -> 
         return Err("database reference edges do not match resolved references".into());
     }
     check_cancelled(cancelled)?;
+    // One grouped pass per table: a correlated per-file subquery rescanned
+    // every relation-site gap for each file (14 s on a 911-file C++ image).
     let mismatch = connection
         .query_row(
-            "SELECT f.path FROM files f
-              WHERE f.observed_relation_sites !=
-                    (SELECT count(*) FROM refs r
-                       JOIN nodes n ON n.id=r.source_id WHERE n.file_id=f.id)
-                  + (SELECT count(*) FROM modeled_sites m WHERE m.file_id=f.id)
-                  + (SELECT coalesce(sum(g.occurrences),0) FROM graph_gaps g
-                       LEFT JOIN nodes n ON n.id=g.source_id
-                      WHERE g.relation_site=1 AND coalesce(g.file_id,n.file_id)=f.id)
+            "WITH sites(file_id, total) AS (
+                 SELECT n.file_id, count(*) FROM refs r JOIN nodes n ON n.id=r.source_id
+                  GROUP BY n.file_id
+                 UNION ALL
+                 SELECT file_id, count(*) FROM modeled_sites GROUP BY file_id
+                 UNION ALL
+                 SELECT coalesce(g.file_id, n.file_id), sum(g.occurrences)
+                   FROM graph_gaps g LEFT JOIN nodes n ON n.id=g.source_id
+                  WHERE g.relation_site=1 GROUP BY 1
+             )
+             SELECT f.path FROM files f
+               LEFT JOIN (SELECT file_id, sum(total) AS total FROM sites GROUP BY file_id) s
+                 ON s.file_id=f.id
+              WHERE f.observed_relation_sites != coalesce(s.total, 0)
               ORDER BY f.path LIMIT 1",
             [],
             |row| row.get::<_, String>(0),
@@ -3606,6 +3614,8 @@ fn note_line(tag: &str, path: &str, line: u32, text: &str) -> String {
     format!("note tag={tag} path={path:?} line={line} text={text:?}\n")
 }
 
+/// File-level import pairs. Rust is excluded: modules of one crate may refer
+/// to each other freely, so `use` cycles there are not a defect signal.
 fn load_file_imports(
     connection: &Connection,
     dependency_mode: DependencyMode,
@@ -3620,7 +3630,8 @@ fn load_file_imports(
             "SELECT DISTINCT sf.path, tf.path FROM edges e
                JOIN nodes s ON s.id=e.source_id JOIN files sf ON sf.id=s.file_id
                JOIN nodes t ON t.id=e.target_id JOIN files tf ON tf.id=t.file_id
-              WHERE e.kind='IMPORTS' AND sf.id!=tf.id{path_filter}"
+              WHERE e.kind='IMPORTS' AND sf.id!=tf.id
+                AND sf.language!='rust' AND tf.language!='rust'{path_filter}"
         ))
         .map_err(db_error)?;
     statement
