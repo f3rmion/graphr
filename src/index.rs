@@ -356,7 +356,10 @@ impl Engine {
                     .is_none()
                     .then_some(candidates)
                     .into_iter()
-                    .flatten(),
+                    .flatten()
+                    // Evidence images carry imported artifacts and SCIP
+                    // resolutions that a source-only image must not inherit.
+                    .filter(|entry| entry.provenance.evidence_manifest_digest.is_none()),
             );
             let mut seeded = false;
             for candidate in candidates {
