@@ -3140,7 +3140,17 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     let graph = complete.split_once("graph\n").unwrap().1;
     assert!(graph.contains("file-mapped src/lib.rs"), "{changed}");
     assert!(graph.contains("unmapped_ranges=0"), "{changed}");
-    assert!(!graph.contains("removed_symbol"), "{changed}");
+    // The deleted symbol is no head node; only the base-vs-head diff names it.
+    assert!(
+        graph.contains("api_removed kind=function symbol=removed_symbol path=src/removed.rs"),
+        "{changed}"
+    );
+    assert!(
+        !graph
+            .lines()
+            .any(|line| line.contains("removed_symbol") && !line.starts_with("api_removed ")),
+        "{changed}"
+    );
     assert!(!graph.contains("ignored_symbol"), "{changed}");
     assert!(text.len() <= 8192, "{}", text.len());
     assert_eq!(database_generation(&graph_path(&fixture.path)), generation);
@@ -3292,6 +3302,151 @@ fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
     ] {
         assert!(full_graph.contains(expected), "missing {expected}: {full}");
     }
+    client.close();
+}
+
+fn graph_diff_fixture(base: &[(&str, &str)], head: &[(&str, &str)]) -> Fixture {
+    let fixture = Fixture::new();
+    init_git(&fixture.path);
+    for (files, message) in [(base, "base"), (head, "head")] {
+        for (path, content) in files {
+            let path = fixture.path.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        git(&fixture.path, &["add", "-A"]);
+        git_commit(&fixture.path, message);
+    }
+    fixture
+}
+
+fn commit_graph_section(client: &mut Client, base: &str) -> (rmcp::serde_json::Value, String) {
+    let completion =
+        client.index_target_and_wait(base, "HEAD", rmcp::serde_json::json!({ "kind": "commit" }));
+    let snapshot = client.snapshot_id().to_owned();
+    let changes = capture_changes(client, &snapshot, 6, 50);
+    (completion, change_section_text(&changes, "graph"))
+}
+
+#[test]
+fn graph_diff_reports_removed_symbol_with_dangling_callers() {
+    let fixture = graph_diff_fixture(
+        &[
+            ("src/lib.rs", "pub mod api;\npub mod caller;\n"),
+            ("src/api.rs", "pub fn old_api() {}\npub fn kept() {}\n"),
+            (
+                "src/caller.rs",
+                "pub fn caller() {\n    crate::api::old_api();\n}\n",
+            ),
+        ],
+        &[("src/api.rs", "pub fn kept() {}\n")],
+    );
+    let mut client = Client::start_unindexed(&fixture.path);
+
+    let (completion, graph) = commit_graph_section(&mut client, "HEAD~1");
+
+    assert!(
+        completion["provenance"]["base_graph_image_id"].is_string(),
+        "{completion}"
+    );
+    assert!(
+        graph.contains(
+            "api_removed kind=function symbol=old_api path=src/api.rs line=1 head_callers=1\n"
+        ),
+        "{graph}"
+    );
+    assert!(
+        graph.contains("broken_reference source=caller@src/caller.rs:2 target="),
+        "{graph}"
+    );
+    assert!(
+        graph.contains(
+            " api_removed=1 api_signature_changed=0 broken_references=1 base_graph=present\n"
+        ),
+        "{graph}"
+    );
+    assert!(!graph.contains("api_added "), "{graph}");
+    client.close();
+}
+
+#[test]
+fn graph_diff_reports_signature_changes_and_added_symbols() {
+    let fixture = graph_diff_fixture(
+        &[("src/lib.rs", "pub fn compute(a: u32) -> u32 {\n    a\n}\n")],
+        &[(
+            "src/lib.rs",
+            "pub fn compute(a: u32, b: u32) -> u32 {\n    a + b\n}\npub fn helper() {}\n",
+        )],
+    );
+    let mut client = Client::start_unindexed(&fixture.path);
+
+    let (_, graph) = commit_graph_section(&mut client, "HEAD~1");
+
+    assert!(
+        graph.contains(
+            "api_signature_changed symbol=compute path=src/lib.rs line=1 before=\"pub fn compute(a: u32) -> u32\" after=\"pub fn compute(a: u32, b: u32) -> u32\"\n"
+        ),
+        "{graph}"
+    );
+    assert!(
+        graph.contains("api_added kind=function symbol=helper path=src/lib.rs line=4\n"),
+        "{graph}"
+    );
+    assert!(
+        graph.contains(
+            " api_removed=0 api_signature_changed=1 broken_references=0 base_graph=present\n"
+        ),
+        "{graph}"
+    );
+    client.close();
+}
+
+#[test]
+fn graph_diff_reuses_the_cached_base_image_and_reports_identical_sources() {
+    let fixture = graph_diff_fixture(
+        &[("src/lib.rs", "pub fn first() {}\n")],
+        &[("src/lib.rs", "pub fn first() {}\npub fn second() {}\n")],
+    );
+    let mut client = Client::start_unindexed(&fixture.path);
+    let (first, _) = commit_graph_section(&mut client, "HEAD~1");
+    assert_eq!(first["base_stats"]["files_parsed"], 1, "{first}");
+
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn first() {}\npub fn second() {}\npub fn third() {}\n",
+    )
+    .unwrap();
+    git(&fixture.path, &["add", "-A"]);
+    git_commit(&fixture.path, "third");
+    let (second, graph) = commit_graph_section(&mut client, "HEAD~2");
+    assert_eq!(
+        second["provenance"]["base_graph_image_id"],
+        first["provenance"]["base_graph_image_id"]
+    );
+    assert_eq!(second["base_stats"]["files_parsed"], 0, "{second}");
+    assert_eq!(second["base_stats"]["files_reused"], 1, "{second}");
+    assert!(
+        graph.contains(
+            "api_removed=0 api_signature_changed=0 broken_references=0 base_graph=present"
+        ),
+        "{graph}"
+    );
+
+    fs::write(fixture.path.join("README.md"), "docs only\n").unwrap();
+    git(&fixture.path, &["add", "-A"]);
+    git_commit(&fixture.path, "docs");
+    let (docs, graph) = commit_graph_section(&mut client, "HEAD~1");
+    assert!(
+        docs["provenance"]["base_graph_image_id"].is_null(),
+        "{docs}"
+    );
+    assert!(docs["base_stats"].is_null(), "{docs}");
+    assert!(
+        graph.contains(
+            " api_removed=0 api_signature_changed=0 broken_references=0 base_graph=absent:identical_sources\n"
+        ),
+        "{graph}"
+    );
     client.close();
 }
 
@@ -4481,6 +4636,12 @@ fn is_graph_non_node(line: &str) -> bool {
         "claim ",
         "file-mapped ",
         "unmapped ",
+        "api_removed ",
+        "api_signature_changed ",
+        "api_added ",
+        "api_added_omitted=",
+        "broken_reference ",
+        "broken_references_omitted=",
     ]
     .iter()
     .any(|prefix| line.starts_with(prefix) && line.len() > prefix.len())

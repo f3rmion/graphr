@@ -999,6 +999,7 @@ mod tests {
                 index_generation: 1,
                 source_snapshot_id: None,
                 evidence_manifest_digest: None,
+                base_graph_image_id: None,
             },
             stats: IndexStats {
                 files_total: 1,
@@ -1006,6 +1007,7 @@ mod tests {
                 files_parsed: 1,
                 files_skipped: 0,
             },
+            base_stats: None,
         }
     }
 }
