@@ -183,6 +183,12 @@ The closed v1 manifest is:
       "run_label": "strict-roundtrip",
       "test_name": "strict_roundtrip"
     }
+  ],
+  "scip": [
+    {
+      "path": "index.scip",
+      "blake3": "<64 lowercase hex>"
+    }
   ]
 }
 ```
@@ -191,8 +197,10 @@ V1 accepts LLVM coverage-export JSON major versions 2 and 3 (`format: "llvm"`)
 and Coverage.py JSON with `meta.format=3` (`format: "coverage_py"`). The fixed
 bounds are 64 KiB for the manifest, 2 MiB per input or generated artifact,
 64 MiB per coverage report, 64 generated mappings, eight coverage reports,
-128 MiB of unique evidence bytes total, and 200 line-safe bytes per `run_label`
-or `test_name`; paths retain the existing repository-path bound.
+four SCIP indexes of at most 64 MiB each, 128 MiB of unique evidence bytes
+total, and 200 line-safe bytes per `run_label` or `test_name`; paths retain the
+existing repository-path bound. `scip` is optional; duplicate SCIP paths are
+rejected.
 
 Generated Rust enters the static graph only when its verified output has one
 unique lexical `include!(concat!(env!("OUT_DIR"), "/file.rs"))` site. The
@@ -206,6 +214,24 @@ An `observed` result means a positive count in one declared run;
 paths use `basis=resolved-static-call-graph`; they are possible source paths,
 not execution observations. Manifest provenance uses
 `basis=verified-generated-manifest`, not causal build proof.
+
+A SCIP index (`rust-analyzer scip .`, `scip-python`, `scip-typescript`,
+`scip-clang`, run at the repository root so `relative_path` values are
+repository-relative) upgrades static references Graphr left `missing` or
+`ambiguous`. Graphr reads only documents, occurrence ranges, symbols, and the
+definition role, ignores `local` symbols, and rejects malformed protobuf,
+unsafe paths, or more than 100,000 documents or 4,000,000 occurrences per
+index. A SCIP definition maps to the innermost Graphr node in that file whose
+span contains the definition line and whose name equals the last descriptor
+name; ties or conflicting definitions stay unmapped. A reference occurrence
+resolves a call only when exactly one unresolved non-alias call sits on that
+file line and exactly one mapped symbol there matches the call's lookup name.
+SCIP never overrides a static resolution and cannot add calls Graphr did not
+record. The evidence section reports
+`claim kind=scip-resolved-references count=N basis=verified-scip-manifest`,
+and `view` and `changes` relation lines whose edge only SCIP supports end in
+` via=scip`. Like coverage, this is producer attestation: Graphr verifies the
+digest and wire format, not the indexer's type analysis.
 
 This milestone has no process execution, causal build trace, runtime call
 ordering, mutation proof, JavaScript runtime coverage, before/after trust query,
