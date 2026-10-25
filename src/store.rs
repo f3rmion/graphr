@@ -1030,7 +1030,7 @@ impl Store {
             };
             let traversal_complete = deleted_paths_unanalyzed == 0;
             let mut output = format!(
-                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} static_test_path_gaps=0 traversal_complete={traversal_complete} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 dependency_analysis={} {}\n",
+                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} static_test_path_gaps=0 traversal_complete={traversal_complete} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 import_cycles=0 dependency_analysis={} {}\n",
                 dependency_analysis(dependency_mode),
                 risk_metadata(None),
             );
@@ -1301,6 +1301,30 @@ impl Store {
             evidence_node_ids.extend(flow.nodes.iter().map(|node| node.id));
             lines.push(flow_line(flow, dependency_mode)?);
         }
+        let changed_paths = changes
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<HashSet<_>>();
+        let file_imports = load_file_imports(&tx, dependency_mode)?;
+        let (import_cycle_total, cycle_routes) = import_cycles(&file_imports, &changed_paths);
+        for (size, route) in cycle_routes.iter().take(IMPORT_CYCLE_LINE_LIMIT) {
+            let mut line = format!("import_cycle files={size} route=");
+            for (index, path) in route.iter().chain(route.first()).enumerate() {
+                if index > 0 {
+                    line.push_str(" -> ");
+                }
+                push_escaped(&mut line, path, usize::MAX);
+            }
+            line.push('\n');
+            lines.push(line);
+        }
+        if cycle_routes.len() > IMPORT_CYCLE_LINE_LIMIT {
+            lines.push(format!(
+                "import_cycles_omitted={}\n",
+                cycle_routes.len() - IMPORT_CYCLE_LINE_LIMIT
+            ));
+        }
         let overall = analysis
             .risks
             .values()
@@ -1345,7 +1369,7 @@ impl Store {
         lines.insert(
             0,
             format!(
-                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} static_test_path_gaps={} traversal_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} dependency_analysis={} {}\n",
+                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} static_test_path_gaps={} traversal_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} import_cycles={} dependency_analysis={} {}\n",
                 score_text(overall),
                 changed_symbols_total,
                 analysis.risks.len(),
@@ -1359,6 +1383,7 @@ impl Store {
                 neighborhood_omitted,
                 unmapped_range_count,
                 file_mapped_range_count,
+                import_cycle_total,
                 dependency_analysis(dependency_mode),
                 risk_metadata(top_risk),
             ),
@@ -3029,6 +3054,144 @@ fn node_risk_counts(connection: &Connection, ids: &[i64]) -> Result<(NodeRiskCou
         );
     }
     Ok((counts, omitted))
+}
+
+const IMPORT_CYCLE_LINE_LIMIT: usize = 16;
+
+fn load_file_imports(
+    connection: &Connection,
+    dependency_mode: DependencyMode,
+) -> Result<Vec<(String, String)>> {
+    let path_filter = if dependency_mode == DependencyMode::Boundary {
+        " AND sf.path NOT GLOB '.cargo/vendor/*/*' AND tf.path NOT GLOB '.cargo/vendor/*/*'"
+    } else {
+        ""
+    };
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT DISTINCT sf.path, tf.path FROM edges e
+               JOIN nodes s ON s.id=e.source_id JOIN files sf ON sf.id=s.file_id
+               JOIN nodes t ON t.id=e.target_id JOIN files tf ON tf.id=t.file_id
+              WHERE e.kind='IMPORTS' AND sf.id!=tf.id{path_filter}"
+        ))
+        .map_err(db_error)?;
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(db_error)
+}
+
+/// Returns the number of import SCCs (>= 2 files) containing a changed file and,
+/// per changed member file in path order, the SCC size with the shortest import
+/// cycle starting at that file (ties broken by path order).
+fn import_cycles<'a>(
+    imports: &'a [(String, String)],
+    changed: &HashSet<&str>,
+) -> (usize, Vec<(usize, Vec<&'a str>)>) {
+    let mut paths = imports
+        .iter()
+        .flat_map(|(source, target)| [source.as_str(), target.as_str()])
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    let position = |path: &str| paths.binary_search(&path).expect("import path is indexed");
+    let mut adjacency = vec![Vec::new(); paths.len()];
+    for (source, target) in imports {
+        if source != target {
+            adjacency[position(source)].push(position(target));
+        }
+    }
+    for targets in &mut adjacency {
+        targets.sort_unstable();
+        targets.dedup();
+    }
+
+    // Iterative Tarjan: explicit call stack of (node, next edge index).
+    let unvisited = usize::MAX;
+    let mut index = vec![unvisited; paths.len()];
+    let mut low = vec![0; paths.len()];
+    let mut on_stack = vec![false; paths.len()];
+    let mut component = vec![0; paths.len()];
+    let mut sizes = Vec::new();
+    let mut stack = Vec::new();
+    let mut next = 0;
+    for root in 0..paths.len() {
+        if index[root] != unvisited {
+            continue;
+        }
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        let mut calls = vec![(root, 0)];
+        while let Some(frame) = calls.last_mut() {
+            let node = frame.0;
+            if let Some(&target) = adjacency[node].get(frame.1) {
+                frame.1 += 1;
+                if index[target] == unvisited {
+                    index[target] = next;
+                    low[target] = next;
+                    next += 1;
+                    stack.push(target);
+                    on_stack[target] = true;
+                    calls.push((target, 0));
+                } else if on_stack[target] {
+                    low[node] = low[node].min(index[target]);
+                }
+                continue;
+            }
+            calls.pop();
+            if let Some(&(parent, _)) = calls.last() {
+                low[parent] = low[parent].min(low[node]);
+            }
+            if low[node] == index[node] {
+                let mut size = 0;
+                loop {
+                    let member = stack.pop().expect("Tarjan stack holds the component");
+                    on_stack[member] = false;
+                    component[member] = sizes.len();
+                    size += 1;
+                    if member == node {
+                        break;
+                    }
+                }
+                sizes.push(size);
+            }
+        }
+    }
+
+    let mut relevant = vec![false; sizes.len()];
+    let mut routes = Vec::new();
+    for start in 0..paths.len() {
+        let scc = component[start];
+        if sizes[scc] < 2 || !changed.contains(paths[start]) {
+            continue;
+        }
+        relevant[scc] = true;
+        let mut parent = vec![unvisited; paths.len()];
+        let mut queue = std::collections::VecDeque::from([start]);
+        parent[start] = start;
+        'search: while let Some(node) = queue.pop_front() {
+            for &target in &adjacency[node] {
+                if target == start {
+                    let mut route = vec![node];
+                    while *route.last().expect("route is non-empty") != start {
+                        route.push(parent[*route.last().expect("route is non-empty")]);
+                    }
+                    route.reverse();
+                    routes.push((sizes[scc], route.into_iter().map(|id| paths[id]).collect()));
+                    break 'search;
+                }
+                if component[target] == scc && parent[target] == unvisited {
+                    parent[target] = node;
+                    queue.push_back(target);
+                }
+            }
+        }
+    }
+    (relevant.into_iter().filter(|&found| found).count(), routes)
 }
 
 fn node_risk(
@@ -12805,5 +12968,35 @@ mod tests {
             }],
             gaps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn import_cycles_report_shortest_routes_through_changed_files() {
+        let imports = [
+            ("a", "b"),
+            ("b", "a"),
+            ("c", "d"),
+            ("d", "e"),
+            ("e", "c"),
+            ("c", "e"),
+            ("f", "f"),
+            ("f", "a"),
+            ("x", "y"),
+            ("y", "x"),
+        ]
+        .map(|(source, target)| (source.to_owned(), target.to_owned()));
+        let changed = HashSet::from(["a", "c", "d", "f"]);
+
+        let (total, routes) = import_cycles(&imports, &changed);
+
+        assert_eq!(total, 2);
+        assert_eq!(
+            routes,
+            vec![
+                (2, vec!["a", "b"]),
+                (3, vec!["c", "e"]),
+                (3, vec!["d", "e", "c"]),
+            ]
+        );
     }
 }

@@ -251,6 +251,8 @@ implementations, base classes, `extends`/`implements`), so a call bound to a
 trait or base method can reach a changed override. Such hops render as ` ~> `,
 the flow line carries `dispatch_hops=N`, and DOT draws them dotted. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale. The caller component tiers direct production fan-in, including callers of overridden members, at 1, 2–3, 4–15, and 16 or more callers; 16 or more adds `high-fan-in` to the rationale. `test_path_confidence=heuristic` and `test_path_provenance=resolved-static-call-graph` describe bounded static evidence, not runtime test proof; community and churn factors are not used.
 
+Each changed file inside a file-level import cycle adds an `import_cycle files=N route=a -> b -> a` line naming the shortest import cycle through it; at most 16 such lines are emitted (`import_cycles_omitted=N` counts the rest), and the summary's `import_cycles=N` counts the cycles containing a changed file.
+
 Artifact text and semantics belong to the immutable snapshot. Non-symbol source
 ranges map to their indexed file node and are reported as `file-mapped`;
 targeted `search` or `view` remediation is named for unresolved graph coverage.

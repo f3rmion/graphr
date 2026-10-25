@@ -1127,6 +1127,48 @@ fn override_dispatch_links_trait_and_template_method_flows() {
 }
 
 #[test]
+fn import_cycle_through_changed_file_is_reported() {
+    let module = |import: &str, name: &str, value: u8| {
+        format!("import \"./{import}\";\nexport function {name}() {{ return {value}; }}\n")
+    };
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    for (path, import, name) in [
+        ("a", "b", "a"),
+        ("b", "a", "b"),
+        ("c", "d", "c"),
+        ("d", "c", "d"),
+    ] {
+        fs::write(
+            fixture.path.join(format!("src/{path}.js")),
+            module(import, name, 1),
+        )
+        .unwrap();
+    }
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git_commit(&fixture.path, "cycle baseline");
+    fs::write(fixture.path.join("src/a.js"), module("b", "a", 2)).unwrap();
+
+    let mut client = Client::start(&fixture.path);
+    let snapshot_id = client.snapshot_id().to_owned();
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    let graph = change_section_text(&changes, "graph");
+    let cycles = graph
+        .lines()
+        .filter(|line| line.starts_with("import_cycle"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        cycles,
+        ["import_cycle files=2 route=src/a.js -> src/b.js -> src/a.js"],
+        "{graph}"
+    );
+    assert!(graph.contains(" import_cycles=1 "), "{graph}");
+    client.close();
+}
+
+#[test]
 fn completeness_reports_direct_static_calls_without_legacy_fields() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
