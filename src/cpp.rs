@@ -4,10 +4,10 @@ use std::path::{Component, Path};
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::git::Source;
-use crate::parse::syntax_gaps;
+use crate::parse::{source_notes, syntax_gaps};
 use crate::store::{
     GapCategory, GapInput, GapReason, Graph, ModeledSiteInput, ModeledSiteKind, NodeInput,
-    NodeKind, RefInput, RefKind, ResolutionState, TraitImplementationInput,
+    NodeKind, RefInput, RefKind, ResolutionState, SourceNoteInput, TraitImplementationInput,
 };
 
 const CPP_QUERY: &str = include_str!("../queries/cpp.scm");
@@ -119,6 +119,14 @@ pub(crate) fn add_file(
             GapReason::ParserError,
         )?;
     }
+    graph.source_notes.extend(
+        source_notes(tree.root_node(), &source.text)
+            .into_iter()
+            .map(|note| SourceNoteInput {
+                file_key: source.path.clone(),
+                note,
+            }),
+    );
     let mut class_lookup = collect_class_lookup(parser, tree.root_node(), source)?;
 
     let mut scopes = Vec::<Scope>::new();
@@ -1380,6 +1388,39 @@ TEST_CASE("worker runs") { app::execute(); }
                 .filter_map(|site| site.target_hint.as_deref())
                 .collect::<Vec<_>>(),
             ["WorkerTest.Runs", "worker runs"]
+        );
+    }
+
+    #[test]
+    fn records_tagged_comments_as_source_notes() {
+        let source = Source {
+            path: "src/buffer.cpp".into(),
+            text: "/* plain comment */\n\
+                   int size(const int* data) {\n\
+                   \x20 /* NOTE: data ends with a sentinel */\n\
+                   \x20 // SAFETY: data is non-null\n\
+                   \x20 return *data;\n\
+                   }\n"
+            .into(),
+        };
+        let mut graph = Graph::default();
+
+        add_file(&mut graph, &source, &mut CppParser::new().unwrap()).unwrap();
+
+        let notes = graph
+            .source_notes
+            .iter()
+            .map(|row| {
+                let note = &row.note;
+                (note.line_start, note.tag, note.text.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notes,
+            [
+                (3, "NOTE", "data ends with a sentinel"),
+                (4, "SAFETY", "data is non-null"),
+            ]
         );
     }
 

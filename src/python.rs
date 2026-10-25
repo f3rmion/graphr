@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::git::Source;
-use crate::parse::{ParseGap, parser_no_tree_gaps, syntax_gaps};
+use crate::parse::{ParseGap, parser_no_tree_gaps, source_notes, syntax_gaps};
 use crate::store::{
     GapCategory, GapInput, GapReason, Graph, NodeInput, NodeKind, RefInput, RefKind,
-    ResolutionState, TraitImplementationInput,
+    ResolutionState, SourceNote, SourceNoteInput, TraitImplementationInput,
 };
 
 const PYTHON_QUERY: &str = include_str!("../queries/python.scm");
@@ -58,6 +58,7 @@ struct ParsedFile {
     bindings: Vec<ValueBinding>,
     calls: Vec<Call>,
     parse_gaps: Vec<ParseGap>,
+    notes: Vec<SourceNote>,
     parser_no_tree: bool,
 }
 
@@ -114,6 +115,7 @@ impl PythonParser {
         };
         let mut parsed = ParsedFile {
             parse_gaps: syntax_gaps(tree.root_node()),
+            notes: source_notes(tree.root_node(), source),
             ..ParsedFile::default()
         };
         let mut scopes = Vec::<Scope>::new();
@@ -237,7 +239,7 @@ pub fn add_file(
 ) -> Result<(), String> {
     let target = PythonTarget::for_path(&source.path)
         .ok_or_else(|| "Python source path is invalid".to_owned())?;
-    let parsed = parser.parse(&source.text)?;
+    let mut parsed = parser.parse(&source.text)?;
     let mut observed_relation_sites = 0_u32;
     let file_key = identity(&source.path, "file", &source.path, 0, 0);
     graph.nodes.push(NodeInput {
@@ -272,6 +274,12 @@ pub fn add_file(
             relation_site: false,
         });
     }
+    graph
+        .source_notes
+        .extend(parsed.notes.drain(..).map(|note| SourceNoteInput {
+            file_key: source.path.clone(),
+            note,
+        }));
 
     let mut paths = Vec::with_capacity(parsed.definitions.len());
     let mut node_keys = Vec::with_capacity(parsed.definitions.len());
@@ -1021,6 +1029,38 @@ def broken(
         });
         add_file(&mut graph, &source, &mut PythonParser::new().unwrap()).unwrap();
         graph
+    }
+
+    #[test]
+    fn records_tagged_comments_as_source_notes() {
+        let graph = graph_of(
+            "app.py",
+            "# plain comment\n\
+             def run():\n\
+             \x20   # WHY: retries hide flaky upstreams\n\
+             \x20   return 1  # ADR-7 picks this default\n\
+             \"\"\"NOTE: docstrings are not notes\"\"\"\n",
+        );
+        let notes = graph
+            .source_notes
+            .iter()
+            .map(|row| {
+                let note = &row.note;
+                (
+                    row.file_key.as_str(),
+                    note.line_start,
+                    note.tag,
+                    note.text.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notes,
+            [
+                ("app.py", 3, "WHY", "retries hide flaky upstreams"),
+                ("app.py", 4, "ADR", "ADR-7 picks this default"),
+            ]
+        );
     }
 
     fn inheritance(path: &str, text: &str) -> Vec<(String, String)> {

@@ -26,7 +26,7 @@ use crate::store::{
     CoverageRegionInput, CoverageRunInput, EdgeInput, EdgeKind, EvidenceInput, EvidenceLineSpan,
     FileInput, GapCategory, GapInput, GapReason, Graph, ImportedArtifactInput, ModeledSiteInput,
     ModeledSiteKind, NodeInput, NodeKind, ProvenanceInput, RefInput, RefKind, ResolutionState,
-    Store, TraitImplementationInput, no_change_dot,
+    SourceNoteInput, Store, TraitImplementationInput, no_change_dot,
 };
 use crate::workspace::{
     BuildProgress, BuildStage, CACHE_FORMAT_VERSION, ErrorCode, GRAPH_ANALYZER_VERSION,
@@ -2352,6 +2352,7 @@ fn build_index(
         graph.edges.append(&mut part.edges);
         graph.modeled_sites.append(&mut part.modeled_sites);
         graph.gaps.append(&mut part.gaps);
+        graph.source_notes.append(&mut part.source_notes);
     }
     if full {
         resolve(&mut graph, cancelled)?;
@@ -2536,6 +2537,7 @@ fn build_graph(sources: &[Source], cancelled: &AtomicBool) -> Result<Graph, Stri
         edges: Vec::new(),
         modeled_sites: Vec::new(),
         gaps: Vec::new(),
+        source_notes: Vec::new(),
     };
     for source in sources {
         check_cancelled(cancelled)?;
@@ -2563,7 +2565,7 @@ fn add_rust_file(
     target: &TargetPath,
     parser: &mut RustParser,
 ) -> Result<(), String> {
-    let parsed = parser.parse(&source.text)?;
+    let mut parsed = parser.parse(&source.text)?;
     let mut observed_relation_sites = 0_u32;
 
     let file_key = identity(&source.path, "file", &source.path, 0, 0);
@@ -2599,6 +2601,12 @@ fn add_rust_file(
             relation_site: false,
         });
     }
+    graph
+        .source_notes
+        .extend(parsed.notes.drain(..).map(|note| SourceNoteInput {
+            file_key: source.path.clone(),
+            note,
+        }));
 
     let module = target.module.as_str();
     let module_paths = inline_module_paths(&parsed, module)?;

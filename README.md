@@ -266,6 +266,8 @@ the flow line carries `dispatch_hops=N`, and DOT draws them dotted. These are po
 
 Each changed file inside a file-level import cycle adds an `import_cycle files=N route=a -> b -> a` line naming the shortest import cycle through it; at most 16 such lines are emitted (`import_cycles_omitted=N` counts the rest), and the summary's `import_cycles=N` counts the cycles containing a changed file.
 
+Comments whose text starts with `SAFETY:`, `WHY:`, `NOTE:`, or `INVARIANT:`, or that cite `ADR-N`/`RFC-N` (tags `ADR`/`RFC`), are indexed as source notes in every supported language; Python docstrings are not. A changed symbol's notes, and notes on changed lines, render after the root and neighbor lines as `note tag=SAFETY path="src/lib.rs" line=2 text="caller guarantees ptr is valid"`, ordered by path and line; at most 16 are emitted (`notes_omitted=N` counts the rest), and the summary's `notes=N` counts them all. `view` of a type, function, or test lists up to 8 notes inside its span.
+
 Artifact text and semantics belong to the immutable snapshot. Non-symbol source
 ranges map to their indexed file node and are reported as `file-mapped`;
 targeted `search` or `view` remediation is named for unresolved graph coverage.

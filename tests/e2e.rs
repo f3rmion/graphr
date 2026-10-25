@@ -1256,6 +1256,50 @@ fn import_cycle_through_changed_file_is_reported() {
 }
 
 #[test]
+fn changed_symbol_surfaces_safety_note() {
+    let source = |read_body: &str| {
+        format!(
+            "pub fn read(ptr: *const u8) -> u8 {{\n    // SAFETY: caller guarantees ptr is valid\n    unsafe {{ {read_body} }}\n}}\n\npub fn untouched(ptr: *const u8) -> u8 {{\n    // SAFETY: untouched caller contract\n    unsafe {{ *ptr }}\n}}\n"
+        )
+    };
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(fixture.path.join("src/lib.rs"), source("*ptr")).unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "src/lib.rs"]);
+    git_commit(&fixture.path, "notes baseline");
+    fs::write(fixture.path.join("src/lib.rs"), source("*ptr.add(1)")).unwrap();
+
+    let mut client = Client::start(&fixture.path);
+    let snapshot_id = client.snapshot_id().to_owned();
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    let graph = change_section_text(&changes, "graph");
+    let notes = graph
+        .lines()
+        .filter(|line| line.starts_with("note "))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        notes,
+        ["note tag=SAFETY path=\"src/lib.rs\" line=2 text=\"caller guarantees ptr is valid\""],
+        "{graph}"
+    );
+    assert!(graph.contains(" import_cycles=0 notes=1 "), "{graph}");
+    assert!(!graph.contains("untouched caller contract"), "{graph}");
+
+    let search = response_text(&client.search("untouched", Some("function")));
+    let node_ref = search.split_whitespace().next().unwrap();
+    let view = response_text(&client.view(node_ref, 0, 20));
+    assert!(
+        view.contains(
+            "note tag=SAFETY path=\"src/lib.rs\" line=7 text=\"untouched caller contract\"\n"
+        ),
+        "{view}"
+    );
+    client.close();
+}
+
+#[test]
 fn completeness_reports_direct_static_calls_without_legacy_fields() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();

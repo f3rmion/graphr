@@ -7,10 +7,11 @@ use tree_sitter::{
 };
 
 use crate::git::{Language, Source};
-use crate::parse::{ParseGap, parser_no_tree_gaps, syntax_gaps};
+use crate::parse::{ParseGap, parser_no_tree_gaps, source_notes, syntax_gaps};
 use crate::store::{
     GapCategory, GapInput, GapReason, Graph, ModeledSiteInput, ModeledSiteKind, NodeInput,
-    NodeKind, RefInput, RefKind, ResolutionState, TraitImplementationInput,
+    NodeKind, RefInput, RefKind, ResolutionState, SourceNote, SourceNoteInput,
+    TraitImplementationInput,
 };
 
 const ECMASCRIPT_QUERY: &str = include_str!("../queries/ecmascript.scm");
@@ -156,6 +157,7 @@ impl ScriptParser {
 
         let mut parsed = ParsedFile {
             parse_gaps: syntax_gaps(tree.root_node()),
+            notes: source_notes(tree.root_node(), source),
             ..ParsedFile::default()
         };
         for capture in &captured {
@@ -477,6 +479,7 @@ struct ParsedFile {
     unsupported: Vec<UnsupportedRelation>,
     exports: Vec<Export>,
     parse_gaps: Vec<ParseGap>,
+    notes: Vec<SourceNote>,
     parser_no_tree: bool,
 }
 
@@ -497,7 +500,7 @@ pub(crate) fn add_file(
     }
     let aliases = module_aliases(&source.path)?;
     let stem = &aliases[0];
-    let parsed = parsers.parse(&source.path, &source.text)?;
+    let mut parsed = parsers.parse(&source.path, &source.text)?;
     let mut observed_relation_sites = 0_u32;
     let file_key = identity(language, &source.path, "file", &source.path, 0, 0);
     graph.nodes.push(NodeInput {
@@ -532,6 +535,12 @@ pub(crate) fn add_file(
             relation_site: false,
         });
     }
+    graph
+        .source_notes
+        .extend(parsed.notes.drain(..).map(|note| SourceNoteInput {
+            file_key: source.path.clone(),
+            note,
+        }));
 
     let mut paths = Vec::with_capacity(parsed.definitions.len());
     let mut node_keys = Vec::with_capacity(parsed.definitions.len());
@@ -3405,6 +3414,45 @@ it("works", () => direct());
             .into_iter()
             .map(|relation| (relation.implementor_key, relation.trait_key))
             .collect()
+    }
+
+    #[test]
+    fn records_tagged_comments_as_source_notes() {
+        let mut graph = Graph::default();
+        let source = Source {
+            path: "src/app.ts".to_owned(),
+            text: "// plain comment\n\
+                   export function load(): number {\n\
+                   \x20 // see ADR-12 and ADR-13\n\
+                   \x20 /**\n\
+                   \x20  * NOTE: cached per request\n\
+                   \x20  */\n\
+                   \x20 return 1;\n\
+                   }\n"
+            .to_owned(),
+        };
+        add_file(
+            &mut graph,
+            &source,
+            StoredLanguage::TypeScript,
+            &mut ScriptParsers::default(),
+        )
+        .unwrap();
+        let notes = graph
+            .source_notes
+            .iter()
+            .map(|row| {
+                let note = &row.note;
+                (note.line_start, note.line_end, note.tag, note.text.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notes,
+            [
+                (3, 3, "ADR", "see ADR-12 and ADR-13"),
+                (4, 6, "NOTE", "cached per request"),
+            ]
+        );
     }
 
     #[test]

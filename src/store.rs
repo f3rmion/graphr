@@ -18,7 +18,7 @@ use crate::git::{
 };
 use crate::graph::{CodeGraph, Relation, Step};
 
-pub(crate) const SCHEMA_VERSION: i64 = 8;
+pub(crate) const SCHEMA_VERSION: i64 = 9;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
@@ -368,6 +368,19 @@ pub struct EdgeInput {
     pub support_count: u32,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct SourceNote {
+    pub line_start: usize,
+    pub line_end: usize,
+    pub tag: &'static str,
+    pub text: String,
+}
+
+pub struct SourceNoteInput {
+    pub file_key: String,
+    pub note: SourceNote,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ArtifactRole {
     Manifest,
@@ -512,6 +525,7 @@ pub struct Graph {
     pub edges: Vec<EdgeInput>,
     pub modeled_sites: Vec<ModeledSiteInput>,
     pub gaps: Vec<GapInput>,
+    pub source_notes: Vec<SourceNoteInput>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -950,6 +964,29 @@ impl Store {
             })
             .map_err(db_error)?
         };
+        if root.kind != "file" {
+            let mut statement = tx
+                .prepare(
+                    "SELECT s.line_start, s.tag, s.text
+                       FROM nodes n JOIN source_notes s ON s.file_id=n.file_id
+                      WHERE n.id=?1 AND s.line_start>=n.line_start AND s.line_end<=n.line_end
+                      ORDER BY s.line_start, s.id LIMIT ?2",
+                )
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map(params![root_id, VIEW_NOTE_LIMIT], |row| {
+                    Ok(note_line(
+                        &row.get::<_, String>(1)?,
+                        &root.path,
+                        row.get(0)?,
+                        &row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                lines.push(row.map_err(db_error)?);
+            }
+        }
         let mut evidence_scope = CoverageScope::node(
             root_id,
             &root.path,
@@ -1137,7 +1174,7 @@ impl Store {
             };
             let traversal_complete = deleted_paths_unanalyzed == 0;
             let mut output = format!(
-                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} static_test_path_gaps=0 traversal_complete={traversal_complete} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 import_cycles=0 dependency_analysis={} {}\n",
+                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} static_test_path_gaps=0 traversal_complete={traversal_complete} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 import_cycles=0 notes=0 dependency_analysis={} {}\n",
                 dependency_analysis(dependency_mode),
                 risk_metadata(None),
             );
@@ -1232,6 +1269,14 @@ impl Store {
                   WHERE f.path=?1 AND n.kind='file'",
             )
             .map_err(db_error)?;
+        let mut file_notes = tx
+            .prepare(
+                "SELECT n.line_start, n.line_end, n.tag, n.text
+                   FROM files f JOIN source_notes n ON n.file_id=f.id
+                  WHERE f.path=?1 ORDER BY n.line_start, n.id",
+            )
+            .map_err(db_error)?;
+        let mut notes = Vec::new();
 
         for file in files {
             check_cancelled(cancelled)?;
@@ -1246,6 +1291,7 @@ impl Store {
             }
             let mut span_index = 0;
             let mut coverage = Vec::new();
+            let mut changed_symbol_spans = Vec::new();
             let rows = symbols
                 .query_map([&file.path], |row| {
                     Ok((
@@ -1278,6 +1324,9 @@ impl Store {
                         .spans
                         .get(span_index)
                         .is_some_and(|span| span.start <= interval.end);
+                if changed {
+                    changed_symbol_spans.push(interval);
+                }
                 if changed && root_seen.insert(id) {
                     symbol_root_ids.push(id);
                 }
@@ -1294,6 +1343,32 @@ impl Store {
             } else {
                 &file.spans
             };
+            let rows = file_notes
+                .query_map([&file.path], |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                let (line_start, line_end, tag, text) = row.map_err(db_error)?;
+                let note = LineSpan {
+                    start: u64::from(line_start) * 2,
+                    end: u64::from(line_end) * 2,
+                };
+                if changed_symbol_spans
+                    .iter()
+                    .any(|span| span.start <= note.start && note.end <= span.end)
+                    || changed_spans
+                        .iter()
+                        .any(|span| span.start <= note.end && note.start <= span.end)
+                {
+                    notes.push((file.path.as_str(), line_start, tag, text));
+                }
+            }
             let residual = unmapped_spans(changed_spans, &coverage);
             let unmapped = file.report_unmapped
                 && if changed_spans.is_empty() {
@@ -1319,6 +1394,8 @@ impl Store {
         }
         drop(symbols);
         drop(file_nodes);
+        drop(file_notes);
+        notes.sort_by_key(|(path, line, _, _)| (*path, *line));
 
         let changed_symbols_total = symbol_root_ids.len();
         let analysis_roots_total = changed_symbols_total.saturating_add(file_root_ids.len());
@@ -1401,6 +1478,12 @@ impl Store {
                 &mut calls,
             )?
         };
+        for (path, line, tag, text) in notes.iter().take(NOTE_LINE_LIMIT) {
+            lines.push(note_line(tag, path, *line, text));
+        }
+        if notes.len() > NOTE_LINE_LIMIT {
+            lines.push(format!("notes_omitted={}\n", notes.len() - NOTE_LINE_LIMIT));
+        }
         for flow in &analysis.flows {
             traversed_ids.insert(flow.entry.id);
             traversed_ids.extend(flow.nodes.iter().map(|node| node.id));
@@ -1476,7 +1559,7 @@ impl Store {
         lines.insert(
             0,
             format!(
-                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} static_test_path_gaps={} traversal_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} import_cycles={} dependency_analysis={} {}\n",
+                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} static_test_path_gaps={} traversal_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} import_cycles={} notes={} dependency_analysis={} {}\n",
                 score_text(overall),
                 changed_symbols_total,
                 analysis.risks.len(),
@@ -1491,6 +1574,7 @@ impl Store {
                 unmapped_range_count,
                 file_mapped_range_count,
                 import_cycle_total,
+                notes.len(),
                 dependency_analysis(dependency_mode),
                 risk_metadata(top_risk),
             ),
@@ -3149,6 +3233,12 @@ fn node_risk_counts(connection: &Connection, ids: &[i64]) -> Result<(NodeRiskCou
 }
 
 const IMPORT_CYCLE_LINE_LIMIT: usize = 16;
+const NOTE_LINE_LIMIT: usize = 16;
+const VIEW_NOTE_LIMIT: u32 = 8;
+
+fn note_line(tag: &str, path: &str, line: u32, text: &str) -> String {
+    format!("note tag={tag} path={path:?} line={line} text={text:?}\n")
+}
 
 fn load_file_imports(
     connection: &Connection,
@@ -5469,6 +5559,7 @@ fn apply_incremental(
             || !graph.refs.is_empty()
             || !graph.trait_implementations.is_empty()
             || !graph.modeled_sites.is_empty()
+            || !graph.source_notes.is_empty()
             || graph.gaps.iter().any(|gap| !global_gap(gap)))
     {
         return Err("no-op incremental graph contains parsed rows".into());
@@ -6932,6 +7023,34 @@ fn insert_graph(
         }
     }
 
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO source_notes(file_id, line_start, line_end, tag, text)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(db_error)?;
+        for source_note in &graph.source_notes {
+            check_cancelled(cancelled)?;
+            let (file_id, _) = files
+                .get(source_note.file_key.as_str())
+                .ok_or_else(|| "source note references an unknown file".to_owned())?;
+            let note = &source_note.note;
+            let line = |line: usize| {
+                i64::try_from(line).map_err(|_| "source note line exceeds SQLite range".to_owned())
+            };
+            insert
+                .execute(params![
+                    file_id,
+                    line(note.line_start)?,
+                    line(note.line_end)?,
+                    note.tag,
+                    note.text
+                ])
+                .map_err(db_error)?;
+        }
+    }
+
     let mut reference_ids = if delta {
         Vec::with_capacity(graph.refs.len())
     } else {
@@ -7345,9 +7464,18 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE INDEX graph_gaps_order ON graph_gaps(
             path, line_start, line_end, category, reason, target_hint, id
          );
+         CREATE TABLE source_notes(
+            id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            line_start INTEGER NOT NULL CHECK(line_start>0),
+            line_end INTEGER NOT NULL CHECK(line_end>=line_start),
+            tag TEXT NOT NULL CHECK(tag IN ('SAFETY','WHY','NOTE','INVARIANT','ADR','RFC')),
+            text TEXT NOT NULL
+         );
+         CREATE INDEX source_notes_file_lines ON source_notes(file_id, line_start);
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=8;",
+         PRAGMA user_version=9;",
     )
     .map_err(db_error)
 }
@@ -9636,6 +9764,93 @@ mod tests {
                 })
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn source_notes_follow_incremental_file_replacement() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        let cancelled = AtomicBool::new(false);
+        let file = |path: &str, replace| FileInput {
+            path: path.into(),
+            language: Language::Rust,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: String::new(),
+            byte_size: 1,
+            replace,
+            observed_relation_sites: 0,
+        };
+        let note = |path: &str, line_start, tag, text: &str| SourceNoteInput {
+            file_key: path.into(),
+            note: SourceNote {
+                line_start,
+                line_end: line_start,
+                tag,
+                text: text.into(),
+            },
+        };
+        let notes = |store: &Store| {
+            store
+                .connection
+                .prepare(
+                    "SELECT f.path, n.line_start, n.tag, n.text
+                       FROM source_notes n JOIN files f ON f.id=n.file_id
+                      ORDER BY f.path, n.line_start",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok(format!(
+                        "{}:{} {} {}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+
+        let graph = Graph {
+            files: vec![
+                file("src/edited.rs", true),
+                file("src/kept.rs", true),
+                file("src/removed.rs", true),
+            ],
+            source_notes: vec![
+                note("src/edited.rs", 2, "SAFETY", "old"),
+                note("src/kept.rs", 3, "WHY", "kept"),
+                note("src/removed.rs", 4, "ADR", "ADR-1"),
+            ],
+            ..Graph::default()
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        assert_eq!(
+            notes(&store),
+            [
+                "src/edited.rs:2 SAFETY old",
+                "src/kept.rs:3 WHY kept",
+                "src/removed.rs:4 ADR ADR-1"
+            ]
+        );
+
+        let graph = Graph {
+            files: vec![file("src/edited.rs", true), file("src/kept.rs", false)],
+            source_notes: vec![note("src/edited.rs", 5, "INVARIANT", "new")],
+            ..Graph::default()
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        assert_eq!(
+            notes(&store),
+            ["src/edited.rs:5 INVARIANT new", "src/kept.rs:3 WHY kept"]
         );
     }
 
