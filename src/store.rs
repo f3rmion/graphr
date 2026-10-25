@@ -2977,7 +2977,7 @@ fn node_risk(
     let flow_component = flow_score.min(2_500);
     let test_component = 3_000_u32.saturating_sub(tests.min(5) * 500);
     let security_component = u32::from(security) * 2_000;
-    let caller_component = callers.min(2) * 500;
+    let caller_component = fan_in_component(callers);
     NodeRisk {
         score: flow_component + test_component + security_component + caller_component,
         flow_component,
@@ -2989,6 +2989,19 @@ fn node_risk(
         indirect_test_covered,
     }
 }
+
+/// Direct production fan-in tiers: one caller, a few, a shared helper, a hub.
+const fn fan_in_component(callers: u32) -> u32 {
+    match callers {
+        0 => 0,
+        1 => 250,
+        2..=3 => 500,
+        4..HUB_FAN_IN => 750,
+        _ => 1_000,
+    }
+}
+
+const HUB_FAN_IN: u32 = 16;
 
 fn security_sensitive(name: &str, qualified_name: &str) -> bool {
     let name = name.to_lowercase();
@@ -3045,6 +3058,10 @@ fn risk_metadata(risk: Option<&NodeRisk>) -> String {
         (risk.flow_component > 0, "affected-flow"),
         (risk.security_component > 0, "security-sensitive"),
         (risk.caller_component > 0, "caller-impact"),
+        (
+            risk.caller_component == fan_in_component(HUB_FAN_IN),
+            "high-fan-in",
+        ),
     ] {
         if present {
             rationale.push('+');
@@ -8214,11 +8231,11 @@ mod tests {
         assert_eq!(evidence_render_count(), renders_before + 1);
         assert!(
             output.contains(
-                "risk overall=0.4200 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown static_test_path_gaps=0 traversal_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
+                "risk overall=0.3950 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown static_test_path_gaps=0 traversal_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
             ),
             "{output}"
         );
-        assert!(output.contains("risk 0.4200"), "{output}");
+        assert!(output.contains("risk 0.3950"), "{output}");
         assert!(
             output.contains(
                 "flow 0.1200 depth=2 nodes=3 files=1 changed=1 caller@src/lib.rs:9 -> root@src/lib.rs:2"
@@ -8368,10 +8385,10 @@ mod tests {
     }
 
     #[test]
-    fn flow_and_risk_scores_match_crg_factors() {
+    fn flow_and_risk_scores_weight_flow_tests_security_and_fan_in() {
         assert_eq!(flow_criticality(4, 3, 2, 1, 2, 5), 4_175);
         let risk = node_risk(1_500, 3, true, 1, false, false, true);
-        assert_eq!(risk.score, 5_500);
+        assert_eq!(risk.score, 5_250);
         assert_eq!(
             (
                 risk.flow_component,
@@ -8379,12 +8396,20 @@ mod tests {
                 risk.security_component,
                 risk.caller_component,
             ),
-            (1_500, 1_500, 2_000, 500)
+            (1_500, 1_500, 2_000, 250)
         );
         assert_eq!(
             node_risk(4_000, 5, true, 10, false, false, false).score,
-            6_000
+            5_750
         );
+        assert_eq!(
+            [0, 1, 2, 3, 4, 15, 16, 5_000].map(fan_in_component),
+            [0, 250, 500, 500, 750, 750, 1_000, 1_000]
+        );
+        let hub = risk_metadata(Some(&node_risk(0, 0, false, 16, false, true, false)));
+        assert!(hub.contains("+caller-impact+high-fan-in"), "{hub}");
+        let shared = risk_metadata(Some(&node_risk(0, 0, false, 15, false, true, false)));
+        assert!(!shared.contains("high-fan-in"), "{shared}");
         let changed_test = node_risk(0, 5, false, 0, true, false, false);
         assert!(
             risk_metadata(Some(&changed_test)).contains("risk_rationale=changed-test"),

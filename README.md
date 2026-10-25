@@ -236,7 +236,7 @@ GoogleTest or Catch2/doctest test cases. Graphr does not preprocess source, read
 `compile_commands.json`, resolve system headers, instantiate templates, infer
 receiver types, or choose between overloads; ambiguous targets produce no edge.
 
-Affected-flow discovery follows `CALLS` edges up to 15 hops. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale. `test_path_confidence=heuristic` and `test_path_provenance=resolved-static-call-graph` describe bounded static evidence, not runtime test proof; community and churn factors are not used.
+Affected-flow discovery follows `CALLS` edges up to 15 hops. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale. The caller component tiers direct production fan-in at 1, 2–3, 4–15, and 16 or more callers; 16 or more adds `high-fan-in` to the rationale. `test_path_confidence=heuristic` and `test_path_provenance=resolved-static-call-graph` describe bounded static evidence, not runtime test proof; community and churn factors are not used.
 
 Artifact text and semantics belong to the immutable snapshot. Non-symbol source
 ranges map to their indexed file node and are reported as `file-mapped`;
