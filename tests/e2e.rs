@@ -1362,10 +1362,28 @@ fn import_cycle_through_changed_file_is_reported() {
         )
         .unwrap();
     }
+    let rust = |value: u8| format!("mod left;\nmod right;\npub fn top() -> u8 {{ {value} }}\n");
+    fs::write(fixture.path.join("src/lib.rs"), rust(1)).unwrap();
+    fs::write(
+        fixture.path.join("src/left.rs"),
+        "use crate::right::right;\npub fn left() -> u8 { right() }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/right.rs"),
+        "use crate::left::left;\npub fn right() -> u8 { 0 }\npub fn back() -> u8 { left() }\n",
+    )
+    .unwrap();
     init_git(&fixture.path);
     git(&fixture.path, &["add", "--", "."]);
     git_commit(&fixture.path, "cycle baseline");
     fs::write(fixture.path.join("src/a.js"), module("b", "a", 2)).unwrap();
+    // Rust modules of one crate may use each other; that is not reported.
+    fs::write(
+        fixture.path.join("src/left.rs"),
+        "use crate::right::right;\npub fn left() -> u8 { right() + 1 }\n",
+    )
+    .unwrap();
 
     let mut client = Client::start(&fixture.path);
     let snapshot_id = client.snapshot_id().to_owned();
