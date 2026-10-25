@@ -340,6 +340,136 @@ fn coverage_evidence_imports_scoped_rust_observations_without_dynamic_edges() {
 }
 
 #[test]
+fn scip_manifest_resolves_unresolved_reference() {
+    // Regenerate by adding a `scipfix` Cargo.toml beside `src/`, running
+    // `rust-analyzer scip .` there, and committing only `src/` and `index.scip`.
+    const SOURCE: &str = include_str!("fixtures/scip/src/lib.rs");
+    const INDEX: &[u8] = include_bytes!("fixtures/scip/index.scip");
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        SOURCE.replace("s.alpha_only()", "0"),
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "src/lib.rs"]);
+    git_commit(&fixture.path, "scip baseline");
+    fs::write(fixture.path.join("src/lib.rs"), SOURCE).unwrap();
+    git(&fixture.path, &["add", "--", "src/lib.rs"]);
+    git_commit(&fixture.path, "scip change");
+    let source = index_repository_request(&fixture.path, "HEAD~1", "HEAD");
+    let ref_state = |path: &Path| {
+        Connection::open(graph_path(path))
+            .unwrap()
+            .query_row(
+                "SELECT r.resolution_state, r.resolution_source,
+                        (SELECT count(*) FROM edges e JOIN nodes t ON t.id=e.target_id
+                          WHERE e.source_id=r.source_id AND e.kind='CALLS'
+                            AND t.name='alpha_only')
+                   FROM refs r JOIN nodes n ON n.id=r.source_id
+                  WHERE n.name='bounded' AND r.line=10",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        ref_state(&fixture.path),
+        ("missing".to_owned(), "static".to_owned(), 0)
+    );
+
+    fs::write(fixture.path.join("index.scip"), INDEX).unwrap();
+    let manifest = |digest: String| {
+        rmcp::serde_json::to_vec(&rmcp::serde_json::json!({
+            "format_version": 1,
+            "source_snapshot_id": source["snapshot_id"],
+            "generated": [],
+            "coverage": [],
+            "scip": [{"path": "index.scip", "blake3": digest}]
+        }))
+        .unwrap()
+    };
+    let index_with_evidence = || {
+        cli_index_with_evidence_request(
+            &fixture.path,
+            "evidence.json",
+            "HEAD~1",
+            "HEAD",
+            "worktree",
+            true,
+            "boundary",
+        )
+    };
+    fs::write(fixture.path.join("evidence.json"), manifest("0".repeat(64))).unwrap();
+    let rejected = index_with_evidence();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("SCIP index digest does not match"),
+        "{:?}",
+        rejected.stderr
+    );
+
+    fs::write(
+        fixture.path.join("evidence.json"),
+        manifest(blake3::hash(INDEX).to_hex().to_string()),
+    )
+    .unwrap();
+    let output = index_with_evidence();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let completion: rmcp::serde_json::Value =
+        rmcp::serde_json::from_slice(output.stdout.trim_ascii()).unwrap();
+    remember_graph(&fixture.path, &completion);
+    assert_eq!(
+        ref_state(&fixture.path),
+        ("resolved".to_owned(), "scip".to_owned(), 1)
+    );
+
+    let mut client = Client::start_unindexed(&fixture.path);
+    client.snapshot_id = Some(completion["snapshot_id"].as_str().unwrap().into());
+    let snapshot_id = client.snapshot_id().to_owned();
+    let inspection = client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({
+            "worktree_root": &fixture.path,
+            "snapshot_id": snapshot_id,
+        }),
+    );
+    assert!(!tool_failed(&inspection), "{inspection}");
+    let mut changes = response_text(&client.changes(6, 50, None));
+    let mut cursor = page_cursor(&changes, "review_next_cursor");
+    while let Some(token) = cursor {
+        let page = changes_page(&mut client, &token);
+        cursor = page_cursor(&page, "review_next_cursor");
+        changes.push_str(&page);
+    }
+    for expected in [
+        "claim kind=scip-resolved-references count=1 basis=verified-scip-manifest\n",
+        "Function alpha_only src/lib.rs:2 via=scip\n",
+    ] {
+        assert!(changes.contains(expected), "missing {expected}: {changes}");
+    }
+    assert!(!changes.contains("index.scip"), "{changes}");
+    let search = response_text(&client.search("bounded", Some("function")));
+    let node_ref = search.split_whitespace().next().unwrap();
+    let view = response_text(&client.view(node_ref, 1, 10));
+    for expected in [
+        "call -> ",
+        "Function alpha_only src/lib.rs:2 via=scip\n",
+        "claim kind=scip-resolved-references count=1 basis=verified-scip-manifest\n",
+    ] {
+        assert!(view.contains(expected), "missing {expected}: {view}");
+    }
+    client.close();
+}
+
+#[test]
 fn coverage_evidence_imports_python_contexts_with_run_scoped_arcs() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();

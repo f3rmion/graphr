@@ -11,6 +11,7 @@ mod parse;
 mod pinned;
 mod python;
 mod schema;
+mod scip;
 mod store;
 pub mod workspace;
 
