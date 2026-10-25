@@ -10,7 +10,7 @@ use crate::git::{Language, Source};
 use crate::parse::{ParseGap, parser_no_tree_gaps, syntax_gaps};
 use crate::store::{
     GapCategory, GapInput, GapReason, Graph, ModeledSiteInput, ModeledSiteKind, NodeInput,
-    NodeKind, RefInput, RefKind, ResolutionState,
+    NodeKind, RefInput, RefKind, ResolutionState, TraitImplementationInput,
 };
 
 const ECMASCRIPT_QUERY: &str = include_str!("../queries/ecmascript.scm");
@@ -206,6 +206,12 @@ impl ScriptParser {
                 .min_by_key(|(_, definition)| definition.structure.end - definition.structure.start)
                 .map(|(parent, _)| parent);
         }
+        for definition in &mut parsed.definitions {
+            let parent = definition.parent;
+            for base in &mut definition.heritage {
+                base.call.source = parent;
+            }
+        }
         for import in &mut parsed.imports {
             import.source = containing_definition(import.byte, &parsed.definitions);
         }
@@ -380,6 +386,12 @@ struct Definition {
     range: ByteRange,
     structure: ByteRange,
     binding: Option<ByteRange>,
+    heritage: Vec<Heritage>,
+}
+
+struct Heritage {
+    call: Call,
+    type_position: bool,
 }
 
 enum ImportedName {
@@ -834,6 +846,20 @@ pub(crate) fn add_file(
             }
         }
     }
+    for (local, definition) in parsed.definitions.iter().enumerate() {
+        for base in &definition.heritage {
+            let Some(trait_key) = heritage_key(base, &parsed, &paths, stem, &import_modules) else {
+                continue;
+            };
+            graph.trait_implementations.push(TraitImplementationInput {
+                file_key: source.path.clone(),
+                line_start: to_u32(definition.line_start)?,
+                line_end: to_u32(definition.line_end)?,
+                implementor_key: local_type_key(stem, &paths[local]),
+                trait_key,
+            });
+        }
+    }
 
     for call in &parsed.calls {
         let keys = call_keys(call, &parsed, &paths, stem, &import_modules);
@@ -995,7 +1021,7 @@ fn call_keys(
     import_modules: &[Option<String>],
 ) -> Vec<String> {
     match &call.target {
-        CallTarget::Identifier(name) => match visible_value(call, name, parsed) {
+        CallTarget::Identifier(name) => match visible_value(call, name, parsed, false) {
             VisibleValue::Definition(target) => vec![local_value_key(
                 stem,
                 paths.get(target).map_or(name, String::as_str),
@@ -1017,7 +1043,8 @@ fn call_keys(
                 .into_iter()
                 .collect()
         }
-        CallTarget::Member { object, property } => match visible_value(call, object, parsed) {
+        CallTarget::Member { object, property } => match visible_value(call, object, parsed, false)
+        {
             VisibleValue::Definition(target)
                 if matches!(parsed.definitions[target].kind, DefinitionKind::Class) =>
             {
@@ -1036,6 +1063,37 @@ fn call_keys(
                 Vec::new()
             }
         },
+    }
+}
+
+fn heritage_key(
+    base: &Heritage,
+    parsed: &ParsedFile,
+    paths: &[String],
+    stem: &str,
+    import_modules: &[Option<String>],
+) -> Option<String> {
+    if !base.type_position {
+        return call_keys(&base.call, parsed, paths, stem, import_modules).pop();
+    }
+    let (name, member) = match &base.call.target {
+        CallTarget::Identifier(name) => (name, None),
+        CallTarget::Member { object, property } => (object, Some(property.as_str())),
+        CallTarget::ThisMethod { .. } => return None,
+    };
+    match (visible_value(&base.call, name, parsed, true), member) {
+        (VisibleValue::Definition(target), None) => Some(local_type_key(stem, paths.get(target)?)),
+        (VisibleValue::Import(import, binding), _) => {
+            let module = import_modules.get(import)?.as_deref()?;
+            let name = match (&parsed.imports[import].bindings[binding].imported, member) {
+                (ImportedName::Named(name), None) => name.as_str(),
+                (ImportedName::Default | ImportedName::CommonJsModule, None) => "default",
+                (ImportedName::Namespace | ImportedName::CommonJsModule, Some(member)) => member,
+                _ => return None,
+            };
+            Some(export_type_key(module, name))
+        }
+        _ => None,
     }
 }
 
@@ -1105,7 +1163,14 @@ fn visible_import(parsed: &ParsedFile, name: &str, byte: usize) -> Option<(usize
     (!parsed.imports[import].bindings[imported].type_only).then_some((import, imported))
 }
 
-fn visible_value(call: &Call, name: &str, parsed: &ParsedFile) -> VisibleValue {
+fn visible_value(call: &Call, name: &str, parsed: &ParsedFile, types: bool) -> VisibleValue {
+    let visible_kind = |kind: DefinitionKind| {
+        if types {
+            matches!(kind, DefinitionKind::Class | DefinitionKind::Type { .. })
+        } else {
+            is_runtime_value(kind)
+        }
+    };
     let bindings = parsed
         .bindings
         .iter()
@@ -1130,7 +1195,7 @@ fn visible_value(call: &Call, name: &str, parsed: &ParsedFile) -> VisibleValue {
             return VisibleValue::Ambiguous;
         }
         if let Some((import, imported)) = binding.import {
-            return if parsed.imports[import].bindings[imported].type_only {
+            return if parsed.imports[import].bindings[imported].type_only && !types {
                 VisibleValue::Ambiguous
             } else {
                 VisibleValue::Import(import, imported)
@@ -1143,7 +1208,7 @@ fn visible_value(call: &Call, name: &str, parsed: &ParsedFile) -> VisibleValue {
             .find_map(|(index, definition)| {
                 (definition.name == name
                     && definition.range.start == binding.byte
-                    && is_runtime_value(definition.kind))
+                    && visible_kind(definition.kind))
                 .then_some(index)
             })
             .map_or(VisibleValue::Ambiguous, VisibleValue::Definition);
@@ -1158,7 +1223,7 @@ fn visible_value(call: &Call, name: &str, parsed: &ParsedFile) -> VisibleValue {
             .filter(|(_, definition)| {
                 definition.parent == owner
                     && definition.name == name
-                    && is_runtime_value(definition.kind)
+                    && visible_kind(definition.kind)
             });
         let candidate = candidates.next().map(|(index, _)| index);
         if candidate.is_some() && candidates.next().is_none() {
@@ -1176,7 +1241,7 @@ fn visible_value(call: &Call, name: &str, parsed: &ParsedFile) -> VisibleValue {
                 .filter(|(_, definition)| {
                     definition.parent.is_none()
                         && definition.name == name
-                        && is_runtime_value(definition.kind)
+                        && visible_kind(definition.kind)
                 });
             let candidate = top_level.next().map(|(index, _)| index);
             return match (candidate, top_level.next()) {
@@ -1481,12 +1546,21 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
     let body = node.child_by_field_name("body");
     let signature_end = body.map_or(node.end_byte(), |body| body.start_byte());
     let body = body.unwrap_or(node);
+    let heritage = if matches!(
+        node.kind(),
+        "class_declaration" | "abstract_class_declaration" | "class" | "interface_declaration"
+    ) {
+        heritage(node, source)
+    } else {
+        Vec::new()
+    };
     let binding = definition_binding(node, &kind, &name, source);
     Some(Definition {
         binding,
         kind,
         method_resolution: method_resolution(node),
         name,
+        heritage,
         parent: None,
         line_start: line_at(source, start),
         line_end: line_end(node),
@@ -1504,6 +1578,76 @@ fn definition(node: Node<'_>, path: &str, source: &str) -> Option<Definition> {
             end: node.end_byte(),
         },
     })
+}
+
+fn heritage(node: Node<'_>, source: &str) -> Vec<Heritage> {
+    let mut bases = Vec::new();
+    let mut push = |base: Node<'_>, type_position: bool| {
+        if let Some(target) = heritage_target(base, source) {
+            bases.push(Heritage {
+                call: Call {
+                    source: None,
+                    byte: base.start_byte(),
+                    target,
+                    line: line_start(base),
+                },
+                type_position,
+            });
+        }
+    };
+    let mut cursor = node.walk();
+    for clause in node.named_children(&mut cursor) {
+        let mut inner = clause.walk();
+        match clause.kind() {
+            "class_heritage" => {
+                for child in clause.named_children(&mut clause.walk()) {
+                    match child.kind() {
+                        "extends_clause" => {
+                            for value in child.children_by_field_name("value", &mut inner) {
+                                push(value, false);
+                            }
+                        }
+                        "implements_clause" => {
+                            for interface in child.named_children(&mut inner) {
+                                push(interface, true);
+                            }
+                        }
+                        _ => push(child, false),
+                    }
+                }
+            }
+            "extends_type_clause" => {
+                for base in clause.children_by_field_name("type", &mut inner) {
+                    push(base, true);
+                }
+            }
+            _ => {}
+        }
+    }
+    bases
+}
+
+fn heritage_target(node: Node<'_>, source: &str) -> Option<CallTarget> {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            Some(CallTarget::Identifier(text(node, source).to_owned()))
+        }
+        "generic_type" => heritage_target(node.child_by_field_name("name")?, source),
+        "member_expression" | "nested_type_identifier" => {
+            let (object, property) = if node.kind() == "member_expression" {
+                ("object", "property")
+            } else {
+                ("module", "name")
+            };
+            let object = node.child_by_field_name(object)?;
+            let property = node.child_by_field_name(property)?;
+            (object.kind() == "identifier").then(|| CallTarget::Member {
+                object: text(object, source).to_owned(),
+                property: text(property, source).to_owned(),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn method_resolution(node: Node<'_>) -> Option<MethodResolution> {
@@ -3247,6 +3391,91 @@ it("works", () => direct());
                 .any(|node| node.key == reference.source_key && node.name == source)
                 && reference.keys.iter().any(|candidate| candidate == key)
         })
+    }
+
+    fn heritage(path: &str, language: StoredLanguage, text: &str) -> Vec<(String, String)> {
+        let mut graph = Graph::default();
+        let source = Source {
+            path: path.to_owned(),
+            text: text.to_owned(),
+        };
+        add_file(&mut graph, &source, language, &mut ScriptParsers::default()).unwrap();
+        graph
+            .trait_implementations
+            .into_iter()
+            .map(|relation| (relation.implementor_key, relation.trait_key))
+            .collect()
+    }
+
+    #[test]
+    fn records_class_and_interface_heritage() {
+        let pair = |implementor: &str, base: &str| (implementor.to_owned(), base.to_owned());
+        assert_eq!(
+            heritage(
+                "src/a.js",
+                StoredLanguage::JavaScript,
+                r#"
+const { Model } = require("./model");
+class Base {}
+class Child extends Base {}
+class Sub extends Model {}
+class Mixed extends mixin(Base) {}
+"#,
+            ),
+            [
+                pair("script:type:src/a::Child", "script:value:src/a::Base"),
+                pair(
+                    "script:type:src/a::Sub",
+                    "script:export-value:src/model::Model"
+                ),
+            ]
+        );
+        assert_eq!(
+            heritage(
+                "src/child.ts",
+                StoredLanguage::TypeScript,
+                r#"
+import { Base, Shape } from "./base";
+import type { Named } from "./types";
+import * as models from "./models";
+interface Local {}
+interface Wide extends Local, Named<string> {}
+export class Child extends Base implements Shape, Named {}
+class Generic extends models.Model<number> implements models.Entity {}
+class Mixed extends mixin(Base) {}
+"#,
+            ),
+            [
+                pair(
+                    "script:type:src/child::Wide",
+                    "script:type:src/child::Local"
+                ),
+                pair(
+                    "script:type:src/child::Wide",
+                    "script:export-type:src/types::Named"
+                ),
+                pair(
+                    "script:type:src/child::Child",
+                    "script:export-value:src/base::Base"
+                ),
+                pair(
+                    "script:type:src/child::Child",
+                    "script:export-type:src/base::Shape"
+                ),
+                pair(
+                    "script:type:src/child::Child",
+                    "script:export-type:src/types::Named"
+                ),
+                pair(
+                    "script:type:src/child::Generic",
+                    "script:export-value:src/models::Model"
+                ),
+                pair(
+                    "script:type:src/child::Generic",
+                    "script:export-type:src/models::Entity"
+                ),
+            ]
+        );
     }
 
     #[test]

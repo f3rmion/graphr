@@ -2305,6 +2305,58 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
 }
 
 #[test]
+fn javascript_typescript_class_heritage_renders_impl_relations_over_mcp() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/base.ts"),
+        "export class Base {}\nexport interface Shape { area(): number }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/child.ts"),
+        "import { Base, Shape } from \"./base\";\n\nexport class Child extends Base implements Shape {\n    area() { return 1; }\n}\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+
+    index_repository(&fixture.path);
+    assert_eq!(
+        trait_implementation_count(&fixture.path, "Child", "Base"),
+        1
+    );
+    assert_eq!(
+        trait_implementation_count(&fixture.path, "Child", "Shape"),
+        1
+    );
+
+    let mut client = Client::start(&fixture.path);
+    for (query, relation, related) in [
+        ("Child", "implements ->", ["Base", "Shape"].as_slice()),
+        ("Base", "impl <-", ["Child"].as_slice()),
+    ] {
+        let search = response_text(&client.search(query, Some("type")));
+        let node_ref = search
+            .lines()
+            .find(|line| line.contains(&format!(" Type {query} ")))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let view = client.view(node_ref, 2, 30);
+        for related in related {
+            assert!(
+                view.lines()
+                    .any(|line| line.contains(relation) && line.contains(related)),
+                "{view}"
+            );
+        }
+    }
+    client.close();
+}
+
+#[test]
 fn script_class_member_calls_require_callable_static_methods() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
