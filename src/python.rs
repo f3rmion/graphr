@@ -28,6 +28,7 @@ struct Definition {
     line_end: usize,
     signature: String,
     bases: Vec<String>,
+    first_parameter: Option<String>,
 }
 
 struct Import {
@@ -143,6 +144,7 @@ impl PythonParser {
                         line_end: line_end(coverage),
                         signature: signature(node, source),
                         bases: base_names(node, source),
+                        first_parameter: None,
                     });
                     scopes.push(Scope {
                         end_byte: node.end_byte(),
@@ -166,6 +168,7 @@ impl PythonParser {
                         line_end: line_end(coverage),
                         signature: signature(node, source),
                         bases: Vec::new(),
+                        first_parameter: first_parameter(node, source),
                     });
                     scopes.push(Scope {
                         end_byte: node.end_byte(),
@@ -325,6 +328,27 @@ pub fn add_file(
         imports: import_bindings(&parsed, &target)?,
         values,
     };
+    let base_key = |class: &Definition, base: &str| {
+        let (head, rest) = base.split_once('.').unwrap_or((base, ""));
+        let call = Call {
+            source: class.parent,
+            target: head.to_owned(),
+            bare: true,
+            line: class.line_start,
+        };
+        let keys = call_keys(
+            &call,
+            &parsed.definitions,
+            &paths,
+            &target,
+            &bindings,
+            &available,
+        );
+        let [key] = keys.as_slice() else {
+            return None;
+        };
+        Some(join(key, &rest.replace('.', "::")))
+    };
     for import in &parsed.imports {
         let source_key = import
             .source
@@ -372,6 +396,16 @@ pub fn add_file(
                 &bindings,
                 &available,
             )
+        } else if let Some((class, name)) = self_call(call, &parsed.definitions) {
+            std::iter::once(item_key(&join(&paths[class], name)))
+                .chain(
+                    parsed.definitions[class]
+                        .bases
+                        .iter()
+                        .filter_map(|base| base_key(&parsed.definitions[class], base))
+                        .map(|base| join(&base, name)),
+                )
+                .collect()
         } else {
             Vec::new()
         };
@@ -404,22 +438,7 @@ pub fn add_file(
     }
     for (local, definition) in parsed.definitions.iter().enumerate() {
         for base in &definition.bases {
-            let (head, rest) = base.split_once('.').unwrap_or((base, ""));
-            let call = Call {
-                source: definition.parent,
-                target: head.to_owned(),
-                bare: true,
-                line: definition.line_start,
-            };
-            let keys = call_keys(
-                &call,
-                &parsed.definitions,
-                &paths,
-                &target,
-                &bindings,
-                &available,
-            );
-            let [key] = keys.as_slice() else {
+            let Some(trait_key) = base_key(definition, base) else {
                 continue;
             };
             graph.trait_implementations.push(TraitImplementationInput {
@@ -427,7 +446,7 @@ pub fn add_file(
                 line_start: to_u32(definition.line_start)?,
                 line_end: to_u32(definition.line_end)?,
                 implementor_key: item_key(&paths[local]),
-                trait_key: join(key, &rest.replace('.', "::")),
+                trait_key,
             });
         }
     }
@@ -485,6 +504,21 @@ fn import_bindings(parsed: &ParsedFile, target: &PythonTarget) -> Result<ImportB
     Ok(bindings)
 }
 
+/// `self.name()`/`cls.name()` inside a class method, where the receiver is the
+/// method's own first parameter; returns the enclosing class and member name.
+fn self_call<'call>(call: &'call Call, definitions: &[Definition]) -> Option<(usize, &'call str)> {
+    let method = definitions.get(call.source?)?;
+    let class = method
+        .parent
+        .filter(|class| definitions[*class].kind == DefinitionKind::Type)?;
+    let (receiver, name) = call.target.split_once('.')?;
+    let member = !name.is_empty() && name.chars().all(|c| c == '_' || c.is_alphanumeric());
+    (matches!(receiver, "self" | "cls")
+        && method.first_parameter.as_deref() == Some(receiver)
+        && member)
+        .then_some((class, name))
+}
+
 fn call_keys(
     call: &Call,
     definitions: &[Definition],
@@ -493,8 +527,8 @@ fn call_keys(
     bindings: &Bindings,
     available: &HashSet<String>,
 ) -> Vec<String> {
-    // ponytail: bare calls cover the measured Python corpus; add attribute
-    // resolution only when static receiver evidence can keep it precise.
+    // ponytail: bare calls plus `self.name()`/`cls.name()` in methods cover the
+    // measured Python corpus; add other receivers only with static type evidence.
     let name = call.target.as_str();
     for scope in call
         .source
@@ -767,6 +801,17 @@ fn base_names(node: Node<'_>, source: &str) -> Vec<String> {
         .collect()
 }
 
+/// Plain or annotated first parameter name; other parameter shapes are skipped.
+fn first_parameter(node: Node<'_>, source: &str) -> Option<String> {
+    let first = node.child_by_field_name("parameters")?.named_child(0)?;
+    let name = match first.kind() {
+        "identifier" => first,
+        "typed_parameter" => first.named_child(0)?,
+        _ => return None,
+    };
+    Some(text(name, source).to_owned())
+}
+
 fn field_text<'source>(node: Node<'_>, field: &str, source: &'source str) -> Option<&'source str> {
     let value = text(node.child_by_field_name(field)?, source);
     (!value.is_empty()).then_some(value)
@@ -958,7 +1003,7 @@ def broken(
         );
     }
 
-    fn inheritance(path: &str, text: &str) -> Vec<(String, String)> {
+    fn graph_of(path: &str, text: &str) -> Graph {
         let source = Source {
             path: path.into(),
             text: text.into(),
@@ -976,10 +1021,90 @@ def broken(
         });
         add_file(&mut graph, &source, &mut PythonParser::new().unwrap()).unwrap();
         graph
+    }
+
+    fn inheritance(path: &str, text: &str) -> Vec<(String, String)> {
+        graph_of(path, text)
             .trait_implementations
             .into_iter()
             .map(|row| (row.implementor_key, row.trait_key))
             .collect()
+    }
+
+    #[test]
+    fn keys_self_and_cls_calls_to_class_then_base_members() {
+        let graph = graph_of(
+            "pkg/app.py",
+            r#"from pkg.base import Remote
+
+class Base:
+    def run(self):
+        return self.step()
+
+    def step(self):
+        other.step()
+        self.a.b()
+        def inner(self):
+            self.step()
+
+    def helper(self):
+        pass
+
+    @classmethod
+    def build(cls):
+        return cls.make()
+
+    @classmethod
+    def make(cls):
+        pass
+
+class Child(Base, Remote):
+    def go(self):
+        return self.helper()
+"#,
+        );
+        let name_of = |key: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.key == key)
+                .map(|node| node.name.as_str())
+                .unwrap()
+        };
+        let item = |path: &str| format!("python:item:{path}");
+        let calls = graph
+            .refs
+            .iter()
+            .filter(|reference| reference.kind == RefKind::Calls)
+            .map(|reference| (name_of(&reference.source_key), reference.keys.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls,
+            [
+                ("run", vec![item("pkg::app::Base::step")]),
+                ("build", vec![item("pkg::app::Base::make")]),
+                (
+                    "go",
+                    vec![
+                        item("pkg::app::Child::helper"),
+                        item("pkg::app::Base::helper"),
+                        item("pkg::base::Remote::helper"),
+                    ]
+                ),
+            ]
+        );
+        for key in [item("pkg::app::Base::step"), item("pkg::app::Base::make")] {
+            assert!(graph.nodes.iter().any(|node| node.keys.contains(&key)));
+        }
+        assert_eq!(
+            graph
+                .gaps
+                .iter()
+                .filter(|gap| gap.reason == GapReason::DynamicOrUnsupportedDispatch)
+                .filter_map(|gap| gap.target_hint.as_deref())
+                .collect::<Vec<_>>(),
+            ["other.step", "self.a.b", "self.step"]
+        );
     }
 
     #[test]
