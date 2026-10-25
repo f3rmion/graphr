@@ -25,7 +25,7 @@ worktrees. Authorization is only a boundary: every operation still names the
 exact canonical worktree it intends to use. Graphr never selects the server's
 current checkout or falls back to another allowed root.
 
-Graphr exposes seven MCP tools:
+Graphr exposes nine MCP tools:
 
 - `inspect_root` cheaply authorizes an explicit worktree and returns its Git
   identity and status without indexing.
@@ -33,8 +33,8 @@ Graphr exposes seven MCP tools:
   worktree, range, target, and dependency mode.
 - `index_status` reports progress and returns the completed `snapshot_id`.
 - `cancel_index` requests cooperative cancellation of a job.
-- `search`, `view`, and `changes` query one required `snapshot_id`; there is no
-  default snapshot.
+- `search`, `view`, `impact`, `path`, and `changes` query one required
+  `snapshot_id`; there is no default snapshot.
 
 ## Snapshot workflow
 
@@ -67,7 +67,20 @@ Query only the completed snapshot:
 changes({"snapshot_id": "<digest>", "depth": 6, "max_nodes": 50})
 search({"snapshot_id": "<digest>", "query": "AuditRecord", "limit": 10})
 view({"snapshot_id": "<digest>", "node_ref": "<opaque>", "depth": 6, "max_nodes": 50})
+impact({"snapshot_id": "<digest>", "node_ref": "<opaque>", "depth": 3, "max_nodes": 30})
+path({"snapshot_id": "<digest>", "from_ref": "<opaque>", "to_ref": "<opaque>", "max_hops": 6, "direction": "forward"})
 ```
+
+`impact` lists what reaches a node in reverse, breadth first: `caller <-`,
+`test <-`, `importer <-`, `impl <-`, and `dispatch <-` (a supertype member that
+the node overrides). `path` returns the shortest static route between two nodes
+as `path hops=N direction=forward|any` followed by one line per hop
+(`call ->`, `test-call ->`, `import ->`, `implements ->`, `dispatch ->`, or the
+reverse labels when `direction` is `any`), or
+`no path within max_hops=N direction=...` when none exists inside the bound.
+Ties resolve to the lowest node ids. Both answer from one in-memory adjacency
+built on first use per snapshot; on a 911-file C++ snapshot the first call took
+24 ms and later calls about 0.3 ms. `[truncated]` marks bounded output.
 
 Review is the default. For one complete bounded DOT change-impact graph, opt in:
 
