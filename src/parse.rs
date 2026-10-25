@@ -570,13 +570,94 @@ fn binding_type(mut node: Node<'_>, source: &str) -> Option<String> {
     while node.kind() == "reference_type" {
         node = node.child_by_field_name("type")?;
     }
+    if matches!(node.kind(), "dynamic_type" | "abstract_type") {
+        node = node.child_by_field_name("trait")?;
+    }
+    if node.kind() == "type_identifier"
+        && let Some(bound) = single_trait_bound(node, source)
+    {
+        node = bound;
+    }
+    nominal_type(node)
+        .then(|| text(node, source).trim())
+        .filter(|target| !target.is_empty() && target.len() <= PATH_LIMIT)
+        .map(str::to_owned)
+}
+
+fn nominal_type(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
         "type_identifier" | "scoped_type_identifier" | "generic_type"
     )
-    .then(|| text(node, source).trim())
-    .filter(|target| !target.is_empty() && target.len() <= PATH_LIMIT)
-    .map(str::to_owned)
+}
+
+/// The one non-marker trait bounding the innermost generic parameter named
+/// like `parameter`, from `<S: Trait>` or `where S: Trait`. Several candidate
+/// traits stay unresolved rather than guessing which one owns the method.
+fn single_trait_bound<'tree>(parameter: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    const MARKERS: [&str; 5] = ["Send", "Sync", "Unpin", "Copy", "Sized"];
+    let name = text(parameter, source);
+    let mut scope = parameter.parent();
+    let mut bounds: Vec<Node<'tree>> = Vec::new();
+    while let Some(item) = scope {
+        scope = item.parent();
+        if !matches!(
+            item.kind(),
+            "function_item" | "function_signature_item" | "impl_item" | "trait_item"
+        ) {
+            continue;
+        }
+        let mut declared = false;
+        let mut cursor = item.walk();
+        for child in item.named_children(&mut cursor) {
+            let mut inner = child.walk();
+            let constraints = match child.kind() {
+                "type_parameters" => child
+                    .named_children(&mut inner)
+                    .filter(|parameter| parameter.kind() == "type_parameter")
+                    .filter(|parameter| {
+                        parameter
+                            .child_by_field_name("name")
+                            .is_some_and(|node| text(node, source) == name)
+                    })
+                    .collect::<Vec<_>>(),
+                "where_clause" => child
+                    .named_children(&mut inner)
+                    .filter(|predicate| {
+                        predicate.child_by_field_name("left").is_some_and(|node| {
+                            node.kind() == "type_identifier" && text(node, source) == name
+                        })
+                    })
+                    .collect(),
+                _ => continue,
+            };
+            declared |= child.kind() == "type_parameters" && !constraints.is_empty();
+            for constraint in constraints {
+                let Some(trait_bounds) = constraint.child_by_field_name("bounds") else {
+                    continue;
+                };
+                let mut cursor = trait_bounds.walk();
+                for bound in trait_bounds.named_children(&mut cursor) {
+                    let bound_text = text(bound, source).trim();
+                    if nominal_type(bound)
+                        && !MARKERS.contains(&bound_text)
+                        && !bounds
+                            .iter()
+                            .any(|known| text(*known, source).trim() == bound_text)
+                    {
+                        bounds.push(bound);
+                    }
+                }
+            }
+        }
+        if declared {
+            return match bounds.as_slice() {
+                [bound] => Some(*bound),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 fn flatten_use(
@@ -1055,5 +1136,36 @@ mod tests {
         assert!(parsed.bindings.iter().any(|binding| {
             binding.name == "other" && binding.type_target.as_deref() == Some("Item")
         }));
+    }
+
+    #[test]
+    fn types_trait_receivers_by_their_single_bound() {
+        let parsed = RustParser::new()
+            .unwrap()
+            .parse(
+                "fn a<W, M, T, G>(d: &dyn Store, i: impl Store, g: &G, w: W, m: M, two: T, s: S, c: C) where W: Store, M: Store + Send + Sync, T: Store + Other, C: Store {}\nfn b<G: Store, S: Store>() {}\nimpl<V: Store> Wrap<V> { fn c(&self, v: &V) {} }\nstruct S;\n",
+            )
+            .unwrap();
+        let types = parsed
+            .bindings
+            .iter()
+            .map(|binding| (binding.name.as_str(), binding.type_target.as_deref()))
+            .collect::<Vec<_>>();
+        for expected in [
+            ("d", Some("Store")),
+            ("i", Some("Store")),
+            ("w", Some("Store")),
+            ("m", Some("Store")),
+            ("two", Some("T")),
+            ("v", Some("Store")),
+        ] {
+            assert!(types.contains(&expected), "{expected:?} not in {types:?}");
+        }
+        for (name, unbound) in [("g", "G"), ("s", "S"), ("c", "C")] {
+            assert!(
+                types.contains(&(name, Some(unbound))),
+                "{name}: undeclared, unbounded, or concrete types keep their name: {types:?}"
+            );
+        }
     }
 }

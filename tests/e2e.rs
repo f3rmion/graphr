@@ -961,7 +961,7 @@ fn mixed_evidence_gaps_keep_completed_transport_distinct_from_partial_static_evi
     git_commit(&fixture.path, "mixed gap baseline");
     fs::write(
         fixture.path.join("src/lib.rs"),
-        "pub fn ambiguous() {}\npub fn ambiguous() {}\npub trait Runner { fn run(&self); }\npub fn resolved() {}\npub fn changed(value: &dyn Runner) {\n    resolved();\n    ambiguous();\n    value.run();\n    println!(\"macro boundary\");\n}\n",
+        "pub fn ambiguous() {}\npub fn ambiguous() {}\npub trait Runner { fn run(&self); }\npub fn resolved() {}\npub fn changed(values: Vec<&dyn Runner>) {\n    resolved();\n    ambiguous();\n    for value in values { value.run(); }\n    println!(\"macro boundary\");\n}\n",
     )
     .unwrap();
     fs::write(fixture.path.join("src/broken.rs"), "pub fn broken( {\n").unwrap();
@@ -1040,6 +1040,89 @@ fn mixed_evidence_gaps_keep_completed_transport_distinct_from_partial_static_evi
                 .any(|line| line.contains("test <-") && line.contains("Test exercise")),
         "{graph}"
     );
+    client.close();
+}
+
+#[test]
+fn override_dispatch_links_trait_and_template_method_flows() {
+    let rust = |value: u8| {
+        format!(
+            "pub trait Store {{\n    fn get(&self) -> u8;\n}}\npub struct Db;\nimpl Store for Db {{\n    fn get(&self) -> u8 {{ {value} }}\n}}\npub struct Cache;\nimpl Cache {{\n    pub fn get(&self) -> u8 {{ 0 }}\n}}\npub fn read_dyn(store: &dyn Store) -> u8 {{ store.get() }}\npub fn read_generic<S>(store: &S) -> u8 where S: Store {{ store.get() }}\npub fn read_cache(cache: &Cache) -> u8 {{ cache.get() }}\n#[test]\nfn reads_through_trait() {{ read_dyn(&Db); }}\n"
+        )
+    };
+    let child = |value: u8| {
+        format!(
+            "import {{ Base }} from './base.js';\nexport class Child extends Base {{\n  step() {{ return {value}; }}\n}}\n"
+        )
+    };
+    let shape = |value: u8| {
+        format!(
+            "class Shape {{\n public:\n  int area() {{ return this->scale(); }}\n  virtual int scale() {{ return 1; }}\n}};\nclass Square : public Shape {{\n public:\n  int scale() override {{ return {value}; }}\n}};\n"
+        )
+    };
+    let shapes = |value: u8| {
+        format!(
+            "class Base:\n    def run(self):\n        return self.step()\n    def step(self):\n        return 1\nclass Child(Base):\n    def step(self):\n        return {value}\n"
+        )
+    };
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(fixture.path.join("src/lib.rs"), rust(1)).unwrap();
+    fs::write(
+        fixture.path.join("src/base.js"),
+        "export class Base {\n  run() { return this.step(); }\n  step() { return 1; }\n}\n",
+    )
+    .unwrap();
+    fs::write(fixture.path.join("src/child.js"), child(2)).unwrap();
+    fs::write(fixture.path.join("src/shape.hpp"), shape(2)).unwrap();
+    fs::write(fixture.path.join("src/shapes.py"), shapes(2)).unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git_commit(&fixture.path, "dispatch baseline");
+    fs::write(fixture.path.join("src/lib.rs"), rust(2)).unwrap();
+    fs::write(fixture.path.join("src/child.js"), child(3)).unwrap();
+    fs::write(fixture.path.join("src/shape.hpp"), shape(3)).unwrap();
+    fs::write(fixture.path.join("src/shapes.py"), shapes(3)).unwrap();
+
+    let mut client = Client::start(&fixture.path);
+    let snapshot_id = client.snapshot_id().to_owned();
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    let graph = change_section_text(&changes, "graph");
+    let flows = graph
+        .lines()
+        .filter(|line| line.starts_with("flow "))
+        .collect::<Vec<_>>();
+    for route in [
+        "read_dyn@src/lib.rs:12 -> get@src/lib.rs:2 ~> get@src/lib.rs:6",
+        "read_generic@src/lib.rs:13 -> get@src/lib.rs:2 ~> get@src/lib.rs:6",
+        "run@src/base.js:2 -> step@src/base.js:3 ~> step@src/child.js:3",
+        "area@src/shape.hpp:3 -> scale@src/shape.hpp:4 ~> scale@src/shape.hpp:8",
+        "run@src/shapes.py:2 -> step@src/shapes.py:4 ~> step@src/shapes.py:7",
+    ] {
+        assert!(
+            flows
+                .iter()
+                .any(|line| line.contains("dispatch_hops=1 ") && line.ends_with(route)),
+            "missing {route}: {graph}"
+        );
+    }
+    assert!(
+        !flows.iter().any(|line| line.contains("@src/lib.rs:10")),
+        "same-name method on an unrelated type must not be linked: {graph}"
+    );
+    let changed_get = graph
+        .lines()
+        .find(|line| line.contains("Function get src/lib.rs:6"))
+        .unwrap_or_else(|| panic!("missing changed override: {graph}"));
+    // Two trait callers reach the override only through dispatch: flow 0.25 +
+    // indirect test path 0.25 + fan-in tier for 2 callers 0.05.
+    assert!(
+        changed_get.contains("risk 0.5500 indirect-test-covered"),
+        "{changed_get}"
+    );
+
+    let dot = response_text(&client.changes_dot(6, 50));
+    assert!(dot.contains("[style=dotted]"), "{dot}");
     client.close();
 }
 

@@ -28,6 +28,8 @@ const DEPENDENCY_NEIGHBOR_SCAN_LIMIT: usize = 256;
 const FLOW_DEPTH: u32 = 15;
 const FLOW_SCAN_LIMIT: usize = 500;
 const FLOW_QUERY_LIMIT: usize = 5_000;
+/// Supertype hops followed when linking a method to the members it overrides.
+const DISPATCH_DEPTH: u32 = 16;
 const DOT_BUDGET: usize = 8 * 1024;
 const DOT_LABEL_PART_LIMIT: usize = 160;
 const TRUNCATED: &str = "[truncated]\n";
@@ -2120,6 +2122,8 @@ struct AffectedFlow {
     entry: FlowNode,
     nodes: Vec<FlowNode>,
     parents: HashMap<i64, i64>,
+    /// Nodes whose parent hop is supertype-member dispatch, not a resolved call.
+    dispatched: HashSet<i64>,
     changed: Vec<i64>,
     depth: u32,
     file_count: usize,
@@ -2580,11 +2584,11 @@ fn affected_entries(
             entries.push(current.clone());
         }
         if depth == FLOW_DEPTH {
-            omitted |= callers.iter().any(|node| !visited.contains(&node.id));
+            omitted |= callers.iter().any(|(node, _)| !visited.contains(&node.id));
             continue;
         }
 
-        for caller in callers {
+        for (caller, _) in callers {
             if visited.contains(&caller.id) {
                 continue;
             }
@@ -2623,6 +2627,7 @@ fn trace_flow(
 ) -> Result<(Option<AffectedFlow>, bool)> {
     let mut nodes = vec![entry.clone()];
     let mut parents = HashMap::new();
+    let mut dispatched = HashSet::new();
     let mut visited = HashSet::from([entry.id]);
     let mut dependency_packages = dependency_package(&entry.path)
         .map(|package| HashSet::from([package.to_owned()]))
@@ -2654,11 +2659,11 @@ fn trace_flow(
         )?;
         omitted |= more;
         if depth == FLOW_DEPTH {
-            omitted |= callees.iter().any(|node| !visited.contains(&node.id));
+            omitted |= callees.iter().any(|(node, _)| !visited.contains(&node.id));
             continue;
         }
 
-        for callee in callees {
+        for (callee, dispatch) in callees {
             if visited.contains(&callee.id) {
                 continue;
             }
@@ -2682,6 +2687,9 @@ fn trace_flow(
             }
             visited.insert(callee.id);
             parents.insert(callee.id, current.id);
+            if dispatch {
+                dispatched.insert(callee.id);
+            }
             depth_reached = depth_reached.max(depth + 1);
             nodes.push(callee.clone());
             queue.push_back((callee, depth + 1));
@@ -2702,6 +2710,7 @@ fn trace_flow(
             entry,
             nodes,
             parents,
+            dispatched,
             changed,
             depth: depth_reached,
             file_count,
@@ -2743,17 +2752,31 @@ fn load_flow_nodes(connection: &Connection, ids: &[i64]) -> Result<Vec<FlowNode>
         .collect()
 }
 
+/// Resolved `CALLS` neighbors plus same-name members of transitive supertypes
+/// (incoming) or subtypes (outgoing); the flag marks dispatch-only hops.
 fn load_flow_neighbors(
     connection: &Connection,
     id: i64,
     incoming: bool,
     limit: usize,
     dependency_mode: DependencyMode,
-) -> Result<(Vec<FlowNode>, bool)> {
-    let (neighbor, source, kind) = if incoming {
-        ("source_id", "target_id", " AND n.kind='function'")
+) -> Result<(Vec<(FlowNode, bool)>, bool)> {
+    let (neighbor, source, kind, near, far) = if incoming {
+        (
+            "source_id",
+            "target_id",
+            " AND n.kind='function'",
+            "resolved_implementor_id",
+            "resolved_trait_id",
+        )
     } else {
-        ("target_id", "source_id", "")
+        (
+            "target_id",
+            "source_id",
+            "",
+            "resolved_trait_id",
+            "resolved_implementor_id",
+        )
     };
     let fetch = limit
         .checked_add(1)
@@ -2765,15 +2788,34 @@ fn load_flow_neighbors(
         ""
     };
     let sql = format!(
-        "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start
-           FROM edges e JOIN nodes n ON n.id=e.{neighbor}
+        "WITH RECURSIVE related(type_id, hops) AS (
+             SELECT ti.{far}, 1 FROM nodes m
+               JOIN trait_implementations ti ON ti.{near}=m.parent_id
+              WHERE m.id=?1 AND m.kind='function' AND ti.{far} IS NOT NULL
+             UNION
+             SELECT ti.{far}, related.hops + 1 FROM related
+               JOIN trait_implementations ti ON ti.{near}=related.type_id
+              WHERE ti.{far} IS NOT NULL AND related.hops < {DISPATCH_DEPTH}
+         ),
+         neighbors(id, dispatch) AS (
+             SELECT e.{neighbor}, 0 FROM edges e WHERE e.{source}=?1 AND e.kind='CALLS'
+             UNION ALL
+             SELECT n.id, 1 FROM related JOIN nodes n ON n.parent_id=related.type_id
+              WHERE n.kind='function' AND n.id<>?1
+                AND n.name=(SELECT name FROM nodes WHERE id=?1)
+         )
+         SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start,
+                MIN(neighbors.dispatch)
+           FROM neighbors JOIN nodes n ON n.id=neighbors.id
            JOIN files f ON f.id=n.file_id
-          WHERE e.{source}=?1 AND e.kind='CALLS'{kind}{path_filter}
-          ORDER BY n.id LIMIT ?2"
+          WHERE 1{kind}{path_filter}
+          GROUP BY n.id ORDER BY n.id LIMIT ?2"
     );
     let mut statement = connection.prepare(&sql).map_err(db_error)?;
     let mut nodes = statement
-        .query_map(params![id, fetch], flow_node)
+        .query_map(params![id, fetch], |row| {
+            Ok((flow_node(row)?, row.get::<_, bool>(6)?))
+        })
         .map_err(db_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(db_error)?;
@@ -2802,7 +2844,8 @@ fn load_flow_neighbors(
         nodes.extend(
             dependencies
                 .into_iter()
-                .take(DEPENDENCY_NEIGHBOR_SCAN_LIMIT),
+                .take(DEPENDENCY_NEIGHBOR_SCAN_LIMIT)
+                .map(|node| (node, false)),
         );
         return Ok((nodes, more || dependencies_more));
     }
@@ -2914,18 +2957,41 @@ fn node_risk_counts(connection: &Connection, ids: &[i64]) -> Result<(NodeRiskCou
         .ok_or_else(|| "caller traversal limit overflow".to_owned())?;
     let sql = format!(
         "WITH RECURSIVE changed(id) AS (VALUES {values}),
+         type_supers(type_id, super_id, hops) AS (
+             SELECT resolved_implementor_id, resolved_trait_id, 1
+               FROM trait_implementations
+              WHERE resolved_implementor_id IS NOT NULL AND resolved_trait_id IS NOT NULL
+             UNION
+             SELECT type_supers.type_id, ti.resolved_trait_id, type_supers.hops + 1
+               FROM type_supers
+               JOIN trait_implementations ti ON ti.resolved_implementor_id=type_supers.super_id
+              WHERE ti.resolved_trait_id IS NOT NULL AND type_supers.hops < {DISPATCH_DEPTH}
+         ),
+         overrides(member_id, base_id) AS MATERIALIZED (
+             SELECT DISTINCT member.id, base.id FROM type_supers
+               JOIN nodes member ON member.parent_id=type_supers.type_id
+                                AND member.kind='function'
+               JOIN nodes base ON base.parent_id=type_supers.super_id
+                              AND base.kind='function' AND base.name=member.name
+         ),
          callers(changed_id, node_id) AS (
              SELECT id, id FROM changed
              UNION
              SELECT callers.changed_id AS changed_id, edges.source_id AS node_id
                FROM callers JOIN edges ON edges.target_id=callers.node_id
               WHERE edges.kind='CALLS'
+             UNION
+             SELECT callers.changed_id AS changed_id, overrides.base_id AS node_id
+               FROM callers JOIN overrides ON overrides.member_id=callers.node_id
               ORDER BY changed_id, node_id
               LIMIT {caller_limit}
          )
          SELECT changed.id,
-                (SELECT count(*) FROM edges
-                  WHERE target_id=changed.id AND kind='CALLS'),
+                (SELECT count(DISTINCT source_id) FROM edges
+                  WHERE kind='CALLS'
+                    AND (target_id=changed.id
+                         OR target_id IN (SELECT base_id FROM overrides
+                                           WHERE member_id=changed.id))),
                 (SELECT count(DISTINCT test.source_id)
                    FROM callers
                    JOIN edges test ON test.target_id=callers.node_id
@@ -4472,6 +4538,14 @@ fn flow_line(flow: &AffectedFlow, dependency_mode: DependencyMode) -> Result<Str
         flow.file_count,
         flow.changed.len()
     );
+    let dispatch_hops = route
+        .iter()
+        .skip(1)
+        .filter(|id| flow.dispatched.contains(id))
+        .count();
+    if dispatch_hops > 0 {
+        output.push_str(&format!("dispatch_hops={dispatch_hops} "));
+    }
     for (index, id) in route.into_iter().enumerate() {
         let node = flow
             .nodes
@@ -4496,7 +4570,11 @@ fn flow_line(flow: &AffectedFlow, dependency_mode: DependencyMode) -> Result<Str
         if !complete {
             return Err("affected flow line exceeds address space".into());
         }
-        let separator = if index == 0 { "" } else { " -> " };
+        let separator = match (index, flow.dispatched.contains(&id)) {
+            (0, _) => "",
+            (_, true) => " ~> ",
+            (_, false) => " -> ",
+        };
         output.push_str(separator);
         output.push_str(&step);
     }
@@ -4654,7 +4732,16 @@ fn render_change_dot(
     let mut selected_set = changed_ids.clone();
     let mut impact_ids = HashSet::new();
     let mut impact_order = Vec::new();
-    let mut edges = BTreeMap::<(i64, i64), bool>::new();
+    let dispatch_edges = analysis
+        .flows
+        .iter()
+        .flat_map(|flow| {
+            flow.dispatched
+                .iter()
+                .filter_map(|id| flow.parents.get(id).map(|parent| (*parent, *id)))
+        })
+        .collect::<HashSet<_>>();
+    let mut edges = BTreeMap::<(i64, i64), &'static str>::new();
     for path in paths {
         for id in path {
             if selected_set.insert(*id) {
@@ -4668,7 +4755,13 @@ fn render_change_dot(
             impact_order.push(*target);
         }
         for edge in path.windows(2) {
-            edges.insert((edge[0], edge[1]), false);
+            let edge = (edge[0], edge[1]);
+            let style = if dispatch_edges.contains(&edge) {
+                DOT_DISPATCH_EDGE
+            } else {
+                ""
+            };
+            edges.insert(edge, style);
         }
     }
 
@@ -4700,18 +4793,12 @@ fn render_change_dot(
                 if selected_set.contains(&caller) {
                     pending.push_back(caller);
                 }
-                edges
-                    .entry((caller, callee))
-                    .and_modify(|dashed| *dashed |= is_test_call)
-                    .or_insert(is_test_call);
+                set_call_edge_style(&mut edges, caller, callee, is_test_call);
             }
         }
         for &(caller, callee, is_test_call) in &calls.edges {
             if selected_set.contains(&caller) && selected_set.contains(&callee) {
-                edges
-                    .entry((caller, callee))
-                    .and_modify(|dashed| *dashed |= is_test_call)
-                    .or_insert(is_test_call);
+                set_call_edge_style(&mut edges, caller, callee, is_test_call);
             }
         }
     }
@@ -4791,16 +4878,27 @@ fn render_change_dot(
         };
         output.push_str(&format!("  n{} [style=filled, {}];\n", node.id, attributes));
     }
-    for ((caller, callee), dashed) in edges {
-        if dashed {
-            output.push_str(&format!("  n{caller} -> n{callee} [style=dashed];\n"));
-        } else {
-            output.push_str(&format!("  n{caller} -> n{callee};\n"));
-        }
+    for ((caller, callee), style) in edges {
+        output.push_str(&format!("  n{caller} -> n{callee}{style};\n"));
     }
     output.push_str("}\n");
     // ponytail: re-rendering is bounded to 50 nodes; stream with reserved bytes only if that cap grows.
     (output, calls_complete)
+}
+
+const DOT_TEST_EDGE: &str = " [style=dashed]";
+const DOT_DISPATCH_EDGE: &str = " [style=dotted]";
+
+fn set_call_edge_style(
+    edges: &mut BTreeMap<(i64, i64), &'static str>,
+    caller: i64,
+    callee: i64,
+    is_test_call: bool,
+) {
+    let style = edges.entry((caller, callee)).or_insert("");
+    if is_test_call {
+        *style = DOT_TEST_EDGE;
+    }
 }
 
 fn shorten(value: &str, limit: usize) -> Cow<'_, str> {
@@ -11566,6 +11664,7 @@ mod tests {
             entry: entry.clone(),
             nodes: vec![entry, changed, helper, dependency, dependency_internal],
             parents: HashMap::from([(2, 1), (3, 2), (4, 3), (5, 4)]),
+            dispatched: HashSet::new(),
             changed: vec![2],
             depth: 4,
             file_count: 4,
@@ -11611,6 +11710,7 @@ mod tests {
                     entry: left.clone(),
                     nodes: vec![left.clone(), merged.clone(), target.clone()],
                     parents: HashMap::from([(3, 1), (5, 3)]),
+                    dispatched: HashSet::new(),
                     changed: vec![5],
                     depth: 2,
                     file_count: 2,
@@ -11620,6 +11720,7 @@ mod tests {
                     entry: right.clone(),
                     nodes: vec![right, merged, target.clone()],
                     parents: HashMap::from([(3, 2), (5, 3)]),
+                    dispatched: HashSet::new(),
                     changed: vec![5],
                     depth: 2,
                     file_count: 1,
@@ -11825,6 +11926,7 @@ mod tests {
                 entry: caller.clone(),
                 nodes: vec![caller, affected],
                 parents: HashMap::from([(3, 2)]),
+                dispatched: HashSet::new(),
                 changed: vec![3],
                 depth: 1,
                 file_count: 2,
@@ -11872,6 +11974,7 @@ mod tests {
                 entry: affected.clone(),
                 nodes: vec![affected],
                 parents: HashMap::new(),
+                dispatched: HashSet::new(),
                 changed: vec![2],
                 depth: 0,
                 file_count: 1,
@@ -11992,6 +12095,7 @@ mod tests {
                     },
                 ],
                 parents: HashMap::from([(target_id, caller_id)]),
+                dispatched: HashSet::new(),
                 changed: vec![target_id],
                 depth: 1,
                 file_count: 2,
@@ -12051,6 +12155,7 @@ mod tests {
                     entry: caller.clone(),
                     nodes: vec![caller.clone(), target.clone()],
                     parents: HashMap::from([(target.id, caller.id)]),
+                    dispatched: HashSet::new(),
                     changed: vec![target.id],
                     depth: 1,
                     file_count: 2,

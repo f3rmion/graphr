@@ -224,9 +224,18 @@ symbols, affected static execution paths, and graph impact. `.cargo/vendor`
 changes collapse to deterministic package boundaries by default; select
 `dependency_mode="full"` while indexing to inspect dependency internals.
 
+For Rust, method calls on receivers typed `&dyn Trait`, `impl Trait`, or a
+generic parameter with exactly one non-marker trait bound resolve to the trait
+method. Several candidate traits leave the call unresolved.
+
+For Python, class bases, `self.method()` and `cls.method()` calls inside class
+methods resolve to the enclosing class member first, then the same member on
+each direct base. Other attribute receivers produce a dispatch gap.
+
 For JavaScript and TypeScript, graph semantics include definitions, ESM and
-CommonJS imports, direct re-exports, resolvable calls, conventional tests, and
-JSX component calls. Module resolution is limited to relative repository-local
+CommonJS imports, direct re-exports, resolvable calls, conventional tests,
+JSX component calls, class `extends`, TypeScript `implements`, and interface
+`extends`. Module resolution is limited to relative repository-local
 specifiers. There is no package or `tsconfig` resolution and no type checker;
 ambiguous module aliases produce no edge.
 
@@ -236,7 +245,11 @@ GoogleTest or Catch2/doctest test cases. Graphr does not preprocess source, read
 `compile_commands.json`, resolve system headers, instantiate templates, infer
 receiver types, or choose between overloads; ambiguous targets produce no edge.
 
-Affected-flow discovery follows `CALLS` edges up to 15 hops. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale. The caller component tiers direct production fan-in at 1, 2–3, 4–15, and 16 or more callers; 16 or more adds `high-fan-in` to the rationale. `test_path_confidence=heuristic` and `test_path_provenance=resolved-static-call-graph` describe bounded static evidence, not runtime test proof; community and churn factors are not used.
+Affected-flow discovery follows `CALLS` edges up to 15 hops. A method also
+reaches the same-name members of its type's transitive supertypes (trait
+implementations, base classes, `extends`/`implements`), so a call bound to a
+trait or base method can reach a changed override. Such hops render as ` ~> `,
+the flow line carries `dispatch_hops=N`, and DOT draws them dotted. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale. The caller component tiers direct production fan-in, including callers of overridden members, at 1, 2–3, 4–15, and 16 or more callers; 16 or more adds `high-fan-in` to the rationale. `test_path_confidence=heuristic` and `test_path_provenance=resolved-static-call-graph` describe bounded static evidence, not runtime test proof; community and churn factors are not used.
 
 Artifact text and semantics belong to the immutable snapshot. Non-symbol source
 ranges map to their indexed file node and are reported as `file-mapped`;
