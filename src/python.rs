@@ -6,7 +6,7 @@ use crate::git::Source;
 use crate::parse::{ParseGap, parser_no_tree_gaps, syntax_gaps};
 use crate::store::{
     GapCategory, GapInput, GapReason, Graph, NodeInput, NodeKind, RefInput, RefKind,
-    ResolutionState,
+    ResolutionState, TraitImplementationInput,
 };
 
 const PYTHON_QUERY: &str = include_str!("../queries/python.scm");
@@ -27,6 +27,7 @@ struct Definition {
     line_start: usize,
     line_end: usize,
     signature: String,
+    bases: Vec<String>,
 }
 
 struct Import {
@@ -141,6 +142,7 @@ impl PythonParser {
                         line_start: line_start(coverage),
                         line_end: line_end(coverage),
                         signature: signature(node, source),
+                        bases: base_names(node, source),
                     });
                     scopes.push(Scope {
                         end_byte: node.end_byte(),
@@ -163,6 +165,7 @@ impl PythonParser {
                         line_start: line_start(coverage),
                         line_end: line_end(coverage),
                         signature: signature(node, source),
+                        bases: Vec::new(),
                     });
                     scopes.push(Scope {
                         end_byte: node.end_byte(),
@@ -398,6 +401,35 @@ pub fn add_file(
             });
         }
         observed_relation_sites += 1;
+    }
+    for (local, definition) in parsed.definitions.iter().enumerate() {
+        for base in &definition.bases {
+            let (head, rest) = base.split_once('.').unwrap_or((base, ""));
+            let call = Call {
+                source: definition.parent,
+                target: head.to_owned(),
+                bare: true,
+                line: definition.line_start,
+            };
+            let keys = call_keys(
+                &call,
+                &parsed.definitions,
+                &paths,
+                &target,
+                &bindings,
+                &available,
+            );
+            let [key] = keys.as_slice() else {
+                continue;
+            };
+            graph.trait_implementations.push(TraitImplementationInput {
+                file_key: source.path.clone(),
+                line_start: to_u32(definition.line_start)?,
+                line_end: to_u32(definition.line_end)?,
+                implementor_key: item_key(&paths[local]),
+                trait_key: join(key, &rest.replace('.', "::")),
+            });
+        }
     }
     graph
         .files
@@ -710,6 +742,31 @@ fn definition_coverage(node: Node<'_>) -> Node<'_> {
         .unwrap_or(node)
 }
 
+/// Base class names from `class C(A, m.B, Generic[T], metaclass=M)`; keyword
+/// arguments and non-name expressions are skipped.
+fn base_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(arguments) = node.child_by_field_name("superclasses") else {
+        return Vec::new();
+    };
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .filter_map(|argument| {
+            let argument = if argument.kind() == "subscript" {
+                argument.child_by_field_name("value")?
+            } else {
+                argument
+            };
+            let mut name = argument;
+            while name.kind() == "attribute" {
+                name = name.child_by_field_name("object")?;
+            }
+            (name.kind() == "identifier")
+                .then(|| text(argument, source).split_whitespace().collect())
+        })
+        .collect()
+}
+
 fn field_text<'source>(node: Node<'_>, field: &str, source: &'source str) -> Option<&'source str> {
     let value = text(node.child_by_field_name(field)?, source);
     (!value.is_empty()).then_some(value)
@@ -898,6 +955,70 @@ def broken(
                 .bindings
                 .iter()
                 .any(|binding| binding.source == Some(3) && binding.name == "callback")
+        );
+    }
+
+    fn inheritance(path: &str, text: &str) -> Vec<(String, String)> {
+        let source = Source {
+            path: path.into(),
+            text: text.into(),
+        };
+        let mut graph = Graph::default();
+        graph.files.push(crate::store::FileInput {
+            path: source.path.clone(),
+            language: crate::git::Language::Python,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: "python".into(),
+            byte_size: source.text.len() as u64,
+            replace: true,
+            observed_relation_sites: 0,
+        });
+        add_file(&mut graph, &source, &mut PythonParser::new().unwrap()).unwrap();
+        graph
+            .trait_implementations
+            .into_iter()
+            .map(|row| (row.implementor_key, row.trait_key))
+            .collect()
+    }
+
+    #[test]
+    fn records_python_base_classes_with_call_keys() {
+        let rows = inheritance(
+            "pkg/app.py",
+            r#"import pkg.models
+import pkg.shapes as shapes
+from pkg.base import Base
+from pkg.base import Other as Alias
+from typing import Generic, TypeVar
+
+class Local:
+    pass
+
+class Child(Local, Base, metaclass=Meta):
+    pass
+
+class Aliased(Alias, shapes.Shape, pkg.models.Model, Generic[T], make()):
+    pass
+"#,
+        );
+
+        let row = |implementor: &str, base: &str| {
+            (
+                format!("python:item:pkg::app::{implementor}"),
+                format!("python:item:{base}"),
+            )
+        };
+        assert_eq!(
+            rows,
+            [
+                row("Child", "pkg::app::Local"),
+                row("Child", "pkg::base::Base"),
+                row("Aliased", "pkg::base::Other"),
+                row("Aliased", "pkg::shapes::Shape"),
+                row("Aliased", "pkg::models::Model"),
+                row("Aliased", "typing::Generic"),
+            ]
         );
     }
 }

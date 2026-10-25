@@ -1472,6 +1472,50 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
 }
 
 #[test]
+fn python_class_inheritance_renders_impl_relations_over_mcp() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src/shapes")).unwrap();
+    fs::write(fixture.path.join("src/shapes/__init__.py"), "").unwrap();
+    fs::write(
+        fixture.path.join("src/shapes/base.py"),
+        "class Base:\n    def area(self):\n        return 0\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/shapes/square.py"),
+        "from shapes.base import Base\n\nclass Square(Base, metaclass=type):\n    def area(self):\n        return 1\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+
+    index_repository(&fixture.path);
+    assert_eq!(
+        trait_implementation_count(&fixture.path, "Square", "Base"),
+        1
+    );
+
+    let mut client = Client::start(&fixture.path);
+    for (query, relation, related) in [
+        ("Square", "implements ->", "Base"),
+        ("Base", "impl <-", "Square"),
+    ] {
+        let search = response_text(&client.search(query, Some("type")));
+        let node_ref = search
+            .lines()
+            .find(|line| line.contains(&format!(" Type {query} ")))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let view = client.view(node_ref, 2, 30);
+        assert!(view.contains(relation), "{view}");
+        assert!(view.contains(related), "{view}");
+    }
+    client.close();
+}
+
+#[test]
 fn cpp_index_search_view_and_changes_over_mcp() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
