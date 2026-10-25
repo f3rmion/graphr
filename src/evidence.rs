@@ -13,6 +13,8 @@ pub const ARTIFACT_LIMIT: u64 = 2 * 1024 * 1024;
 pub const COVERAGE_LIMIT: u64 = 64 * 1024 * 1024;
 pub const GENERATED_LIMIT: usize = 64;
 pub const COVERAGE_REPORT_LIMIT: usize = 8;
+pub const SCIP_LIMIT: u64 = 64 * 1024 * 1024;
+pub const SCIP_INDEX_LIMIT: usize = 4;
 pub const EVIDENCE_TOTAL_LIMIT: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -58,6 +60,7 @@ pub struct CapturedEvidence {
     pub manifest: CapturedArtifact,
     pub generated: Vec<CapturedGenerated>,
     pub coverage: Vec<CapturedCoverage>,
+    pub scip: Vec<CapturedArtifact>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +113,13 @@ struct ManifestCoverage {
     test_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(deny_unknown_fields)]
+struct ManifestScip {
+    path: String,
+    blake3: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
@@ -117,6 +127,8 @@ struct Manifest {
     source_snapshot_id: String,
     generated: Vec<ManifestGenerated>,
     coverage: Vec<ManifestCoverage>,
+    #[serde(default)]
+    scip: Vec<ManifestScip>,
 }
 
 pub(crate) struct EvidenceManifest {
@@ -124,6 +136,7 @@ pub(crate) struct EvidenceManifest {
     manifest: CapturedArtifact,
     generated: Vec<ManifestGenerated>,
     coverage: Vec<ManifestCoverage>,
+    scip: Vec<ManifestScip>,
 }
 
 impl EvidenceManifest {
@@ -146,6 +159,7 @@ impl EvidenceManifest {
                     .map(|generated| generated.output.path.clone()),
             )
             .chain(self.coverage.iter().map(|coverage| coverage.path.clone()))
+            .chain(self.scip.iter().map(|scip| scip.path.clone()))
             .collect()
     }
 
@@ -239,11 +253,28 @@ impl EvidenceManifest {
                 test_name: declaration.test_name,
             });
         }
+        let mut scip = Vec::with_capacity(self.scip.len());
+        for declaration in self.scip {
+            let bytes = capture_evidence_file(root, &declaration.path, SCIP_LIMIT, cancelled)?;
+            let content_hash = *blake3::hash(&bytes).as_bytes();
+            if content_hash != parse_digest(&declaration.blake3)? {
+                return Err(invalid("SCIP index digest does not match"));
+            }
+            let index = CapturedArtifact {
+                path: declaration.path,
+                content_hash,
+                bytes,
+            };
+            record_unique(&mut unique, &index)?;
+            charge_retained(&mut retained, &index)?;
+            scip.push(index);
+        }
         Ok(CapturedEvidence {
             source_snapshot_id: self.source_snapshot_id,
             manifest: self.manifest,
             generated,
             coverage,
+            scip,
         })
     }
 }
@@ -270,6 +301,9 @@ pub(crate) fn capture_manifest(
     if value.coverage.len() > COVERAGE_REPORT_LIMIT {
         return Err(invalid("evidence manifest has too many coverage reports"));
     }
+    if value.scip.len() > SCIP_INDEX_LIMIT {
+        return Err(invalid("evidence manifest has too many SCIP indexes"));
+    }
     for generated in &value.generated {
         validate_artifact_span(&generated.input, false)?;
         validate_source_span(&generated.generator)?;
@@ -282,6 +316,10 @@ pub(crate) fn capture_manifest(
         if let Some(test_name) = &coverage.test_name {
             validate_label(test_name)?;
         }
+    }
+    for scip in &value.scip {
+        let _ = safe_str_path(&scip.path)?;
+        let _ = parse_digest(&scip.blake3)?;
     }
     value.generated.sort_unstable();
     if value.generated.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -300,6 +338,14 @@ pub(crate) fn capture_manifest(
             "evidence manifest contains a duplicate coverage run",
         ));
     }
+    value.scip.sort_unstable();
+    if value
+        .scip
+        .windows(2)
+        .any(|pair| pair[0].path == pair[1].path)
+    {
+        return Err(invalid("evidence manifest contains a duplicate SCIP index"));
+    }
     Ok(EvidenceManifest {
         source_snapshot_id: value.source_snapshot_id,
         manifest: CapturedArtifact {
@@ -309,6 +355,7 @@ pub(crate) fn capture_manifest(
         },
         generated: value.generated,
         coverage: value.coverage,
+        scip: value.scip,
     })
 }
 
@@ -898,6 +945,92 @@ mod tests {
                 .capture(&root, &inputs, &AtomicBool::new(false))
                 .is_err()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_captures_scip_indexes_and_rejects_bad_digests_counts_and_duplicates() {
+        let root = fixture("scip");
+        let index = b"\x12\x00".to_vec();
+        fs::write(root.join("index.scip"), &index).unwrap();
+        let digest = blake3::hash(&index).to_hex().to_string();
+        let manifest = |scip: rmcp::serde_json::Value| {
+            rmcp::serde_json::json!({
+                "format_version": 1,
+                "source_snapshot_id": "a".repeat(64),
+                "generated": [],
+                "coverage": [],
+                "scip": scip
+            })
+            .to_string()
+        };
+        write_manifest(
+            &root,
+            &manifest(rmcp::serde_json::json!([{"path": "index.scip", "blake3": digest}])),
+        );
+        let captured =
+            capture_manifest(&root, Path::new("evidence.json"), &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            captured.evidence_only_paths(),
+            BTreeSet::from(["evidence.json".to_owned(), "index.scip".to_owned()])
+        );
+        let captured = captured
+            .capture(&root, &BTreeMap::new(), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(captured.scip.len(), 1);
+        assert_eq!(captured.scip[0].bytes, index);
+
+        write_manifest(
+            &root,
+            &manifest(rmcp::serde_json::json!([{"path": "index.scip", "blake3": "b".repeat(64)}])),
+        );
+        let Err(error) =
+            capture_manifest(&root, Path::new("evidence.json"), &AtomicBool::new(false))
+                .unwrap()
+                .capture(&root, &BTreeMap::new(), &AtomicBool::new(false))
+        else {
+            panic!("SCIP index with a mismatched digest was accepted");
+        };
+        assert_eq!(error.message, "SCIP index digest does not match");
+
+        for (scip, message) in [
+            (
+                rmcp::serde_json::Value::Array(
+                    (0..=SCIP_INDEX_LIMIT)
+                        .map(|index| {
+                            rmcp::serde_json::json!({
+                                "path": format!("index-{index}.scip"),
+                                "blake3": digest,
+                            })
+                        })
+                        .collect(),
+                ),
+                "evidence manifest has too many SCIP indexes",
+            ),
+            (
+                rmcp::serde_json::json!([
+                    {"path": "index.scip", "blake3": digest},
+                    {"path": "index.scip", "blake3": "b".repeat(64)}
+                ]),
+                "evidence manifest contains a duplicate SCIP index",
+            ),
+            (
+                rmcp::serde_json::json!([{"path": "../index.scip", "blake3": digest}]),
+                "evidence path is unsafe",
+            ),
+            (
+                rmcp::serde_json::json!([{"path": "index.scip", "blake3": digest, "x": 1}]),
+                "evidence manifest is invalid",
+            ),
+        ] {
+            write_manifest(&root, &manifest(scip));
+            let Err(error) =
+                capture_manifest(&root, Path::new("evidence.json"), &AtomicBool::new(false))
+            else {
+                panic!("invalid SCIP declaration was accepted: {message}");
+            };
+            assert_eq!(error.message, message);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

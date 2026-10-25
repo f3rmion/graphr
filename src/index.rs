@@ -240,7 +240,7 @@ impl Engine {
                 &evidence.source_snapshot_id,
                 manifest_digest,
                 artifacts,
-                4,
+                5,
                 CACHE_FORMAT_VERSION,
                 GRAPH_ANALYZER_VERSION,
                 crate::store::SCHEMA_VERSION,
@@ -366,7 +366,10 @@ impl Engine {
                     .is_none()
                     .then_some(candidates)
                     .into_iter()
-                    .flatten(),
+                    .flatten()
+                    // Evidence images carry imported artifacts and SCIP
+                    // resolutions that a source-only image must not inherit.
+                    .filter(|entry| entry.provenance.evidence_manifest_digest.is_none()),
             );
             let seeded = self.copy_first_seed(
                 &job,
@@ -409,6 +412,20 @@ impl Engine {
                 let evidence_stats = store
                     .replace_evidence(generated_graph, &evidence_input, cancelled)
                     .map_err(index_operation_error)?;
+                if !evidence.scip.is_empty() {
+                    let mut documents = Vec::new();
+                    for index in &evidence.scip {
+                        documents.extend(crate::scip::decode(&index.bytes).map_err(|error| {
+                            OperationError::new(
+                                ErrorCode::InvalidParameters,
+                                format!("SCIP index {:?} is invalid: {error}", index.path),
+                            )
+                        })?);
+                    }
+                    store
+                        .resolve_scip(&documents, cancelled)
+                        .map_err(index_operation_error)?;
+                }
                 IndexStats {
                     files_total: total + evidence_stats.generated_files,
                     files_reused: total,
@@ -1101,6 +1118,9 @@ fn evidence_artifacts(
     }
     for coverage in &evidence.coverage {
         insert(ArtifactRole::CoverageReport, &coverage.report)?;
+    }
+    for index in &evidence.scip {
+        insert(ArtifactRole::ScipIndex, index)?;
     }
     Ok(artifacts
         .into_iter()
@@ -4317,6 +4337,7 @@ mod tests {
                 },
             }],
             coverage: Vec::new(),
+            scip: Vec::new(),
         };
         let artifacts = evidence_artifacts(&evidence).unwrap();
 
@@ -4404,6 +4425,7 @@ mod tests {
             },
             generated,
             coverage: Vec::new(),
+            scip: Vec::new(),
         };
         let artifacts = evidence_artifacts(&captured).unwrap();
 
@@ -4534,6 +4556,7 @@ mod tests {
             },
             generated,
             coverage: Vec::new(),
+            scip: Vec::new(),
         };
         let artifacts = evidence_artifacts(&captured).unwrap();
 
@@ -4657,6 +4680,7 @@ mod tests {
                     },
                 }],
                 coverage: Vec::new(),
+                scip: Vec::new(),
             };
             let artifacts = evidence_artifacts(&captured).unwrap();
             let (graph, evidence) =

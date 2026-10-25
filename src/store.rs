@@ -18,7 +18,7 @@ use crate::git::{
 };
 use crate::graph::{CodeGraph, Relation, Step};
 
-pub(crate) const SCHEMA_VERSION: i64 = 9;
+pub(crate) const SCHEMA_VERSION: i64 = 10;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
@@ -387,6 +387,7 @@ pub enum ArtifactRole {
     Input,
     GeneratedRust,
     CoverageReport,
+    ScipIndex,
 }
 
 impl ArtifactRole {
@@ -396,6 +397,7 @@ impl ArtifactRole {
             Self::Input => "input",
             Self::GeneratedRust => "generated-rust",
             Self::CoverageReport => "coverage-report",
+            Self::ScipIndex => "scip-index",
         }
     }
 
@@ -405,6 +407,7 @@ impl ArtifactRole {
             "input" => Some(Self::Input),
             "generated-rust" => Some(Self::GeneratedRust),
             "coverage-report" => Some(Self::CoverageReport),
+            "scip-index" => Some(Self::ScipIndex),
             _ => None,
         }
     }
@@ -816,6 +819,30 @@ impl Store {
         Ok(stats)
     }
 
+    /// Applies verified SCIP occurrences after `replace_evidence` imported the
+    /// SCIP artifacts into this private image; returns the upgraded ref count.
+    pub fn resolve_scip(
+        &mut self,
+        documents: &[crate::scip::Document],
+        cancelled: &AtomicBool,
+    ) -> Result<usize> {
+        let tx = begin_immediate(&self.connection, cancelled)?;
+        read_state(&tx)?;
+        let resolved = resolve_scip_references(&tx, documents, cancelled)?;
+        require_graph_invariants(&tx, cancelled)?;
+        require_evidence_invariants(&tx, cancelled)?;
+        if resolved != 0 {
+            tx.execute(
+                "UPDATE state SET generation=generation+1 WHERE singleton=1",
+                [],
+            )
+            .map_err(db_error)?;
+        }
+        check_cancelled(cancelled)?;
+        tx.commit().map_err(db_error)?;
+        Ok(resolved)
+    }
+
     pub fn generated_inclusion_candidates(
         &self,
         output_basename: &str,
@@ -844,7 +871,7 @@ impl Store {
         self.connection
             .prepare(
                 "SELECT path FROM imported_artifacts
-                  WHERE role IN ('manifest','generated-rust','coverage-report')
+                  WHERE role IN ('manifest','generated-rust','coverage-report','scip-index')
                   ORDER BY path",
             )
             .map_err(db_error)?
@@ -943,11 +970,13 @@ impl Store {
                 }
                 visited.insert(node.id);
                 let include_traits = node.kind == "type";
-                let Some(line) = node.line(snapshot_id, &state, Some(&relation), VIEW_BUDGET)?
+                let Some(mut line) =
+                    node.line(snapshot_id, &state, Some(&relation), VIEW_BUDGET)?
                 else {
                     omitted = true;
                     break;
                 };
+                mark_scip_edge(&tx, &relation, current, node.id, &mut line)?;
                 lines.push(line);
                 queue.push_back((node.id, include_traits, level + 1));
             }
@@ -2065,6 +2094,24 @@ fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) 
             _ => return Err("database coverage format is invalid".into()),
         }
     }
+    let unattested_scip: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM refs r
+                  WHERE r.resolution_source!='static'
+                    AND (r.resolution_source!='scip' OR r.kind!='CALLS'
+                         OR r.alias_key IS NOT NULL
+                         OR NOT EXISTS(
+                             SELECT 1 FROM imported_artifacts WHERE role='scip-index'
+                         ))
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if unattested_scip {
+        return Err("database SCIP resolution is unattested".into());
+    }
     for kind in distinct_text(connection, "SELECT DISTINCT kind FROM coverage_branches")? {
         CoverageBranchKind::parse(&kind)
             .ok_or_else(|| "database coverage branch kind is invalid".to_owned())?;
@@ -2439,7 +2486,7 @@ fn require_provenance_invariants(connection: &Connection, cancelled: &AtomicBool
 fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
     let mut load_references = connection
         .prepare(
-            "SELECT id, alias_key, resolved_target_id, resolution_state
+            "SELECT id, alias_key, resolved_target_id, resolution_state, resolution_source
                FROM refs ORDER BY id",
         )
         .map_err(db_error)?;
@@ -2450,6 +2497,7 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<i64>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)? == "scip",
             ))
         })
         .map_err(db_error)?;
@@ -2466,7 +2514,7 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
         .map_err(db_error)?;
     let mut loaded = Vec::with_capacity(references.len());
     let mut aliases = HashMap::new();
-    for (id, alias, target, state) in references {
+    for (id, alias, target, state, scip) in references {
         check_cancelled(cancelled)?;
         let rows = load_keys
             .query_map([id], |row| row.get::<_, String>(0))
@@ -2494,7 +2542,7 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
                 })
                 .or_insert(direct);
         }
-        loaded.push((alias, target, state, keys, direct));
+        loaded.push((alias, target, state, scip, keys, direct));
     }
 
     #[cfg(test)]
@@ -2505,7 +2553,7 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
     });
     check_cancelled(cancelled)?;
 
-    for (alias, actual_target, actual_state, keys, direct) in loaded {
+    for (alias, actual_target, actual_state, scip, keys, direct) in loaded {
         check_cancelled(cancelled)?;
         let expected = if alias.is_some() {
             direct
@@ -2517,7 +2565,15 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
             DbCandidate::Missing => (None, ResolutionState::Missing),
             DbCandidate::Ambiguous => (None, ResolutionState::Ambiguous),
         };
-        if actual_target != expected_target || actual_state != expected_state.db() {
+        // SCIP evidence may only upgrade refs static candidates leave unresolved.
+        let consistent = if scip {
+            expected_state != ResolutionState::Resolved
+                && actual_target.is_some()
+                && actual_state == ResolutionState::Resolved.db()
+        } else {
+            actual_target == expected_target && actual_state == expected_state.db()
+        };
+        if !consistent {
             return Err("database reference resolution does not match candidates".into());
         }
     }
@@ -2841,9 +2897,10 @@ fn traverse_changes(
                         return Ok(true);
                     }
                     row_budget -= 1;
-                    let line = node
+                    let mut line = node
                         .line(snapshot_id, state, Some(relation), usize::MAX)?
                         .ok_or_else(|| "changed neighbor line exceeds address space".to_owned())?;
+                    mark_scip_edge(connection, relation, source, node.id, &mut line)?;
                     lines.push(line);
                     visited.insert(node.id);
                     next.push((node.id, node.kind == "type"));
@@ -2859,6 +2916,38 @@ fn traverse_changes(
         std::mem::swap(&mut current, &mut next);
     }
     Ok(dependency_omitted)
+}
+
+/// Appends ` via=scip` to a rendered call relation whose edge only SCIP
+/// evidence supports.
+fn mark_scip_edge(
+    connection: &Connection,
+    relation: &str,
+    current: i64,
+    neighbor: i64,
+    line: &mut String,
+) -> Result<()> {
+    let (source, target) = match relation {
+        "test <-" | "caller <-" => (neighbor, current),
+        "call ->" => (current, neighbor),
+        _ => return Ok(()),
+    };
+    let scip_only: bool = connection
+        .prepare(
+            "SELECT EXISTS(
+                        SELECT 1 FROM refs WHERE source_id=?1 AND kind='CALLS'
+                           AND resolved_target_id=?2 AND resolution_source='scip')
+                    AND NOT EXISTS(
+                        SELECT 1 FROM refs WHERE source_id=?1 AND kind='CALLS'
+                           AND resolved_target_id=?2 AND resolution_source='static')",
+        )
+        .map_err(db_error)?
+        .query_row(params![source, target], |row| row.get(0))
+        .map_err(db_error)?;
+    if scip_only {
+        line.insert_str(line.len() - 1, " via=scip");
+    }
+    Ok(())
 }
 
 fn analyze_changed_roots(
@@ -4463,6 +4552,7 @@ fn render_evidence(
         "completeness evidence_capture=complete provenance_model={} execution_mapping={execution_status}\n",
         provenance_status
     );
+    render_scip_claim(connection, scope, &mut text)?;
     for row in rows {
         let complete = row.12 == "linked" && row.11.is_some();
         let input = format!("{}:{}-{}", row.1, row.2, row.3);
@@ -4521,6 +4611,45 @@ fn render_evidence(
         provenance_status,
         execution_status,
     })
+}
+
+/// Producer-attested SCIP resolutions relevant to `scope`; omitted when the
+/// manifest declared no SCIP index.
+fn render_scip_claim(
+    connection: &Connection,
+    scope: Option<&CoverageScope>,
+    text: &mut String,
+) -> Result<()> {
+    let indexes: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM imported_artifacts WHERE role='scip-index'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if indexes == 0 {
+        return Ok(());
+    }
+    let count = connection
+        .prepare(
+            "SELECT f.path, r.line FROM refs r JOIN nodes n ON n.id=r.source_id
+               JOIN files f ON f.id=n.file_id
+              WHERE r.resolution_source='scip'",
+        )
+        .map_err(db_error)?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?
+        .into_iter()
+        .filter(|(path, line)| scope.is_none_or(|scope| scope.relevant(path, *line, *line)))
+        .count();
+    text.push_str(&format!(
+        "claim kind=scip-resolved-references count={count} basis=verified-scip-manifest\n"
+    ));
+    Ok(())
 }
 
 fn coverage_relevance(
@@ -6006,7 +6135,8 @@ fn apply_incremental(
         // narrow this to affected refs only if incremental profiling requires it.
         tx.execute("DELETE FROM edges", []).map_err(db_error)?;
         tx.execute(
-            "UPDATE refs SET resolved_target_id=NULL, resolution_state='pending'",
+            "UPDATE refs SET resolved_target_id=NULL, resolution_state='pending',
+                    resolution_source='static'",
             [],
         )
         .map_err(db_error)?;
@@ -6802,6 +6932,88 @@ fn refresh_script_export_methods(tx: &Transaction<'_>, cancelled: &AtomicBool) -
     resolve_references(tx, references, cancelled)
 }
 
+/// Moves one reference to a new resolution while keeping derived `edges`
+/// support counts exact; every resolver routes through here.
+struct ReferenceTransitions<'tx> {
+    update_ref: rusqlite::Statement<'tx>,
+    decrement: rusqlite::Statement<'tx>,
+    delete_edge: rusqlite::Statement<'tx>,
+    increment: rusqlite::Statement<'tx>,
+}
+
+impl<'tx> ReferenceTransitions<'tx> {
+    fn new(tx: &'tx Transaction<'_>) -> Result<Self> {
+        Ok(Self {
+            update_ref: tx
+                .prepare(
+                    "UPDATE refs SET resolved_target_id=?1, resolution_state=?2,
+                            resolution_source=?3
+                      WHERE id=?4",
+                )
+                .map_err(db_error)?,
+            decrement: tx
+                .prepare(
+                    "UPDATE edges SET support_count=support_count-1
+                      WHERE source_id=(SELECT source_id FROM refs WHERE id=?1)
+                        AND target_id=?2 AND kind=?3 AND support_count>1",
+                )
+                .map_err(db_error)?,
+            delete_edge: tx
+                .prepare(
+                    "DELETE FROM edges
+                      WHERE source_id=(SELECT source_id FROM refs WHERE id=?1)
+                        AND target_id=?2 AND kind=?3 AND support_count=1",
+                )
+                .map_err(db_error)?,
+            increment: tx
+                .prepare(
+                    "INSERT INTO edges(source_id, target_id, kind, support_count)
+                     SELECT source_id, ?2, ?3, 1 FROM refs WHERE id=?1
+                     ON CONFLICT(source_id, target_id, kind)
+                     DO UPDATE SET support_count=support_count+1",
+                )
+                .map_err(db_error)?,
+        })
+    }
+
+    fn apply(
+        &mut self,
+        reference_id: i64,
+        (ref_kind, source_kind): (&str, &str),
+        old_target: Option<i64>,
+        new_target: Option<i64>,
+        new_state: ResolutionState,
+        source: &str,
+    ) -> Result<()> {
+        let edge_kind = match (ref_kind, source_kind) {
+            ("IMPORTS", _) => "IMPORTS",
+            ("CALLS", "test") => "TEST_CALLS",
+            ("CALLS", "file" | "type" | "function") => "CALLS",
+            _ => return Err("database reference kind is invalid".into()),
+        };
+        if let Some(target) = old_target
+            && self
+                .decrement
+                .execute(params![reference_id, target, edge_kind])
+                .map_err(db_error)?
+                == 0
+        {
+            self.delete_edge
+                .execute(params![reference_id, target, edge_kind])
+                .map_err(db_error)?;
+        }
+        self.update_ref
+            .execute(params![new_target, new_state.db(), source, reference_id])
+            .map_err(db_error)?;
+        if let Some(target) = new_target {
+            self.increment
+                .execute(params![reference_id, target, edge_kind])
+                .map_err(db_error)?;
+        }
+        Ok(())
+    }
+}
+
 fn resolve_references(
     tx: &Transaction<'_>,
     mut references: HashSet<i64>,
@@ -6873,32 +7085,7 @@ fn resolve_references(
                FROM refs WHERE alias_key=?1",
         )
         .map_err(db_error)?;
-    let mut update_ref = tx
-        .prepare("UPDATE refs SET resolved_target_id=?1, resolution_state=?2 WHERE id=?3")
-        .map_err(db_error)?;
-    let mut decrement = tx
-        .prepare(
-            "UPDATE edges SET support_count=support_count-1
-              WHERE source_id=(SELECT source_id FROM refs WHERE id=?1)
-                AND target_id=?2 AND kind=?3 AND support_count>1",
-        )
-        .map_err(db_error)?;
-    let mut delete_edge = tx
-        .prepare(
-            "DELETE FROM edges
-              WHERE source_id=(SELECT source_id FROM refs WHERE id=?1)
-                AND target_id=?2 AND kind=?3 AND support_count=1",
-        )
-        .map_err(db_error)?;
-    let mut increment = tx
-        .prepare(
-            "INSERT INTO edges(source_id, target_id, kind, support_count)
-             SELECT source_id, ?2, ?3, 1 FROM refs WHERE id=?1
-             ON CONFLICT(source_id, target_id, kind)
-             DO UPDATE SET support_count=support_count+1",
-        )
-        .map_err(db_error)?;
-
+    let mut transitions = ReferenceTransitions::new(tx)?;
     for (_, reference_id) in references {
         check_cancelled(cancelled)?;
         let Some((ref_kind, source_kind, alias_key, old_target, old_state)) = load_ref
@@ -6948,32 +7135,143 @@ fn resolve_references(
         if old_target == new_target && old_state == new_state.db() {
             continue;
         }
-        let edge_kind = match (ref_kind.as_str(), source_kind.as_str()) {
-            ("IMPORTS", _) => "IMPORTS",
-            ("CALLS", "test") => "TEST_CALLS",
-            ("CALLS", "file" | "type" | "function") => "CALLS",
-            _ => return Err("database reference kind is invalid".into()),
-        };
-        if let Some(target) = old_target
-            && decrement
-                .execute(params![reference_id, target, edge_kind])
-                .map_err(db_error)?
-                == 0
-        {
-            delete_edge
-                .execute(params![reference_id, target, edge_kind])
-                .map_err(db_error)?;
-        }
-        update_ref
-            .execute(params![new_target, new_state.db(), reference_id])
-            .map_err(db_error)?;
-        if let Some(target) = new_target {
-            increment
-                .execute(params![reference_id, target, edge_kind])
-                .map_err(db_error)?;
-        }
+        transitions.apply(
+            reference_id,
+            (&ref_kind, &source_kind),
+            old_target,
+            new_target,
+            new_state,
+            "static",
+        )?;
     }
     Ok(())
+}
+
+/// Upgrades unresolved static calls with producer-attested SCIP occurrences.
+///
+/// A SCIP symbol maps to the innermost node in its definition file whose span
+/// contains the definition line and whose name equals the last descriptor;
+/// ties, conflicting definitions, or unmapped definitions leave it unmapped.
+/// A reference occurrence resolves a ref only when exactly one missing or
+/// ambiguous non-alias `CALLS` ref sits on that file line and exactly one
+/// mapped symbol on the line matches one of the ref's lookup-key names.
+fn resolve_scip_references(
+    tx: &Transaction<'_>,
+    documents: &[crate::scip::Document],
+    cancelled: &AtomicBool,
+) -> Result<usize> {
+    let mut definition = tx
+        .prepare(
+            "SELECT n.id, n.line_end-n.line_start FROM nodes n JOIN files f ON f.id=n.file_id
+              WHERE f.path=?1 AND n.name=?2 AND n.kind!='file'
+                AND n.line_start<=?3 AND n.line_end>=?3
+              ORDER BY n.line_end-n.line_start, n.id LIMIT 2",
+        )
+        .map_err(db_error)?;
+    let mut targets = HashMap::<&str, Option<i64>>::new();
+    for document in documents {
+        for occurrence in document.occurrences.iter().filter(|occ| occ.definition) {
+            check_cancelled(cancelled)?;
+            let target = match crate::scip::symbol_name(&occurrence.symbol) {
+                Some(name) => {
+                    let rows = definition
+                        .query_map(params![document.path, name, occurrence.line], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .map_err(db_error)?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(db_error)?;
+                    match rows.as_slice() {
+                        [(id, _)] => Some(*id),
+                        [(id, span), (_, next)] if span < next => Some(*id),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            targets
+                .entry(&occurrence.symbol)
+                .and_modify(|current| {
+                    if *current != target {
+                        *current = None;
+                    }
+                })
+                .or_insert(target);
+        }
+    }
+    let mut sites = BTreeMap::<(&str, u32), BTreeSet<(&str, i64)>>::new();
+    for document in documents {
+        for occurrence in document.occurrences.iter().filter(|occ| !occ.definition) {
+            if let (Some(Some(target)), Some(name)) = (
+                targets.get(occurrence.symbol.as_str()),
+                crate::scip::symbol_name(&occurrence.symbol),
+            ) {
+                sites
+                    .entry((&document.path, occurrence.line))
+                    .or_default()
+                    .insert((name, *target));
+            }
+        }
+    }
+    let mut unresolved = tx
+        .prepare(
+            "SELECT r.id, r.kind, n.kind, r.alias_key IS NULL
+               FROM files f JOIN nodes n ON n.file_id=f.id
+               JOIN refs r ON r.source_id=n.id
+              WHERE f.path=?1 AND r.line=?2 AND r.resolution_state IN ('missing','ambiguous')
+              ORDER BY r.id LIMIT 2",
+        )
+        .map_err(db_error)?;
+    let mut keys = tx
+        .prepare("SELECT key FROM ref_keys WHERE ref_id=?1 ORDER BY rank")
+        .map_err(db_error)?;
+    let mut transitions = ReferenceTransitions::new(tx)?;
+    let mut resolved = 0;
+    for ((path, line), symbols) in sites {
+        check_cancelled(cancelled)?;
+        let rows = unresolved
+            .query_map(params![path, line], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        let [(reference_id, ref_kind, source_kind, true)] = rows.as_slice() else {
+            continue;
+        };
+        if ref_kind != "CALLS" {
+            continue;
+        }
+        let names = keys
+            .query_map([reference_id], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+            .map(|key| key.map(|key| key.rsplit(':').next().unwrap_or_default().to_owned()))
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .map_err(db_error)?;
+        let matches = symbols
+            .iter()
+            .filter(|(name, _)| names.contains(*name))
+            .map(|(_, target)| *target)
+            .collect::<BTreeSet<_>>();
+        let [target] = matches.into_iter().collect::<Vec<_>>()[..] else {
+            continue;
+        };
+        transitions.apply(
+            *reference_id,
+            (ref_kind, source_kind),
+            None,
+            Some(target),
+            ResolutionState::Resolved,
+            "scip",
+        )?;
+        resolved += 1;
+    }
+    Ok(resolved)
 }
 
 fn resolve_trait_implementations(
@@ -7551,7 +7849,10 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             resolved_target_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
             resolution_state TEXT NOT NULL
                 CHECK(resolution_state IN ('pending','resolved','missing','ambiguous')),
-            CHECK((resolution_state='resolved') = (resolved_target_id IS NOT NULL))
+            resolution_source TEXT NOT NULL DEFAULT 'static'
+                CHECK(resolution_source IN ('static','scip')),
+            CHECK((resolution_state='resolved') = (resolved_target_id IS NOT NULL)),
+            CHECK(resolution_source='static' OR resolution_state='resolved')
          );
          CREATE INDEX refs_source_target
              ON refs(source_id, kind, resolved_target_id);
@@ -7614,7 +7915,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             id INTEGER PRIMARY KEY,
             key TEXT NOT NULL UNIQUE CHECK(length(key)>0),
             role TEXT NOT NULL CHECK(role IN (
-                'manifest','input','generated-rust','coverage-report'
+                'manifest','input','generated-rust','coverage-report','scip-index'
             )),
             path TEXT NOT NULL CHECK(length(path)>0),
             content_hash BLOB NOT NULL CHECK(length(content_hash)=32),
@@ -7752,7 +8053,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE INDEX source_notes_file_lines ON source_notes(file_id, line_start);
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=9;",
+         PRAGMA user_version=10;",
     )
     .map_err(db_error)
 }
@@ -8357,6 +8658,97 @@ mod tests {
             "database contains pending references"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scip_resolution_upgrades_ambiguous_call_only_with_attested_index() {
+        let root = canonical_temp_dir().join(format!(
+            "graphr-scip-resolution-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let cancelled = AtomicBool::new(false);
+        let mut graph = resolution_graph(2);
+        for node in &mut graph.nodes[1..] {
+            node.name = "callee".into();
+        }
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        let symbol = "scip-test cargo pkg 1.0 callee().".to_owned();
+        let documents = vec![crate::scip::Document {
+            path: "src/lib.rs".into(),
+            occurrences: vec![
+                crate::scip::Occurrence {
+                    line: 3,
+                    symbol: symbol.clone(),
+                    definition: true,
+                },
+                crate::scip::Occurrence {
+                    line: 1,
+                    symbol,
+                    definition: false,
+                },
+            ],
+        }];
+
+        assert_eq!(
+            store.resolve_scip(&documents, &cancelled).unwrap_err(),
+            "database SCIP resolution is unattested"
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO imported_artifacts(key, role, path, content_hash, byte_size)
+                 VALUES('scip', 'scip-index', 'index.scip', zeroblob(32), 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.resolve_scip(&documents, &cancelled).unwrap(), 1);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT r.resolution_state, r.resolution_source, n.qualified_name,
+                            (SELECT support_count FROM edges)
+                       FROM refs r JOIN nodes n ON n.id=r.resolved_target_id",
+                    [],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?
+                    )),
+                )
+                .unwrap(),
+            (
+                "resolved".to_owned(),
+                "scip".to_owned(),
+                "target-1".to_owned(),
+                1
+            )
+        );
+        store.seal(&cancelled).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seal_rejects_scip_source_on_statically_resolved_reference() {
+        let error = sealed_resolution_corruption("scip-override", |connection| {
+            connection
+                .execute("UPDATE refs SET resolution_source='scip'", [])
+                .unwrap();
+        });
+        assert_eq!(
+            error,
+            "database reference resolution does not match candidates"
+        );
     }
 
     #[test]
