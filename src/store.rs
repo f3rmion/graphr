@@ -16,6 +16,7 @@ use crate::git::{
     ChangedFile, DependencyMode, Language, LineSpan, PathRecord, WorktreeChanges,
     change_content_complete, dependency_package,
 };
+use crate::graph::{CodeGraph, Relation, Step};
 
 pub(crate) const SCHEMA_VERSION: i64 = 8;
 const SEARCH_BUDGET: usize = 1536;
@@ -892,15 +893,8 @@ impl Store {
         if depth > 6 || !(1..=50).contains(&max_nodes) || node_ref.len() > 116 {
             return Err("invalid view parameters".into());
         }
-        let (embedded_snapshot, epoch, generation, root_id) = parse_ref(node_ref)?;
-        if embedded_snapshot != snapshot_id {
-            return Err("node_snapshot_mismatch".into());
-        }
         let tx = self.connection.transaction().map_err(db_error)?;
-        let state = read_state(&tx)?;
-        if epoch != state.epoch || generation != state.generation {
-            return Err("stale node_ref".into());
-        }
+        let (state, root_id) = checked_ref(&tx, snapshot_id, node_ref)?;
         let root = load_node(&tx, root_id)?.ok_or_else(|| "node not found".to_owned())?;
         let Some(root_line) = root.line(snapshot_id, &state, None, VIEW_BUDGET)? else {
             return Ok(TRUNCATED.into());
@@ -973,6 +967,119 @@ impl Store {
             lines.extend(evidence.text.split_inclusive('\n').map(str::to_owned));
         }
         Ok(bounded(lines, VIEW_BUDGET, omitted))
+    }
+
+    /// Whole-image adjacency for `impact` and `path`: resolved edges,
+    /// implementations, and supertype-member dispatch.
+    pub fn code_graph(&mut self) -> Result<CodeGraph> {
+        let tx = self.connection.transaction().map_err(db_error)?;
+        let ids = tx
+            .prepare("SELECT id FROM nodes")
+            .map_err(db_error)?
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        let mut edges = Vec::new();
+        let mut statement = tx
+            .prepare("SELECT source_id, target_id, kind FROM edges")
+            .map_err(db_error)?;
+        let mut rows = statement.query([]).map_err(db_error)?;
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let kind = row
+                .get_ref(2)
+                .map_err(db_error)?
+                .as_str()
+                .map_err(|error| error.to_string())?;
+            let relation =
+                Relation::parse(kind).ok_or_else(|| "database edge kind is invalid".to_owned())?;
+            edges.push((
+                row.get(0).map_err(db_error)?,
+                row.get(1).map_err(db_error)?,
+                relation,
+            ));
+        }
+        for (sql, relation) in [
+            (
+                "SELECT resolved_implementor_id, resolved_trait_id FROM trait_implementations
+                  WHERE resolved_implementor_id IS NOT NULL AND resolved_trait_id IS NOT NULL"
+                    .to_owned(),
+                Relation::Implements,
+            ),
+            (
+                format!(
+                    "WITH RECURSIVE {} SELECT base_id, member_id FROM overrides",
+                    overrides_cte()
+                ),
+                Relation::Dispatch,
+            ),
+        ] {
+            let mut statement = tx.prepare(&sql).map_err(db_error)?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, relation)))
+                .map_err(db_error)?;
+            for row in rows {
+                edges.push(row.map_err(db_error)?);
+            }
+        }
+        CodeGraph::new(ids, &edges)
+    }
+
+    /// Nodes that reach `node_ref` in reverse: callers, tests, importers,
+    /// implementors, and supertype members that dispatch to it.
+    pub fn impact(
+        &mut self,
+        snapshot_id: &str,
+        node_ref: &str,
+        depth: u32,
+        max_nodes: u32,
+        graph: &CodeGraph,
+    ) -> Result<String> {
+        if !(1..=6).contains(&depth) || !(1..=50).contains(&max_nodes) || node_ref.len() > 116 {
+            return Err("invalid impact parameters".into());
+        }
+        let tx = self.connection.transaction().map_err(db_error)?;
+        let (state, root_id) = checked_ref(&tx, snapshot_id, node_ref)?;
+        let impact = graph
+            .impact(root_id, depth, max_nodes as usize)
+            .ok_or_else(|| "node not found".to_owned())?;
+        let root = std::iter::once(Step {
+            id: root_id,
+            label: "",
+        });
+        let lines = step_lines(&tx, snapshot_id, &state, root.chain(impact.steps))?;
+        Ok(bounded(lines, VIEW_BUDGET, !impact.complete))
+    }
+
+    /// Shortest route between two nodes, following edge direction unless
+    /// `undirected`.
+    pub fn path(
+        &mut self,
+        snapshot_id: &str,
+        from_ref: &str,
+        to_ref: &str,
+        max_hops: u32,
+        undirected: bool,
+        graph: &CodeGraph,
+    ) -> Result<String> {
+        if !(1..=8).contains(&max_hops) || from_ref.len() > 116 || to_ref.len() > 116 {
+            return Err("invalid path parameters".into());
+        }
+        let tx = self.connection.transaction().map_err(db_error)?;
+        let (state, from) = checked_ref(&tx, snapshot_id, from_ref)?;
+        let (_, to) = checked_ref(&tx, snapshot_id, to_ref)?;
+        let direction = if undirected { "any" } else { "forward" };
+        let Some(route) = graph.path(from, to, max_hops, undirected) else {
+            return Ok(format!(
+                "no path within max_hops={max_hops} direction={direction}\n"
+            ));
+        };
+        let mut lines = vec![format!(
+            "path hops={} direction={direction}\n",
+            route.len() - 1
+        )];
+        lines.extend(step_lines(&tx, snapshot_id, &state, route)?);
+        Ok(bounded(lines, VIEW_BUDGET, false))
     }
 
     pub fn changes(
@@ -2982,23 +3089,7 @@ fn node_risk_counts(connection: &Connection, ids: &[i64]) -> Result<(NodeRiskCou
         .ok_or_else(|| "caller traversal limit overflow".to_owned())?;
     let sql = format!(
         "WITH RECURSIVE changed(id) AS (VALUES {values}),
-         type_supers(type_id, super_id, hops) AS (
-             SELECT resolved_implementor_id, resolved_trait_id, 1
-               FROM trait_implementations
-              WHERE resolved_implementor_id IS NOT NULL AND resolved_trait_id IS NOT NULL
-             UNION
-             SELECT type_supers.type_id, ti.resolved_trait_id, type_supers.hops + 1
-               FROM type_supers
-               JOIN trait_implementations ti ON ti.resolved_implementor_id=type_supers.super_id
-              WHERE ti.resolved_trait_id IS NOT NULL AND type_supers.hops < {DISPATCH_DEPTH}
-         ),
-         overrides(member_id, base_id) AS MATERIALIZED (
-             SELECT DISTINCT member.id, base.id FROM type_supers
-               JOIN nodes member ON member.parent_id=type_supers.type_id
-                                AND member.kind='function'
-               JOIN nodes base ON base.parent_id=type_supers.super_id
-                              AND base.kind='function' AND base.name=member.name
-         ),
+         {},
          callers(changed_id, node_id) AS (
              SELECT id, id FROM changed
              UNION
@@ -3025,7 +3116,8 @@ fn node_risk_counts(connection: &Connection, ids: &[i64]) -> Result<(NodeRiskCou
                 EXISTS(SELECT 1 FROM edges
                         WHERE target_id=changed.id AND kind='TEST_CALLS'),
                 (SELECT count(*) FROM callers) > {FLOW_QUERY_LIMIT}
-           FROM changed"
+           FROM changed",
+        overrides_cte()
     );
     let mut statement = connection.prepare(&sql).map_err(db_error)?;
     let rows = statement
@@ -7493,6 +7585,62 @@ fn literal_fts(query: &str) -> Result<String> {
     } else {
         Ok(terms.join(" AND "))
     }
+}
+
+/// `type_supers` closes resolved implementations transitively; `overrides`
+/// pairs each method with same-name members of its type's supertypes.
+fn overrides_cte() -> String {
+    format!(
+        "type_supers(type_id, super_id, hops) AS (
+             SELECT resolved_implementor_id, resolved_trait_id, 1
+               FROM trait_implementations
+              WHERE resolved_implementor_id IS NOT NULL AND resolved_trait_id IS NOT NULL
+             UNION
+             SELECT type_supers.type_id, ti.resolved_trait_id, type_supers.hops + 1
+               FROM type_supers
+               JOIN trait_implementations ti ON ti.resolved_implementor_id=type_supers.super_id
+              WHERE ti.resolved_trait_id IS NOT NULL AND type_supers.hops < {DISPATCH_DEPTH}
+         ),
+         overrides(member_id, base_id) AS MATERIALIZED (
+             SELECT DISTINCT member.id, base.id FROM type_supers
+               JOIN nodes member ON member.parent_id=type_supers.type_id
+                                AND member.kind='function'
+               JOIN nodes base ON base.parent_id=type_supers.super_id
+                              AND base.kind='function' AND base.name=member.name
+         )"
+    )
+}
+
+/// Validates a `node_ref` against this snapshot and image state.
+fn checked_ref(connection: &Connection, snapshot_id: &str, node_ref: &str) -> Result<(State, i64)> {
+    let (embedded_snapshot, epoch, generation, id) = parse_ref(node_ref)?;
+    if embedded_snapshot != snapshot_id {
+        return Err("node_snapshot_mismatch".into());
+    }
+    let state = read_state(connection)?;
+    if epoch != state.epoch || generation != state.generation {
+        return Err("stale node_ref".into());
+    }
+    Ok((state, id))
+}
+
+/// One `view`-style line per step; the unlabeled first step is the root.
+fn step_lines(
+    connection: &Connection,
+    snapshot_id: &str,
+    state: &State,
+    steps: impl IntoIterator<Item = Step>,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for step in steps {
+        let node = load_node(connection, step.id)?.ok_or_else(|| "node not found".to_owned())?;
+        let relation = (!step.label.is_empty()).then_some(step.label);
+        let Some(line) = node.line(snapshot_id, state, relation, VIEW_BUDGET)? else {
+            break;
+        };
+        lines.push(line);
+    }
+    Ok(lines)
 }
 
 fn parse_ref(value: &str) -> Result<(&str, &str, i64, i64)> {

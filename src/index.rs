@@ -633,6 +633,43 @@ impl Engine {
         Ok(query_output(&snapshot, text))
     }
 
+    pub fn impact(
+        &self,
+        snapshot_id: &str,
+        node_ref: &str,
+        depth: u32,
+        max_nodes: u32,
+    ) -> Result<QueryOutput, OperationError> {
+        let snapshot = self.catalog.get(snapshot_id)?;
+        let text = snapshot
+            .open_graph()
+            .and_then(|mut store| {
+                let graph = snapshot.code_graph(&mut store)?;
+                store.impact(snapshot_id, node_ref, depth, max_nodes, &graph)
+            })
+            .map_err(query_operation_error)?;
+        Ok(query_output(&snapshot, text))
+    }
+
+    pub fn path(
+        &self,
+        snapshot_id: &str,
+        from_ref: &str,
+        to_ref: &str,
+        max_hops: u32,
+        undirected: bool,
+    ) -> Result<QueryOutput, OperationError> {
+        let snapshot = self.catalog.get(snapshot_id)?;
+        let text = snapshot
+            .open_graph()
+            .and_then(|mut store| {
+                let graph = snapshot.code_graph(&mut store)?;
+                store.path(snapshot_id, from_ref, to_ref, max_hops, undirected, &graph)
+            })
+            .map_err(query_operation_error)?;
+        Ok(query_output(&snapshot, text))
+    }
+
     pub fn changes(
         &self,
         snapshot_id: &str,

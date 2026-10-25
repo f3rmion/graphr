@@ -9,12 +9,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::git::{
     CapturedSource, ChangeLayer, DependencyMode, Repository, SourceOmission, WorktreeChanges,
     resolve_commit,
 };
+use crate::graph::CodeGraph;
 use crate::index::IndexStats;
 use crate::store;
 
@@ -276,6 +277,7 @@ pub struct SnapshotEntry {
     pub provenance: Provenance,
     graph_file: Arc<File>,
     graph_checksum: String,
+    code_graph: OnceLock<Arc<CodeGraph>>,
 }
 
 impl SnapshotEntry {
@@ -288,6 +290,18 @@ impl SnapshotEntry {
         let store = store::Store::open_reader(&self.graph_path)?;
         pin.require_used()?;
         Ok(store)
+    }
+
+    /// The image's adjacency, loaded on first use and shared afterwards.
+    pub(crate) fn code_graph(
+        &self,
+        store: &mut store::Store,
+    ) -> std::result::Result<Arc<CodeGraph>, String> {
+        if let Some(graph) = self.code_graph.get() {
+            return Ok(Arc::clone(graph));
+        }
+        let graph = Arc::new(store.code_graph()?);
+        Ok(Arc::clone(self.code_graph.get_or_init(|| graph)))
     }
 }
 
@@ -1090,6 +1104,7 @@ impl SnapshotCatalog {
             provenance: manifest.provenance,
             graph_file: Arc::new(graph_file),
             graph_checksum: manifest.graph_checksum,
+            code_graph: OnceLock::new(),
         }))
     }
 }

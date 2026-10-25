@@ -139,6 +139,53 @@ struct ViewParams {
 #[derive(Clone, Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
+struct ImpactParams {
+    #[schemars(length(min = 64, max = 64))]
+    snapshot_id: String,
+    #[schemars(length(min = 1, max = 116))]
+    node_ref: String,
+    #[serde(default = "default_impact_depth")]
+    #[schemars(range(min = 1, max = 6))]
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
+    depth: u32,
+    #[serde(default = "default_max_nodes")]
+    #[schemars(range(min = 1, max = 50))]
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
+    max_nodes: u32,
+}
+
+#[derive(Clone, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
+struct PathParams {
+    #[schemars(length(min = 64, max = 64))]
+    snapshot_id: String,
+    #[schemars(length(min = 1, max = 116))]
+    from_ref: String,
+    #[schemars(length(min = 1, max = 116))]
+    to_ref: String,
+    #[serde(default = "default_max_hops")]
+    #[schemars(range(min = 1, max = 8))]
+    #[schemars(schema_with = "crate::schema::unsigned_integer")]
+    max_hops: u32,
+    #[serde(default)]
+    direction: PathDirection,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(crate = "rmcp::schemars")]
+enum PathDirection {
+    /// Follow call, import, implementation, and dispatch edges as stored.
+    #[default]
+    Forward,
+    /// Ignore edge direction.
+    Any,
+}
+
+#[derive(Clone, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
 struct ChangesParams {
     #[schemars(length(min = 64, max = 64))]
     snapshot_id: String,
@@ -246,6 +293,37 @@ impl Graphr {
             &params.node_ref,
             params.depth,
             params.max_nodes,
+        )))
+    }
+
+    #[tool(
+        description = "List what reaches a snapshot-bound node in reverse: callers, tests, importers, implementors, and supertype members dispatching to it"
+    )]
+    async fn impact(
+        &self,
+        Parameters(params): Parameters<ImpactParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(query_result(self.engine.impact(
+            &params.snapshot_id,
+            &params.node_ref,
+            params.depth,
+            params.max_nodes,
+        )))
+    }
+
+    #[tool(
+        description = "Find the shortest static route between two snapshot-bound nodes over calls, imports, implementations, and dispatch"
+    )]
+    async fn path(
+        &self,
+        Parameters(params): Parameters<PathParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(query_result(self.engine.path(
+            &params.snapshot_id,
+            &params.from_ref,
+            &params.to_ref,
+            params.max_hops,
+            matches!(params.direction, PathDirection::Any),
         )))
     }
 
@@ -464,6 +542,14 @@ const fn default_max_nodes() -> u32 {
     30
 }
 
+const fn default_impact_depth() -> u32 {
+    3
+}
+
+const fn default_max_hops() -> u32 {
+    6
+}
+
 const fn default_changes_depth() -> u32 {
     1
 }
@@ -497,9 +583,11 @@ mod tests {
             BTreeSet::from([
                 "cancel_index",
                 "changes",
+                "impact",
                 "index",
                 "index_status",
                 "inspect_root",
+                "path",
                 "search",
                 "view",
             ])
@@ -514,6 +602,8 @@ mod tests {
             ("cancel_index", &["job_id"][..]),
             ("search", &["snapshot_id", "query"][..]),
             ("view", &["snapshot_id", "node_ref"][..]),
+            ("impact", &["snapshot_id", "node_ref"][..]),
+            ("path", &["snapshot_id", "from_ref", "to_ref"][..]),
             ("changes", &["snapshot_id"][..]),
         ] {
             let tool = by_name(name);

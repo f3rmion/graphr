@@ -3,6 +3,7 @@ mod coverage;
 mod cpp;
 mod evidence;
 mod git;
+mod graph;
 mod index;
 mod javascript;
 pub mod job;

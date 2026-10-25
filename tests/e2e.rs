@@ -1123,6 +1123,93 @@ fn override_dispatch_links_trait_and_template_method_flows() {
 
     let dot = response_text(&client.changes_dot(6, 50));
     assert!(dot.contains("[style=dotted]"), "{dot}");
+
+    let node = |client: &mut Client, name: &str, location: &str| {
+        response_text(&client.search(name, Some("function")))
+            .lines()
+            .find(|line| line.ends_with(location))
+            .unwrap_or_else(|| panic!("missing {name} at {location}"))
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let changed = node(&mut client, "get", "src/lib.rs:6");
+    let reader = node(&mut client, "read_dyn", "src/lib.rs:12");
+    let impact = response_text(&client.call(
+        "impact",
+        rmcp::serde_json::json!({
+            "snapshot_id": &snapshot_id,
+            "node_ref": &changed,
+            "depth": 3,
+        }),
+    ));
+    let relations = impact
+        .lines()
+        .map(|line| {
+            let (relation, rest) = line.split_once(" n1:").unwrap_or(("", line));
+            let location = rest.rsplit(' ').next().unwrap_or_default();
+            format!("{}{location}", relation.trim())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relations,
+        [
+            "src/lib.rs:6",
+            "dispatch <-src/lib.rs:2",
+            "caller <-src/lib.rs:12",
+            "caller <-src/lib.rs:13",
+            "test <-src/lib.rs:15",
+        ],
+        "{impact}"
+    );
+    let shallow = response_text(&client.call(
+        "impact",
+        rmcp::serde_json::json!({
+            "snapshot_id": &snapshot_id,
+            "node_ref": &changed,
+            "depth": 1,
+        }),
+    ));
+    assert!(shallow.ends_with("[truncated]\n"), "{shallow}");
+
+    let path = |client: &mut Client, from: &str, to: &str, direction: &str| {
+        response_text(&client.call(
+            "path",
+            rmcp::serde_json::json!({
+                "snapshot_id": &snapshot_id,
+                "from_ref": from,
+                "to_ref": to,
+                "direction": direction,
+            }),
+        ))
+    };
+    let forward = path(&mut client, &reader, &changed, "forward");
+    let hops = forward
+        .lines()
+        .map(|line| line.split("n1:").next().unwrap().trim())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        hops,
+        [
+            "path hops=2 direction=forward",
+            "",
+            "call ->",
+            "dispatch ->"
+        ],
+        "{forward}"
+    );
+    assert_eq!(
+        path(&mut client, &changed, &reader, "forward"),
+        "no path within max_hops=6 direction=forward\n"
+    );
+    let any = path(&mut client, &changed, &reader, "any");
+    assert!(
+        any.starts_with("path hops=2 direction=any\n")
+            && any.contains("  dispatch <- ")
+            && any.contains("  caller <- "),
+        "{any}"
+    );
     client.close();
 }
 
@@ -5043,6 +5130,8 @@ fn rust_index_search_view_and_inspection_over_explicit_snapshots() {
         "cancel_index",
         "search",
         "view",
+        "impact",
+        "path",
         "changes",
     ] {
         assert!(tools.contains(&format!("\"name\":\"{name}\"")), "{tools}");
