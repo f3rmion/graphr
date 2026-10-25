@@ -127,8 +127,9 @@ graphr index --worktree-root /tmp/project-feature --base main --head HEAD \
 Every snapshot-backed response carries repository/workspace identity, common
 and per-worktree Git directories, canonical root, branch, exact refs and OIDs,
 target state, selected layers, dirty digest, commit and changed-file counts,
-index generation, and snapshot ID. A genuine empty review includes a structured
-reason such as `identical_commit_oids`; an unqualified “no changes” is invalid.
+index generation, base graph image ID, and snapshot ID. A genuine empty review
+includes a structured reason such as `identical_commit_oids`; an unqualified
+“no changes” is invalid.
 
 Graphr reads Git and worktree state without modifying HEAD, refs, objects,
 indexes, tracked files, or untracked files. Cache writes are confined to the
@@ -250,6 +251,31 @@ reaches the same-name members of its type's transitive supertypes (trait
 implementations, base classes, `extends`/`implements`), so a call bound to a
 trait or base method can reach a changed override. Such hops render as ` ~> `,
 the flow line carries `dispatch_hops=N`, and DOT draws them dotted. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale. The caller component tiers direct production fan-in, including callers of overridden members, at 1, 2–3, 4–15, and 16 or more callers; 16 or more adds `high-fan-in` to the rationale. `test_path_confidence=heuristic` and `test_path_provenance=resolved-static-call-graph` describe bounded static evidence, not runtime test proof; community and churn factors are not used.
+
+The graph section also compares the head graph with a graph image of the base
+commit's supported sources, built during indexing and cached under the same
+content key as any other graph image, so a later review from the same base
+parses no base files (`base_stats.files_parsed=0`). Symbols match by file path,
+node kind, and scope-qualified name, ignoring line positions. After the flow
+lines, it emits:
+
+```text
+api_removed kind=function symbol=old_api path=src/api.rs line=1 head_callers=1
+broken_reference source=caller@src/caller.rs:2 target=rust:function:api::old_api
+api_signature_changed symbol=compute path=src/lib.rs line=1 before="pub fn compute(a: u32) -> u32" after="pub fn compute(a: u32, b: u32) -> u32"
+api_added kind=function symbol=helper path=src/lib.rs line=4
+```
+
+`api_removed` uses the base line; `head_callers` counts head references left
+missing or ambiguous whose candidate keys name the removed symbol, each listed
+as a `broken_reference` at its call site. Signatures are quoted and shortened to
+120 bytes. `broken_reference` and `api_added` records stop at 32, followed by
+`broken_references_omitted=N` or `api_added_omitted=N`. A renamed or moved
+symbol is reported as removed plus added. The `risk` line ends with
+`api_removed=N api_signature_changed=N broken_references=N` and
+`base_graph=present` or `base_graph=absent:identical_sources` when the base
+sources match the head image. Boundary mode leaves `.cargo/vendor` out of the
+comparison.
 
 Artifact text and semantics belong to the immutable snapshot. Non-symbol source
 ranges map to their indexed file node and are reported as `file-mapped`;
