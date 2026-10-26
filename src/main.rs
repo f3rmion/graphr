@@ -3,6 +3,7 @@ mod coverage;
 mod cpp;
 mod evidence;
 mod git;
+mod graph;
 mod index;
 mod javascript;
 pub mod job;
@@ -11,6 +12,7 @@ mod parse;
 mod pinned;
 mod python;
 mod schema;
+mod scip;
 mod store;
 pub mod workspace;
 

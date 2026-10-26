@@ -16,8 +16,9 @@ use crate::git::{
     ChangedFile, DependencyMode, Language, LineSpan, PathRecord, WorktreeChanges,
     change_content_complete, dependency_package,
 };
+use crate::graph::{CodeGraph, Relation, Step};
 
-pub(crate) const SCHEMA_VERSION: i64 = 8;
+pub(crate) const SCHEMA_VERSION: i64 = 10;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
@@ -28,6 +29,8 @@ const DEPENDENCY_NEIGHBOR_SCAN_LIMIT: usize = 256;
 const FLOW_DEPTH: u32 = 15;
 const FLOW_SCAN_LIMIT: usize = 500;
 const FLOW_QUERY_LIMIT: usize = 5_000;
+/// Supertype hops followed when linking a method to the members it overrides.
+const DISPATCH_DEPTH: u32 = 16;
 const DOT_BUDGET: usize = 8 * 1024;
 const DOT_LABEL_PART_LIMIT: usize = 160;
 const TRUNCATED: &str = "[truncated]\n";
@@ -365,12 +368,26 @@ pub struct EdgeInput {
     pub support_count: u32,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct SourceNote {
+    pub line_start: usize,
+    pub line_end: usize,
+    pub tag: &'static str,
+    pub text: String,
+}
+
+pub struct SourceNoteInput {
+    pub file_key: String,
+    pub note: SourceNote,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ArtifactRole {
     Manifest,
     Input,
     GeneratedRust,
     CoverageReport,
+    ScipIndex,
 }
 
 impl ArtifactRole {
@@ -380,6 +397,7 @@ impl ArtifactRole {
             Self::Input => "input",
             Self::GeneratedRust => "generated-rust",
             Self::CoverageReport => "coverage-report",
+            Self::ScipIndex => "scip-index",
         }
     }
 
@@ -389,6 +407,7 @@ impl ArtifactRole {
             "input" => Some(Self::Input),
             "generated-rust" => Some(Self::GeneratedRust),
             "coverage-report" => Some(Self::CoverageReport),
+            "scip-index" => Some(Self::ScipIndex),
             _ => None,
         }
     }
@@ -509,6 +528,7 @@ pub struct Graph {
     pub edges: Vec<EdgeInput>,
     pub modeled_sites: Vec<ModeledSiteInput>,
     pub gaps: Vec<GapInput>,
+    pub source_notes: Vec<SourceNoteInput>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -799,6 +819,30 @@ impl Store {
         Ok(stats)
     }
 
+    /// Applies verified SCIP occurrences after `replace_evidence` imported the
+    /// SCIP artifacts into this private image; returns the upgraded ref count.
+    pub fn resolve_scip(
+        &mut self,
+        documents: &[crate::scip::Document],
+        cancelled: &AtomicBool,
+    ) -> Result<usize> {
+        let tx = begin_immediate(&self.connection, cancelled)?;
+        read_state(&tx)?;
+        let resolved = resolve_scip_references(&tx, documents, cancelled)?;
+        require_graph_invariants(&tx, cancelled)?;
+        require_evidence_invariants(&tx, cancelled)?;
+        if resolved != 0 {
+            tx.execute(
+                "UPDATE state SET generation=generation+1 WHERE singleton=1",
+                [],
+            )
+            .map_err(db_error)?;
+        }
+        check_cancelled(cancelled)?;
+        tx.commit().map_err(db_error)?;
+        Ok(resolved)
+    }
+
     pub fn generated_inclusion_candidates(
         &self,
         output_basename: &str,
@@ -827,7 +871,7 @@ impl Store {
         self.connection
             .prepare(
                 "SELECT path FROM imported_artifacts
-                  WHERE role IN ('manifest','generated-rust','coverage-report')
+                  WHERE role IN ('manifest','generated-rust','coverage-report','scip-index')
                   ORDER BY path",
             )
             .map_err(db_error)?
@@ -890,15 +934,8 @@ impl Store {
         if depth > 6 || !(1..=50).contains(&max_nodes) || node_ref.len() > 116 {
             return Err("invalid view parameters".into());
         }
-        let (embedded_snapshot, epoch, generation, root_id) = parse_ref(node_ref)?;
-        if embedded_snapshot != snapshot_id {
-            return Err("node_snapshot_mismatch".into());
-        }
         let tx = self.connection.transaction().map_err(db_error)?;
-        let state = read_state(&tx)?;
-        if epoch != state.epoch || generation != state.generation {
-            return Err("stale node_ref".into());
-        }
+        let (state, root_id) = checked_ref(&tx, snapshot_id, node_ref)?;
         let root = load_node(&tx, root_id)?.ok_or_else(|| "node not found".to_owned())?;
         let Some(root_line) = root.line(snapshot_id, &state, None, VIEW_BUDGET)? else {
             return Ok(TRUNCATED.into());
@@ -933,11 +970,13 @@ impl Store {
                 }
                 visited.insert(node.id);
                 let include_traits = node.kind == "type";
-                let Some(line) = node.line(snapshot_id, &state, Some(&relation), VIEW_BUDGET)?
+                let Some(mut line) =
+                    node.line(snapshot_id, &state, Some(&relation), VIEW_BUDGET)?
                 else {
                     omitted = true;
                     break;
                 };
+                mark_scip_edge(&tx, &relation, current, node.id, &mut line)?;
                 lines.push(line);
                 queue.push_back((node.id, include_traits, level + 1));
             }
@@ -954,6 +993,29 @@ impl Store {
             })
             .map_err(db_error)?
         };
+        if root.kind != "file" {
+            let mut statement = tx
+                .prepare(
+                    "SELECT s.line_start, s.tag, s.text
+                       FROM nodes n JOIN source_notes s ON s.file_id=n.file_id
+                      WHERE n.id=?1 AND s.line_start>=n.line_start AND s.line_end<=n.line_end
+                      ORDER BY s.line_start, s.id LIMIT ?2",
+                )
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map(params![root_id, VIEW_NOTE_LIMIT], |row| {
+                    Ok(note_line(
+                        &row.get::<_, String>(1)?,
+                        &root.path,
+                        row.get(0)?,
+                        &row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                lines.push(row.map_err(db_error)?);
+            }
+        }
         let mut evidence_scope = CoverageScope::node(
             root_id,
             &root.path,
@@ -973,6 +1035,120 @@ impl Store {
         Ok(bounded(lines, VIEW_BUDGET, omitted))
     }
 
+    /// Whole-image adjacency for `impact` and `path`: resolved edges,
+    /// implementations, and supertype-member dispatch.
+    pub fn code_graph(&mut self) -> Result<CodeGraph> {
+        let tx = self.connection.transaction().map_err(db_error)?;
+        let ids = tx
+            .prepare("SELECT id FROM nodes")
+            .map_err(db_error)?
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        let mut edges = Vec::new();
+        let mut statement = tx
+            .prepare("SELECT source_id, target_id, kind FROM edges")
+            .map_err(db_error)?;
+        let mut rows = statement.query([]).map_err(db_error)?;
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let kind = row
+                .get_ref(2)
+                .map_err(db_error)?
+                .as_str()
+                .map_err(|error| error.to_string())?;
+            let relation =
+                Relation::parse(kind).ok_or_else(|| "database edge kind is invalid".to_owned())?;
+            edges.push((
+                row.get(0).map_err(db_error)?,
+                row.get(1).map_err(db_error)?,
+                relation,
+            ));
+        }
+        for (sql, relation) in [
+            (
+                "SELECT resolved_implementor_id, resolved_trait_id FROM trait_implementations
+                  WHERE resolved_implementor_id IS NOT NULL AND resolved_trait_id IS NOT NULL"
+                    .to_owned(),
+                Relation::Implements,
+            ),
+            (
+                format!(
+                    "WITH RECURSIVE {} SELECT base_id, member_id FROM overrides",
+                    overrides_cte()
+                ),
+                Relation::Dispatch,
+            ),
+        ] {
+            let mut statement = tx.prepare(&sql).map_err(db_error)?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, relation)))
+                .map_err(db_error)?;
+            for row in rows {
+                edges.push(row.map_err(db_error)?);
+            }
+        }
+        CodeGraph::new(ids, &edges)
+    }
+
+    /// Nodes that reach `node_ref` in reverse: callers, tests, importers,
+    /// implementors, and supertype members that dispatch to it.
+    pub fn impact(
+        &mut self,
+        snapshot_id: &str,
+        node_ref: &str,
+        depth: u32,
+        max_nodes: u32,
+        graph: &CodeGraph,
+    ) -> Result<String> {
+        if !(1..=6).contains(&depth) || !(1..=50).contains(&max_nodes) || node_ref.len() > 116 {
+            return Err("invalid impact parameters".into());
+        }
+        let tx = self.connection.transaction().map_err(db_error)?;
+        let (state, root_id) = checked_ref(&tx, snapshot_id, node_ref)?;
+        let impact = graph
+            .impact(root_id, depth, max_nodes as usize)
+            .ok_or_else(|| "node not found".to_owned())?;
+        let root = std::iter::once(Step {
+            id: root_id,
+            label: "",
+        });
+        let lines = step_lines(&tx, snapshot_id, &state, root.chain(impact.steps))?;
+        Ok(bounded(lines, VIEW_BUDGET, !impact.complete))
+    }
+
+    /// Shortest route between two nodes, following edge direction unless
+    /// `undirected`.
+    pub fn path(
+        &mut self,
+        snapshot_id: &str,
+        from_ref: &str,
+        to_ref: &str,
+        max_hops: u32,
+        undirected: bool,
+        graph: &CodeGraph,
+    ) -> Result<String> {
+        if !(1..=8).contains(&max_hops) || from_ref.len() > 116 || to_ref.len() > 116 {
+            return Err("invalid path parameters".into());
+        }
+        let tx = self.connection.transaction().map_err(db_error)?;
+        let (state, from) = checked_ref(&tx, snapshot_id, from_ref)?;
+        let (_, to) = checked_ref(&tx, snapshot_id, to_ref)?;
+        let direction = if undirected { "any" } else { "forward" };
+        let Some(route) = graph.path(from, to, max_hops, undirected) else {
+            return Ok(format!(
+                "no path within max_hops={max_hops} direction={direction}\n"
+            ));
+        };
+        let mut lines = vec![format!(
+            "path hops={} direction={direction}\n",
+            route.len() - 1
+        )];
+        lines.extend(step_lines(&tx, snapshot_id, &state, route)?);
+        Ok(bounded(lines, VIEW_BUDGET, false))
+    }
+
+    #[allow(clippy::too_many_arguments)] // One call binds one review request and its base image.
     pub fn changes(
         &mut self,
         snapshot_id: &str,
@@ -980,6 +1156,7 @@ impl Store {
         depth: u32,
         max_nodes: u32,
         dependency_mode: DependencyMode,
+        base: Option<&Store>,
         cancelled: &AtomicBool,
     ) -> Result<ChangeReview> {
         if depth > 6 || !(1..=50).contains(&max_nodes) {
@@ -1008,6 +1185,7 @@ impl Store {
                 dynamic_status: evidence.status,
             });
         }
+        let diff = graph_diff(&self.connection, base, dependency_mode, cancelled)?;
         let deleted_paths_unanalyzed = changes
             .records
             .iter()
@@ -1028,9 +1206,10 @@ impl Store {
             };
             let traversal_complete = deleted_paths_unanalyzed == 0;
             let mut output = format!(
-                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} static_test_path_gaps=0 traversal_complete={traversal_complete} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 dependency_analysis={} {}\n",
+                "risk overall=0.0000 changed_symbols_total=0 changed_symbols_analyzed=0 changed_symbols_emitted=0 changed_symbols_omitted=0 {flow_accounting} static_test_path_gaps=0 traversal_complete={traversal_complete} analysis_roots_omitted=0 deleted_paths_unanalyzed={deleted_paths_unanalyzed} neighborhood_omitted=false unmapped_ranges=0 file_mapped_ranges=0 import_cycles=0 notes=0 dependency_analysis={} {}{}\n",
                 dependency_analysis(dependency_mode),
                 risk_metadata(None),
+                diff.summary,
             );
             let accounting = static_accounting(&self.connection, &evidence_scope)?;
             let content_complete = change_content_complete(changes, dependency_mode);
@@ -1041,6 +1220,7 @@ impl Store {
                 traversal_complete,
                 &evidence,
             ));
+            output.extend(diff.records);
             let static_status = accounting.overall(content_complete, true, traversal_complete);
             let dynamic_status = evidence.status;
             return Ok(ChangeReview {
@@ -1123,6 +1303,14 @@ impl Store {
                   WHERE f.path=?1 AND n.kind='file'",
             )
             .map_err(db_error)?;
+        let mut file_notes = tx
+            .prepare(
+                "SELECT n.line_start, n.line_end, n.tag, n.text
+                   FROM files f JOIN source_notes n ON n.file_id=f.id
+                  WHERE f.path=?1 ORDER BY n.line_start, n.id",
+            )
+            .map_err(db_error)?;
+        let mut notes = Vec::new();
 
         for file in files {
             check_cancelled(cancelled)?;
@@ -1137,6 +1325,7 @@ impl Store {
             }
             let mut span_index = 0;
             let mut coverage = Vec::new();
+            let mut changed_symbol_spans = Vec::new();
             let rows = symbols
                 .query_map([&file.path], |row| {
                     Ok((
@@ -1169,6 +1358,9 @@ impl Store {
                         .spans
                         .get(span_index)
                         .is_some_and(|span| span.start <= interval.end);
+                if changed {
+                    changed_symbol_spans.push(interval);
+                }
                 if changed && root_seen.insert(id) {
                     symbol_root_ids.push(id);
                 }
@@ -1185,6 +1377,32 @@ impl Store {
             } else {
                 &file.spans
             };
+            let rows = file_notes
+                .query_map([&file.path], |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                let (line_start, line_end, tag, text) = row.map_err(db_error)?;
+                let note = LineSpan {
+                    start: u64::from(line_start) * 2,
+                    end: u64::from(line_end) * 2,
+                };
+                if changed_symbol_spans
+                    .iter()
+                    .any(|span| span.start <= note.start && note.end <= span.end)
+                    || changed_spans
+                        .iter()
+                        .any(|span| span.start <= note.end && note.start <= span.end)
+                {
+                    notes.push((file.path.as_str(), line_start, tag, text));
+                }
+            }
             let residual = unmapped_spans(changed_spans, &coverage);
             let unmapped = file.report_unmapped
                 && if changed_spans.is_empty() {
@@ -1210,6 +1428,8 @@ impl Store {
         }
         drop(symbols);
         drop(file_nodes);
+        drop(file_notes);
+        notes.sort_by_key(|(path, line, _, _)| (*path, *line));
 
         let changed_symbols_total = symbol_root_ids.len();
         let analysis_roots_total = changed_symbols_total.saturating_add(file_root_ids.len());
@@ -1292,6 +1512,12 @@ impl Store {
                 &mut calls,
             )?
         };
+        for (path, line, tag, text) in notes.iter().take(NOTE_LINE_LIMIT) {
+            lines.push(note_line(tag, path, *line, text));
+        }
+        if notes.len() > NOTE_LINE_LIMIT {
+            lines.push(format!("notes_omitted={}\n", notes.len() - NOTE_LINE_LIMIT));
+        }
         for flow in &analysis.flows {
             traversed_ids.insert(flow.entry.id);
             traversed_ids.extend(flow.nodes.iter().map(|node| node.id));
@@ -1299,6 +1525,31 @@ impl Store {
             evidence_node_ids.extend(flow.nodes.iter().map(|node| node.id));
             lines.push(flow_line(flow, dependency_mode)?);
         }
+        let changed_paths = changes
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<HashSet<_>>();
+        let file_imports = load_file_imports(&tx, dependency_mode)?;
+        let (import_cycle_total, cycle_routes) = import_cycles(&file_imports, &changed_paths);
+        for (size, route) in cycle_routes.iter().take(IMPORT_CYCLE_LINE_LIMIT) {
+            let mut line = format!("import_cycle files={size} route=");
+            for (index, path) in route.iter().chain(route.first()).enumerate() {
+                if index > 0 {
+                    line.push_str(" -> ");
+                }
+                push_escaped(&mut line, path, usize::MAX);
+            }
+            line.push('\n');
+            lines.push(line);
+        }
+        if cycle_routes.len() > IMPORT_CYCLE_LINE_LIMIT {
+            lines.push(format!(
+                "import_cycles_omitted={}\n",
+                cycle_routes.len() - IMPORT_CYCLE_LINE_LIMIT
+            ));
+        }
+        lines.extend(diff.records);
         let overall = analysis
             .risks
             .values()
@@ -1343,7 +1594,7 @@ impl Store {
         lines.insert(
             0,
             format!(
-                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} static_test_path_gaps={} traversal_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} dependency_analysis={} {}\n",
+                "risk overall={} changed_symbols_total={} changed_symbols_analyzed={} changed_symbols_emitted={} changed_symbols_omitted={} {} static_test_path_gaps={} traversal_complete={} analysis_roots_omitted={} deleted_paths_unanalyzed={} neighborhood_omitted={} unmapped_ranges={} file_mapped_ranges={} import_cycles={} notes={} dependency_analysis={} {}{}\n",
                 score_text(overall),
                 changed_symbols_total,
                 analysis.risks.len(),
@@ -1357,8 +1608,11 @@ impl Store {
                 neighborhood_omitted,
                 unmapped_range_count,
                 file_mapped_range_count,
+                import_cycle_total,
+                notes.len(),
                 dependency_analysis(dependency_mode),
                 risk_metadata(top_risk),
+                diff.summary,
             ),
         );
         let static_status =
@@ -1388,6 +1642,276 @@ impl Store {
             dynamic_status,
         })
     }
+}
+
+/// Reason rendered when a snapshot carries no base graph image: the base
+/// tree's supported sources hash to the head image.
+const BASE_GRAPH_ABSENT: &str = "identical_sources";
+const API_RECORD_LIMIT: usize = 32;
+const API_SIGNATURE_LIMIT: usize = 120;
+const API_FIELD_LIMIT: usize = 256;
+
+#[derive(Debug)]
+struct ApiSymbol {
+    id: i64,
+    identity: String,
+    name: String,
+    kind: String,
+    path: String,
+    line: u32,
+    signature: String,
+}
+
+#[derive(Debug, Default)]
+struct ApiDiff<'a> {
+    removed: Vec<&'a ApiSymbol>,
+    changed: Vec<(&'a ApiSymbol, &'a ApiSymbol)>,
+    added: Vec<&'a ApiSymbol>,
+}
+
+struct GraphDiff {
+    summary: String,
+    records: Vec<String>,
+}
+
+/// Node identity that is stable across images: the qualified name
+/// (`lang:len#path:len#kind:len#scope:line:ordinal`) without its trailing
+/// `:line:ordinal`, i.e. language, path, kind and scope-qualified name.
+fn stable_identity(qualified_name: &str) -> &str {
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    let mut parts = qualified_name.rsplitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(ordinal), Some(line), Some(identity)) if digits(ordinal) && digits(line) => identity,
+        _ => qualified_name,
+    }
+}
+
+fn load_api_symbols(
+    connection: &Connection,
+    dependency_mode: DependencyMode,
+    cancelled: &AtomicBool,
+) -> Result<Vec<ApiSymbol>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start, n.signature
+               FROM nodes n JOIN files f ON f.id=n.file_id
+              WHERE n.kind!='file'
+                AND NOT EXISTS(SELECT 1 FROM imported_artifacts a
+                                WHERE a.role='generated-rust' AND a.path=f.path)
+              ORDER BY f.path, n.line_start, n.id",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut symbols = Vec::new();
+    for row in rows {
+        check_cancelled(cancelled)?;
+        let (id, kind, name, qualified_name, path, line, signature) = row.map_err(db_error)?;
+        if dependency_mode == DependencyMode::Boundary && dependency_package(&path).is_some() {
+            continue;
+        }
+        symbols.push(ApiSymbol {
+            id,
+            identity: stable_identity(&qualified_name).to_owned(),
+            name,
+            kind,
+            path,
+            line,
+            signature,
+        });
+    }
+    Ok(symbols)
+}
+
+/// Matches symbols by stable identity. Within one identity (overloads, cfg
+/// variants) equal signatures pair first; leftovers pair in line order as
+/// signature changes and the remainder is removed or added.
+fn classify_api<'a>(base: &'a [ApiSymbol], head: &'a [ApiSymbol]) -> ApiDiff<'a> {
+    fn group(symbols: &[ApiSymbol]) -> BTreeMap<&str, Vec<&ApiSymbol>> {
+        let mut groups = BTreeMap::<&str, Vec<&ApiSymbol>>::new();
+        for symbol in symbols {
+            groups.entry(&symbol.identity).or_default().push(symbol);
+        }
+        groups
+    }
+    let mut head = group(head);
+    let mut diff = ApiDiff::default();
+    for (identity, mut before) in group(base) {
+        let mut after = head.remove(identity).unwrap_or_default();
+        before.retain(
+            |old| match after.iter().position(|new| new.signature == old.signature) {
+                Some(index) => {
+                    after.remove(index);
+                    false
+                }
+                None => true,
+            },
+        );
+        let paired = before.len().min(after.len());
+        diff.changed
+            .extend(before.iter().copied().zip(after.iter().copied()));
+        diff.removed.extend(&before[paired..]);
+        diff.added.extend(&after[paired..]);
+    }
+    diff.added.extend(head.into_values().flatten());
+    fn order(left: &ApiSymbol, right: &ApiSymbol) -> std::cmp::Ordering {
+        (&left.path, left.line, &left.name).cmp(&(&right.path, right.line, &right.name))
+    }
+    diff.removed.sort_by(|left, right| order(left, right));
+    diff.added.sort_by(|left, right| order(left, right));
+    diff.changed
+        .sort_by(|(_, left), (_, right)| order(left, right));
+    diff
+}
+
+fn push_api_field(output: &mut String, label: &str, value: &str) {
+    output.push(' ');
+    output.push_str(label);
+    output.push('=');
+    push_escaped(output, &shorten(value, API_FIELD_LIMIT), usize::MAX);
+}
+
+fn api_symbol_line(record: &str, symbol: &ApiSymbol, kind: bool) -> String {
+    let mut output = String::from(record);
+    if kind {
+        push_api_field(&mut output, "kind", &symbol.kind);
+    }
+    push_api_field(&mut output, "symbol", &symbol.name);
+    push_api_field(&mut output, "path", &symbol.path);
+    output.push_str(&format!(" line={}", symbol.line));
+    output
+}
+
+/// Compares the head image with the base image: removed and added symbols,
+/// signature changes, and head references left dangling by removals.
+fn graph_diff(
+    head: &Connection,
+    base: Option<&Store>,
+    dependency_mode: DependencyMode,
+    cancelled: &AtomicBool,
+) -> Result<GraphDiff> {
+    let Some(base) = base else {
+        return Ok(GraphDiff {
+            summary: format!(
+                " api_removed=0 api_signature_changed=0 broken_references=0 base_graph=absent:{BASE_GRAPH_ABSENT}"
+            ),
+            records: Vec::new(),
+        });
+    };
+    let before = load_api_symbols(&base.connection, dependency_mode, cancelled)?;
+    let after = load_api_symbols(head, dependency_mode, cancelled)?;
+    let diff = classify_api(&before, &after);
+    let mut node_keys = base
+        .connection
+        .prepare("SELECT key FROM node_keys WHERE node_id=?1 ORDER BY key")
+        .map_err(db_error)?;
+    let mut dangling = head
+        .prepare(
+            "SELECT r.id, n.name, f.path, r.line
+               FROM ref_keys k
+               JOIN refs r ON r.id=k.ref_id
+               JOIN nodes n ON n.id=r.source_id
+               JOIN files f ON f.id=n.file_id
+              WHERE k.key=?1 AND r.resolution_state IN ('missing','ambiguous')
+              ORDER BY r.id",
+        )
+        .map_err(db_error)?;
+    let mut broken = BTreeMap::<i64, (String, u32, String, String)>::new();
+    let mut records = Vec::new();
+    for symbol in &diff.removed {
+        let keys = node_keys
+            .query_map([symbol.id], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        let mut callers = BTreeSet::new();
+        for key in keys {
+            check_cancelled(cancelled)?;
+            let rows = dangling
+                .query_map([&key], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u32>(3)?,
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                let (id, name, path, line) = row.map_err(db_error)?;
+                if dependency_mode == DependencyMode::Boundary
+                    && dependency_package(&path).is_some()
+                {
+                    continue;
+                }
+                callers.insert(id);
+                broken
+                    .entry(id)
+                    .or_insert_with(|| (path, line, name, key.clone()));
+            }
+        }
+        let mut line = api_symbol_line("api_removed", symbol, true);
+        line.push_str(&format!(" head_callers={}\n", callers.len()));
+        records.push(line);
+    }
+    let mut broken = broken.into_values().collect::<Vec<_>>();
+    broken.sort();
+    for (path, line, name, key) in broken.iter().take(API_RECORD_LIMIT) {
+        let mut output = String::from("broken_reference source=");
+        push_escaped(&mut output, &shorten(name, API_FIELD_LIMIT), usize::MAX);
+        output.push('@');
+        push_escaped(&mut output, &shorten(path, API_FIELD_LIMIT), usize::MAX);
+        output.push_str(&format!(":{line}"));
+        push_api_field(&mut output, "target", key);
+        output.push('\n');
+        records.push(output);
+    }
+    if broken.len() > API_RECORD_LIMIT {
+        records.push(format!(
+            "broken_references_omitted={}\n",
+            broken.len() - API_RECORD_LIMIT
+        ));
+    }
+    for (old, new) in &diff.changed {
+        let mut line = api_symbol_line("api_signature_changed", new, false);
+        line.push_str(&format!(
+            " before={:?} after={:?}\n",
+            shorten(&old.signature, API_SIGNATURE_LIMIT),
+            shorten(&new.signature, API_SIGNATURE_LIMIT)
+        ));
+        records.push(line);
+    }
+    for symbol in diff.added.iter().take(API_RECORD_LIMIT) {
+        let mut line = api_symbol_line("api_added", symbol, true);
+        line.push('\n');
+        records.push(line);
+    }
+    if diff.added.len() > API_RECORD_LIMIT {
+        records.push(format!(
+            "api_added_omitted={}\n",
+            diff.added.len() - API_RECORD_LIMIT
+        ));
+    }
+    Ok(GraphDiff {
+        summary: format!(
+            " api_removed={} api_signature_changed={} broken_references={} base_graph=present",
+            diff.removed.len(),
+            diff.changed.len(),
+            broken.len()
+        ),
+        records,
+    })
 }
 
 pub fn validate_image(path: &Path) -> Result<State> {
@@ -1530,16 +2054,24 @@ fn require_graph_invariants(connection: &Connection, cancelled: &AtomicBool) -> 
         return Err("database reference edges do not match resolved references".into());
     }
     check_cancelled(cancelled)?;
+    // One grouped pass per table: a correlated per-file subquery rescanned
+    // every relation-site gap for each file (14 s on a 911-file C++ image).
     let mismatch = connection
         .query_row(
-            "SELECT f.path FROM files f
-              WHERE f.observed_relation_sites !=
-                    (SELECT count(*) FROM refs r
-                       JOIN nodes n ON n.id=r.source_id WHERE n.file_id=f.id)
-                  + (SELECT count(*) FROM modeled_sites m WHERE m.file_id=f.id)
-                  + (SELECT coalesce(sum(g.occurrences),0) FROM graph_gaps g
-                       LEFT JOIN nodes n ON n.id=g.source_id
-                      WHERE g.relation_site=1 AND coalesce(g.file_id,n.file_id)=f.id)
+            "WITH sites(file_id, total) AS (
+                 SELECT n.file_id, count(*) FROM refs r JOIN nodes n ON n.id=r.source_id
+                  GROUP BY n.file_id
+                 UNION ALL
+                 SELECT file_id, count(*) FROM modeled_sites GROUP BY file_id
+                 UNION ALL
+                 SELECT coalesce(g.file_id, n.file_id), sum(g.occurrences)
+                   FROM graph_gaps g LEFT JOIN nodes n ON n.id=g.source_id
+                  WHERE g.relation_site=1 GROUP BY 1
+             )
+             SELECT f.path FROM files f
+               LEFT JOIN (SELECT file_id, sum(total) AS total FROM sites GROUP BY file_id) s
+                 ON s.file_id=f.id
+              WHERE f.observed_relation_sites != coalesce(s.total, 0)
               ORDER BY f.path LIMIT 1",
             [],
             |row| row.get::<_, String>(0),
@@ -1569,6 +2101,24 @@ fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) 
             "llvm" | "coverage_py" => {}
             _ => return Err("database coverage format is invalid".into()),
         }
+    }
+    let unattested_scip: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM refs r
+                  WHERE r.resolution_source!='static'
+                    AND (r.resolution_source!='scip' OR r.kind!='CALLS'
+                         OR r.alias_key IS NOT NULL
+                         OR NOT EXISTS(
+                             SELECT 1 FROM imported_artifacts WHERE role='scip-index'
+                         ))
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if unattested_scip {
+        return Err("database SCIP resolution is unattested".into());
     }
     for kind in distinct_text(connection, "SELECT DISTINCT kind FROM coverage_branches")? {
         CoverageBranchKind::parse(&kind)
@@ -1944,7 +2494,7 @@ fn require_provenance_invariants(connection: &Connection, cancelled: &AtomicBool
 fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
     let mut load_references = connection
         .prepare(
-            "SELECT id, alias_key, resolved_target_id, resolution_state
+            "SELECT id, alias_key, resolved_target_id, resolution_state, resolution_source
                FROM refs ORDER BY id",
         )
         .map_err(db_error)?;
@@ -1955,6 +2505,7 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<i64>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)? == "scip",
             ))
         })
         .map_err(db_error)?;
@@ -1971,7 +2522,7 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
         .map_err(db_error)?;
     let mut loaded = Vec::with_capacity(references.len());
     let mut aliases = HashMap::new();
-    for (id, alias, target, state) in references {
+    for (id, alias, target, state, scip) in references {
         check_cancelled(cancelled)?;
         let rows = load_keys
             .query_map([id], |row| row.get::<_, String>(0))
@@ -1999,7 +2550,7 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
                 })
                 .or_insert(direct);
         }
-        loaded.push((alias, target, state, keys, direct));
+        loaded.push((alias, target, state, scip, keys, direct));
     }
 
     #[cfg(test)]
@@ -2010,7 +2561,7 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
     });
     check_cancelled(cancelled)?;
 
-    for (alias, actual_target, actual_state, keys, direct) in loaded {
+    for (alias, actual_target, actual_state, scip, keys, direct) in loaded {
         check_cancelled(cancelled)?;
         let expected = if alias.is_some() {
             direct
@@ -2022,7 +2573,15 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
             DbCandidate::Missing => (None, ResolutionState::Missing),
             DbCandidate::Ambiguous => (None, ResolutionState::Ambiguous),
         };
-        if actual_target != expected_target || actual_state != expected_state.db() {
+        // SCIP evidence may only upgrade refs static candidates leave unresolved.
+        let consistent = if scip {
+            expected_state != ResolutionState::Resolved
+                && actual_target.is_some()
+                && actual_state == ResolutionState::Resolved.db()
+        } else {
+            actual_target == expected_target && actual_state == expected_state.db()
+        };
+        if !consistent {
             return Err("database reference resolution does not match candidates".into());
         }
     }
@@ -2120,6 +2679,8 @@ struct AffectedFlow {
     entry: FlowNode,
     nodes: Vec<FlowNode>,
     parents: HashMap<i64, i64>,
+    /// Nodes whose parent hop is supertype-member dispatch, not a resolved call.
+    dispatched: HashSet<i64>,
     changed: Vec<i64>,
     depth: u32,
     file_count: usize,
@@ -2344,9 +2905,10 @@ fn traverse_changes(
                         return Ok(true);
                     }
                     row_budget -= 1;
-                    let line = node
+                    let mut line = node
                         .line(snapshot_id, state, Some(relation), usize::MAX)?
                         .ok_or_else(|| "changed neighbor line exceeds address space".to_owned())?;
+                    mark_scip_edge(connection, relation, source, node.id, &mut line)?;
                     lines.push(line);
                     visited.insert(node.id);
                     next.push((node.id, node.kind == "type"));
@@ -2362,6 +2924,38 @@ fn traverse_changes(
         std::mem::swap(&mut current, &mut next);
     }
     Ok(dependency_omitted)
+}
+
+/// Appends ` via=scip` to a rendered call relation whose edge only SCIP
+/// evidence supports.
+fn mark_scip_edge(
+    connection: &Connection,
+    relation: &str,
+    current: i64,
+    neighbor: i64,
+    line: &mut String,
+) -> Result<()> {
+    let (source, target) = match relation {
+        "test <-" | "caller <-" => (neighbor, current),
+        "call ->" => (current, neighbor),
+        _ => return Ok(()),
+    };
+    let scip_only: bool = connection
+        .prepare(
+            "SELECT EXISTS(
+                        SELECT 1 FROM refs WHERE source_id=?1 AND kind='CALLS'
+                           AND resolved_target_id=?2 AND resolution_source='scip')
+                    AND NOT EXISTS(
+                        SELECT 1 FROM refs WHERE source_id=?1 AND kind='CALLS'
+                           AND resolved_target_id=?2 AND resolution_source='static')",
+        )
+        .map_err(db_error)?
+        .query_row(params![source, target], |row| row.get(0))
+        .map_err(db_error)?;
+    if scip_only {
+        line.insert_str(line.len() - 1, " via=scip");
+    }
+    Ok(())
 }
 
 fn analyze_changed_roots(
@@ -2580,11 +3174,11 @@ fn affected_entries(
             entries.push(current.clone());
         }
         if depth == FLOW_DEPTH {
-            omitted |= callers.iter().any(|node| !visited.contains(&node.id));
+            omitted |= callers.iter().any(|(node, _)| !visited.contains(&node.id));
             continue;
         }
 
-        for caller in callers {
+        for (caller, _) in callers {
             if visited.contains(&caller.id) {
                 continue;
             }
@@ -2623,6 +3217,7 @@ fn trace_flow(
 ) -> Result<(Option<AffectedFlow>, bool)> {
     let mut nodes = vec![entry.clone()];
     let mut parents = HashMap::new();
+    let mut dispatched = HashSet::new();
     let mut visited = HashSet::from([entry.id]);
     let mut dependency_packages = dependency_package(&entry.path)
         .map(|package| HashSet::from([package.to_owned()]))
@@ -2654,11 +3249,11 @@ fn trace_flow(
         )?;
         omitted |= more;
         if depth == FLOW_DEPTH {
-            omitted |= callees.iter().any(|node| !visited.contains(&node.id));
+            omitted |= callees.iter().any(|(node, _)| !visited.contains(&node.id));
             continue;
         }
 
-        for callee in callees {
+        for (callee, dispatch) in callees {
             if visited.contains(&callee.id) {
                 continue;
             }
@@ -2682,6 +3277,9 @@ fn trace_flow(
             }
             visited.insert(callee.id);
             parents.insert(callee.id, current.id);
+            if dispatch {
+                dispatched.insert(callee.id);
+            }
             depth_reached = depth_reached.max(depth + 1);
             nodes.push(callee.clone());
             queue.push_back((callee, depth + 1));
@@ -2702,6 +3300,7 @@ fn trace_flow(
             entry,
             nodes,
             parents,
+            dispatched,
             changed,
             depth: depth_reached,
             file_count,
@@ -2743,17 +3342,31 @@ fn load_flow_nodes(connection: &Connection, ids: &[i64]) -> Result<Vec<FlowNode>
         .collect()
 }
 
+/// Resolved `CALLS` neighbors plus same-name members of transitive supertypes
+/// (incoming) or subtypes (outgoing); the flag marks dispatch-only hops.
 fn load_flow_neighbors(
     connection: &Connection,
     id: i64,
     incoming: bool,
     limit: usize,
     dependency_mode: DependencyMode,
-) -> Result<(Vec<FlowNode>, bool)> {
-    let (neighbor, source, kind) = if incoming {
-        ("source_id", "target_id", " AND n.kind='function'")
+) -> Result<(Vec<(FlowNode, bool)>, bool)> {
+    let (neighbor, source, kind, near, far) = if incoming {
+        (
+            "source_id",
+            "target_id",
+            " AND n.kind='function'",
+            "resolved_implementor_id",
+            "resolved_trait_id",
+        )
     } else {
-        ("target_id", "source_id", "")
+        (
+            "target_id",
+            "source_id",
+            "",
+            "resolved_trait_id",
+            "resolved_implementor_id",
+        )
     };
     let fetch = limit
         .checked_add(1)
@@ -2765,15 +3378,34 @@ fn load_flow_neighbors(
         ""
     };
     let sql = format!(
-        "SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start
-           FROM edges e JOIN nodes n ON n.id=e.{neighbor}
+        "WITH RECURSIVE related(type_id, hops) AS (
+             SELECT ti.{far}, 1 FROM nodes m
+               JOIN trait_implementations ti ON ti.{near}=m.parent_id
+              WHERE m.id=?1 AND m.kind='function' AND ti.{far} IS NOT NULL
+             UNION
+             SELECT ti.{far}, related.hops + 1 FROM related
+               JOIN trait_implementations ti ON ti.{near}=related.type_id
+              WHERE ti.{far} IS NOT NULL AND related.hops < {DISPATCH_DEPTH}
+         ),
+         neighbors(id, dispatch) AS (
+             SELECT e.{neighbor}, 0 FROM edges e WHERE e.{source}=?1 AND e.kind='CALLS'
+             UNION ALL
+             SELECT n.id, 1 FROM related JOIN nodes n ON n.parent_id=related.type_id
+              WHERE n.kind='function' AND n.id<>?1
+                AND n.name=(SELECT name FROM nodes WHERE id=?1)
+         )
+         SELECT n.id, n.kind, n.name, n.qualified_name, f.path, n.line_start,
+                MIN(neighbors.dispatch)
+           FROM neighbors JOIN nodes n ON n.id=neighbors.id
            JOIN files f ON f.id=n.file_id
-          WHERE e.{source}=?1 AND e.kind='CALLS'{kind}{path_filter}
-          ORDER BY n.id LIMIT ?2"
+          WHERE 1{kind}{path_filter}
+          GROUP BY n.id ORDER BY n.id LIMIT ?2"
     );
     let mut statement = connection.prepare(&sql).map_err(db_error)?;
     let mut nodes = statement
-        .query_map(params![id, fetch], flow_node)
+        .query_map(params![id, fetch], |row| {
+            Ok((flow_node(row)?, row.get::<_, bool>(6)?))
+        })
         .map_err(db_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(db_error)?;
@@ -2802,7 +3434,8 @@ fn load_flow_neighbors(
         nodes.extend(
             dependencies
                 .into_iter()
-                .take(DEPENDENCY_NEIGHBOR_SCAN_LIMIT),
+                .take(DEPENDENCY_NEIGHBOR_SCAN_LIMIT)
+                .map(|node| (node, false)),
         );
         return Ok((nodes, more || dependencies_more));
     }
@@ -2914,18 +3547,25 @@ fn node_risk_counts(connection: &Connection, ids: &[i64]) -> Result<(NodeRiskCou
         .ok_or_else(|| "caller traversal limit overflow".to_owned())?;
     let sql = format!(
         "WITH RECURSIVE changed(id) AS (VALUES {values}),
+         {},
          callers(changed_id, node_id) AS (
              SELECT id, id FROM changed
              UNION
              SELECT callers.changed_id AS changed_id, edges.source_id AS node_id
                FROM callers JOIN edges ON edges.target_id=callers.node_id
               WHERE edges.kind='CALLS'
+             UNION
+             SELECT callers.changed_id AS changed_id, overrides.base_id AS node_id
+               FROM callers JOIN overrides ON overrides.member_id=callers.node_id
               ORDER BY changed_id, node_id
               LIMIT {caller_limit}
          )
          SELECT changed.id,
-                (SELECT count(*) FROM edges
-                  WHERE target_id=changed.id AND kind='CALLS'),
+                (SELECT count(DISTINCT source_id) FROM edges
+                  WHERE kind='CALLS'
+                    AND (target_id=changed.id
+                         OR target_id IN (SELECT base_id FROM overrides
+                                           WHERE member_id=changed.id))),
                 (SELECT count(DISTINCT test.source_id)
                    FROM callers
                    JOIN edges test ON test.target_id=callers.node_id
@@ -2934,7 +3574,8 @@ fn node_risk_counts(connection: &Connection, ids: &[i64]) -> Result<(NodeRiskCou
                 EXISTS(SELECT 1 FROM edges
                         WHERE target_id=changed.id AND kind='TEST_CALLS'),
                 (SELECT count(*) FROM callers) > {FLOW_QUERY_LIMIT}
-           FROM changed"
+           FROM changed",
+        overrides_cte()
     );
     let mut statement = connection.prepare(&sql).map_err(db_error)?;
     let rows = statement
@@ -2965,6 +3606,153 @@ fn node_risk_counts(connection: &Connection, ids: &[i64]) -> Result<(NodeRiskCou
     Ok((counts, omitted))
 }
 
+const IMPORT_CYCLE_LINE_LIMIT: usize = 16;
+const NOTE_LINE_LIMIT: usize = 16;
+const VIEW_NOTE_LIMIT: u32 = 8;
+
+fn note_line(tag: &str, path: &str, line: u32, text: &str) -> String {
+    format!("note tag={tag} path={path:?} line={line} text={text:?}\n")
+}
+
+/// File-level import pairs. Rust is excluded: modules of one crate may refer
+/// to each other freely, so `use` cycles there are not a defect signal.
+fn load_file_imports(
+    connection: &Connection,
+    dependency_mode: DependencyMode,
+) -> Result<Vec<(String, String)>> {
+    let path_filter = if dependency_mode == DependencyMode::Boundary {
+        " AND sf.path NOT GLOB '.cargo/vendor/*/*' AND tf.path NOT GLOB '.cargo/vendor/*/*'"
+    } else {
+        ""
+    };
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT DISTINCT sf.path, tf.path FROM edges e
+               JOIN nodes s ON s.id=e.source_id JOIN files sf ON sf.id=s.file_id
+               JOIN nodes t ON t.id=e.target_id JOIN files tf ON tf.id=t.file_id
+              WHERE e.kind='IMPORTS' AND sf.id!=tf.id
+                AND sf.language!='rust' AND tf.language!='rust'{path_filter}"
+        ))
+        .map_err(db_error)?;
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(db_error)
+}
+
+/// Returns the number of import SCCs (>= 2 files) containing a changed file and,
+/// per changed member file in path order, the SCC size with the shortest import
+/// cycle starting at that file (ties broken by path order).
+fn import_cycles<'a>(
+    imports: &'a [(String, String)],
+    changed: &HashSet<&str>,
+) -> (usize, Vec<(usize, Vec<&'a str>)>) {
+    let mut paths = imports
+        .iter()
+        .flat_map(|(source, target)| [source.as_str(), target.as_str()])
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    let position = |path: &str| paths.binary_search(&path).expect("import path is indexed");
+    let mut adjacency = vec![Vec::new(); paths.len()];
+    for (source, target) in imports {
+        if source != target {
+            adjacency[position(source)].push(position(target));
+        }
+    }
+    for targets in &mut adjacency {
+        targets.sort_unstable();
+        targets.dedup();
+    }
+
+    // Iterative Tarjan: explicit call stack of (node, next edge index).
+    let unvisited = usize::MAX;
+    let mut index = vec![unvisited; paths.len()];
+    let mut low = vec![0; paths.len()];
+    let mut on_stack = vec![false; paths.len()];
+    let mut component = vec![0; paths.len()];
+    let mut sizes = Vec::new();
+    let mut stack = Vec::new();
+    let mut next = 0;
+    for root in 0..paths.len() {
+        if index[root] != unvisited {
+            continue;
+        }
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        let mut calls = vec![(root, 0)];
+        while let Some(frame) = calls.last_mut() {
+            let node = frame.0;
+            if let Some(&target) = adjacency[node].get(frame.1) {
+                frame.1 += 1;
+                if index[target] == unvisited {
+                    index[target] = next;
+                    low[target] = next;
+                    next += 1;
+                    stack.push(target);
+                    on_stack[target] = true;
+                    calls.push((target, 0));
+                } else if on_stack[target] {
+                    low[node] = low[node].min(index[target]);
+                }
+                continue;
+            }
+            calls.pop();
+            if let Some(&(parent, _)) = calls.last() {
+                low[parent] = low[parent].min(low[node]);
+            }
+            if low[node] == index[node] {
+                let mut size = 0;
+                loop {
+                    let member = stack.pop().expect("Tarjan stack holds the component");
+                    on_stack[member] = false;
+                    component[member] = sizes.len();
+                    size += 1;
+                    if member == node {
+                        break;
+                    }
+                }
+                sizes.push(size);
+            }
+        }
+    }
+
+    let mut relevant = vec![false; sizes.len()];
+    let mut routes = Vec::new();
+    for start in 0..paths.len() {
+        let scc = component[start];
+        if sizes[scc] < 2 || !changed.contains(paths[start]) {
+            continue;
+        }
+        relevant[scc] = true;
+        let mut parent = vec![unvisited; paths.len()];
+        let mut queue = std::collections::VecDeque::from([start]);
+        parent[start] = start;
+        'search: while let Some(node) = queue.pop_front() {
+            for &target in &adjacency[node] {
+                if target == start {
+                    let mut route = vec![node];
+                    while *route.last().expect("route is non-empty") != start {
+                        route.push(parent[*route.last().expect("route is non-empty")]);
+                    }
+                    route.reverse();
+                    routes.push((sizes[scc], route.into_iter().map(|id| paths[id]).collect()));
+                    break 'search;
+                }
+                if component[target] == scc && parent[target] == unvisited {
+                    parent[target] = node;
+                    queue.push_back(target);
+                }
+            }
+        }
+    }
+    (relevant.into_iter().filter(|&found| found).count(), routes)
+}
+
 fn node_risk(
     flow_score: u32,
     tests: u32,
@@ -2977,7 +3765,7 @@ fn node_risk(
     let flow_component = flow_score.min(2_500);
     let test_component = 3_000_u32.saturating_sub(tests.min(5) * 500);
     let security_component = u32::from(security) * 2_000;
-    let caller_component = callers.min(2) * 500;
+    let caller_component = fan_in_component(callers);
     NodeRisk {
         score: flow_component + test_component + security_component + caller_component,
         flow_component,
@@ -2989,6 +3777,19 @@ fn node_risk(
         indirect_test_covered,
     }
 }
+
+/// Direct production fan-in tiers: one caller, a few, a shared helper, a hub.
+const fn fan_in_component(callers: u32) -> u32 {
+    match callers {
+        0 => 0,
+        1 => 250,
+        2..=3 => 500,
+        4..HUB_FAN_IN => 750,
+        _ => 1_000,
+    }
+}
+
+const HUB_FAN_IN: u32 = 16;
 
 fn security_sensitive(name: &str, qualified_name: &str) -> bool {
     let name = name.to_lowercase();
@@ -3045,6 +3846,10 @@ fn risk_metadata(risk: Option<&NodeRisk>) -> String {
         (risk.flow_component > 0, "affected-flow"),
         (risk.security_component > 0, "security-sensitive"),
         (risk.caller_component > 0, "caller-impact"),
+        (
+            risk.caller_component == fan_in_component(HUB_FAN_IN),
+            "high-fan-in",
+        ),
     ] {
         if present {
             rationale.push('+');
@@ -3758,6 +4563,7 @@ fn render_evidence(
         "completeness evidence_capture=complete provenance_model={} execution_mapping={execution_status}\n",
         provenance_status
     );
+    render_scip_claim(connection, scope, &mut text)?;
     for row in rows {
         let complete = row.12 == "linked" && row.11.is_some();
         let input = format!("{}:{}-{}", row.1, row.2, row.3);
@@ -3816,6 +4622,45 @@ fn render_evidence(
         provenance_status,
         execution_status,
     })
+}
+
+/// Producer-attested SCIP resolutions relevant to `scope`; omitted when the
+/// manifest declared no SCIP index.
+fn render_scip_claim(
+    connection: &Connection,
+    scope: Option<&CoverageScope>,
+    text: &mut String,
+) -> Result<()> {
+    let indexes: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM imported_artifacts WHERE role='scip-index'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if indexes == 0 {
+        return Ok(());
+    }
+    let count = connection
+        .prepare(
+            "SELECT f.path, r.line FROM refs r JOIN nodes n ON n.id=r.source_id
+               JOIN files f ON f.id=n.file_id
+              WHERE r.resolution_source='scip'",
+        )
+        .map_err(db_error)?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?
+        .into_iter()
+        .filter(|(path, line)| scope.is_none_or(|scope| scope.relevant(path, *line, *line)))
+        .count();
+    text.push_str(&format!(
+        "claim kind=scip-resolved-references count={count} basis=verified-scip-manifest\n"
+    ));
+    Ok(())
 }
 
 fn coverage_relevance(
@@ -4455,6 +5300,14 @@ fn flow_line(flow: &AffectedFlow, dependency_mode: DependencyMode) -> Result<Str
         flow.file_count,
         flow.changed.len()
     );
+    let dispatch_hops = route
+        .iter()
+        .skip(1)
+        .filter(|id| flow.dispatched.contains(id))
+        .count();
+    if dispatch_hops > 0 {
+        output.push_str(&format!("dispatch_hops={dispatch_hops} "));
+    }
     for (index, id) in route.into_iter().enumerate() {
         let node = flow
             .nodes
@@ -4479,7 +5332,11 @@ fn flow_line(flow: &AffectedFlow, dependency_mode: DependencyMode) -> Result<Str
         if !complete {
             return Err("affected flow line exceeds address space".into());
         }
-        let separator = if index == 0 { "" } else { " -> " };
+        let separator = match (index, flow.dispatched.contains(&id)) {
+            (0, _) => "",
+            (_, true) => " ~> ",
+            (_, false) => " -> ",
+        };
         output.push_str(separator);
         output.push_str(&step);
     }
@@ -4637,7 +5494,16 @@ fn render_change_dot(
     let mut selected_set = changed_ids.clone();
     let mut impact_ids = HashSet::new();
     let mut impact_order = Vec::new();
-    let mut edges = BTreeMap::<(i64, i64), bool>::new();
+    let dispatch_edges = analysis
+        .flows
+        .iter()
+        .flat_map(|flow| {
+            flow.dispatched
+                .iter()
+                .filter_map(|id| flow.parents.get(id).map(|parent| (*parent, *id)))
+        })
+        .collect::<HashSet<_>>();
+    let mut edges = BTreeMap::<(i64, i64), &'static str>::new();
     for path in paths {
         for id in path {
             if selected_set.insert(*id) {
@@ -4651,7 +5517,13 @@ fn render_change_dot(
             impact_order.push(*target);
         }
         for edge in path.windows(2) {
-            edges.insert((edge[0], edge[1]), false);
+            let edge = (edge[0], edge[1]);
+            let style = if dispatch_edges.contains(&edge) {
+                DOT_DISPATCH_EDGE
+            } else {
+                ""
+            };
+            edges.insert(edge, style);
         }
     }
 
@@ -4683,18 +5555,12 @@ fn render_change_dot(
                 if selected_set.contains(&caller) {
                     pending.push_back(caller);
                 }
-                edges
-                    .entry((caller, callee))
-                    .and_modify(|dashed| *dashed |= is_test_call)
-                    .or_insert(is_test_call);
+                set_call_edge_style(&mut edges, caller, callee, is_test_call);
             }
         }
         for &(caller, callee, is_test_call) in &calls.edges {
             if selected_set.contains(&caller) && selected_set.contains(&callee) {
-                edges
-                    .entry((caller, callee))
-                    .and_modify(|dashed| *dashed |= is_test_call)
-                    .or_insert(is_test_call);
+                set_call_edge_style(&mut edges, caller, callee, is_test_call);
             }
         }
     }
@@ -4774,16 +5640,27 @@ fn render_change_dot(
         };
         output.push_str(&format!("  n{} [style=filled, {}];\n", node.id, attributes));
     }
-    for ((caller, callee), dashed) in edges {
-        if dashed {
-            output.push_str(&format!("  n{caller} -> n{callee} [style=dashed];\n"));
-        } else {
-            output.push_str(&format!("  n{caller} -> n{callee};\n"));
-        }
+    for ((caller, callee), style) in edges {
+        output.push_str(&format!("  n{caller} -> n{callee}{style};\n"));
     }
     output.push_str("}\n");
     // ponytail: re-rendering is bounded to 50 nodes; stream with reserved bytes only if that cap grows.
     (output, calls_complete)
+}
+
+const DOT_TEST_EDGE: &str = " [style=dashed]";
+const DOT_DISPATCH_EDGE: &str = " [style=dotted]";
+
+fn set_call_edge_style(
+    edges: &mut BTreeMap<(i64, i64), &'static str>,
+    caller: i64,
+    callee: i64,
+    is_test_call: bool,
+) {
+    let style = edges.entry((caller, callee)).or_insert("");
+    if is_test_call {
+        *style = DOT_TEST_EDGE;
+    }
 }
 
 fn shorten(value: &str, limit: usize) -> Cow<'_, str> {
@@ -5099,6 +5976,7 @@ fn apply_incremental(
             || !graph.refs.is_empty()
             || !graph.trait_implementations.is_empty()
             || !graph.modeled_sites.is_empty()
+            || !graph.source_notes.is_empty()
             || graph.gaps.iter().any(|gap| !global_gap(gap)))
     {
         return Err("no-op incremental graph contains parsed rows".into());
@@ -5268,7 +6146,8 @@ fn apply_incremental(
         // narrow this to affected refs only if incremental profiling requires it.
         tx.execute("DELETE FROM edges", []).map_err(db_error)?;
         tx.execute(
-            "UPDATE refs SET resolved_target_id=NULL, resolution_state='pending'",
+            "UPDATE refs SET resolved_target_id=NULL, resolution_state='pending',
+                    resolution_source='static'",
             [],
         )
         .map_err(db_error)?;
@@ -6064,6 +6943,88 @@ fn refresh_script_export_methods(tx: &Transaction<'_>, cancelled: &AtomicBool) -
     resolve_references(tx, references, cancelled)
 }
 
+/// Moves one reference to a new resolution while keeping derived `edges`
+/// support counts exact; every resolver routes through here.
+struct ReferenceTransitions<'tx> {
+    update_ref: rusqlite::Statement<'tx>,
+    decrement: rusqlite::Statement<'tx>,
+    delete_edge: rusqlite::Statement<'tx>,
+    increment: rusqlite::Statement<'tx>,
+}
+
+impl<'tx> ReferenceTransitions<'tx> {
+    fn new(tx: &'tx Transaction<'_>) -> Result<Self> {
+        Ok(Self {
+            update_ref: tx
+                .prepare(
+                    "UPDATE refs SET resolved_target_id=?1, resolution_state=?2,
+                            resolution_source=?3
+                      WHERE id=?4",
+                )
+                .map_err(db_error)?,
+            decrement: tx
+                .prepare(
+                    "UPDATE edges SET support_count=support_count-1
+                      WHERE source_id=(SELECT source_id FROM refs WHERE id=?1)
+                        AND target_id=?2 AND kind=?3 AND support_count>1",
+                )
+                .map_err(db_error)?,
+            delete_edge: tx
+                .prepare(
+                    "DELETE FROM edges
+                      WHERE source_id=(SELECT source_id FROM refs WHERE id=?1)
+                        AND target_id=?2 AND kind=?3 AND support_count=1",
+                )
+                .map_err(db_error)?,
+            increment: tx
+                .prepare(
+                    "INSERT INTO edges(source_id, target_id, kind, support_count)
+                     SELECT source_id, ?2, ?3, 1 FROM refs WHERE id=?1
+                     ON CONFLICT(source_id, target_id, kind)
+                     DO UPDATE SET support_count=support_count+1",
+                )
+                .map_err(db_error)?,
+        })
+    }
+
+    fn apply(
+        &mut self,
+        reference_id: i64,
+        (ref_kind, source_kind): (&str, &str),
+        old_target: Option<i64>,
+        new_target: Option<i64>,
+        new_state: ResolutionState,
+        source: &str,
+    ) -> Result<()> {
+        let edge_kind = match (ref_kind, source_kind) {
+            ("IMPORTS", _) => "IMPORTS",
+            ("CALLS", "test") => "TEST_CALLS",
+            ("CALLS", "file" | "type" | "function") => "CALLS",
+            _ => return Err("database reference kind is invalid".into()),
+        };
+        if let Some(target) = old_target
+            && self
+                .decrement
+                .execute(params![reference_id, target, edge_kind])
+                .map_err(db_error)?
+                == 0
+        {
+            self.delete_edge
+                .execute(params![reference_id, target, edge_kind])
+                .map_err(db_error)?;
+        }
+        self.update_ref
+            .execute(params![new_target, new_state.db(), source, reference_id])
+            .map_err(db_error)?;
+        if let Some(target) = new_target {
+            self.increment
+                .execute(params![reference_id, target, edge_kind])
+                .map_err(db_error)?;
+        }
+        Ok(())
+    }
+}
+
 fn resolve_references(
     tx: &Transaction<'_>,
     mut references: HashSet<i64>,
@@ -6135,32 +7096,7 @@ fn resolve_references(
                FROM refs WHERE alias_key=?1",
         )
         .map_err(db_error)?;
-    let mut update_ref = tx
-        .prepare("UPDATE refs SET resolved_target_id=?1, resolution_state=?2 WHERE id=?3")
-        .map_err(db_error)?;
-    let mut decrement = tx
-        .prepare(
-            "UPDATE edges SET support_count=support_count-1
-              WHERE source_id=(SELECT source_id FROM refs WHERE id=?1)
-                AND target_id=?2 AND kind=?3 AND support_count>1",
-        )
-        .map_err(db_error)?;
-    let mut delete_edge = tx
-        .prepare(
-            "DELETE FROM edges
-              WHERE source_id=(SELECT source_id FROM refs WHERE id=?1)
-                AND target_id=?2 AND kind=?3 AND support_count=1",
-        )
-        .map_err(db_error)?;
-    let mut increment = tx
-        .prepare(
-            "INSERT INTO edges(source_id, target_id, kind, support_count)
-             SELECT source_id, ?2, ?3, 1 FROM refs WHERE id=?1
-             ON CONFLICT(source_id, target_id, kind)
-             DO UPDATE SET support_count=support_count+1",
-        )
-        .map_err(db_error)?;
-
+    let mut transitions = ReferenceTransitions::new(tx)?;
     for (_, reference_id) in references {
         check_cancelled(cancelled)?;
         let Some((ref_kind, source_kind, alias_key, old_target, old_state)) = load_ref
@@ -6210,32 +7146,143 @@ fn resolve_references(
         if old_target == new_target && old_state == new_state.db() {
             continue;
         }
-        let edge_kind = match (ref_kind.as_str(), source_kind.as_str()) {
-            ("IMPORTS", _) => "IMPORTS",
-            ("CALLS", "test") => "TEST_CALLS",
-            ("CALLS", "file" | "type" | "function") => "CALLS",
-            _ => return Err("database reference kind is invalid".into()),
-        };
-        if let Some(target) = old_target
-            && decrement
-                .execute(params![reference_id, target, edge_kind])
-                .map_err(db_error)?
-                == 0
-        {
-            delete_edge
-                .execute(params![reference_id, target, edge_kind])
-                .map_err(db_error)?;
-        }
-        update_ref
-            .execute(params![new_target, new_state.db(), reference_id])
-            .map_err(db_error)?;
-        if let Some(target) = new_target {
-            increment
-                .execute(params![reference_id, target, edge_kind])
-                .map_err(db_error)?;
-        }
+        transitions.apply(
+            reference_id,
+            (&ref_kind, &source_kind),
+            old_target,
+            new_target,
+            new_state,
+            "static",
+        )?;
     }
     Ok(())
+}
+
+/// Upgrades unresolved static calls with producer-attested SCIP occurrences.
+///
+/// A SCIP symbol maps to the innermost node in its definition file whose span
+/// contains the definition line and whose name equals the last descriptor;
+/// ties, conflicting definitions, or unmapped definitions leave it unmapped.
+/// A reference occurrence resolves a ref only when exactly one missing or
+/// ambiguous non-alias `CALLS` ref sits on that file line and exactly one
+/// mapped symbol on the line matches one of the ref's lookup-key names.
+fn resolve_scip_references(
+    tx: &Transaction<'_>,
+    documents: &[crate::scip::Document],
+    cancelled: &AtomicBool,
+) -> Result<usize> {
+    let mut definition = tx
+        .prepare(
+            "SELECT n.id, n.line_end-n.line_start FROM nodes n JOIN files f ON f.id=n.file_id
+              WHERE f.path=?1 AND n.name=?2 AND n.kind!='file'
+                AND n.line_start<=?3 AND n.line_end>=?3
+              ORDER BY n.line_end-n.line_start, n.id LIMIT 2",
+        )
+        .map_err(db_error)?;
+    let mut targets = HashMap::<&str, Option<i64>>::new();
+    for document in documents {
+        for occurrence in document.occurrences.iter().filter(|occ| occ.definition) {
+            check_cancelled(cancelled)?;
+            let target = match crate::scip::symbol_name(&occurrence.symbol) {
+                Some(name) => {
+                    let rows = definition
+                        .query_map(params![document.path, name, occurrence.line], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .map_err(db_error)?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(db_error)?;
+                    match rows.as_slice() {
+                        [(id, _)] => Some(*id),
+                        [(id, span), (_, next)] if span < next => Some(*id),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            targets
+                .entry(&occurrence.symbol)
+                .and_modify(|current| {
+                    if *current != target {
+                        *current = None;
+                    }
+                })
+                .or_insert(target);
+        }
+    }
+    let mut sites = BTreeMap::<(&str, u32), BTreeSet<(&str, i64)>>::new();
+    for document in documents {
+        for occurrence in document.occurrences.iter().filter(|occ| !occ.definition) {
+            if let (Some(Some(target)), Some(name)) = (
+                targets.get(occurrence.symbol.as_str()),
+                crate::scip::symbol_name(&occurrence.symbol),
+            ) {
+                sites
+                    .entry((&document.path, occurrence.line))
+                    .or_default()
+                    .insert((name, *target));
+            }
+        }
+    }
+    let mut unresolved = tx
+        .prepare(
+            "SELECT r.id, r.kind, n.kind, r.alias_key IS NULL
+               FROM files f JOIN nodes n ON n.file_id=f.id
+               JOIN refs r ON r.source_id=n.id
+              WHERE f.path=?1 AND r.line=?2 AND r.resolution_state IN ('missing','ambiguous')
+              ORDER BY r.id LIMIT 2",
+        )
+        .map_err(db_error)?;
+    let mut keys = tx
+        .prepare("SELECT key FROM ref_keys WHERE ref_id=?1 ORDER BY rank")
+        .map_err(db_error)?;
+    let mut transitions = ReferenceTransitions::new(tx)?;
+    let mut resolved = 0;
+    for ((path, line), symbols) in sites {
+        check_cancelled(cancelled)?;
+        let rows = unresolved
+            .query_map(params![path, line], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        let [(reference_id, ref_kind, source_kind, true)] = rows.as_slice() else {
+            continue;
+        };
+        if ref_kind != "CALLS" {
+            continue;
+        }
+        let names = keys
+            .query_map([reference_id], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+            .map(|key| key.map(|key| key.rsplit(':').next().unwrap_or_default().to_owned()))
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .map_err(db_error)?;
+        let matches = symbols
+            .iter()
+            .filter(|(name, _)| names.contains(*name))
+            .map(|(_, target)| *target)
+            .collect::<BTreeSet<_>>();
+        let [target] = matches.into_iter().collect::<Vec<_>>()[..] else {
+            continue;
+        };
+        transitions.apply(
+            *reference_id,
+            (ref_kind, source_kind),
+            None,
+            Some(target),
+            ResolutionState::Resolved,
+            "scip",
+        )?;
+        resolved += 1;
+    }
+    Ok(resolved)
 }
 
 fn resolve_trait_implementations(
@@ -6562,6 +7609,34 @@ fn insert_graph(
         }
     }
 
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO source_notes(file_id, line_start, line_end, tag, text)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(db_error)?;
+        for source_note in &graph.source_notes {
+            check_cancelled(cancelled)?;
+            let (file_id, _) = files
+                .get(source_note.file_key.as_str())
+                .ok_or_else(|| "source note references an unknown file".to_owned())?;
+            let note = &source_note.note;
+            let line = |line: usize| {
+                i64::try_from(line).map_err(|_| "source note line exceeds SQLite range".to_owned())
+            };
+            insert
+                .execute(params![
+                    file_id,
+                    line(note.line_start)?,
+                    line(note.line_end)?,
+                    note.tag,
+                    note.text
+                ])
+                .map_err(db_error)?;
+        }
+    }
+
     let mut reference_ids = if delta {
         Vec::with_capacity(graph.refs.len())
     } else {
@@ -6785,7 +7860,10 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             resolved_target_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
             resolution_state TEXT NOT NULL
                 CHECK(resolution_state IN ('pending','resolved','missing','ambiguous')),
-            CHECK((resolution_state='resolved') = (resolved_target_id IS NOT NULL))
+            resolution_source TEXT NOT NULL DEFAULT 'static'
+                CHECK(resolution_source IN ('static','scip')),
+            CHECK((resolution_state='resolved') = (resolved_target_id IS NOT NULL)),
+            CHECK(resolution_source='static' OR resolution_state='resolved')
          );
          CREATE INDEX refs_source_target
              ON refs(source_id, kind, resolved_target_id);
@@ -6848,7 +7926,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             id INTEGER PRIMARY KEY,
             key TEXT NOT NULL UNIQUE CHECK(length(key)>0),
             role TEXT NOT NULL CHECK(role IN (
-                'manifest','input','generated-rust','coverage-report'
+                'manifest','input','generated-rust','coverage-report','scip-index'
             )),
             path TEXT NOT NULL CHECK(length(path)>0),
             content_hash BLOB NOT NULL CHECK(length(content_hash)=32),
@@ -6975,9 +8053,18 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE INDEX graph_gaps_order ON graph_gaps(
             path, line_start, line_end, category, reason, target_hint, id
          );
+         CREATE TABLE source_notes(
+            id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            line_start INTEGER NOT NULL CHECK(line_start>0),
+            line_end INTEGER NOT NULL CHECK(line_end>=line_start),
+            tag TEXT NOT NULL CHECK(tag IN ('SAFETY','WHY','NOTE','INVARIANT','ADR','RFC')),
+            text TEXT NOT NULL
+         );
+         CREATE INDEX source_notes_file_lines ON source_notes(file_id, line_start);
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=8;",
+         PRAGMA user_version=10;",
     )
     .map_err(db_error)
 }
@@ -7215,6 +8302,62 @@ fn literal_fts(query: &str) -> Result<String> {
     } else {
         Ok(terms.join(" AND "))
     }
+}
+
+/// `type_supers` closes resolved implementations transitively; `overrides`
+/// pairs each method with same-name members of its type's supertypes.
+fn overrides_cte() -> String {
+    format!(
+        "type_supers(type_id, super_id, hops) AS (
+             SELECT resolved_implementor_id, resolved_trait_id, 1
+               FROM trait_implementations
+              WHERE resolved_implementor_id IS NOT NULL AND resolved_trait_id IS NOT NULL
+             UNION
+             SELECT type_supers.type_id, ti.resolved_trait_id, type_supers.hops + 1
+               FROM type_supers
+               JOIN trait_implementations ti ON ti.resolved_implementor_id=type_supers.super_id
+              WHERE ti.resolved_trait_id IS NOT NULL AND type_supers.hops < {DISPATCH_DEPTH}
+         ),
+         overrides(member_id, base_id) AS MATERIALIZED (
+             SELECT DISTINCT member.id, base.id FROM type_supers
+               JOIN nodes member ON member.parent_id=type_supers.type_id
+                                AND member.kind='function'
+               JOIN nodes base ON base.parent_id=type_supers.super_id
+                              AND base.kind='function' AND base.name=member.name
+         )"
+    )
+}
+
+/// Validates a `node_ref` against this snapshot and image state.
+fn checked_ref(connection: &Connection, snapshot_id: &str, node_ref: &str) -> Result<(State, i64)> {
+    let (embedded_snapshot, epoch, generation, id) = parse_ref(node_ref)?;
+    if embedded_snapshot != snapshot_id {
+        return Err("node_snapshot_mismatch".into());
+    }
+    let state = read_state(connection)?;
+    if epoch != state.epoch || generation != state.generation {
+        return Err("stale node_ref".into());
+    }
+    Ok((state, id))
+}
+
+/// One `view`-style line per step; the unlabeled first step is the root.
+fn step_lines(
+    connection: &Connection,
+    snapshot_id: &str,
+    state: &State,
+    steps: impl IntoIterator<Item = Step>,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for step in steps {
+        let node = load_node(connection, step.id)?.ok_or_else(|| "node not found".to_owned())?;
+        let relation = (!step.label.is_empty()).then_some(step.label);
+        let Some(line) = node.line(snapshot_id, state, relation, VIEW_BUDGET)? else {
+            break;
+        };
+        lines.push(line);
+    }
+    Ok(lines)
 }
 
 fn parse_ref(value: &str) -> Result<(&str, &str, i64, i64)> {
@@ -7526,6 +8669,97 @@ mod tests {
             "database contains pending references"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scip_resolution_upgrades_ambiguous_call_only_with_attested_index() {
+        let root = canonical_temp_dir().join(format!(
+            "graphr-scip-resolution-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("graph.db");
+        let cancelled = AtomicBool::new(false);
+        let mut graph = resolution_graph(2);
+        for node in &mut graph.nodes[1..] {
+            node.name = "callee".into();
+        }
+        let mut store = Store::open_private_image(&path, &cancelled).unwrap();
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        let symbol = "scip-test cargo pkg 1.0 callee().".to_owned();
+        let documents = vec![crate::scip::Document {
+            path: "src/lib.rs".into(),
+            occurrences: vec![
+                crate::scip::Occurrence {
+                    line: 3,
+                    symbol: symbol.clone(),
+                    definition: true,
+                },
+                crate::scip::Occurrence {
+                    line: 1,
+                    symbol,
+                    definition: false,
+                },
+            ],
+        }];
+
+        assert_eq!(
+            store.resolve_scip(&documents, &cancelled).unwrap_err(),
+            "database SCIP resolution is unattested"
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO imported_artifacts(key, role, path, content_hash, byte_size)
+                 VALUES('scip', 'scip-index', 'index.scip', zeroblob(32), 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.resolve_scip(&documents, &cancelled).unwrap(), 1);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT r.resolution_state, r.resolution_source, n.qualified_name,
+                            (SELECT support_count FROM edges)
+                       FROM refs r JOIN nodes n ON n.id=r.resolved_target_id",
+                    [],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?
+                    )),
+                )
+                .unwrap(),
+            (
+                "resolved".to_owned(),
+                "scip".to_owned(),
+                "target-1".to_owned(),
+                1
+            )
+        );
+        store.seal(&cancelled).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn seal_rejects_scip_source_on_statically_resolved_reference() {
+        let error = sealed_resolution_corruption("scip-override", |connection| {
+            connection
+                .execute("UPDATE refs SET resolution_source='scip'", [])
+                .unwrap();
+        });
+        assert_eq!(
+            error,
+            "database reference resolution does not match candidates"
+        );
     }
 
     #[test]
@@ -8064,6 +9298,7 @@ mod tests {
                 6,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8092,6 +9327,7 @@ mod tests {
                     7,
                     50,
                     DependencyMode::Boundary,
+                    None,
                     &cancelled
                 )
                 .is_err()
@@ -8207,6 +9443,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8214,11 +9451,11 @@ mod tests {
         assert_eq!(evidence_render_count(), renders_before + 1);
         assert!(
             output.contains(
-                "risk overall=0.4200 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown static_test_path_gaps=0 traversal_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
+                "risk overall=0.3950 changed_symbols_total=1 changed_symbols_analyzed=1 changed_symbols_emitted=1 changed_symbols_omitted=0 flows_discovered=1 flows_total=unknown static_test_path_gaps=0 traversal_complete=false analysis_roots_omitted=0 deleted_paths_unanalyzed=1 neighborhood_omitted=false"
             ),
             "{output}"
         );
-        assert!(output.contains("risk 0.4200"), "{output}");
+        assert!(output.contains("risk 0.3950"), "{output}");
         assert!(
             output.contains(
                 "flow 0.1200 depth=2 nodes=3 files=1 changed=1 caller@src/lib.rs:9 -> root@src/lib.rs:2"
@@ -8240,6 +9477,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8270,6 +9508,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8310,6 +9549,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8347,6 +9587,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8368,10 +9609,10 @@ mod tests {
     }
 
     #[test]
-    fn flow_and_risk_scores_match_crg_factors() {
+    fn flow_and_risk_scores_weight_flow_tests_security_and_fan_in() {
         assert_eq!(flow_criticality(4, 3, 2, 1, 2, 5), 4_175);
         let risk = node_risk(1_500, 3, true, 1, false, false, true);
-        assert_eq!(risk.score, 5_500);
+        assert_eq!(risk.score, 5_250);
         assert_eq!(
             (
                 risk.flow_component,
@@ -8379,12 +9620,20 @@ mod tests {
                 risk.security_component,
                 risk.caller_component,
             ),
-            (1_500, 1_500, 2_000, 500)
+            (1_500, 1_500, 2_000, 250)
         );
         assert_eq!(
             node_risk(4_000, 5, true, 10, false, false, false).score,
-            6_000
+            5_750
         );
+        assert_eq!(
+            [0, 1, 2, 3, 4, 15, 16, 5_000].map(fan_in_component),
+            [0, 250, 500, 500, 750, 750, 1_000, 1_000]
+        );
+        let hub = risk_metadata(Some(&node_risk(0, 0, false, 16, false, true, false)));
+        assert!(hub.contains("+caller-impact+high-fan-in"), "{hub}");
+        let shared = risk_metadata(Some(&node_risk(0, 0, false, 15, false, true, false)));
+        assert!(!shared.contains("high-fan-in"), "{shared}");
         let changed_test = node_risk(0, 5, false, 0, true, false, false);
         assert!(
             risk_metadata(Some(&changed_test)).contains("risk_rationale=changed-test"),
@@ -8456,6 +9705,77 @@ mod tests {
                 &residual,
             ),
             Some("unmapped src/lib.rs:1,5,9\n".into())
+        );
+    }
+
+    #[test]
+    fn stable_identity_drops_only_the_line_and_ordinal_suffix() {
+        assert_eq!(
+            stable_identity("rust:10#src/lib.rs:8#function:7#Db::get:4:3"),
+            "rust:10#src/lib.rs:8#function:7#Db::get"
+        );
+        assert_eq!(
+            stable_identity("script-node:10#typescript:8#src/a.ts:4#type:3#Box:12:0"),
+            "script-node:10#typescript:8#src/a.ts:4#type:3#Box"
+        );
+        // Only the final two numeric fields are position; earlier ones stay.
+        assert_eq!(
+            stable_identity("cpp:7#src/a.cc:8#function:3#a:1:12:0"),
+            "cpp:7#src/a.cc:8#function:3#a:1"
+        );
+        assert_eq!(stable_identity("generated"), "generated");
+        assert_eq!(stable_identity("x:1:y"), "x:1:y");
+    }
+
+    #[test]
+    fn classify_api_pairs_identities_overloads_and_signatures() {
+        let symbol = |identity: &str, line: u32, signature: &str| ApiSymbol {
+            id: 0,
+            identity: identity.into(),
+            name: identity.into(),
+            kind: "function".into(),
+            path: "src/lib.rs".into(),
+            line,
+            signature: signature.into(),
+        };
+        let base = [
+            symbol("kept", 1, "fn kept()"),
+            symbol("changed", 2, "fn changed(a: u8)"),
+            symbol("removed", 3, "fn removed()"),
+            symbol("overload", 4, "void f(int)"),
+            symbol("overload", 5, "void f(char)"),
+        ];
+        let head = [
+            symbol("kept", 9, "fn kept()"),
+            symbol("changed", 2, "fn changed(a: u16)"),
+            symbol("added", 3, "fn added()"),
+            symbol("overload", 4, "void f(char)"),
+        ];
+        let diff = classify_api(&base, &head);
+        let view = |symbols: &[&ApiSymbol]| {
+            symbols
+                .iter()
+                .map(|symbol| (symbol.name.clone(), symbol.line, symbol.signature.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            view(&diff.removed),
+            [
+                ("removed".into(), 3, "fn removed()".into()),
+                ("overload".into(), 4, "void f(int)".into()),
+            ]
+        );
+        assert_eq!(
+            diff.changed
+                .iter()
+                .map(|(before, after)| (before.signature.as_str(), after.signature.as_str()))
+                .collect::<Vec<_>>(),
+            [("fn changed(a: u8)", "fn changed(a: u16)")]
+        );
+        assert_eq!(
+            view(&diff.added),
+            [("added".into(), 3, "fn added()".into())]
         );
     }
 
@@ -8542,6 +9862,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8576,6 +9897,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8596,6 +9918,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8628,6 +9951,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap()
@@ -8706,6 +10030,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8764,6 +10089,7 @@ mod tests {
                 0,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8849,6 +10175,7 @@ mod tests {
                 1,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -8909,6 +10236,7 @@ mod tests {
                 0,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -9160,6 +10488,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -9202,6 +10531,93 @@ mod tests {
                 })
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn source_notes_follow_incremental_file_replacement() {
+        let mut store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        let cancelled = AtomicBool::new(false);
+        let file = |path: &str, replace| FileInput {
+            path: path.into(),
+            language: Language::Rust,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: String::new(),
+            byte_size: 1,
+            replace,
+            observed_relation_sites: 0,
+        };
+        let note = |path: &str, line_start, tag, text: &str| SourceNoteInput {
+            file_key: path.into(),
+            note: SourceNote {
+                line_start,
+                line_end: line_start,
+                tag,
+                text: text.into(),
+            },
+        };
+        let notes = |store: &Store| {
+            store
+                .connection
+                .prepare(
+                    "SELECT f.path, n.line_start, n.tag, n.text
+                       FROM source_notes n JOIN files f ON f.id=n.file_id
+                      ORDER BY f.path, n.line_start",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok(format!(
+                        "{}:{} {} {}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+
+        let graph = Graph {
+            files: vec![
+                file("src/edited.rs", true),
+                file("src/kept.rs", true),
+                file("src/removed.rs", true),
+            ],
+            source_notes: vec![
+                note("src/edited.rs", 2, "SAFETY", "old"),
+                note("src/kept.rs", 3, "WHY", "kept"),
+                note("src/removed.rs", 4, "ADR", "ADR-1"),
+            ],
+            ..Graph::default()
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        assert_eq!(
+            notes(&store),
+            [
+                "src/edited.rs:2 SAFETY old",
+                "src/kept.rs:3 WHY kept",
+                "src/removed.rs:4 ADR ADR-1"
+            ]
+        );
+
+        let graph = Graph {
+            files: vec![file("src/edited.rs", true), file("src/kept.rs", false)],
+            source_notes: vec![note("src/edited.rs", 5, "INVARIANT", "new")],
+            ..Graph::default()
+        };
+        store
+            .index_with(&cancelled, |_full, _existing| Ok((graph, ())))
+            .unwrap();
+        assert_eq!(
+            notes(&store),
+            ["src/edited.rs:5 INVARIANT new", "src/kept.rs:3 WHY kept"]
         );
     }
 
@@ -9333,6 +10749,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -9625,6 +11042,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -9675,6 +11093,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -9850,6 +11269,7 @@ mod tests {
                     1,
                     10,
                     DependencyMode::Boundary,
+                    None,
                     &cancelled,
                 )
                 .unwrap();
@@ -9911,6 +11331,7 @@ mod tests {
                     1,
                     10,
                     DependencyMode::Boundary,
+                    None,
                     &cancelled,
                 )
                 .unwrap();
@@ -10019,6 +11440,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10120,6 +11542,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10183,6 +11606,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10248,6 +11672,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10316,6 +11741,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10684,6 +12110,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10863,6 +12290,7 @@ mod tests {
                 1,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -10947,6 +12375,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -11029,6 +12458,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -11090,6 +12520,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap();
@@ -11207,6 +12638,7 @@ mod tests {
                 0,
                 10,
                 DependencyMode::Boundary,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -11268,6 +12700,7 @@ mod tests {
                 1,
                 3,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -11350,6 +12783,7 @@ mod tests {
                 1,
                 3,
                 DependencyMode::Boundary,
+                None,
                 &cancelled,
             )
             .unwrap()
@@ -11541,6 +12975,7 @@ mod tests {
             entry: entry.clone(),
             nodes: vec![entry, changed, helper, dependency, dependency_internal],
             parents: HashMap::from([(2, 1), (3, 2), (4, 3), (5, 4)]),
+            dispatched: HashSet::new(),
             changed: vec![2],
             depth: 4,
             file_count: 4,
@@ -11586,6 +13021,7 @@ mod tests {
                     entry: left.clone(),
                     nodes: vec![left.clone(), merged.clone(), target.clone()],
                     parents: HashMap::from([(3, 1), (5, 3)]),
+                    dispatched: HashSet::new(),
                     changed: vec![5],
                     depth: 2,
                     file_count: 2,
@@ -11595,6 +13031,7 @@ mod tests {
                     entry: right.clone(),
                     nodes: vec![right, merged, target.clone()],
                     parents: HashMap::from([(3, 2), (5, 3)]),
+                    dispatched: HashSet::new(),
                     changed: vec![5],
                     depth: 2,
                     file_count: 1,
@@ -11800,6 +13237,7 @@ mod tests {
                 entry: caller.clone(),
                 nodes: vec![caller, affected],
                 parents: HashMap::from([(3, 2)]),
+                dispatched: HashSet::new(),
                 changed: vec![3],
                 depth: 1,
                 file_count: 2,
@@ -11847,6 +13285,7 @@ mod tests {
                 entry: affected.clone(),
                 nodes: vec![affected],
                 parents: HashMap::new(),
+                dispatched: HashSet::new(),
                 changed: vec![2],
                 depth: 0,
                 file_count: 1,
@@ -11967,6 +13406,7 @@ mod tests {
                     },
                 ],
                 parents: HashMap::from([(target_id, caller_id)]),
+                dispatched: HashSet::new(),
                 changed: vec![target_id],
                 depth: 1,
                 file_count: 2,
@@ -12026,6 +13466,7 @@ mod tests {
                     entry: caller.clone(),
                     nodes: vec![caller.clone(), target.clone()],
                     parents: HashMap::from([(target.id, caller.id)]),
+                    dispatched: HashSet::new(),
                     changed: vec![target.id],
                     depth: 1,
                     file_count: 2,
@@ -12082,6 +13523,7 @@ mod tests {
                 6,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -12132,6 +13574,7 @@ mod tests {
                 6,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -12206,6 +13649,7 @@ mod tests {
                 6,
                 50,
                 DependencyMode::Boundary,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap()
@@ -12675,5 +14119,35 @@ mod tests {
             }],
             gaps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn import_cycles_report_shortest_routes_through_changed_files() {
+        let imports = [
+            ("a", "b"),
+            ("b", "a"),
+            ("c", "d"),
+            ("d", "e"),
+            ("e", "c"),
+            ("c", "e"),
+            ("f", "f"),
+            ("f", "a"),
+            ("x", "y"),
+            ("y", "x"),
+        ]
+        .map(|(source, target)| (source.to_owned(), target.to_owned()));
+        let changed = HashSet::from(["a", "c", "d", "f"]);
+
+        let (total, routes) = import_cycles(&imports, &changed);
+
+        assert_eq!(total, 2);
+        assert_eq!(
+            routes,
+            vec![
+                (2, vec!["a", "b"]),
+                (3, vec!["c", "e"]),
+                (3, vec!["d", "e", "c"]),
+            ]
+        );
     }
 }

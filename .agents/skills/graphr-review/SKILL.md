@@ -9,7 +9,7 @@ description: Use when reviewing Git working-tree, staged, commit, branch, or pul
 
 Review one explicitly selected canonical worktree through one immutable snapshot. Never substitute another allowed root, the server's checkout, an older snapshot, a live Git diff, or a repository scan.
 
-Use only Graphr's exact MCP tool names: `inspect_root`, `index`, `index_status`, `cancel_index`, `changes`, `search`, and `view`. A client may render its server prefix differently; do not invent aliases such as `index_repository` or rename any field below.
+Use only Graphr's exact MCP tool names: `inspect_root`, `index`, `index_status`, `cancel_index`, `changes`, `search`, `view`, `impact`, and `path`. A client may render its server prefix differently; do not invent aliases such as `index_repository` or rename any field below.
 
 ## Select the snapshot
 
@@ -61,7 +61,11 @@ Ask for a missing target branch. Stop if a required base does not exist, includi
 4. Use `search` or `view` only when an emitted graph `coverage` line names that
    exact remediation. Pass the same `snapshot_id`; pass returned `node_ref`
    values verbatim. `file-mapped` ranges need no remediation. Do not search
-   unrelated names or read the repository.
+   unrelated names or read the repository. Use `impact` on a changed symbol's
+   `node_ref` only when its traversal is incomplete (`traversal_complete=false`
+   or `neighborhood_omitted=true`) and the full reverse caller set decides a
+   finding; use `path` only to confirm one suspected static route between two
+   returned `node_ref` values.
 5. Before concluding, call `inspect_root({"worktree_root": ROOT,
    "snapshot_id": SNAPSHOT_ID})`. Require its canonical `worktree_root` to
    equal `ROOT` and `snapshot_matches_worktree=true`. On a mismatch, queue a
@@ -91,6 +95,6 @@ Stop rather than conclude on any structured root, job, snapshot, cursor, provena
 
 ## Report
 
-Before concluding, account for every changed symbol and behavioral substitution, risk score and affected static flow, bounded graph callers and tests, visible entry-point or registration macros, production or public-surface impact, deterministic outputs, and static test-path heuristics (`test_path_confidence=heuristic`, `test_path_provenance=resolved-static-call-graph`). Distinguish “Graphr showed no edge within six hops” from “no caller exists.”
+Before concluding, account for every changed symbol and behavioral substitution, risk score and affected static flow, bounded graph callers and tests, visible entry-point or registration macros, production or public-surface impact, deterministic outputs, and static test-path heuristics (`test_path_confidence=heuristic`, `test_path_provenance=resolved-static-call-graph`). Flow hops written ` ~> ` are supertype-member dispatch to an override, not a resolved call. Report every `import_cycle` route through a changed file. Distinguish “Graphr showed no edge within six hops” from “no caller exists.”
 
 Return findings from critical to low severity, then one line summarizing changed symbols, risk, affected flows, blast radius, related tests, and any incomplete coverage. If no bug is found, say so explicitly. Keep the response under 220 words.

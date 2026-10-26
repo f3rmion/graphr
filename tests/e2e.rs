@@ -340,6 +340,136 @@ fn coverage_evidence_imports_scoped_rust_observations_without_dynamic_edges() {
 }
 
 #[test]
+fn scip_manifest_resolves_unresolved_reference() {
+    // Regenerate by adding a `scipfix` Cargo.toml beside `src/`, running
+    // `rust-analyzer scip .` there, and committing only `src/` and `index.scip`.
+    const SOURCE: &str = include_str!("fixtures/scip/src/lib.rs");
+    const INDEX: &[u8] = include_bytes!("fixtures/scip/index.scip");
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        SOURCE.replace("s.alpha_only()", "0"),
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "src/lib.rs"]);
+    git_commit(&fixture.path, "scip baseline");
+    fs::write(fixture.path.join("src/lib.rs"), SOURCE).unwrap();
+    git(&fixture.path, &["add", "--", "src/lib.rs"]);
+    git_commit(&fixture.path, "scip change");
+    let source = index_repository_request(&fixture.path, "HEAD~1", "HEAD");
+    let ref_state = |path: &Path| {
+        Connection::open(graph_path(path))
+            .unwrap()
+            .query_row(
+                "SELECT r.resolution_state, r.resolution_source,
+                        (SELECT count(*) FROM edges e JOIN nodes t ON t.id=e.target_id
+                          WHERE e.source_id=r.source_id AND e.kind='CALLS'
+                            AND t.name='alpha_only')
+                   FROM refs r JOIN nodes n ON n.id=r.source_id
+                  WHERE n.name='bounded' AND r.line=10",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        ref_state(&fixture.path),
+        ("missing".to_owned(), "static".to_owned(), 0)
+    );
+
+    fs::write(fixture.path.join("index.scip"), INDEX).unwrap();
+    let manifest = |digest: String| {
+        rmcp::serde_json::to_vec(&rmcp::serde_json::json!({
+            "format_version": 1,
+            "source_snapshot_id": source["snapshot_id"],
+            "generated": [],
+            "coverage": [],
+            "scip": [{"path": "index.scip", "blake3": digest}]
+        }))
+        .unwrap()
+    };
+    let index_with_evidence = || {
+        cli_index_with_evidence_request(
+            &fixture.path,
+            "evidence.json",
+            "HEAD~1",
+            "HEAD",
+            "worktree",
+            true,
+            "boundary",
+        )
+    };
+    fs::write(fixture.path.join("evidence.json"), manifest("0".repeat(64))).unwrap();
+    let rejected = index_with_evidence();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("SCIP index digest does not match"),
+        "{:?}",
+        rejected.stderr
+    );
+
+    fs::write(
+        fixture.path.join("evidence.json"),
+        manifest(blake3::hash(INDEX).to_hex().to_string()),
+    )
+    .unwrap();
+    let output = index_with_evidence();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let completion: rmcp::serde_json::Value =
+        rmcp::serde_json::from_slice(output.stdout.trim_ascii()).unwrap();
+    remember_graph(&fixture.path, &completion);
+    assert_eq!(
+        ref_state(&fixture.path),
+        ("resolved".to_owned(), "scip".to_owned(), 1)
+    );
+
+    let mut client = Client::start_unindexed(&fixture.path);
+    client.snapshot_id = Some(completion["snapshot_id"].as_str().unwrap().into());
+    let snapshot_id = client.snapshot_id().to_owned();
+    let inspection = client.call(
+        "inspect_root",
+        rmcp::serde_json::json!({
+            "worktree_root": &fixture.path,
+            "snapshot_id": snapshot_id,
+        }),
+    );
+    assert!(!tool_failed(&inspection), "{inspection}");
+    let mut changes = response_text(&client.changes(6, 50, None));
+    let mut cursor = page_cursor(&changes, "review_next_cursor");
+    while let Some(token) = cursor {
+        let page = changes_page(&mut client, &token);
+        cursor = page_cursor(&page, "review_next_cursor");
+        changes.push_str(&page);
+    }
+    for expected in [
+        "claim kind=scip-resolved-references count=1 basis=verified-scip-manifest\n",
+        "Function alpha_only src/lib.rs:2 via=scip\n",
+    ] {
+        assert!(changes.contains(expected), "missing {expected}: {changes}");
+    }
+    assert!(!changes.contains("index.scip"), "{changes}");
+    let search = response_text(&client.search("bounded", Some("function")));
+    let node_ref = search.split_whitespace().next().unwrap();
+    let view = response_text(&client.view(node_ref, 1, 10));
+    for expected in [
+        "call -> ",
+        "Function alpha_only src/lib.rs:2 via=scip\n",
+        "claim kind=scip-resolved-references count=1 basis=verified-scip-manifest\n",
+    ] {
+        assert!(view.contains(expected), "missing {expected}: {view}");
+    }
+    client.close();
+}
+
+#[test]
 fn coverage_evidence_imports_python_contexts_with_run_scoped_arcs() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
@@ -961,7 +1091,7 @@ fn mixed_evidence_gaps_keep_completed_transport_distinct_from_partial_static_evi
     git_commit(&fixture.path, "mixed gap baseline");
     fs::write(
         fixture.path.join("src/lib.rs"),
-        "pub fn ambiguous() {}\npub fn ambiguous() {}\npub trait Runner { fn run(&self); }\npub fn resolved() {}\npub fn changed(value: &dyn Runner) {\n    resolved();\n    ambiguous();\n    value.run();\n    println!(\"macro boundary\");\n}\n",
+        "pub fn ambiguous() {}\npub fn ambiguous() {}\npub trait Runner { fn run(&self); }\npub fn resolved() {}\npub fn changed(values: Vec<&dyn Runner>) {\n    resolved();\n    ambiguous();\n    for value in values { value.run(); }\n    println!(\"macro boundary\");\n}\n",
     )
     .unwrap();
     fs::write(fixture.path.join("src/broken.rs"), "pub fn broken( {\n").unwrap();
@@ -1039,6 +1169,280 @@ fn mixed_evidence_gaps_keep_completed_transport_distinct_from_partial_static_evi
                 .lines()
                 .any(|line| line.contains("test <-") && line.contains("Test exercise")),
         "{graph}"
+    );
+    client.close();
+}
+
+#[test]
+fn override_dispatch_links_trait_and_template_method_flows() {
+    let rust = |value: u8| {
+        format!(
+            "pub trait Store {{\n    fn get(&self) -> u8;\n}}\npub struct Db;\nimpl Store for Db {{\n    fn get(&self) -> u8 {{ {value} }}\n}}\npub struct Cache;\nimpl Cache {{\n    pub fn get(&self) -> u8 {{ 0 }}\n}}\npub fn read_dyn(store: &dyn Store) -> u8 {{ store.get() }}\npub fn read_generic<S>(store: &S) -> u8 where S: Store {{ store.get() }}\npub fn read_cache(cache: &Cache) -> u8 {{ cache.get() }}\n#[test]\nfn reads_through_trait() {{ read_dyn(&Db); }}\n"
+        )
+    };
+    let child = |value: u8| {
+        format!(
+            "import {{ Base }} from './base.js';\nexport class Child extends Base {{\n  step() {{ return {value}; }}\n}}\n"
+        )
+    };
+    let shape = |value: u8| {
+        format!(
+            "class Shape {{\n public:\n  int area() {{ return this->scale(); }}\n  virtual int scale() {{ return 1; }}\n}};\nclass Square : public Shape {{\n public:\n  int scale() override {{ return {value}; }}\n}};\n"
+        )
+    };
+    let shapes = |value: u8| {
+        format!(
+            "class Base:\n    def run(self):\n        return self.step()\n    def step(self):\n        return 1\nclass Child(Base):\n    def step(self):\n        return {value}\n"
+        )
+    };
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(fixture.path.join("src/lib.rs"), rust(1)).unwrap();
+    fs::write(
+        fixture.path.join("src/base.js"),
+        "export class Base {\n  run() { return this.step(); }\n  step() { return 1; }\n}\n",
+    )
+    .unwrap();
+    fs::write(fixture.path.join("src/child.js"), child(2)).unwrap();
+    fs::write(fixture.path.join("src/shape.hpp"), shape(2)).unwrap();
+    fs::write(fixture.path.join("src/shapes.py"), shapes(2)).unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git_commit(&fixture.path, "dispatch baseline");
+    fs::write(fixture.path.join("src/lib.rs"), rust(2)).unwrap();
+    fs::write(fixture.path.join("src/child.js"), child(3)).unwrap();
+    fs::write(fixture.path.join("src/shape.hpp"), shape(3)).unwrap();
+    fs::write(fixture.path.join("src/shapes.py"), shapes(3)).unwrap();
+
+    let mut client = Client::start(&fixture.path);
+    let snapshot_id = client.snapshot_id().to_owned();
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    let graph = change_section_text(&changes, "graph");
+    let flows = graph
+        .lines()
+        .filter(|line| line.starts_with("flow "))
+        .collect::<Vec<_>>();
+    for route in [
+        "read_dyn@src/lib.rs:12 -> get@src/lib.rs:2 ~> get@src/lib.rs:6",
+        "read_generic@src/lib.rs:13 -> get@src/lib.rs:2 ~> get@src/lib.rs:6",
+        "run@src/base.js:2 -> step@src/base.js:3 ~> step@src/child.js:3",
+        "area@src/shape.hpp:3 -> scale@src/shape.hpp:4 ~> scale@src/shape.hpp:8",
+        "run@src/shapes.py:2 -> step@src/shapes.py:4 ~> step@src/shapes.py:7",
+    ] {
+        assert!(
+            flows
+                .iter()
+                .any(|line| line.contains("dispatch_hops=1 ") && line.ends_with(route)),
+            "missing {route}: {graph}"
+        );
+    }
+    assert!(
+        !flows.iter().any(|line| line.contains("@src/lib.rs:10")),
+        "same-name method on an unrelated type must not be linked: {graph}"
+    );
+    let changed_get = graph
+        .lines()
+        .find(|line| line.contains("Function get src/lib.rs:6"))
+        .unwrap_or_else(|| panic!("missing changed override: {graph}"));
+    // Two trait callers reach the override only through dispatch: flow 0.25 +
+    // indirect test path 0.25 + fan-in tier for 2 callers 0.05.
+    assert!(
+        changed_get.contains("risk 0.5500 indirect-test-covered"),
+        "{changed_get}"
+    );
+
+    let dot = response_text(&client.changes_dot(6, 50));
+    assert!(dot.contains("[style=dotted]"), "{dot}");
+
+    let node = |client: &mut Client, name: &str, location: &str| {
+        response_text(&client.search(name, Some("function")))
+            .lines()
+            .find(|line| line.ends_with(location))
+            .unwrap_or_else(|| panic!("missing {name} at {location}"))
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let changed = node(&mut client, "get", "src/lib.rs:6");
+    let reader = node(&mut client, "read_dyn", "src/lib.rs:12");
+    let impact = response_text(&client.call(
+        "impact",
+        rmcp::serde_json::json!({
+            "snapshot_id": &snapshot_id,
+            "node_ref": &changed,
+            "depth": 3,
+        }),
+    ));
+    let relations = impact
+        .lines()
+        .map(|line| {
+            let (relation, rest) = line.split_once(" n1:").unwrap_or(("", line));
+            let location = rest.rsplit(' ').next().unwrap_or_default();
+            format!("{}{location}", relation.trim())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relations,
+        [
+            "src/lib.rs:6",
+            "dispatch <-src/lib.rs:2",
+            "caller <-src/lib.rs:12",
+            "caller <-src/lib.rs:13",
+            "test <-src/lib.rs:15",
+        ],
+        "{impact}"
+    );
+    let shallow = response_text(&client.call(
+        "impact",
+        rmcp::serde_json::json!({
+            "snapshot_id": &snapshot_id,
+            "node_ref": &changed,
+            "depth": 1,
+        }),
+    ));
+    assert!(shallow.ends_with("[truncated]\n"), "{shallow}");
+
+    let path = |client: &mut Client, from: &str, to: &str, direction: &str| {
+        response_text(&client.call(
+            "path",
+            rmcp::serde_json::json!({
+                "snapshot_id": &snapshot_id,
+                "from_ref": from,
+                "to_ref": to,
+                "direction": direction,
+            }),
+        ))
+    };
+    let forward = path(&mut client, &reader, &changed, "forward");
+    let hops = forward
+        .lines()
+        .map(|line| line.split("n1:").next().unwrap().trim())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        hops,
+        [
+            "path hops=2 direction=forward",
+            "",
+            "call ->",
+            "dispatch ->"
+        ],
+        "{forward}"
+    );
+    assert_eq!(
+        path(&mut client, &changed, &reader, "forward"),
+        "no path within max_hops=6 direction=forward\n"
+    );
+    let any = path(&mut client, &changed, &reader, "any");
+    assert!(
+        any.starts_with("path hops=2 direction=any\n")
+            && any.contains("  dispatch <- ")
+            && any.contains("  caller <- "),
+        "{any}"
+    );
+    client.close();
+}
+
+#[test]
+fn import_cycle_through_changed_file_is_reported() {
+    let module = |import: &str, name: &str, value: u8| {
+        format!("import \"./{import}\";\nexport function {name}() {{ return {value}; }}\n")
+    };
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    for (path, import, name) in [
+        ("a", "b", "a"),
+        ("b", "a", "b"),
+        ("c", "d", "c"),
+        ("d", "c", "d"),
+    ] {
+        fs::write(
+            fixture.path.join(format!("src/{path}.js")),
+            module(import, name, 1),
+        )
+        .unwrap();
+    }
+    let rust = |value: u8| format!("mod left;\nmod right;\npub fn top() -> u8 {{ {value} }}\n");
+    fs::write(fixture.path.join("src/lib.rs"), rust(1)).unwrap();
+    fs::write(
+        fixture.path.join("src/left.rs"),
+        "use crate::right::right;\npub fn left() -> u8 { right() }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/right.rs"),
+        "use crate::left::left;\npub fn right() -> u8 { 0 }\npub fn back() -> u8 { left() }\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+    git_commit(&fixture.path, "cycle baseline");
+    fs::write(fixture.path.join("src/a.js"), module("b", "a", 2)).unwrap();
+    // Rust modules of one crate may use each other; that is not reported.
+    fs::write(
+        fixture.path.join("src/left.rs"),
+        "use crate::right::right;\npub fn left() -> u8 { right() + 1 }\n",
+    )
+    .unwrap();
+
+    let mut client = Client::start(&fixture.path);
+    let snapshot_id = client.snapshot_id().to_owned();
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    let graph = change_section_text(&changes, "graph");
+    let cycles = graph
+        .lines()
+        .filter(|line| line.starts_with("import_cycle"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        cycles,
+        ["import_cycle files=2 route=src/a.js -> src/b.js -> src/a.js"],
+        "{graph}"
+    );
+    assert!(graph.contains(" import_cycles=1 "), "{graph}");
+    client.close();
+}
+
+#[test]
+fn changed_symbol_surfaces_safety_note() {
+    let source = |read_body: &str| {
+        format!(
+            "pub fn read(ptr: *const u8) -> u8 {{\n    // SAFETY: caller guarantees ptr is valid\n    unsafe {{ {read_body} }}\n}}\n\npub fn untouched(ptr: *const u8) -> u8 {{\n    // SAFETY: untouched caller contract\n    unsafe {{ *ptr }}\n}}\n"
+        )
+    };
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(fixture.path.join("src/lib.rs"), source("*ptr")).unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "src/lib.rs"]);
+    git_commit(&fixture.path, "notes baseline");
+    fs::write(fixture.path.join("src/lib.rs"), source("*ptr.add(1)")).unwrap();
+
+    let mut client = Client::start(&fixture.path);
+    let snapshot_id = client.snapshot_id().to_owned();
+    let changes = capture_changes(&mut client, &snapshot_id, 6, 50);
+    let graph = change_section_text(&changes, "graph");
+    let notes = graph
+        .lines()
+        .filter(|line| line.starts_with("note "))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        notes,
+        ["note tag=SAFETY path=\"src/lib.rs\" line=2 text=\"caller guarantees ptr is valid\""],
+        "{graph}"
+    );
+    assert!(graph.contains(" import_cycles=0 notes=1 "), "{graph}");
+    assert!(!graph.contains("untouched caller contract"), "{graph}");
+
+    let search = response_text(&client.search("untouched", Some("function")));
+    let node_ref = search.split_whitespace().next().unwrap();
+    let view = response_text(&client.view(node_ref, 0, 20));
+    assert!(
+        view.contains(
+            "note tag=SAFETY path=\"src/lib.rs\" line=7 text=\"untouched caller contract\"\n"
+        ),
+        "{view}"
     );
     client.close();
 }
@@ -1468,6 +1872,50 @@ fn python_index_search_view_and_incremental_changes_over_mcp() {
     let text = complete_graph_pages(&mut client, response_text(&changes), 1, 50);
     assert!(text.contains("dispatch"), "{changes}");
     assert!(text.contains("decorated"), "{changes}");
+    client.close();
+}
+
+#[test]
+fn python_class_inheritance_renders_impl_relations_over_mcp() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src/shapes")).unwrap();
+    fs::write(fixture.path.join("src/shapes/__init__.py"), "").unwrap();
+    fs::write(
+        fixture.path.join("src/shapes/base.py"),
+        "class Base:\n    def area(self):\n        return 0\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/shapes/square.py"),
+        "from shapes.base import Base\n\nclass Square(Base, metaclass=type):\n    def area(self):\n        return 1\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+
+    index_repository(&fixture.path);
+    assert_eq!(
+        trait_implementation_count(&fixture.path, "Square", "Base"),
+        1
+    );
+
+    let mut client = Client::start(&fixture.path);
+    for (query, relation, related) in [
+        ("Square", "implements ->", "Base"),
+        ("Base", "impl <-", "Square"),
+    ] {
+        let search = response_text(&client.search(query, Some("type")));
+        let node_ref = search
+            .lines()
+            .find(|line| line.contains(&format!(" Type {query} ")))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let view = client.view(node_ref, 2, 30);
+        assert!(view.contains(relation), "{view}");
+        assert!(view.contains(related), "{view}");
+    }
     client.close();
 }
 
@@ -2261,6 +2709,58 @@ fn javascript_typescript_index_search_view_and_incremental_changes_over_mcp() {
 }
 
 #[test]
+fn javascript_typescript_class_heritage_renders_impl_relations_over_mcp() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path.join("src")).unwrap();
+    fs::write(
+        fixture.path.join("src/base.ts"),
+        "export class Base {}\nexport interface Shape { area(): number }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.path.join("src/child.ts"),
+        "import { Base, Shape } from \"./base\";\n\nexport class Child extends Base implements Shape {\n    area() { return 1; }\n}\n",
+    )
+    .unwrap();
+    init_git(&fixture.path);
+    git(&fixture.path, &["add", "--", "."]);
+
+    index_repository(&fixture.path);
+    assert_eq!(
+        trait_implementation_count(&fixture.path, "Child", "Base"),
+        1
+    );
+    assert_eq!(
+        trait_implementation_count(&fixture.path, "Child", "Shape"),
+        1
+    );
+
+    let mut client = Client::start(&fixture.path);
+    for (query, relation, related) in [
+        ("Child", "implements ->", ["Base", "Shape"].as_slice()),
+        ("Base", "impl <-", ["Child"].as_slice()),
+    ] {
+        let search = response_text(&client.search(query, Some("type")));
+        let node_ref = search
+            .lines()
+            .find(|line| line.contains(&format!(" Type {query} ")))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let view = client.view(node_ref, 2, 30);
+        for related in related {
+            assert!(
+                view.lines()
+                    .any(|line| line.contains(relation) && line.contains(related)),
+                "{view}"
+            );
+        }
+    }
+    client.close();
+}
+
+#[test]
 fn script_class_member_calls_require_callable_static_methods() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.path.join("src")).unwrap();
@@ -2788,7 +3288,17 @@ fn changes_maps_mixed_worktree_edits_to_current_graph() {
     let graph = complete.split_once("graph\n").unwrap().1;
     assert!(graph.contains("file-mapped src/lib.rs"), "{changed}");
     assert!(graph.contains("unmapped_ranges=0"), "{changed}");
-    assert!(!graph.contains("removed_symbol"), "{changed}");
+    // The deleted symbol is no head node; only the base-vs-head diff names it.
+    assert!(
+        graph.contains("api_removed kind=function symbol=removed_symbol path=src/removed.rs"),
+        "{changed}"
+    );
+    assert!(
+        !graph
+            .lines()
+            .any(|line| line.contains("removed_symbol") && !line.starts_with("api_removed ")),
+        "{changed}"
+    );
     assert!(!graph.contains("ignored_symbol"), "{changed}");
     assert!(text.len() <= 8192, "{}", text.len());
     assert_eq!(database_generation(&graph_path(&fixture.path)), generation);
@@ -2940,6 +3450,151 @@ fn changes_collapses_cargo_vendor_by_default_and_keeps_full_mode() {
     ] {
         assert!(full_graph.contains(expected), "missing {expected}: {full}");
     }
+    client.close();
+}
+
+fn graph_diff_fixture(base: &[(&str, &str)], head: &[(&str, &str)]) -> Fixture {
+    let fixture = Fixture::new();
+    init_git(&fixture.path);
+    for (files, message) in [(base, "base"), (head, "head")] {
+        for (path, content) in files {
+            let path = fixture.path.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        git(&fixture.path, &["add", "-A"]);
+        git_commit(&fixture.path, message);
+    }
+    fixture
+}
+
+fn commit_graph_section(client: &mut Client, base: &str) -> (rmcp::serde_json::Value, String) {
+    let completion =
+        client.index_target_and_wait(base, "HEAD", rmcp::serde_json::json!({ "kind": "commit" }));
+    let snapshot = client.snapshot_id().to_owned();
+    let changes = capture_changes(client, &snapshot, 6, 50);
+    (completion, change_section_text(&changes, "graph"))
+}
+
+#[test]
+fn graph_diff_reports_removed_symbol_with_dangling_callers() {
+    let fixture = graph_diff_fixture(
+        &[
+            ("src/lib.rs", "pub mod api;\npub mod caller;\n"),
+            ("src/api.rs", "pub fn old_api() {}\npub fn kept() {}\n"),
+            (
+                "src/caller.rs",
+                "pub fn caller() {\n    crate::api::old_api();\n}\n",
+            ),
+        ],
+        &[("src/api.rs", "pub fn kept() {}\n")],
+    );
+    let mut client = Client::start_unindexed(&fixture.path);
+
+    let (completion, graph) = commit_graph_section(&mut client, "HEAD~1");
+
+    assert!(
+        completion["provenance"]["base_graph_image_id"].is_string(),
+        "{completion}"
+    );
+    assert!(
+        graph.contains(
+            "api_removed kind=function symbol=old_api path=src/api.rs line=1 head_callers=1\n"
+        ),
+        "{graph}"
+    );
+    assert!(
+        graph.contains("broken_reference source=caller@src/caller.rs:2 target="),
+        "{graph}"
+    );
+    assert!(
+        graph.contains(
+            " api_removed=1 api_signature_changed=0 broken_references=1 base_graph=present\n"
+        ),
+        "{graph}"
+    );
+    assert!(!graph.contains("api_added "), "{graph}");
+    client.close();
+}
+
+#[test]
+fn graph_diff_reports_signature_changes_and_added_symbols() {
+    let fixture = graph_diff_fixture(
+        &[("src/lib.rs", "pub fn compute(a: u32) -> u32 {\n    a\n}\n")],
+        &[(
+            "src/lib.rs",
+            "pub fn compute(a: u32, b: u32) -> u32 {\n    a + b\n}\npub fn helper() {}\n",
+        )],
+    );
+    let mut client = Client::start_unindexed(&fixture.path);
+
+    let (_, graph) = commit_graph_section(&mut client, "HEAD~1");
+
+    assert!(
+        graph.contains(
+            "api_signature_changed symbol=compute path=src/lib.rs line=1 before=\"pub fn compute(a: u32) -> u32\" after=\"pub fn compute(a: u32, b: u32) -> u32\"\n"
+        ),
+        "{graph}"
+    );
+    assert!(
+        graph.contains("api_added kind=function symbol=helper path=src/lib.rs line=4\n"),
+        "{graph}"
+    );
+    assert!(
+        graph.contains(
+            " api_removed=0 api_signature_changed=1 broken_references=0 base_graph=present\n"
+        ),
+        "{graph}"
+    );
+    client.close();
+}
+
+#[test]
+fn graph_diff_reuses_the_cached_base_image_and_reports_identical_sources() {
+    let fixture = graph_diff_fixture(
+        &[("src/lib.rs", "pub fn first() {}\n")],
+        &[("src/lib.rs", "pub fn first() {}\npub fn second() {}\n")],
+    );
+    let mut client = Client::start_unindexed(&fixture.path);
+    let (first, _) = commit_graph_section(&mut client, "HEAD~1");
+    assert_eq!(first["base_stats"]["files_parsed"], 1, "{first}");
+
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn first() {}\npub fn second() {}\npub fn third() {}\n",
+    )
+    .unwrap();
+    git(&fixture.path, &["add", "-A"]);
+    git_commit(&fixture.path, "third");
+    let (second, graph) = commit_graph_section(&mut client, "HEAD~2");
+    assert_eq!(
+        second["provenance"]["base_graph_image_id"],
+        first["provenance"]["base_graph_image_id"]
+    );
+    assert_eq!(second["base_stats"]["files_parsed"], 0, "{second}");
+    assert_eq!(second["base_stats"]["files_reused"], 1, "{second}");
+    assert!(
+        graph.contains(
+            "api_removed=0 api_signature_changed=0 broken_references=0 base_graph=present"
+        ),
+        "{graph}"
+    );
+
+    fs::write(fixture.path.join("README.md"), "docs only\n").unwrap();
+    git(&fixture.path, &["add", "-A"]);
+    git_commit(&fixture.path, "docs");
+    let (docs, graph) = commit_graph_section(&mut client, "HEAD~1");
+    assert!(
+        docs["provenance"]["base_graph_image_id"].is_null(),
+        "{docs}"
+    );
+    assert!(docs["base_stats"].is_null(), "{docs}");
+    assert!(
+        graph.contains(
+            " api_removed=0 api_signature_changed=0 broken_references=0 base_graph=absent:identical_sources\n"
+        ),
+        "{graph}"
+    );
     client.close();
 }
 
@@ -4129,6 +4784,12 @@ fn is_graph_non_node(line: &str) -> bool {
         "claim ",
         "file-mapped ",
         "unmapped ",
+        "api_removed ",
+        "api_signature_changed ",
+        "api_added ",
+        "api_added_omitted=",
+        "broken_reference ",
+        "broken_references_omitted=",
     ]
     .iter()
     .any(|prefix| line.starts_with(prefix) && line.len() > prefix.len())
@@ -4822,6 +5483,8 @@ fn rust_index_search_view_and_inspection_over_explicit_snapshots() {
         "cancel_index",
         "search",
         "view",
+        "impact",
+        "path",
         "changes",
     ] {
         assert!(tools.contains(&format!("\"name\":\"{name}\"")), "{tools}");

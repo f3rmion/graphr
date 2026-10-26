@@ -1,6 +1,6 @@
 [package]
 name = "graphr"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Fast, compact Rust, Python, JavaScript, TypeScript, and C++ code graphs for AI code review over MCP stdio"
@@ -12,13 +12,13 @@ categories = ["development-tools"]
 exclude = ["/.agents", "/.claude", "/AGENTS.md"]
 
 [dependencies]
-blake3 = "1.8.5"
-libc = "0.2.189"
-rmcp = { version = "=3.1.0", default-features = false, features = ["server", "macros", "transport-io"] }
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+blake3 = "1.8.7"
+libc = "0.2.191"
+rmcp = { version = "=3.7.0", default-features = false, features = ["server", "macros", "transport-io"] }
+rusqlite = { version = "0.41.0", default-features = false, features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
-tokio = { version = "1.53.1", features = ["macros", "rt", "sync"] }
-tree-sitter = "0.26.11"
+tokio = { version = "1.54.1", features = ["macros", "rt", "sync"] }
+tree-sitter = "0.27.1"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"

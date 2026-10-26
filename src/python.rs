@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::git::Source;
-use crate::parse::{ParseGap, parser_no_tree_gaps, syntax_gaps};
+use crate::parse::{ParseGap, parser_no_tree_gaps, source_notes, syntax_gaps};
 use crate::store::{
     GapCategory, GapInput, GapReason, Graph, NodeInput, NodeKind, RefInput, RefKind,
-    ResolutionState,
+    ResolutionState, SourceNote, SourceNoteInput, TraitImplementationInput,
 };
 
 const PYTHON_QUERY: &str = include_str!("../queries/python.scm");
@@ -27,6 +27,8 @@ struct Definition {
     line_start: usize,
     line_end: usize,
     signature: String,
+    bases: Vec<String>,
+    first_parameter: Option<String>,
 }
 
 struct Import {
@@ -56,6 +58,7 @@ struct ParsedFile {
     bindings: Vec<ValueBinding>,
     calls: Vec<Call>,
     parse_gaps: Vec<ParseGap>,
+    notes: Vec<SourceNote>,
     parser_no_tree: bool,
 }
 
@@ -112,6 +115,7 @@ impl PythonParser {
         };
         let mut parsed = ParsedFile {
             parse_gaps: syntax_gaps(tree.root_node()),
+            notes: source_notes(tree.root_node(), source),
             ..ParsedFile::default()
         };
         let mut scopes = Vec::<Scope>::new();
@@ -120,7 +124,7 @@ impl PythonParser {
             .captures(&self.query, tree.root_node(), source.as_bytes());
 
         while let Some((query_match, capture_index)) = captures.next() {
-            let capture = query_match.captures[*capture_index];
+            let capture = query_match.captures()[*capture_index];
             let node = capture.node;
             while scopes
                 .last()
@@ -141,6 +145,8 @@ impl PythonParser {
                         line_start: line_start(coverage),
                         line_end: line_end(coverage),
                         signature: signature(node, source),
+                        bases: base_names(node, source),
+                        first_parameter: None,
                     });
                     scopes.push(Scope {
                         end_byte: node.end_byte(),
@@ -163,6 +169,8 @@ impl PythonParser {
                         line_start: line_start(coverage),
                         line_end: line_end(coverage),
                         signature: signature(node, source),
+                        bases: Vec::new(),
+                        first_parameter: first_parameter(node, source),
                     });
                     scopes.push(Scope {
                         end_byte: node.end_byte(),
@@ -231,7 +239,7 @@ pub fn add_file(
 ) -> Result<(), String> {
     let target = PythonTarget::for_path(&source.path)
         .ok_or_else(|| "Python source path is invalid".to_owned())?;
-    let parsed = parser.parse(&source.text)?;
+    let mut parsed = parser.parse(&source.text)?;
     let mut observed_relation_sites = 0_u32;
     let file_key = identity(&source.path, "file", &source.path, 0, 0);
     graph.nodes.push(NodeInput {
@@ -266,6 +274,12 @@ pub fn add_file(
             relation_site: false,
         });
     }
+    graph
+        .source_notes
+        .extend(parsed.notes.drain(..).map(|note| SourceNoteInput {
+            file_key: source.path.clone(),
+            note,
+        }));
 
     let mut paths = Vec::with_capacity(parsed.definitions.len());
     let mut node_keys = Vec::with_capacity(parsed.definitions.len());
@@ -322,6 +336,27 @@ pub fn add_file(
         imports: import_bindings(&parsed, &target)?,
         values,
     };
+    let base_key = |class: &Definition, base: &str| {
+        let (head, rest) = base.split_once('.').unwrap_or((base, ""));
+        let call = Call {
+            source: class.parent,
+            target: head.to_owned(),
+            bare: true,
+            line: class.line_start,
+        };
+        let keys = call_keys(
+            &call,
+            &parsed.definitions,
+            &paths,
+            &target,
+            &bindings,
+            &available,
+        );
+        let [key] = keys.as_slice() else {
+            return None;
+        };
+        Some(join(key, &rest.replace('.', "::")))
+    };
     for import in &parsed.imports {
         let source_key = import
             .source
@@ -369,6 +404,16 @@ pub fn add_file(
                 &bindings,
                 &available,
             )
+        } else if let Some((class, name)) = self_call(call, &parsed.definitions) {
+            std::iter::once(item_key(&join(&paths[class], name)))
+                .chain(
+                    parsed.definitions[class]
+                        .bases
+                        .iter()
+                        .filter_map(|base| base_key(&parsed.definitions[class], base))
+                        .map(|base| join(&base, name)),
+                )
+                .collect()
         } else {
             Vec::new()
         };
@@ -398,6 +443,20 @@ pub fn add_file(
             });
         }
         observed_relation_sites += 1;
+    }
+    for (local, definition) in parsed.definitions.iter().enumerate() {
+        for base in &definition.bases {
+            let Some(trait_key) = base_key(definition, base) else {
+                continue;
+            };
+            graph.trait_implementations.push(TraitImplementationInput {
+                file_key: source.path.clone(),
+                line_start: to_u32(definition.line_start)?,
+                line_end: to_u32(definition.line_end)?,
+                implementor_key: item_key(&paths[local]),
+                trait_key,
+            });
+        }
     }
     graph
         .files
@@ -453,6 +512,21 @@ fn import_bindings(parsed: &ParsedFile, target: &PythonTarget) -> Result<ImportB
     Ok(bindings)
 }
 
+/// `self.name()`/`cls.name()` inside a class method, where the receiver is the
+/// method's own first parameter; returns the enclosing class and member name.
+fn self_call<'call>(call: &'call Call, definitions: &[Definition]) -> Option<(usize, &'call str)> {
+    let method = definitions.get(call.source?)?;
+    let class = method
+        .parent
+        .filter(|class| definitions[*class].kind == DefinitionKind::Type)?;
+    let (receiver, name) = call.target.split_once('.')?;
+    let member = !name.is_empty() && name.chars().all(|c| c == '_' || c.is_alphanumeric());
+    (matches!(receiver, "self" | "cls")
+        && method.first_parameter.as_deref() == Some(receiver)
+        && member)
+        .then_some((class, name))
+}
+
 fn call_keys(
     call: &Call,
     definitions: &[Definition],
@@ -461,8 +535,8 @@ fn call_keys(
     bindings: &Bindings,
     available: &HashSet<String>,
 ) -> Vec<String> {
-    // ponytail: bare calls cover the measured Python corpus; add attribute
-    // resolution only when static receiver evidence can keep it precise.
+    // ponytail: bare calls plus `self.name()`/`cls.name()` in methods cover the
+    // measured Python corpus; add other receivers only with static type evidence.
     let name = call.target.as_str();
     for scope in call
         .source
@@ -710,6 +784,42 @@ fn definition_coverage(node: Node<'_>) -> Node<'_> {
         .unwrap_or(node)
 }
 
+/// Base class names from `class C(A, m.B, Generic[T], metaclass=M)`; keyword
+/// arguments and non-name expressions are skipped.
+fn base_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(arguments) = node.child_by_field_name("superclasses") else {
+        return Vec::new();
+    };
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .filter_map(|argument| {
+            let argument = if argument.kind() == "subscript" {
+                argument.child_by_field_name("value")?
+            } else {
+                argument
+            };
+            let mut name = argument;
+            while name.kind() == "attribute" {
+                name = name.child_by_field_name("object")?;
+            }
+            (name.kind() == "identifier")
+                .then(|| text(argument, source).split_whitespace().collect())
+        })
+        .collect()
+}
+
+/// Plain or annotated first parameter name; other parameter shapes are skipped.
+fn first_parameter(node: Node<'_>, source: &str) -> Option<String> {
+    let first = node.child_by_field_name("parameters")?.named_child(0)?;
+    let name = match first.kind() {
+        "identifier" => first,
+        "typed_parameter" => first.named_child(0)?,
+        _ => return None,
+    };
+    Some(text(name, source).to_owned())
+}
+
 fn field_text<'source>(node: Node<'_>, field: &str, source: &'source str) -> Option<&'source str> {
     let value = text(node.child_by_field_name(field)?, source);
     (!value.is_empty()).then_some(value)
@@ -898,6 +1008,182 @@ def broken(
                 .bindings
                 .iter()
                 .any(|binding| binding.source == Some(3) && binding.name == "callback")
+        );
+    }
+
+    fn graph_of(path: &str, text: &str) -> Graph {
+        let source = Source {
+            path: path.into(),
+            text: text.into(),
+        };
+        let mut graph = Graph::default();
+        graph.files.push(crate::store::FileInput {
+            path: source.path.clone(),
+            language: crate::git::Language::Python,
+            git_oid: None,
+            content_hash: [0; 32],
+            parse_context: "python".into(),
+            byte_size: source.text.len() as u64,
+            replace: true,
+            observed_relation_sites: 0,
+        });
+        add_file(&mut graph, &source, &mut PythonParser::new().unwrap()).unwrap();
+        graph
+    }
+
+    #[test]
+    fn records_tagged_comments_as_source_notes() {
+        let graph = graph_of(
+            "app.py",
+            "# plain comment\n\
+             def run():\n\
+             \x20   # WHY: retries hide flaky upstreams\n\
+             \x20   return 1  # ADR-7 picks this default\n\
+             \"\"\"NOTE: docstrings are not notes\"\"\"\n",
+        );
+        let notes = graph
+            .source_notes
+            .iter()
+            .map(|row| {
+                let note = &row.note;
+                (
+                    row.file_key.as_str(),
+                    note.line_start,
+                    note.tag,
+                    note.text.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notes,
+            [
+                ("app.py", 3, "WHY", "retries hide flaky upstreams"),
+                ("app.py", 4, "ADR", "ADR-7 picks this default"),
+            ]
+        );
+    }
+
+    fn inheritance(path: &str, text: &str) -> Vec<(String, String)> {
+        graph_of(path, text)
+            .trait_implementations
+            .into_iter()
+            .map(|row| (row.implementor_key, row.trait_key))
+            .collect()
+    }
+
+    #[test]
+    fn keys_self_and_cls_calls_to_class_then_base_members() {
+        let graph = graph_of(
+            "pkg/app.py",
+            r#"from pkg.base import Remote
+
+class Base:
+    def run(self):
+        return self.step()
+
+    def step(self):
+        other.step()
+        self.a.b()
+        def inner(self):
+            self.step()
+
+    def helper(self):
+        pass
+
+    @classmethod
+    def build(cls):
+        return cls.make()
+
+    @classmethod
+    def make(cls):
+        pass
+
+class Child(Base, Remote):
+    def go(self):
+        return self.helper()
+"#,
+        );
+        let name_of = |key: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.key == key)
+                .map(|node| node.name.as_str())
+                .unwrap()
+        };
+        let item = |path: &str| format!("python:item:{path}");
+        let calls = graph
+            .refs
+            .iter()
+            .filter(|reference| reference.kind == RefKind::Calls)
+            .map(|reference| (name_of(&reference.source_key), reference.keys.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls,
+            [
+                ("run", vec![item("pkg::app::Base::step")]),
+                ("build", vec![item("pkg::app::Base::make")]),
+                (
+                    "go",
+                    vec![
+                        item("pkg::app::Child::helper"),
+                        item("pkg::app::Base::helper"),
+                        item("pkg::base::Remote::helper"),
+                    ]
+                ),
+            ]
+        );
+        for key in [item("pkg::app::Base::step"), item("pkg::app::Base::make")] {
+            assert!(graph.nodes.iter().any(|node| node.keys.contains(&key)));
+        }
+        assert_eq!(
+            graph
+                .gaps
+                .iter()
+                .filter(|gap| gap.reason == GapReason::DynamicOrUnsupportedDispatch)
+                .filter_map(|gap| gap.target_hint.as_deref())
+                .collect::<Vec<_>>(),
+            ["other.step", "self.a.b", "self.step"]
+        );
+    }
+
+    #[test]
+    fn records_python_base_classes_with_call_keys() {
+        let rows = inheritance(
+            "pkg/app.py",
+            r#"import pkg.models
+import pkg.shapes as shapes
+from pkg.base import Base
+from pkg.base import Other as Alias
+from typing import Generic, TypeVar
+
+class Local:
+    pass
+
+class Child(Local, Base, metaclass=Meta):
+    pass
+
+class Aliased(Alias, shapes.Shape, pkg.models.Model, Generic[T], make()):
+    pass
+"#,
+        );
+
+        let row = |implementor: &str, base: &str| {
+            (
+                format!("python:item:pkg::app::{implementor}"),
+                format!("python:item:{base}"),
+            )
+        };
+        assert_eq!(
+            rows,
+            [
+                row("Child", "pkg::app::Local"),
+                row("Child", "pkg::base::Base"),
+                row("Aliased", "pkg::base::Other"),
+                row("Aliased", "pkg::shapes::Shape"),
+                row("Aliased", "pkg::models::Model"),
+                row("Aliased", "typing::Generic"),
+            ]
         );
     }
 }

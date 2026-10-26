@@ -2,9 +2,13 @@ use std::collections::HashMap;
 
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
+use crate::store::SourceNote;
+
 const RUST_QUERY: &str = include_str!("../queries/rust.scm");
 const PATH_LIMIT: usize = 1024;
 const SIGNATURE_LIMIT: usize = 200;
+const NOTE_TEXT_LIMIT: usize = 160;
+const NOTE_TAGS: [&str; 4] = ["SAFETY", "WHY", "NOTE", "INVARIANT"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DefinitionKind {
@@ -79,6 +83,7 @@ pub struct ParsedFile {
     pub calls: Vec<Call>,
     pub macros: Vec<MacroCall>,
     pub parse_gaps: Vec<ParseGap>,
+    pub notes: Vec<SourceNote>,
     pub parser_no_tree: bool,
 }
 
@@ -182,6 +187,7 @@ impl RustParser {
 
         let mut parsed = ParsedFile {
             parse_gaps: syntax_gaps(tree.root_node()),
+            notes: source_notes(tree.root_node(), source),
             ..ParsedFile::default()
         };
         let mut pending_parents = Vec::new();
@@ -193,7 +199,7 @@ impl RustParser {
             .captures(&self.query, tree.root_node(), source.as_bytes());
 
         while let Some((query_match, capture_index)) = captures.next() {
-            let capture = query_match.captures[*capture_index];
+            let capture = query_match.captures()[*capture_index];
             let node = capture.node;
             while scopes
                 .last()
@@ -472,6 +478,100 @@ pub(crate) fn parser_no_tree_gaps(line_end: usize) -> Vec<ParseGap> {
     }]
 }
 
+/// Comments starting with `SAFETY:`, `WHY:`, `NOTE:`, or `INVARIANT:`, and
+/// comments citing `ADR-<n>`/`RFC-<n>`, in source order. An untagged line
+/// comment directly below a line-comment note, at the same column, extends it.
+pub(crate) fn source_notes(root: Node<'_>, source: &str) -> Vec<SourceNote> {
+    let mut notes = Vec::<SourceNote>::new();
+    let mut continued_column = None;
+    let mut cursor = root.walk();
+    'walk: loop {
+        let node = cursor.node();
+        if matches!(node.kind(), "comment" | "line_comment" | "block_comment") {
+            let raw = text(node, source);
+            let line_comment = raw.starts_with("//") || raw.starts_with('#');
+            let column = node.start_position().column;
+            let line_start = node.start_position().row + 1;
+            let end = node.end_position();
+            let line_end = (end.row + usize::from(end.column > 0)).max(line_start);
+            let body = comment_body(raw);
+            if let Some((tag, text)) = note_tag(body) {
+                notes.push(SourceNote {
+                    line_start,
+                    line_end,
+                    tag,
+                    text: note_text(text),
+                });
+                continued_column = line_comment.then_some(column);
+            } else if let Some(note) = notes.last_mut().filter(|note| {
+                line_comment && continued_column == Some(column) && note.line_end + 1 == line_start
+            }) {
+                note.line_end = line_end;
+                if note.text.is_empty() {
+                    note.text = note_text(body);
+                }
+            } else {
+                continued_column = None;
+            }
+        } else if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    notes
+}
+
+fn comment_body(raw: &str) -> &str {
+    let body = match raw.strip_prefix("/*") {
+        Some(block) => block.strip_suffix("*/").unwrap_or(block),
+        None => raw
+            .strip_prefix("//")
+            .or_else(|| raw.strip_prefix('#'))
+            .unwrap_or(raw),
+    };
+    body.trim_start_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '*' | '!' | '/')
+    })
+}
+
+fn note_tag(body: &str) -> Option<(&'static str, &str)> {
+    for tag in NOTE_TAGS {
+        if let Some(text) = body
+            .strip_prefix(tag)
+            .and_then(|rest| rest.strip_prefix(':'))
+        {
+            return Some((tag, text));
+        }
+    }
+    let bytes = body.as_bytes();
+    (0..bytes.len()).find_map(|index| {
+        let tag = ["ADR", "RFC"]
+            .into_iter()
+            .find(|tag| bytes[index..].starts_with(tag.as_bytes()))?;
+        let rest = &bytes[index + tag.len()..];
+        let rest = rest
+            .strip_prefix(b"-")
+            .or(rest.strip_prefix(b" "))
+            .unwrap_or(rest);
+        rest.first()
+            .is_some_and(u8::is_ascii_digit)
+            .then_some((tag, body))
+    })
+}
+
+fn note_text(text: &str) -> String {
+    let text = text.lines().next().unwrap_or_default().trim();
+    let mut end = text.len().min(NOTE_TEXT_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
 fn parse_gap(node: Node<'_>) -> ParseGap {
     let line_start = node.start_position().row + 1;
     let end = node.end_position();
@@ -570,13 +670,94 @@ fn binding_type(mut node: Node<'_>, source: &str) -> Option<String> {
     while node.kind() == "reference_type" {
         node = node.child_by_field_name("type")?;
     }
+    if matches!(node.kind(), "dynamic_type" | "abstract_type") {
+        node = node.child_by_field_name("trait")?;
+    }
+    if node.kind() == "type_identifier"
+        && let Some(bound) = single_trait_bound(node, source)
+    {
+        node = bound;
+    }
+    nominal_type(node)
+        .then(|| text(node, source).trim())
+        .filter(|target| !target.is_empty() && target.len() <= PATH_LIMIT)
+        .map(str::to_owned)
+}
+
+fn nominal_type(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
         "type_identifier" | "scoped_type_identifier" | "generic_type"
     )
-    .then(|| text(node, source).trim())
-    .filter(|target| !target.is_empty() && target.len() <= PATH_LIMIT)
-    .map(str::to_owned)
+}
+
+/// The one non-marker trait bounding the innermost generic parameter named
+/// like `parameter`, from `<S: Trait>` or `where S: Trait`. Several candidate
+/// traits stay unresolved rather than guessing which one owns the method.
+fn single_trait_bound<'tree>(parameter: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    const MARKERS: [&str; 5] = ["Send", "Sync", "Unpin", "Copy", "Sized"];
+    let name = text(parameter, source);
+    let mut scope = parameter.parent();
+    let mut bounds: Vec<Node<'tree>> = Vec::new();
+    while let Some(item) = scope {
+        scope = item.parent();
+        if !matches!(
+            item.kind(),
+            "function_item" | "function_signature_item" | "impl_item" | "trait_item"
+        ) {
+            continue;
+        }
+        let mut declared = false;
+        let mut cursor = item.walk();
+        for child in item.named_children(&mut cursor) {
+            let mut inner = child.walk();
+            let constraints = match child.kind() {
+                "type_parameters" => child
+                    .named_children(&mut inner)
+                    .filter(|parameter| parameter.kind() == "type_parameter")
+                    .filter(|parameter| {
+                        parameter
+                            .child_by_field_name("name")
+                            .is_some_and(|node| text(node, source) == name)
+                    })
+                    .collect::<Vec<_>>(),
+                "where_clause" => child
+                    .named_children(&mut inner)
+                    .filter(|predicate| {
+                        predicate.child_by_field_name("left").is_some_and(|node| {
+                            node.kind() == "type_identifier" && text(node, source) == name
+                        })
+                    })
+                    .collect(),
+                _ => continue,
+            };
+            declared |= child.kind() == "type_parameters" && !constraints.is_empty();
+            for constraint in constraints {
+                let Some(trait_bounds) = constraint.child_by_field_name("bounds") else {
+                    continue;
+                };
+                let mut cursor = trait_bounds.walk();
+                for bound in trait_bounds.named_children(&mut cursor) {
+                    let bound_text = text(bound, source).trim();
+                    if nominal_type(bound)
+                        && !MARKERS.contains(&bound_text)
+                        && !bounds
+                            .iter()
+                            .any(|known| text(*known, source).trim() == bound_text)
+                    {
+                        bounds.push(bound);
+                    }
+                }
+            }
+        }
+        if declared {
+            return match bounds.as_slice() {
+                [bound] => Some(*bound),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 fn flatten_use(
@@ -1055,5 +1236,70 @@ mod tests {
         assert!(parsed.bindings.iter().any(|binding| {
             binding.name == "other" && binding.type_target.as_deref() == Some("Item")
         }));
+    }
+
+    #[test]
+    fn types_trait_receivers_by_their_single_bound() {
+        let parsed = RustParser::new()
+            .unwrap()
+            .parse(
+                "fn a<W, M, T, G>(d: &dyn Store, i: impl Store, g: &G, w: W, m: M, two: T, s: S, c: C) where W: Store, M: Store + Send + Sync, T: Store + Other, C: Store {}\nfn b<G: Store, S: Store>() {}\nimpl<V: Store> Wrap<V> { fn c(&self, v: &V) {} }\nstruct S;\n",
+            )
+            .unwrap();
+        let types = parsed
+            .bindings
+            .iter()
+            .map(|binding| (binding.name.as_str(), binding.type_target.as_deref()))
+            .collect::<Vec<_>>();
+        for expected in [
+            ("d", Some("Store")),
+            ("i", Some("Store")),
+            ("w", Some("Store")),
+            ("m", Some("Store")),
+            ("two", Some("T")),
+            ("v", Some("Store")),
+        ] {
+            assert!(types.contains(&expected), "{expected:?} not in {types:?}");
+        }
+        for (name, unbound) in [("g", "G"), ("s", "S"), ("c", "C")] {
+            assert!(
+                types.contains(&(name, Some(unbound))),
+                "{name}: undeclared, unbounded, or concrete types keep their name: {types:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn records_tagged_comments_as_source_notes() {
+        let parsed = RustParser::new()
+            .unwrap()
+            .parse(
+                "// plain comment\n\
+                 // safety: lowercase is not a tag\n\
+                 // NOTE no colon\n\
+                 pub fn read(ptr: *const u8) -> u8 {\n\
+                 \x20   // SAFETY: caller guarantees ptr is valid\n\
+                 \x20   // and aligned.\n\
+                 \x20   unsafe { *ptr }\n\
+                 }\n\
+                 /// WHY: callers batch writes\n\
+                 /* INVARIANT: never empty */\n\
+                 //! see RFC 9110 for status codes\n",
+            )
+            .unwrap();
+        let notes = parsed
+            .notes
+            .iter()
+            .map(|note| (note.line_start, note.line_end, note.tag, note.text.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notes,
+            [
+                (5, 6, "SAFETY", "caller guarantees ptr is valid"),
+                (9, 9, "WHY", "callers batch writes"),
+                (10, 10, "INVARIANT", "never empty"),
+                (11, 11, "RFC", "see RFC 9110 for status codes"),
+            ]
+        );
     }
 }
