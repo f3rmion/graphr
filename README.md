@@ -5,6 +5,10 @@ views for Codex and Claude over MCP stdio.
 
 Graphr is inspired by [code-review-graph](https://github.com/tirth8205/code-review-graph)'s approach to focusing AI review context. Thanks to @tirth8205 and its contributors for originating that work.
 
+Graphr's inheritance and override-dispatch analysis, `impact` and `path`
+queries, import-cycle report, source notes, and API comparison against the base
+commit follow ideas from [graphify](https://github.com/Graphify-Labs/graphify).
+
 ## Install
 
 ```text
@@ -33,8 +37,14 @@ Graphr exposes nine MCP tools:
   worktree, range, target, and dependency mode.
 - `index_status` reports progress and returns the completed `snapshot_id`.
 - `cancel_index` requests cooperative cancellation of a job.
-- `search`, `view`, `impact`, `path`, and `changes` query one required
-  `snapshot_id`; there is no default snapshot.
+- `search` finds nodes by name, qualified name, path, or signature.
+- `view` shows a bounded neighborhood of one node.
+- `impact` lists everything that reaches one node in reverse.
+- `path` finds the shortest static route between two nodes.
+- `changes` returns the paged review or one DOT change-impact graph.
+
+`search`, `view`, `impact`, `path`, and `changes` take one required
+`snapshot_id`; there is no default snapshot.
 
 ## Snapshot workflow
 
@@ -71,17 +81,6 @@ impact({"snapshot_id": "<digest>", "node_ref": "<opaque>", "depth": 3, "max_node
 path({"snapshot_id": "<digest>", "from_ref": "<opaque>", "to_ref": "<opaque>", "max_hops": 6, "direction": "forward"})
 ```
 
-`impact` lists what reaches a node in reverse, breadth first: `caller <-`,
-`test <-`, `importer <-`, `impl <-`, and `dispatch <-` (a supertype member that
-the node overrides). `path` returns the shortest static route between two nodes
-as `path hops=N direction=forward|any` followed by one line per hop
-(`call ->`, `test-call ->`, `import ->`, `implements ->`, `dispatch ->`, or the
-reverse labels when `direction` is `any`), or
-`no path within max_hops=N direction=...` when none exists inside the bound.
-Ties resolve to the lowest node ids. Both answer from one in-memory adjacency
-built on first use per snapshot; on a 911-file C++ snapshot the first call took
-24 ms and later calls about 0.3 ms. `[truncated]` marks bounded output.
-
 Review is the default. For one complete bounded DOT change-impact graph, opt in:
 
 ```text
@@ -94,8 +93,9 @@ changes({
 ```
 
 DOT mode has no cursor; its bounds apply to the whole visual graph, and
-omissions and completeness remain explicit. Save the returned text and render
-it outside Graphr, for example:
+omissions and completeness remain explicit. Test calls are drawn dashed and
+supertype dispatch hops dotted. Save the returned text and render it outside
+Graphr, for example:
 
 ```bash
 dot -Tsvg impact.dot -o impact.svg
@@ -153,12 +153,64 @@ analysis but keep distinct workspace and snapshot identities. Published
 snapshots are immutable. Graphr performs no automatic cache garbage
 collection.
 
+## Graph queries
+
+Each snapshot graphs the whole head tree, not only the changed files.
+`search` lines start with an opaque `node_ref`; pass it verbatim to `view`,
+`impact`, or `path`. A `node_ref` from another snapshot is rejected with
+`node_snapshot_mismatch`.
+
+| Tool | Parameters (default) | Output budget |
+| --- | --- | --- |
+| `search` | `query` up to 256 bytes, `kind` `file`, `type`, `function`, or `test`, `limit` 1–20 (8) | 1.5 KiB |
+| `view` | `node_ref`, `depth` 0–6 (1), `max_nodes` 1–50 (30) | 4 KiB |
+| `impact` | `node_ref`, `depth` 1–6 (3), `max_nodes` 1–50 (30) | 4 KiB |
+| `path` | `from_ref`, `to_ref`, `max_hops` 1–8 (6), `direction` `forward` or `any` (`forward`) | 4 KiB |
+
+`search` matches every query token as a prefix of a name, qualified name, path,
+or signature token and returns matches in index order, without relevance
+ranking. `view` walks `member ->`, `test <-`, `caller <-`, `impl <-`,
+`call ->`, `implements ->`, `in <-`, and `import ->` breadth first, then lists
+source notes, gap records, and evidence for the root.
+
+`impact` lists what reaches a node in reverse, breadth first: callers, tests,
+importers, implementors, and the supertype members the node overrides. For a
+changed trait implementation it shows callers that only reach the override
+through the trait method:
+
+```text
+n1:… Function get src/lib.rs:6
+  dispatch <- n1:… Function get src/lib.rs:2
+  caller <- n1:… Function read_dyn src/lib.rs:12
+  caller <- n1:… Function read_generic src/lib.rs:13
+  test <- n1:… Test reads_through_trait src/lib.rs:15
+```
+
+`path` returns the shortest static route between two nodes over calls, test
+calls, imports, implementations, and dispatch. `direction="forward"` follows
+stored edge direction; `direction="any"` also walks edges backwards and prints
+the reverse labels (`caller <-`, `test <-`, `importer <-`, `impl <-`,
+`dispatch <-`):
+
+```text
+path hops=2 direction=forward
+n1:… Function read_dyn src/lib.rs:12
+  call -> n1:… Function get src/lib.rs:2
+  dispatch -> n1:… Function get src/lib.rs:6
+```
+
+When no route exists inside the bound, `path` returns
+`no path within max_hops=N direction=forward`. Ties resolve to the lowest node
+IDs, so routes are deterministic. `[truncated]` marks output cut by a node,
+depth, or byte bound. `impact` and `path` answer from one in-memory adjacency
+built on first use per snapshot; see [Performance](#performance).
+
 ## External execution evidence
 
 First run `index` without evidence and retain its source-only `snapshot_id`.
-Run generators, tests, and coverage tools outside Graphr, write their outputs
-under the authorized worktree, then create a manifest bound to that source
-snapshot. Finally run the same `index` selection with
+Run generators, tests, coverage tools, and SCIP indexers outside Graphr, write
+their outputs under the authorized worktree, then create a manifest bound to
+that source snapshot. Finally run the same `index` selection with
 `"evidence_manifest":"evidence.json"`. Graphr validates and imports the files
 into a new immutable evidence-bearing snapshot; it never executes a producer.
 
@@ -247,37 +299,49 @@ and `view` and `changes` relation lines whose edge only SCIP supports end in
 ` via=scip`. Like coverage, this is producer attestation: Graphr verifies the
 digest and wire format, not the indexer's type analysis.
 
-This milestone has no process execution, causal build trace, runtime call
-ordering, mutation proof, JavaScript runtime coverage, before/after trust query,
-or normative citation mapping.
+Graphr has no process execution, causal build trace, runtime call ordering,
+mutation proof, JavaScript runtime coverage, before/after trust query, or
+normative citation mapping.
 
 ## Review output
+
+`changes` returns bounded 8 KiB review pages with every safe changed path, an
+aggregate count of unsafe paths, supported source diffs, bounded non-source
+text diffs, Markdown/TSV semantics, explicit artifact omissions, risk-ranked
+changed symbols, affected static execution paths, import cycles through changed
+files, source notes on changed code, API changes against the base commit, and
+graph impact. `.cargo/vendor` changes collapse to deterministic package
+boundaries by default; select `dependency_mode="full"` while indexing to
+inspect dependency internals.
+
+### Languages
 
 Graphr detects Rust, Python, JavaScript/JSX, TypeScript/TSX, and C++ sources
 automatically. Rust uses `.rs`, Python uses `.py`, JavaScript and TypeScript use
 `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`, `.cts`, and `.d.ts`, and
-C++ uses `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, and `.h`. `changes`
-returns bounded 8 KiB review pages with every safe changed path, an aggregate
-count of unsafe paths, supported source diffs, bounded non-source text diffs,
-Markdown/TSV semantics, explicit artifact omissions, risk-ranked changed
-symbols, affected static execution paths, and graph impact. `.cargo/vendor`
-changes collapse to deterministic package boundaries by default; select
-`dependency_mode="full"` while indexing to inspect dependency internals.
+C++ uses `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, and `.h`.
 
-For Rust, method calls on receivers typed `&dyn Trait`, `impl Trait`, or a
-generic parameter with exactly one non-marker trait bound resolve to the trait
-method. Several candidate traits leave the call unresolved.
+For Rust, graph semantics include modules, types, functions, methods, `use`
+imports and aliases, calls, `impl Trait for Type` implementations, test
+functions, and verified generated `include!` output. Method calls on receivers
+typed `&dyn Trait`, `impl Trait`, or a generic parameter with exactly one
+non-marker trait bound resolve to the trait method; several candidate traits
+leave the call unresolved. Macros are not expanded.
 
-For Python, class bases, `self.method()` and `cls.method()` calls inside class
-methods resolve to the enclosing class member first, then the same member on
-each direct base. Other attribute receivers produce a dispatch gap.
+For Python, graph semantics include classes and their bases, functions,
+`test_` functions, imports, package re-exports, bare calls, and `self.method()`
+or `cls.method()` calls inside methods. Those calls resolve to the enclosing
+class member first, then to the same member on each direct base. Other
+attribute receivers produce a dispatch gap. Docstrings and decorators are not
+indexed.
 
 For JavaScript and TypeScript, graph semantics include definitions, ESM and
 CommonJS imports, direct re-exports, resolvable calls, conventional tests,
 JSX component calls, class `extends`, TypeScript `implements`, and interface
 `extends`. Module resolution is limited to relative repository-local
 specifiers. There is no package or `tsconfig` resolution and no type checker;
-ambiguous module aliases produce no edge.
+ambiguous module aliases produce no edge. A type re-exported through a barrel
+without `export type` does not resolve as an `implements` base.
 
 For C++, graph semantics include type and function definitions, repository-local
 quoted includes, inheritance, direct and qualified calls, `this` calls, and
@@ -285,22 +349,72 @@ GoogleTest or Catch2/doctest test cases. Graphr does not preprocess source, read
 `compile_commands.json`, resolve system headers, instantiate templates, infer
 receiver types, or choose between overloads; ambiguous targets produce no edge.
 
+Every supported language uses the same incremental indexing and rename
+detection pipeline. Rename detection runs independently within regular source
+diffs and within non-source artifact diffs. Renames crossing those streams are
+conservatively represented as a deletion plus an addition.
+
+### Affected flows and risk
+
 Affected-flow discovery follows `CALLS` edges up to 15 hops. A method also
 reaches the same-name members of its type's transitive supertypes (trait
-implementations, base classes, `extends`/`implements`), so a call bound to a
-trait or base method can reach a changed override. Such hops render as ` ~> `,
-the flow line carries `dispatch_hops=N`, and DOT draws them dotted. These are possible source-level call chains, not recorded runtime call stacks. Risk output states that higher is riskier and includes flow, test, security-name, and caller component scores plus a short rationale. The caller component tiers direct production fan-in, including callers of overridden members, at 1, 2–3, 4–15, and 16 or more callers; 16 or more adds `high-fan-in` to the rationale. `test_path_confidence=heuristic` and `test_path_provenance=resolved-static-call-graph` describe bounded static evidence, not runtime test proof; community and churn factors are not used.
+implementations, base classes, `extends`, and `implements`), so a call bound to
+a trait or base method reaches a changed override. Such hops render as ` ~> `,
+and the flow line carries `dispatch_hops=N`:
 
-Each changed Python, JavaScript/TypeScript, or C++ file inside a file-level import cycle adds an `import_cycle files=N route=a -> b -> a` line naming the shortest import cycle through it; at most 16 such lines are emitted (`import_cycles_omitted=N` counts the rest), and the summary's `import_cycles=N` counts the cycles containing a changed file. Rust is excluded because modules of one crate may refer to each other.
+```text
+flow … dispatch_hops=1 read_dyn@src/lib.rs:12 -> get@src/lib.rs:2 ~> get@src/lib.rs:6
+```
 
-Comments whose text starts with `SAFETY:`, `WHY:`, `NOTE:`, or `INVARIANT:`, or that cite `ADR-N`/`RFC-N` (tags `ADR`/`RFC`), are indexed as source notes in every supported language; Python docstrings are not. A changed symbol's notes, and notes on changed lines, render after the root and neighbor lines as `note tag=SAFETY path="src/lib.rs" line=2 text="caller guarantees ptr is valid"`, ordered by path and line; at most 16 are emitted (`notes_omitted=N` counts the rest), and the summary's `notes=N` counts them all. `view` of a type, function, or test lists up to 8 notes inside its span.
+Override linking matches member names only; it does not compare signatures or
+choose between overloads. Flows are possible source-level call chains, not
+recorded runtime call stacks.
+
+Risk output states that higher is riskier and includes flow, test,
+security-name, and caller component scores plus a short rationale. The caller
+component tiers direct production fan-in, including callers of overridden
+members, at 1, 2–3, 4–15, and 16 or more callers; 16 or more adds
+`high-fan-in` to the rationale. `test_path_confidence=heuristic` and
+`test_path_provenance=resolved-static-call-graph` describe bounded static
+evidence, not runtime test proof; community and churn factors are not used.
+
+### Import cycles
+
+Each changed Python, JavaScript/TypeScript, or C++ file inside a file-level
+import cycle adds one line naming the shortest import cycle through it:
+
+```text
+import_cycle files=2 route=src/a.js -> src/b.js -> src/a.js
+```
+
+At most 16 such lines are emitted (`import_cycles_omitted=N` counts the rest),
+and the summary's `import_cycles=N` counts the cycles containing a changed
+file. Rust is excluded because modules of one crate may refer to each other.
+
+### Source notes
+
+Comments whose text starts with `SAFETY:`, `WHY:`, `NOTE:`, or `INVARIANT:`, or
+that cite `ADR-N` or `RFC-N` (tags `ADR` and `RFC`), are indexed as source notes
+in every supported language. A changed symbol's notes, and notes on changed
+lines, render after the root and neighbor lines, ordered by path and line:
+
+```text
+note tag=SAFETY path="src/lib.rs" line=2 text="caller guarantees ptr is valid"
+```
+
+At most 16 are emitted (`notes_omitted=N` counts the rest), and the summary's
+`notes=N` counts them all. `view` of a type, function, or test lists up to 8
+notes inside its span. Notes in unchanged code outside changed symbols stay out
+of the review.
+
+### API changes against the base
 
 The graph section also compares the head graph with a graph image of the base
 commit's supported sources, built during indexing and cached under the same
 content key as any other graph image, so a later review from the same base
-parses no base files (`base_stats.files_parsed=0`). Symbols match by file path,
-node kind, and scope-qualified name, ignoring line positions. After the flow
-lines, it emits:
+parses no base files (`base_stats.files_parsed=0` in the index result). Symbols
+match by file path, node kind, and scope-qualified name, ignoring line
+positions. After the flow lines, it emits:
 
 ```text
 api_removed kind=function symbol=old_api path=src/api.rs line=1 head_callers=1
@@ -320,17 +434,14 @@ symbol is reported as removed plus added. The `risk` line ends with
 sources match the head image. Boundary mode leaves `.cargo/vendor` out of the
 comparison.
 
+### Artifacts and completeness
+
 Artifact text and semantics belong to the immutable snapshot. Non-symbol source
 ranges map to their indexed file node and are reported as `file-mapped`;
 targeted `search` or `view` remediation is named for unresolved graph coverage.
 Binary, oversized, unsafe, non-regular, type-changed, unmerged, and other
 explicit artifact omissions keep `content_complete_when_pages_exhausted=false`.
 This is complete artifact coverage for every supported source language.
-
-JavaScript, TypeScript, and C++ use the existing incremental indexing and rename
-detection pipeline. Rename detection runs independently within regular source
-diffs and within non-source artifact diffs. Renames crossing those streams are
-conservatively represented as a deletion plus an addition.
 
 ## Codex and Claude review skill
 
@@ -352,8 +463,30 @@ cp -R .agents/skills/graphr-review ~/.claude/skills/
 
 Both clients need the separately registered Graphr MCP server. The skill
 selects the review base, exhausts every bounded `changes` continuation page,
-checks snapshot freshness, follows targeted graph remediation, and keeps the
+checks snapshot freshness, follows targeted graph remediation, uses `impact`
+and `path` only when an incomplete traversal decides a finding, and keeps the
 final review under 220 words.
+
+## Performance
+
+Graph queries were measured over MCP stdio on a 911-file C++ repository
+snapshot with 104,802 nodes and 34,303 edges:
+
+| Call | Time |
+| --- | ---: |
+| `impact`, first call per snapshot (builds the adjacency) | 24.38 ms |
+| `impact`, later calls, p50 of 10 | 0.21 ms |
+| `path` with `direction="any"`, p50 of 50 | 0.28 ms |
+| `view` at depth 6, p50 of 10 | 98.82 ms |
+
+Cold indexing of `HEAD~1..HEAD` in that repository, including the base graph
+image, took 20.4 s in one run.
+
+Measured on the `rust-random/rand` fixture before 0.8.2, server startup was
+31.539 ms p50 and a warm review call 6.704 ms p50. Across 20 interleaved rebuild
+runs, bounded parallel parsing measured 61.290 ms p50 and 64.871 ms p95, versus
+87.847 ms and 97.689 ms for sequential parsing. No-op indexing measured
+23.822 ms versus 23.729 ms p50.
 
 ## Token benchmark
 
@@ -365,23 +498,6 @@ Isolated reviews of `rust-random/rand` commit `bb1262f7` used Codex CLI 0.146.0 
 | Unguided Graphr | 294,000 | 248,064 | 45,936 | 3,388 | 297,388 | 7/10 |
 | Graphr + `$graphr-review` | 82,244 | 64,256 | 17,988 | 2,725 | 84,969 | 9/10 |
 
-This benchmark predates complete artifact coverage. In that historical run, the unguided mode read the full diff, made two `changes` calls and 14 `search`/`view` calls, and re-read source; the guided mode made one `changes` call, no `search`/`view` calls, and one bounded fallback for two unmapped files. It used 52,116 fewer total tokens than plain Codex (-38.0%) and 212,419 fewer than unguided Graphr (-71.4%); uncached input fell 43.6% versus plain Codex.
+This benchmark predates complete artifact coverage and the 0.8.2 graph features. In that historical run, the unguided mode read the full diff, made two `changes` calls and 14 `search`/`view` calls, and re-read source; the guided mode made one `changes` call, no `search`/`view` calls, and one bounded fallback for two unmapped files. It used 52,116 fewer total tokens than plain Codex (-38.0%) and 212,419 fewer than unguided Graphr (-71.4%); uncached input fell 43.6% versus plain Codex.
 
 Each mode was measured once on one small commit, and the guided mode included additional skill instructions, so the results are directional. Token counts were collected before affected-flow and risk fields; for this fixture, those fields add 206 bytes to the raw response.
-
-## Comparison with code-review-graph (CRG)
-
-This comparison also predates complete artifact coverage. The same commit was evaluated against an eight-item, source-verified review checklist. Graphr's raw `changes` response scored 5/8, CRG 2.3.7 `detect_changes` scored 2.5/8, and CRG's larger `get_review_context` scored 3.5/8. Graphr identified both changed paths, all seven changed functions, the RNG substitutions, and the deterministic seed/assertion behavior while excluding an unchanged nested function. Both tools missed public re-export and related-test evidence in bounded context; macro-generated Criterion registration required a targeted source fallback in that historical run.
-
-A common stdio MCP harness used warm indexes, 20 fresh starts, and 100 measured calls after warmup:
-
-| Metric | Graphr | CRG 2.3.7 | Graphr advantage |
-| --- | ---: | ---: | ---: |
-| Startup p50 / p95 | 31.539 / 32.114 ms | 521.904 / 537.368 ms | 16.55x / 16.73x faster |
-| Warm review call p50 / p95 | 6.704 / 7.872 ms | 11.720 / 12.787 ms | 1.75x / 1.62x faster |
-| Review text | 5,662 bytes | 39,783 bytes | 7.03x smaller |
-| MCP response | 5,903 bytes | 82,482 bytes | 13.97x smaller |
-
-Across 20 interleaved rebuild runs, bounded parallel parsing measured 61.290 ms p50 and 64.871 ms p95, versus 87.847 ms and 97.689 ms for sequential parsing. No-op indexing measured 23.822 ms versus 23.729 ms p50.
-
-These results cover one pinned Rust change and are not universal accuracy estimates.
