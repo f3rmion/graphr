@@ -1,6 +1,6 @@
 [package]
 name = "graphr"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Fast, compact Rust, Python, JavaScript, TypeScript, and C++ code graphs for AI code review over MCP stdio"
