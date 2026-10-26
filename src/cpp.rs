@@ -139,7 +139,7 @@ pub(crate) fn add_file(
             .cursor
             .captures(&parser.query, tree.root_node(), source.text.as_bytes());
     while let Some((query_match, capture_index)) = captures.next() {
-        let capture = query_match.captures[*capture_index];
+        let capture = query_match.captures()[*capture_index];
         let node = capture.node;
         while scopes
             .last()
@@ -465,7 +465,7 @@ fn collect_class_lookup(
         .cursor
         .captures(&parser.query, root, source.text.as_bytes());
     while let Some((query_match, capture_index)) = captures.next() {
-        let capture = query_match.captures[*capture_index];
+        let capture = query_match.captures()[*capture_index];
         if capture.index == parser.captures.member {
             if has_preprocessor_ancestor(capture.node) {
                 continue;

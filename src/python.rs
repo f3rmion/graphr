@@ -124,7 +124,7 @@ impl PythonParser {
             .captures(&self.query, tree.root_node(), source.as_bytes());
 
         while let Some((query_match, capture_index)) = captures.next() {
-            let capture = query_match.captures[*capture_index];
+            let capture = query_match.captures()[*capture_index];
             let node = capture.node;
             while scopes
                 .last()

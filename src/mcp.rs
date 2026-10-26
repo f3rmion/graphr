@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     service::RequestContext,
     tool, tool_handler, tool_router,
 };
@@ -354,8 +354,8 @@ impl Graphr {
 
 #[tool_handler]
 impl ServerHandler for Graphr {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("graphr", env!("CARGO_PKG_VERSION")))
             .with_instructions(server_instructions())
     }

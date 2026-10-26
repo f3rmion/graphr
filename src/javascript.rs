@@ -123,7 +123,7 @@ impl ScriptParser {
             .cursor
             .captures(&self.query, tree.root_node(), source.as_bytes());
         while let Some((query_match, capture_index)) = matches.next() {
-            let capture = query_match.captures[*capture_index];
+            let capture = query_match.captures()[*capture_index];
             captured.push(CapturedNode {
                 node: capture.node,
                 name: self.query.capture_names()[capture.index as usize].to_owned(),
