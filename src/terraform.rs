@@ -1,9 +1,11 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rmcp::serde_json;
 use tree_sitter::{Language, Node, Parser};
 
-use crate::git::Source;
+use crate::git::{Language as SourceLanguage, Source};
 use crate::parse::{source_notes, syntax_gaps};
 use crate::store::{
     GapCategory, GapInput, GapReason, Graph, NodeInput, NodeKind, RefInput, RefKind,
@@ -12,6 +14,10 @@ use crate::store::{
 
 const MAX_EXPRESSION_DEPTH: usize = 96;
 const MODULE_SOURCE_KEY: &str = "terraform-source:";
+const MAX_MODULE_DEPTH: usize = 16;
+const MAX_CHILD_RECORDS: usize = 250_000;
+const MAX_CHILD_BYTES: usize = 64 * 1024 * 1024;
+const MODULE_CONTROL_ARGUMENTS: [&str; 3] = ["count", "for_each", "depends_on"];
 
 #[derive(Default)]
 pub(crate) struct TerraformParsers {
@@ -41,10 +47,7 @@ pub(crate) fn add_file(
     source: &Source,
     parsers: &mut TerraformParsers,
 ) -> Result<(), String> {
-    let directory = source
-        .path
-        .rsplit_once('/')
-        .map_or("", |(parent, _)| parent);
+    let directory = module_directory(&source.path);
     let file_key = format!("terraform-file:{}", source.path);
     let line_end = u32::try_from(source.text.lines().count().max(1))
         .map_err(|_| "Terraform file has too many lines")?;
@@ -62,8 +65,6 @@ pub(crate) fn add_file(
         keys: Vec::new(),
     });
 
-    let refs_before = graph.refs.len();
-    let gaps_before = graph.gaps.len();
     let mut file = TerraformFile {
         graph,
         source,
@@ -132,18 +133,6 @@ pub(crate) fn add_file(
         file.gap(None, 1, line_end, GapReason::ParserNoTree, false);
     }
 
-    let sites = file.graph.refs.len() - refs_before
-        + file.graph.gaps[gaps_before..]
-            .iter()
-            .filter(|gap| gap.relation_site)
-            .count();
-    let stored = file
-        .graph
-        .files
-        .last_mut()
-        .ok_or("Terraform graph file is missing")?;
-    stored.observed_relation_sites =
-        u32::try_from(sites).map_err(|_| "too many Terraform dependency sites")?;
     Ok(())
 }
 
@@ -211,7 +200,7 @@ impl TerraformFile<'_> {
             let local = literal
                 .as_deref()
                 .and_then(|path| local_directory(self.directory, path));
-            let node = self.declaration(block, address, local.as_deref());
+            let node = self.declaration(block, address.clone(), local.as_deref());
             if kind == "module" {
                 self.module_boundary(
                     &node,
@@ -222,9 +211,18 @@ impl TerraformFile<'_> {
             }
             for child in attributes {
                 if let Some((name, expression)) = hcl_attribute(child, text) {
-                    self.module_input(&node, kind, name, line(child), local.as_deref());
+                    let binding = local
+                        .as_ref()
+                        .and_then(|_| self.module_argument(&node, &address, name, child));
                     if !literal_hcl_argument(kind, name) {
-                        self.hcl_expression(&node, expression, text, None, &mut Vec::new(), 0);
+                        self.hcl_expression(
+                            binding.as_deref().unwrap_or(&node),
+                            expression,
+                            text,
+                            None,
+                            &mut Vec::new(),
+                            0,
+                        );
                     }
                 } else {
                     self.hcl_expression(&node, child, text, None, &mut Vec::new(), 0);
@@ -283,7 +281,7 @@ impl TerraformFile<'_> {
                     let local = literal
                         .as_deref()
                         .and_then(|path| local_directory(self.directory, path));
-                    let node = self.declaration(property, address, local.as_deref());
+                    let node = self.declaration(property, address.clone(), local.as_deref());
                     if kind == "module" {
                         self.module_boundary(
                             &node,
@@ -293,9 +291,16 @@ impl TerraformFile<'_> {
                         );
                     }
                     for (name, attr, expression) in args {
-                        self.module_input(&node, &kind, &name, line(attr), local.as_deref());
+                        let binding = local
+                            .as_ref()
+                            .and_then(|_| self.module_argument(&node, &address, &name, attr));
                         if !literal_hcl_argument(&kind, &name) {
-                            self.json_expression(&node, expression, name == "depends_on", parser)?;
+                            self.json_expression(
+                                binding.as_deref().unwrap_or(&node),
+                                expression,
+                                name == "depends_on",
+                                parser,
+                            )?;
                         }
                     }
                 }
@@ -343,16 +348,25 @@ impl TerraformFile<'_> {
         }
     }
 
-    fn module_input(&mut self, node: &str, kind: &str, name: &str, line: u32, local: Option<&str>) {
-        if kind == "module"
-            && !matches!(
-                name,
-                "source" | "version" | "count" | "for_each" | "depends_on" | "providers"
-            )
-            && let Some(local) = local
-        {
-            self.reference(node, lookup_key(local, &format!("var.{name}")), line);
+    fn module_argument(
+        &mut self,
+        node: &str,
+        module: &str,
+        name: &str,
+        argument: Node<'_>,
+    ) -> Option<String> {
+        if matches!(name, "source" | "version" | "providers") {
+            return None;
         }
+        let kind = if MODULE_CONTROL_ARGUMENTS.contains(&name) {
+            "configuration"
+        } else {
+            "input"
+        };
+        let address = format!("{module}.{kind}.{name}");
+        let binding = self.declaration(argument, address.clone(), None);
+        self.reference(node, lookup_key(self.directory, &address), line(argument));
+        Some(binding)
     }
 
     fn hcl_expression(
@@ -549,14 +563,7 @@ impl TerraformFile<'_> {
     fn traversal(&mut self, source: &str, root: &str, attributes: &[&str], line: u32) {
         let address = match (root, attributes) {
             ("data" | "ephemeral", [kind, name, ..]) => format!("{root}.{kind}.{name}"),
-            ("module", [name, output, ..]) => {
-                self.reference(
-                    source,
-                    lookup_key(self.directory, &format!("module.{name}")),
-                    line,
-                );
-                format!("module.{name}.{output}")
-            }
+            ("module", [name, output, ..]) => format!("module.{name}.{output}"),
             ("var" | "local" | "module", [name, ..]) => format!("{root}.{name}"),
             (
                 "path" | "terraform" | "count" | "each" | "self" | "data" | "ephemeral" | "var"
@@ -570,15 +577,9 @@ impl TerraformFile<'_> {
     }
 
     fn reference(&mut self, source: &str, key: String, line: u32) {
-        self.graph.refs.push(RefInput {
-            source_key: source.to_owned(),
-            kind: RefKind::DependsOn,
-            line,
-            keys: vec![key],
-            alias_key: None,
-            resolved_target_key: None,
-            resolution: ResolutionState::Pending,
-        });
+        self.graph
+            .refs
+            .push(dependency(source.to_owned(), key, line));
     }
 
     fn gap(
@@ -689,24 +690,391 @@ fn lookup_key(directory: &str, address: &str) -> String {
     format!("terraform:{}:{directory}:{address}", directory.len())
 }
 
-pub(crate) fn module_output(key: &str) -> Option<(String, &str)> {
-    let (directory, address) = lookup_address(key)?;
-    let (module, output) = address.strip_prefix("module.")?.split_once('.')?;
-    Some((lookup_key(directory, &format!("module.{module}")), output))
-}
-
 pub(crate) fn lookup_address(key: &str) -> Option<(&str, &str)> {
     let (size, remainder) = key.strip_prefix("terraform:")?.split_once(':')?;
     let (directory, address) = remainder.split_at_checked(size.parse().ok()?)?;
     Some((directory, address.strip_prefix(':')?))
 }
 
-pub(crate) fn module_source(key: &str) -> Option<&str> {
-    key.strip_prefix(MODULE_SOURCE_KEY)
+fn module_directory(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(directory, _)| directory)
 }
 
-pub(crate) fn output_key(directory: &str, output: &str) -> String {
-    lookup_key(directory, &format!("output.{output}"))
+fn module_source(node: &NodeInput) -> Option<&str> {
+    node.keys
+        .iter()
+        .find_map(|key| key.strip_prefix(MODULE_SOURCE_KEY))
+}
+
+fn module_call(address: &str) -> bool {
+    address
+        .strip_prefix("module.")
+        .is_some_and(|name| !name.contains('.'))
+}
+
+fn module_output_call(address: &str) -> Option<&str> {
+    let (call, _) = address.rsplit_once('.')?;
+    module_call(call).then_some(call)
+}
+
+fn dependency(source_key: String, key: String, line: u32) -> RefInput {
+    RefInput {
+        source_key,
+        kind: RefKind::DependsOn,
+        line,
+        keys: vec![key],
+        alias_key: None,
+        resolved_target_key: None,
+        resolution: ResolutionState::Pending,
+    }
+}
+
+#[derive(Default)]
+struct Module<'a> {
+    declarations: Vec<&'a NodeInput>,
+    symbols: HashSet<&'a str>,
+    calls: BTreeMap<&'a str, Option<&'a NodeInput>>,
+    records: usize,
+    bytes: usize,
+}
+
+struct Instance<'a> {
+    root: &'a str,
+    directory: &'a str,
+    prefix: String,
+    caller: Option<(usize, &'a str)>,
+    depth: usize,
+    children: BTreeMap<&'a str, usize>,
+    controls: Vec<String>,
+}
+
+impl<'a> Instance<'a> {
+    fn root(directory: &'a str) -> Self {
+        Self {
+            root: directory,
+            directory,
+            prefix: String::new(),
+            caller: None,
+            depth: 0,
+            children: BTreeMap::new(),
+            controls: Vec::new(),
+        }
+    }
+
+    fn address(&self, symbol: &str) -> String {
+        if self.prefix.is_empty() {
+            symbol.to_owned()
+        } else {
+            format!("{}.{symbol}", self.prefix)
+        }
+    }
+
+    fn lookup(&self, symbol: &str) -> String {
+        lookup_key(self.root, &self.address(symbol))
+    }
+}
+
+/// Expand local module calls before reference resolution so each call receives
+/// its own declarations and its own bindings to the caller's expressions.
+pub(crate) fn project_modules(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
+    let (declarations, other_nodes): (Vec<_>, Vec<_>) = std::mem::take(&mut graph.nodes)
+        .into_iter()
+        .partition(|node| node.kind == NodeKind::Terraform);
+    graph.nodes = other_nodes;
+    let (terraform_refs, other_refs): (Vec<_>, Vec<_>) = std::mem::take(&mut graph.refs)
+        .into_iter()
+        .partition(|reference| reference.kind == RefKind::DependsOn);
+    graph.refs = other_refs;
+    let mut modules = BTreeMap::<&str, Module<'_>>::new();
+    let mut sites = HashMap::new();
+    for file in graph
+        .files
+        .iter()
+        .filter(|file| file.language == SourceLanguage::Terraform && file.replace)
+    {
+        let module = modules.entry(module_directory(&file.path)).or_default();
+        module.bytes = module
+            .bytes
+            .saturating_add(usize::try_from(file.byte_size).unwrap_or(usize::MAX));
+        sites.insert(file.path.clone(), 0_usize);
+    }
+    let mut refs_by_node = HashMap::<_, Vec<_>>::new();
+    for reference in &terraform_refs {
+        check_projection_cancelled(cancelled)?;
+        refs_by_node
+            .entry(reference.source_key.as_str())
+            .or_default()
+            .push(reference);
+    }
+    for node in &declarations {
+        check_projection_cancelled(cancelled)?;
+        let module = modules
+            .get_mut(module_directory(&node.file_key))
+            .ok_or("Terraform declaration file is missing")?;
+        module.declarations.push(node);
+        module.symbols.insert(&node.name);
+        // Each copy has a declaration, an optional input binding and a
+        // possible edge from the parent call. Controls vary per call.
+        module.records += 3 + refs_by_node.get(node.key.as_str()).map_or(0, Vec::len);
+        if module_call(&node.name) {
+            module
+                .calls
+                .entry(&node.name)
+                .and_modify(|call| *call = None)
+                .or_insert(Some(node));
+        }
+    }
+
+    let (instances, boundaries) = module_instances(&modules, cancelled)?;
+    for gap in &mut graph.gaps {
+        if let Some(count) = gap.file_key.as_ref().and_then(|path| sites.get_mut(path)) {
+            // A parse gap is shared by all calls at the same source location.
+            gap.source_key = None;
+            if gap.relation_site {
+                *count += gap.occurrences as usize;
+            }
+        }
+    }
+    for (instance_id, instance) in instances.iter().enumerate() {
+        let parent = instance
+            .caller
+            .map(|(parent, call)| (&instances[parent], call));
+        for node in &modules[instance.directory].declarations {
+            check_projection_cancelled(cancelled)?;
+            let address = instance.address(&node.name);
+            let key = if instance.prefix.is_empty() {
+                node.key.clone()
+            } else {
+                format!("{}:{}", lookup_key(instance.root, &address), node.key)
+            };
+            let mut keys = vec![lookup_key(instance.root, &address)];
+            if !instance.prefix.is_empty()
+                && let Some(output) = node.name.strip_prefix("output.")
+            {
+                keys.push(lookup_key(
+                    instance.root,
+                    &format!("{}.{output}", instance.prefix),
+                ));
+            }
+            let refs_before = graph.refs.len();
+            for reference in refs_by_node.get(node.key.as_str()).into_iter().flatten() {
+                let (_, target) = reference
+                    .keys
+                    .first()
+                    .and_then(|key| lookup_address(key))
+                    .ok_or("Terraform reference address is missing")?;
+                let target = module_output_call(target)
+                    .filter(|call| {
+                        modules[instance.directory].calls.contains_key(call)
+                            && !instance.children.contains_key(call)
+                    })
+                    .unwrap_or(target);
+                graph.refs.push(dependency(
+                    key.clone(),
+                    instance.lookup(target),
+                    reference.line,
+                ));
+            }
+            if let Some((parent, call)) = parent
+                && let Some(name) = node.name.strip_prefix("var.")
+            {
+                let binding = format!("{call}.input.{name}");
+                if modules[parent.directory].symbols.contains(binding.as_str()) {
+                    graph.refs.push(dependency(
+                        key.clone(),
+                        parent.lookup(&binding),
+                        node.line_start,
+                    ));
+                }
+            }
+            graph.refs.extend(
+                instance
+                    .controls
+                    .iter()
+                    .map(|control| dependency(key.clone(), control.clone(), node.line_start)),
+            );
+            if let Some(&child) = instance.children.get(node.name.as_str()) {
+                let child = &instances[child];
+                for declaration in &modules[child.directory].declarations {
+                    check_projection_cancelled(cancelled)?;
+                    if !declaration.name.starts_with("var.")
+                        && !declaration.name.starts_with("local.")
+                    {
+                        graph.refs.push(dependency(
+                            key.clone(),
+                            child.lookup(&declaration.name),
+                            node.line_start,
+                        ));
+                    }
+                }
+            }
+            let count = sites
+                .get_mut(&node.file_key)
+                .ok_or("Terraform declaration file is missing")?;
+            *count += graph.refs.len() - refs_before;
+            if let Some(&reason) = boundaries.get(&(instance_id, node.name.as_str())) {
+                graph
+                    .gaps
+                    .push(module_gap(node, &key, reason, module_source(node)));
+                *count += 1;
+            }
+            if let Some((call, binding)) = node.name.split_once(".input.")
+                && let Some(child) = instance.children.get(call).map(|&child| &instances[child])
+            {
+                let variable = format!("var.{binding}");
+                if !modules[child.directory].symbols.contains(variable.as_str()) {
+                    graph.gaps.push(module_gap(
+                        node,
+                        &key,
+                        GapReason::UnresolvedDependency,
+                        Some(&child.lookup(&variable)),
+                    ));
+                    *count += 1;
+                }
+            }
+            graph.nodes.push(NodeInput {
+                qualified_name: key.clone(),
+                key,
+                file_key: node.file_key.clone(),
+                kind: node.kind,
+                name: if !instance.prefix.is_empty() && !instance.root.is_empty() {
+                    format!("{}::{address}", instance.root)
+                } else {
+                    address
+                },
+                parent_key: node.parent_key.clone(),
+                owner_key: None,
+                line_start: node.line_start,
+                line_end: node.line_end,
+                signature: String::new(),
+                keys,
+            });
+        }
+    }
+    for file in &mut graph.files {
+        if let Some(count) = sites.get(&file.path) {
+            file.observed_relation_sites =
+                u32::try_from(*count).map_err(|_| "too many Terraform dependency sites")?;
+        }
+    }
+    Ok(())
+}
+
+type ModuleBoundaries<'a> = HashMap<(usize, &'a str), GapReason>;
+
+fn module_instances<'a>(
+    modules: &BTreeMap<&'a str, Module<'a>>,
+    cancelled: &AtomicBool,
+) -> Result<(Vec<Instance<'a>>, ModuleBoundaries<'a>), String> {
+    let called = modules
+        .values()
+        .flat_map(|module| module.calls.values())
+        .filter_map(|call| module_source((*call)?))
+        .collect::<HashSet<_>>();
+    let mut instances = modules
+        .keys()
+        .copied()
+        .filter(|directory| !called.contains(directory))
+        .map(Instance::root)
+        .collect::<Vec<_>>();
+    let mut covered = instances
+        .iter()
+        .map(|instance| instance.directory)
+        .collect::<HashSet<_>>();
+    let mut unvisited = modules.keys().copied();
+    let mut boundaries = HashMap::new();
+    let mut records_left = MAX_CHILD_RECORDS;
+    let mut bytes_left = MAX_CHILD_BYTES;
+    let mut index = 0;
+    loop {
+        if index == instances.len() {
+            // Cycles and bounded expansions can leave directories with no caller coverage.
+            let Some(directory) = unvisited.find(|directory| !covered.contains(directory)) else {
+                break;
+            };
+            instances.push(Instance::root(directory));
+            covered.insert(directory);
+        }
+        for (&address, node) in &modules[instances[index].directory].calls {
+            check_projection_cancelled(cancelled)?;
+            let Some(directory) = node.and_then(module_source) else {
+                continue;
+            };
+            let parent = &instances[index];
+            let mut ancestors = std::iter::successors(Some(index), |&id| {
+                instances[id].caller.map(|(caller, _)| caller)
+            });
+            let reason = if ancestors.any(|id| instances[id].directory == directory) {
+                Some(GapReason::TerraformModuleCycle)
+            } else if let Some(module) = modules.get(directory) {
+                let prefix = parent.address(address);
+                let mut controls = parent.controls.clone();
+                for argument in MODULE_CONTROL_ARGUMENTS {
+                    let control = format!("{address}.configuration.{argument}");
+                    if modules[parent.directory].symbols.contains(control.as_str()) {
+                        controls.push(parent.lookup(&control));
+                    }
+                }
+                let control_records = controls.len().saturating_mul(module.declarations.len());
+                let records = module.records.saturating_add(control_records).max(1);
+                let bytes = module.bytes.saturating_add(
+                    records.saturating_mul(prefix.len().saturating_add(parent.root.len())),
+                );
+                if parent.depth == MAX_MODULE_DEPTH || records > records_left || bytes > bytes_left
+                {
+                    Some(GapReason::TerraformModuleLimit)
+                } else {
+                    let child = Instance {
+                        root: parent.root,
+                        directory,
+                        prefix,
+                        caller: Some((index, address)),
+                        depth: parent.depth + 1,
+                        children: BTreeMap::new(),
+                        controls,
+                    };
+                    let child_id = instances.len();
+                    instances.push(child);
+                    instances[index].children.insert(address, child_id);
+                    covered.insert(directory);
+                    records_left -= records;
+                    bytes_left -= bytes;
+                    None
+                }
+            } else {
+                Some(GapReason::ExternalDependency)
+            };
+            if let Some(reason) = reason {
+                boundaries.insert((index, address), reason);
+            }
+        }
+        index += 1;
+    }
+    Ok((instances, boundaries))
+}
+
+fn module_gap(node: &NodeInput, source: &str, reason: GapReason, target: Option<&str>) -> GapInput {
+    GapInput {
+        file_key: Some(node.file_key.clone()),
+        source_key: Some(source.to_owned()),
+        run_key: None,
+        path: Some(node.file_key.clone()),
+        line_start: Some(node.line_start),
+        line_end: Some(node.line_end),
+        category: GapCategory::Boundary,
+        reason,
+        target_hint: target.map(str::to_owned),
+        occurrences: 1,
+        relation_site: true,
+    }
+}
+
+fn check_projection_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
+    if cancelled.load(Ordering::Relaxed) {
+        Err("index cancelled".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn local_directory(directory: &str, path: &str) -> Option<String> {
@@ -761,6 +1129,24 @@ mod tests {
     use crate::git::Language;
     use crate::store::FileInput;
 
+    fn parse_source(source: &Source) -> Graph {
+        let mut graph = Graph {
+            files: vec![FileInput {
+                path: source.path.clone(),
+                language: Language::Terraform,
+                git_oid: None,
+                content_hash: *blake3::hash(source.text.as_bytes()).as_bytes(),
+                parse_context: String::new(),
+                byte_size: source.text.len() as u64,
+                replace: true,
+                observed_relation_sites: 0,
+            }],
+            ..Graph::default()
+        };
+        add_file(&mut graph, source, &mut TerraformParsers::default()).unwrap();
+        graph
+    }
+
     #[test]
     fn expression_dependencies_distinguish_iterators_from_module_addresses() {
         let source = Source {
@@ -787,20 +1173,7 @@ resource "example" "dynamic" {
 "#
             .into(),
         };
-        let mut graph = Graph {
-            files: vec![FileInput {
-                path: source.path.clone(),
-                language: Language::Terraform,
-                git_oid: None,
-                content_hash: *blake3::hash(source.text.as_bytes()).as_bytes(),
-                parse_context: String::new(),
-                byte_size: source.text.len() as u64,
-                replace: true,
-                observed_relation_sites: 0,
-            }],
-            ..Graph::default()
-        };
-        add_file(&mut graph, &source, &mut TerraformParsers::default()).unwrap();
+        let graph = parse_source(&source);
         assert!(graph.gaps.is_empty());
         let references = graph
             .refs
@@ -818,5 +1191,19 @@ resource "example" "dynamic" {
                 ("infra", "local.id"),
             ]
         );
+    }
+
+    #[test]
+    fn recursive_module_keeps_its_declarations_and_reports_the_cycle() {
+        let mut graph = parse_source(&Source {
+            path: "infra/main.tf".into(),
+            text: "module \"self\" { source = \"./.\" }\n".into(),
+        });
+        project_modules(&mut graph, &AtomicBool::new(false)).unwrap();
+        assert_eq!(graph.nodes.len(), 2);
+        assert!(graph.nodes.iter().any(|node| node.name == "module.self"));
+        assert_eq!(graph.gaps.len(), 1);
+        assert_eq!(graph.gaps[0].reason, GapReason::TerraformModuleCycle);
+        assert_eq!(graph.files[0].observed_relation_sites, 1);
     }
 }

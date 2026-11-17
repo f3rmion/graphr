@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 #[cfg(test)]
@@ -2385,6 +2385,22 @@ fn build_index(
     };
     progress(0, total, 0);
     let mut outputs = (0..total).map(|_| None).collect::<Vec<Option<Graph>>>();
+    let terraform_files = sources
+        .files
+        .iter()
+        .filter(|file| file.language == Language::Terraform);
+    let terraform_paths = terraform_files
+        .clone()
+        .map(|file| file.path.as_str())
+        .collect::<HashSet<_>>();
+    // A caller edit can change the projected declarations of unchanged files.
+    let rebuild_terraform = terraform_files.clone().any(|file| {
+        full || !existing
+            .get(&file.path)
+            .is_some_and(|old| same_captured_file(old, file))
+    }) || existing.iter().any(|(path, old)| {
+        old.language == Language::Terraform && !terraform_paths.contains(path.as_str())
+    });
     let mut pending = Vec::new();
     for (index, file) in sources.files.iter().enumerate() {
         check_cancelled(cancelled)?;
@@ -2393,12 +2409,8 @@ fn build_index(
             .transpose()?;
         let old = existing.get(&file.path);
         if !full
-            && old.is_some_and(|old| {
-                old.language == file.language
-                    && old.parse_context == file.parse_context
-                    && old.git_oid == file.git_oid
-                    && stored_content_key(old) == file.content_key
-            })
+            && !(file.language == Language::Terraform && rebuild_terraform)
+            && old.is_some_and(|old| same_captured_file(old, file))
         {
             let old = old.expect("checked above");
             let mut graph = Graph::default();
@@ -2566,10 +2578,20 @@ fn build_index(
         graph.gaps.append(&mut part.gaps);
         graph.source_notes.append(&mut part.source_notes);
     }
+    if rebuild_terraform {
+        crate::terraform::project_modules(&mut graph, cancelled)?;
+    }
     if full {
         resolve(&mut graph, cancelled)?;
     }
     Ok((graph, stats))
+}
+
+fn same_captured_file(old: &crate::store::StoredFile, file: &CapturedSource) -> bool {
+    old.language == file.language
+        && old.parse_context == file.parse_context
+        && old.git_oid == file.git_oid
+        && stored_content_key(old) == file.content_key
 }
 
 fn stored_content_key(file: &crate::store::StoredFile) -> String {
@@ -3128,33 +3150,7 @@ fn resolve(graph: &mut Graph, cancelled: &AtomicBool) -> Result<(), String> {
     for (index, reference) in graph.refs.iter_mut().enumerate() {
         check_progress(index, cancelled)?;
         let alias_candidates = reference.alias_key.is_none().then_some(&aliases);
-        let terraform_target = (reference.kind == RefKind::DependsOn)
-            .then(|| {
-                reference
-                    .keys
-                    .first()
-                    .and_then(|key| crate::terraform::module_output(key))
-            })
-            .flatten()
-            .map(|(module, output)| match candidates.get(module.as_str()) {
-                Some(Candidate::Unique(index)) => graph.nodes[*index]
-                    .keys
-                    .iter()
-                    .find_map(|key| crate::terraform::module_source(key))
-                    .map_or(Some(Candidate::Unique(*index)), |directory| {
-                        candidates
-                            .get(crate::terraform::output_key(directory, output).as_str())
-                            .copied()
-                    }),
-                other => other.copied(),
-            });
-        let outcome = match terraform_target {
-            Some(Some(Candidate::Unique(index))) => ReferenceTarget::Resolved(index),
-            Some(Some(Candidate::Ambiguous)) => ReferenceTarget::Ambiguous,
-            Some(None) => ReferenceTarget::Missing,
-            None => reference_target(&reference.keys, &candidates, alias_candidates),
-        };
-        let target = match outcome {
+        let target = match reference_target(&reference.keys, &candidates, alias_candidates) {
             ReferenceTarget::Resolved(target) => {
                 reference.resolution = ResolutionState::Resolved;
                 target

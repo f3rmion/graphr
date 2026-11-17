@@ -18,7 +18,7 @@ use crate::git::{
 };
 use crate::graph::{CodeGraph, Relation, Step};
 
-pub(crate) const SCHEMA_VERSION: i64 = 11;
+pub(crate) const SCHEMA_VERSION: i64 = 12;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
@@ -190,6 +190,8 @@ pub enum GapReason {
     ParserError,
     ParserNoTree,
     TerraformOverride,
+    TerraformModuleCycle,
+    TerraformModuleLimit,
     UnresolvedDependency,
     AmbiguousDependency,
     DynamicOrUnsupportedDispatch,
@@ -217,6 +219,8 @@ impl GapReason {
             Self::ParserError => "parser-error",
             Self::ParserNoTree => "parser-no-tree",
             Self::TerraformOverride => "terraform-override-unmodeled",
+            Self::TerraformModuleCycle => "terraform-module-cycle",
+            Self::TerraformModuleLimit => "terraform-module-expansion-limit",
             Self::UnresolvedDependency => "unresolved-dependency",
             Self::AmbiguousDependency => "ambiguous-dependency",
             Self::DynamicOrUnsupportedDispatch => "dynamic-or-unsupported-dispatch",
@@ -244,6 +248,8 @@ impl GapReason {
             "parser-error" => Some(Self::ParserError),
             "parser-no-tree" => Some(Self::ParserNoTree),
             "terraform-override-unmodeled" => Some(Self::TerraformOverride),
+            "terraform-module-cycle" => Some(Self::TerraformModuleCycle),
+            "terraform-module-expansion-limit" => Some(Self::TerraformModuleLimit),
             "unresolved-dependency" => Some(Self::UnresolvedDependency),
             "ambiguous-dependency" => Some(Self::AmbiguousDependency),
             "dynamic-or-unsupported-dispatch" => Some(Self::DynamicOrUnsupportedDispatch),
@@ -2532,7 +2538,6 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
     let mut candidates = connection
         .prepare("SELECT node_id FROM node_keys WHERE key=?1 ORDER BY node_id LIMIT 2")
         .map_err(db_error)?;
-    let mut module_sources = prepare_terraform_module_sources(connection)?;
     let mut loaded = Vec::with_capacity(references.len());
     let mut aliases = HashMap::new();
     for (id, alias, target, state, scip) in references {
@@ -2545,13 +2550,7 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
             check_cancelled(cancelled)?;
             keys.push(row.map_err(db_error)?);
         }
-        let direct = expected_reference_candidate(
-            &keys,
-            &mut candidates,
-            &mut module_sources,
-            None,
-            cancelled,
-        )?;
+        let direct = expected_reference_candidate(&keys, &mut candidates, None, cancelled)?;
         if let Some(alias) = &alias
             && !matches!(direct, DbCandidate::Missing)
         {
@@ -2585,13 +2584,7 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
         let expected = if alias.is_some() {
             direct
         } else {
-            expected_reference_candidate(
-                &keys,
-                &mut candidates,
-                &mut module_sources,
-                Some(&aliases),
-                cancelled,
-            )?
+            expected_reference_candidate(&keys, &mut candidates, Some(&aliases), cancelled)?
         };
         let (expected_target, expected_state) = match expected {
             DbCandidate::Unique(target) => (Some(target), ResolutionState::Resolved),
@@ -2616,13 +2609,12 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
 fn expected_reference_candidate(
     keys: &[String],
     candidates: &mut rusqlite::Statement<'_>,
-    module_sources: &mut rusqlite::Statement<'_>,
     aliases: Option<&HashMap<String, DbCandidate>>,
     cancelled: &AtomicBool,
 ) -> Result<DbCandidate> {
     for key in keys {
         check_cancelled(cancelled)?;
-        let direct = direct_reference_candidate(candidates, module_sources, key)?;
+        let direct = candidate(candidates, key)?;
         let alias = aliases
             .and_then(|aliases| aliases.get(key))
             .copied()
@@ -7193,7 +7185,6 @@ fn resolve_references(
     let mut candidates = tx
         .prepare("SELECT node_id FROM node_keys WHERE key=?1 ORDER BY node_id LIMIT 2")
         .map_err(db_error)?;
-    let mut module_sources = prepare_terraform_module_sources(tx)?;
     let mut alias_candidates = tx
         .prepare(
             "SELECT count(*), coalesce(sum(resolution_state='ambiguous'),0),
@@ -7225,7 +7216,7 @@ fn resolve_references(
             .map_err(db_error)?
         {
             let key = row.map_err(db_error)?;
-            let direct = direct_reference_candidate(&mut candidates, &mut module_sources, &key)?;
+            let direct = candidate(&mut candidates, &key)?;
             let alias = if alias_key.is_none() {
                 alias_candidate(&mut alias_candidates, &key)?
             } else {
@@ -7519,34 +7510,6 @@ enum DbCandidate {
     Missing,
     Unique(i64),
     Ambiguous,
-}
-
-fn prepare_terraform_module_sources(connection: &Connection) -> Result<rusqlite::Statement<'_>> {
-    connection
-        .prepare("SELECT key FROM node_keys WHERE node_id=?1 AND key GLOB 'terraform-source:*' ORDER BY key")
-        .map_err(db_error)
-}
-
-fn direct_reference_candidate(
-    candidates: &mut rusqlite::Statement<'_>,
-    module_sources: &mut rusqlite::Statement<'_>,
-    key: &str,
-) -> Result<DbCandidate> {
-    let Some((module, output)) = crate::terraform::module_output(key) else {
-        return candidate(candidates, key);
-    };
-    let module = candidate(candidates, &module)?;
-    if let DbCandidate::Unique(id) = module
-        && let Some(source) = module_sources
-            .query_row([id], |row| row.get::<_, String>(0))
-            .optional()
-            .map_err(db_error)?
-        && let Some(directory) = crate::terraform::module_source(&source)
-    {
-        candidate(candidates, &crate::terraform::output_key(directory, output))
-    } else {
-        Ok(module)
-    }
 }
 
 fn merge_candidates(left: DbCandidate, right: DbCandidate) -> DbCandidate {
@@ -8174,7 +8137,8 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
                 'generated-output-unobserved','generated-output-ambiguous',
                 'external-dependency','dependency-collapsed','language-not-indexed',
                 'coverage-unmapped-file','coverage-unmapped-region','missing-test-context',
-                'ambiguous-test-context','terraform-override-unmodeled'
+                'ambiguous-test-context','terraform-override-unmodeled','unresolved-dependency',
+                'terraform-module-cycle','terraform-module-expansion-limit'
             )),
             target_hint TEXT,
             occurrences INTEGER NOT NULL CHECK(occurrences>0),
@@ -8200,7 +8164,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE INDEX source_notes_file_lines ON source_notes(file_id, line_start);
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=11;",
+         PRAGMA user_version=12;",
     )
     .map_err(db_error)
 }

@@ -2201,6 +2201,161 @@ resource "aws_subnet" "public" {
     client.close();
 }
 
+#[test]
+fn terraform_module_calls_keep_nested_input_paths_separate() {
+    let fixture = Fixture::new();
+    let root = &fixture.path;
+    let prod = r#"
+module "prod" {
+  source = "./modules/network"
+  vpc = aws_vpc.prod.id
+  depends_on = [aws_vpc.prerequisite]
+}
+output "prod_id" {
+  value = module.prod.subnet_id
+}
+resource "terraform_data" "watcher" {
+  depends_on = [module.prod]
+}
+"#;
+    let files = [
+        ("prod.tf", prod),
+        (
+            "vpcs.tf",
+            r#"
+resource "aws_vpc" "prod" {
+  cidr_block = "10.0.0.0/16"
+}
+resource "aws_vpc" "staging" {}
+resource "aws_vpc" "prerequisite" {}
+"#,
+        ),
+        (
+            "staging.tf.json",
+            r#"{
+  "module": {
+    "staging": {
+      "source": "./modules/network",
+      "vpc": "${aws_vpc.staging.id}"
+    }
+  },
+  "output": {
+    "staging_id": {"value": "${module.staging.subnet_id}"}
+  }
+}"#,
+        ),
+        (
+            "modules/network/main.tf",
+            r#"
+variable "vpc" {}
+module "subnet" {
+  source = "../subnet"
+  vpc = var.vpc
+}
+output "subnet_id" {
+  value = module.subnet.id
+}
+"#,
+        ),
+        (
+            "modules/subnet/main.tf",
+            r#"
+variable "vpc" {}
+resource "aws_subnet" "private" {
+  vpc_id = var.vpc
+}
+output "id" {
+  value = aws_subnet.private.id
+}
+"#,
+        ),
+    ];
+    for (path, contents) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    init_git(root);
+    git(root, &["add", "."]);
+    git_commit(root, "Terraform modules baseline");
+    index_repository(root);
+    let vpcs = fs::read_to_string(root.join("vpcs.tf")).unwrap();
+    fs::write(root.join("vpcs.tf"), vpcs.replace("10.0.0.0", "10.1.0.0")).unwrap();
+
+    let mut client = Client::start(root);
+    let node = |client: &mut Client, address: &str| {
+        let search = response_text(&client.search(address, Some("terraform")));
+        search
+            .lines()
+            .find(|line| line.contains(&format!(" Terraform {address} ")))
+            .unwrap_or_else(|| panic!("missing {address}: {search}"))
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let impact = |client: &mut Client, address: &str| {
+        let node_ref = node(client, address);
+        let snapshot_id = client.snapshot_id.clone().unwrap();
+        response_text(&client.call(
+            "impact",
+            rmcp::serde_json::json!({"snapshot_id": snapshot_id, "node_ref": node_ref, "depth": 6}),
+        ))
+    };
+    let prod_impact = impact(&mut client, "aws_vpc.prod");
+    assert!(
+        prod_impact.contains("module.prod.module.subnet.aws_subnet.private"),
+        "{prod_impact}"
+    );
+    assert!(!prod_impact.contains("module.staging"), "{prod_impact}");
+    let prerequisite = impact(&mut client, "aws_vpc.prerequisite");
+    assert!(
+        prerequisite.contains("module.prod.module.subnet.aws_subnet.private"),
+        "{prerequisite}"
+    );
+    assert!(!prerequisite.contains("module.staging"), "{prerequisite}");
+    let child = impact(&mut client, "module.prod.module.subnet.aws_subnet.private");
+    assert!(child.contains("terraform_data.watcher"), "{child}");
+
+    let snapshot_id = client.snapshot_id.clone().unwrap();
+    let from_ref = node(&mut client, "output.prod_id");
+    let to_ref = node(&mut client, "aws_vpc.prod");
+    let path = response_text(&client.call(
+        "path",
+        rmcp::serde_json::json!({"snapshot_id": snapshot_id, "from_ref": from_ref, "to_ref": to_ref, "max_hops": 8}),
+    ));
+    assert!(
+        path.contains("module.prod.input.vpc")
+            && path.contains("module.prod.module.subnet.aws_subnet.private"),
+        "{path}"
+    );
+    assert!(!path.contains("module.staging"), "{path}");
+
+    let dot = response_text(&client.changes_dot(6, 50));
+    assert!(
+        dot.contains("module.prod.module.subnet.aws_subnet.private"),
+        "{dot}"
+    );
+    assert!(!dot.contains("module.staging"), "{dot}");
+
+    fs::write(
+        root.join("prod.tf"),
+        prod.replace("aws_vpc.prod.id", "aws_vpc.staging.id"),
+    )
+    .unwrap();
+    client.index_and_wait("boundary");
+    let old = impact(&mut client, "aws_vpc.prod");
+    assert!(!old.contains("module.prod"), "{old}");
+    let new = impact(&mut client, "aws_vpc.staging");
+    for address in [
+        "module.prod.module.subnet.aws_subnet.private",
+        "module.staging.module.subnet.aws_subnet.private",
+    ] {
+        assert!(new.contains(address), "{new}");
+    }
+    client.close();
+}
+
 const TYPES: &str = r#"
     export interface Config { value: string }
 "#;

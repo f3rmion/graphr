@@ -354,15 +354,19 @@ receiver types, or choose between overloads; ambiguous targets produce no edge.
 
 Terraform links resources, data sources, ephemeral resources, inputs, locals,
 outputs, and module calls using expression references and `depends_on`. Each
-directory has its own Terraform address space. For a relative module source in
-the snapshot, Graphr links the call to declared inputs it passes and links
-output references to the child declaration. `impact` follows dependents and
-`changes` shows them in the text and DOT graphs.
+configuration root has its own Terraform address space. For a relative module
+source in the snapshot, each call gets its own copies of the child declarations.
+For example, `module.prod.input.vpc` is the argument at the call site and
+`module.prod.var.vpc` is the corresponding child variable. Output references
+follow the same call, including through nested modules. A configuration root in
+a subdirectory prefixes its child addresses with that directory and `::`.
+`impact` follows dependents and `changes` shows them in the text and DOT graphs.
 
 Terraform analysis works at the declaration level, including references with
-indexes and splats. Dynamic and external module sources and override files
-produce coverage gaps. Terraform evaluates provider configuration and expands
-individual instances. Use `terraform plan` for resource creations,
+indexes and splats. Graphr reports coverage gaps for override files, external
+or computed module sources, recursive module calls, and bounded expansions.
+Terraform evaluates provider configuration and expands individual `count` and
+`for_each` instances. Use `terraform plan` for resource creations,
 replacements, and deletions.
 
 Every supported language uses the same incremental indexing and rename
