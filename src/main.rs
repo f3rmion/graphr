@@ -14,6 +14,7 @@ mod python;
 mod schema;
 mod scip;
 mod store;
+mod terraform;
 pub mod workspace;
 
 use std::env;

@@ -229,13 +229,7 @@ pub(crate) fn add_file(
             } else {
                 NodeKind::Function
             };
-            let key = identity(
-                &source.path,
-                kind_name(kind),
-                &path,
-                line_start(node),
-                ordinal,
-            );
+            let key = identity(&source.path, kind.db(), &path, line_start(node), ordinal);
             ordinal += 1;
             let explicit_owner = raw_name
                 .strip_suffix(name)
@@ -1236,15 +1230,6 @@ fn function_leaf(path: &str) -> &str {
         &path[operator + 2..]
     } else {
         last_component(path)
-    }
-}
-
-fn kind_name(kind: NodeKind) -> &'static str {
-    match kind {
-        NodeKind::File => "file",
-        NodeKind::Type => "type",
-        NodeKind::Function => "function",
-        NodeKind::Test => "test",
     }
 }
 

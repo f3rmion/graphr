@@ -18,7 +18,7 @@ use crate::git::{
 };
 use crate::graph::{CodeGraph, Relation, Step};
 
-pub(crate) const SCHEMA_VERSION: i64 = 10;
+pub(crate) const SCHEMA_VERSION: i64 = 11;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
@@ -99,12 +99,14 @@ pub enum NodeKind {
     Type,
     Function,
     Test,
+    Terraform,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefKind {
     Calls,
     Imports,
+    DependsOn,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,6 +189,9 @@ pub enum GapReason {
     MissingDuringRead,
     ParserError,
     ParserNoTree,
+    TerraformOverride,
+    UnresolvedDependency,
+    AmbiguousDependency,
     DynamicOrUnsupportedDispatch,
     MacroExpansionUnavailable,
     GeneratedOutputUnobserved,
@@ -211,6 +216,9 @@ impl GapReason {
             Self::MissingDuringRead => "missing-during-read",
             Self::ParserError => "parser-error",
             Self::ParserNoTree => "parser-no-tree",
+            Self::TerraformOverride => "terraform-override-unmodeled",
+            Self::UnresolvedDependency => "unresolved-dependency",
+            Self::AmbiguousDependency => "ambiguous-dependency",
             Self::DynamicOrUnsupportedDispatch => "dynamic-or-unsupported-dispatch",
             Self::MacroExpansionUnavailable => "macro-expansion-unavailable",
             Self::GeneratedOutputUnobserved => "generated-output-unobserved",
@@ -235,6 +243,9 @@ impl GapReason {
             "missing-during-read" => Some(Self::MissingDuringRead),
             "parser-error" => Some(Self::ParserError),
             "parser-no-tree" => Some(Self::ParserNoTree),
+            "terraform-override-unmodeled" => Some(Self::TerraformOverride),
+            "unresolved-dependency" => Some(Self::UnresolvedDependency),
+            "ambiguous-dependency" => Some(Self::AmbiguousDependency),
             "dynamic-or-unsupported-dispatch" => Some(Self::DynamicOrUnsupportedDispatch),
             "macro-expansion-unavailable" => Some(Self::MacroExpansionUnavailable),
             "generated-output-unobserved" => Some(Self::GeneratedOutputUnobserved),
@@ -282,6 +293,7 @@ pub enum EdgeKind {
     Calls,
     TestCalls,
     Imports,
+    DependsOn,
 }
 
 pub struct FileInput {
@@ -2016,7 +2028,7 @@ fn require_graph_invariants(connection: &Connection, cancelled: &AtomicBool) -> 
             "WITH expected AS (
                  SELECT r.source_id, r.resolved_target_id AS target_id,
                         CASE
-                            WHEN r.kind='IMPORTS' THEN 'IMPORTS'
+                            WHEN r.kind IN ('IMPORTS','DEPENDS_ON') THEN r.kind
                             WHEN n.kind='test' THEN 'TEST_CALLS'
                             ELSE 'CALLS'
                         END AS kind,
@@ -2025,7 +2037,7 @@ fn require_graph_invariants(connection: &Connection, cancelled: &AtomicBool) -> 
                   WHERE r.resolution_state='resolved'
                   GROUP BY r.source_id, r.resolved_target_id,
                            CASE
-                               WHEN r.kind='IMPORTS' THEN 'IMPORTS'
+                               WHEN r.kind IN ('IMPORTS','DEPENDS_ON') THEN r.kind
                                WHEN n.kind='test' THEN 'TEST_CALLS'
                                ELSE 'CALLS'
                            END
@@ -2520,6 +2532,7 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
     let mut candidates = connection
         .prepare("SELECT node_id FROM node_keys WHERE key=?1 ORDER BY node_id LIMIT 2")
         .map_err(db_error)?;
+    let mut module_sources = prepare_terraform_module_sources(connection)?;
     let mut loaded = Vec::with_capacity(references.len());
     let mut aliases = HashMap::new();
     for (id, alias, target, state, scip) in references {
@@ -2532,7 +2545,13 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
             check_cancelled(cancelled)?;
             keys.push(row.map_err(db_error)?);
         }
-        let direct = expected_reference_candidate(&keys, &mut candidates, None, cancelled)?;
+        let direct = expected_reference_candidate(
+            &keys,
+            &mut candidates,
+            &mut module_sources,
+            None,
+            cancelled,
+        )?;
         if let Some(alias) = &alias
             && !matches!(direct, DbCandidate::Missing)
         {
@@ -2566,7 +2585,13 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
         let expected = if alias.is_some() {
             direct
         } else {
-            expected_reference_candidate(&keys, &mut candidates, Some(&aliases), cancelled)?
+            expected_reference_candidate(
+                &keys,
+                &mut candidates,
+                &mut module_sources,
+                Some(&aliases),
+                cancelled,
+            )?
         };
         let (expected_target, expected_state) = match expected {
             DbCandidate::Unique(target) => (Some(target), ResolutionState::Resolved),
@@ -2591,12 +2616,13 @@ fn require_reference_candidates(connection: &Connection, cancelled: &AtomicBool)
 fn expected_reference_candidate(
     keys: &[String],
     candidates: &mut rusqlite::Statement<'_>,
+    module_sources: &mut rusqlite::Statement<'_>,
     aliases: Option<&HashMap<String, DbCandidate>>,
     cancelled: &AtomicBool,
 ) -> Result<DbCandidate> {
     for key in keys {
         check_cancelled(cancelled)?;
-        let direct = candidate(candidates, key)?;
+        let direct = direct_reference_candidate(candidates, module_sources, key)?;
         let alias = aliases
             .and_then(|aliases| aliases.get(key))
             .copied()
@@ -2627,12 +2653,13 @@ fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
 }
 
 impl NodeKind {
-    fn db(self) -> &'static str {
+    pub(crate) const fn db(self) -> &'static str {
         match self {
             Self::File => "file",
             Self::Type => "type",
             Self::Function => "function",
             Self::Test => "test",
+            Self::Terraform => "terraform",
         }
     }
 }
@@ -2642,6 +2669,7 @@ impl RefKind {
         match self {
             Self::Calls => "CALLS",
             Self::Imports => "IMPORTS",
+            Self::DependsOn => "DEPENDS_ON",
         }
     }
 }
@@ -2652,6 +2680,7 @@ impl EdgeKind {
             Self::Calls => "CALLS",
             Self::TestCalls => "TEST_CALLS",
             Self::Imports => "IMPORTS",
+            Self::DependsOn => "DEPENDS_ON",
         }
     }
 }
@@ -2714,6 +2743,7 @@ struct ChangeCalls {
     nodes: HashMap<i64, RowNode>,
     // (caller, callee, is_test_call)
     edges: BTreeSet<(i64, i64, bool)>,
+    dependencies: BTreeSet<(i64, i64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -2754,7 +2784,7 @@ impl RowNode {
     }
 }
 
-const CHANGE_NEIGHBORS: [(&str, bool, &str); 6] = [
+const CHANGE_NEIGHBORS: [(&str, bool, &str); 8] = [
     (
         "test <-",
         false,
@@ -2807,6 +2837,24 @@ const CHANGE_NEIGHBORS: [(&str, bool, &str); 6] = [
            FROM edges e JOIN nodes n ON n.id=e.target_id
            JOIN files f ON f.id=n.file_id
           WHERE e.source_id=?1 AND e.kind='IMPORTS'
+          ORDER BY f.path GLOB '.cargo/vendor/*/*', e.target_id LIMIT ?2",
+    ),
+    (
+        "dependent <-",
+        false,
+        "SELECT n.id, n.kind, n.name, f.path, n.line_start
+           FROM edges e JOIN nodes n ON n.id=e.source_id
+           JOIN files f ON f.id=n.file_id
+          WHERE e.target_id=?1 AND e.kind='DEPENDS_ON'
+          ORDER BY f.path GLOB '.cargo/vendor/*/*', e.source_id LIMIT ?2",
+    ),
+    (
+        "depends-on ->",
+        false,
+        "SELECT n.id, n.kind, n.name, f.path, n.line_start
+           FROM edges e JOIN nodes n ON n.id=e.target_id
+           JOIN files f ON f.id=n.file_id
+          WHERE e.source_id=?1 AND e.kind='DEPENDS_ON'
           ORDER BY f.path GLOB '.cargo/vendor/*/*', e.target_id LIMIT ?2",
     ),
 ];
@@ -2895,6 +2943,14 @@ fn traverse_changes(
                         "caller <-" => {
                             calls.nodes.entry(node.id).or_insert_with(|| node.clone());
                             calls.edges.insert((node.id, source, false));
+                        }
+                        "dependent <-" => {
+                            calls.nodes.entry(node.id).or_insert_with(|| node.clone());
+                            calls.dependencies.insert((node.id, source));
+                        }
+                        "depends-on ->" => {
+                            calls.nodes.entry(node.id).or_insert_with(|| node.clone());
+                            calls.dependencies.insert((source, node.id));
                         }
                         _ => {}
                     }
@@ -3040,6 +3096,7 @@ fn analyze_changed_roots(
             .get(&root.id)
             .ok_or_else(|| "node risk counts are missing".to_owned())?;
         let is_test = node.kind == "test";
+        let tests_apply = !is_test && node.kind != "terraform";
         risks.insert(
             root.id,
             node_risk(
@@ -3048,8 +3105,8 @@ fn analyze_changed_roots(
                 security_sensitive(&node.name, &node.qualified_name),
                 callers,
                 is_test,
-                !is_test && tests == 0,
-                !is_test && tests > 0 && !directly_tested,
+                tests_apply && tests == 0,
+                tests_apply && tests > 0 && !directly_tested,
             ),
         );
     }
@@ -4003,7 +4060,8 @@ fn static_accounting(connection: &Connection, scope: &CoverageScope) -> Result<S
     } else {
         let mut unresolved = connection
             .prepare(
-                "SELECT key.key FROM refs ref JOIN ref_keys key ON key.ref_id=ref.id
+                "SELECT key.key, ref.source_id, ref.kind='DEPENDS_ON'
+                   FROM refs ref JOIN ref_keys key ON key.ref_id=ref.id
                   WHERE ref.resolution_state IN ('missing','ambiguous')
                   ORDER BY ref.id, key.rank",
             )
@@ -4011,7 +4069,12 @@ fn static_accounting(connection: &Connection, scope: &CoverageScope) -> Result<S
         let mut rows = unresolved.query([]).map_err(db_error)?;
         let mut relevant = false;
         while let Some(row) = rows.next().map_err(db_error)? {
-            if relevant_keys.contains(&row.get::<_, String>(0).map_err(db_error)?) {
+            if relevant_keys.contains(&row.get::<_, String>(0).map_err(db_error)?)
+                || (row.get::<_, bool>(2).map_err(db_error)?
+                    && scope
+                        .nodes
+                        .contains(&row.get::<_, i64>(1).map_err(db_error)?))
+            {
                 relevant = true;
                 break;
             }
@@ -4030,7 +4093,14 @@ fn static_gap_records(connection: &Connection, scope: &CoverageScope) -> Result<
             "SELECT category, reason, path, line_start, line_end, target_hint,
                     occurrences, relation_site, id, source_id
                FROM graph_gaps
-              WHERE category NOT IN ('coverage','generated')",
+              WHERE category NOT IN ('coverage','generated')
+             UNION ALL
+             SELECT 'relation', CASE r.resolution_state
+                      WHEN 'missing' THEN 'unresolved-dependency' ELSE 'ambiguous-dependency' END,
+                    f.path, r.line, r.line, k.key, 1, true, r.id, r.source_id
+               FROM refs r JOIN ref_keys k ON k.ref_id=r.id AND k.rank=0
+               JOIN nodes n ON n.id=r.source_id JOIN files f ON f.id=n.file_id
+              WHERE r.kind='DEPENDS_ON' AND r.resolution_state IN ('missing','ambiguous')",
         )
         .map_err(db_error)?;
     let rows = statement
@@ -4057,8 +4127,24 @@ fn static_gap_records(connection: &Connection, scope: &CoverageScope) -> Result<
         if !relevant {
             continue;
         }
+        let reason =
+            GapReason::parse(&reason).ok_or_else(|| "database gap reason is invalid".to_owned())?;
+        let target = target.map(|target| {
+            if matches!(
+                reason,
+                GapReason::UnresolvedDependency | GapReason::AmbiguousDependency
+            ) && let Some((directory, address)) = crate::terraform::lookup_address(&target)
+            {
+                return if directory.is_empty() {
+                    address.to_owned()
+                } else {
+                    format!("{directory}:{address}")
+                };
+            }
+            target
+        });
         gaps.push((
-            GapReason::parse(&reason).ok_or_else(|| "database gap reason is invalid".to_owned())?,
+            reason,
             path,
             start,
             end,
@@ -5463,7 +5549,7 @@ fn change_dot(
         if selected_paths.pop().is_some() {
             continue;
         }
-        if include_call_context && !calls.edges.is_empty() {
+        if include_call_context && (!calls.edges.is_empty() || !calls.dependencies.is_empty()) {
             include_call_context = false;
             continue;
         }
@@ -5533,17 +5619,24 @@ fn render_change_dot(
         .chain(impact_order)
         .collect::<VecDeque<_>>();
     let mut searched = HashSet::new();
-    let mut calls_complete = include_call_context || calls.edges.is_empty();
+    let mut calls_complete =
+        include_call_context || (calls.edges.is_empty() && calls.dependencies.is_empty());
     if include_call_context {
         while let Some(callee) = pending.pop_front() {
             if !searched.insert(callee) {
                 continue;
             }
-            for &(caller, _, is_test_call) in calls
+            let callers = calls
                 .edges
                 .iter()
                 .filter(|(_, target, _)| *target == callee)
-            {
+                .map(|&(caller, _, test)| (caller, if test { DOT_TEST_EDGE } else { "" }));
+            let dependents = calls
+                .dependencies
+                .iter()
+                .filter(|(_, target)| *target == callee)
+                .map(|&(dependent, _)| (dependent, DOT_DEPENDENCY_EDGE));
+            for (caller, style) in callers.chain(dependents) {
                 if selected_set.insert(caller) {
                     if selected.len() == max_nodes {
                         selected_set.remove(&caller);
@@ -5555,12 +5648,21 @@ fn render_change_dot(
                 if selected_set.contains(&caller) {
                     pending.push_back(caller);
                 }
-                set_call_edge_style(&mut edges, caller, callee, is_test_call);
+                if style == DOT_DEPENDENCY_EDGE {
+                    edges.insert((caller, callee), style);
+                } else {
+                    set_call_edge_style(&mut edges, caller, callee, style == DOT_TEST_EDGE);
+                }
             }
         }
         for &(caller, callee, is_test_call) in &calls.edges {
             if selected_set.contains(&caller) && selected_set.contains(&callee) {
                 set_call_edge_style(&mut edges, caller, callee, is_test_call);
+            }
+        }
+        for &(dependent, dependency) in &calls.dependencies {
+            if selected_set.contains(&dependent) && selected_set.contains(&dependency) {
+                edges.insert((dependent, dependency), DOT_DEPENDENCY_EDGE);
             }
         }
     }
@@ -5648,6 +5750,7 @@ fn render_change_dot(
     (output, calls_complete)
 }
 
+const DOT_DEPENDENCY_EDGE: &str = " [label=\"depends on\"]";
 const DOT_TEST_EDGE: &str = " [style=dashed]";
 const DOT_DISPATCH_EDGE: &str = " [style=dotted]";
 
@@ -6998,6 +7101,7 @@ impl<'tx> ReferenceTransitions<'tx> {
     ) -> Result<()> {
         let edge_kind = match (ref_kind, source_kind) {
             ("IMPORTS", _) => "IMPORTS",
+            ("DEPENDS_ON", "terraform") => "DEPENDS_ON",
             ("CALLS", "test") => "TEST_CALLS",
             ("CALLS", "file" | "type" | "function") => "CALLS",
             _ => return Err("database reference kind is invalid".into()),
@@ -7089,6 +7193,7 @@ fn resolve_references(
     let mut candidates = tx
         .prepare("SELECT node_id FROM node_keys WHERE key=?1 ORDER BY node_id LIMIT 2")
         .map_err(db_error)?;
+    let mut module_sources = prepare_terraform_module_sources(tx)?;
     let mut alias_candidates = tx
         .prepare(
             "SELECT count(*), coalesce(sum(resolution_state='ambiguous'),0),
@@ -7120,7 +7225,7 @@ fn resolve_references(
             .map_err(db_error)?
         {
             let key = row.map_err(db_error)?;
-            let direct = candidate(&mut candidates, &key)?;
+            let direct = direct_reference_candidate(&mut candidates, &mut module_sources, &key)?;
             let alias = if alias_key.is_none() {
                 alias_candidate(&mut alias_candidates, &key)?
             } else {
@@ -7414,6 +7519,34 @@ enum DbCandidate {
     Missing,
     Unique(i64),
     Ambiguous,
+}
+
+fn prepare_terraform_module_sources(connection: &Connection) -> Result<rusqlite::Statement<'_>> {
+    connection
+        .prepare("SELECT key FROM node_keys WHERE node_id=?1 AND key GLOB 'terraform-source:*' ORDER BY key")
+        .map_err(db_error)
+}
+
+fn direct_reference_candidate(
+    candidates: &mut rusqlite::Statement<'_>,
+    module_sources: &mut rusqlite::Statement<'_>,
+    key: &str,
+) -> Result<DbCandidate> {
+    let Some((module, output)) = crate::terraform::module_output(key) else {
+        return candidate(candidates, key);
+    };
+    let module = candidate(candidates, &module)?;
+    if let DbCandidate::Unique(id) = module
+        && let Some(source) = module_sources
+            .query_row([id], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(db_error)?
+        && let Some(directory) = crate::terraform::module_source(&source)
+    {
+        candidate(candidates, &crate::terraform::output_key(directory, output))
+    } else {
+        Ok(module)
+    }
 }
 
 fn merge_candidates(left: DbCandidate, right: DbCandidate) -> DbCandidate {
@@ -7832,7 +7965,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE TABLE nodes(
             id INTEGER PRIMARY KEY,
             file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-            kind TEXT NOT NULL CHECK(kind IN ('file','type','function','test')),
+            kind TEXT NOT NULL CHECK(kind IN ('file','type','function','test','terraform')),
             name TEXT NOT NULL,
             qualified_name TEXT NOT NULL UNIQUE,
             parent_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
@@ -7854,7 +7987,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE TABLE refs(
             id INTEGER PRIMARY KEY,
             source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-            kind TEXT NOT NULL CHECK(kind IN ('CALLS','IMPORTS')),
+            kind TEXT NOT NULL CHECK(kind IN ('CALLS','IMPORTS','DEPENDS_ON')),
             line INTEGER NOT NULL CHECK(line>0),
             alias_key TEXT CHECK(alias_key IS NULL OR length(alias_key)>0),
             resolved_target_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
@@ -7869,6 +8002,9 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
              ON refs(source_id, kind, resolved_target_id);
          CREATE INDEX refs_target_source
              ON refs(resolved_target_id, kind, source_id);
+         CREATE INDEX refs_unresolved_dependencies
+             ON refs(source_id, line)
+             WHERE kind='DEPENDS_ON' AND resolution_state IN ('missing','ambiguous');
          CREATE INDEX refs_alias
              ON refs(alias_key, resolved_target_id) WHERE alias_key IS NOT NULL;
          CREATE TABLE ref_keys(
@@ -7903,7 +8039,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE TABLE edges(
             source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
             target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-            kind TEXT NOT NULL CHECK(kind IN ('CALLS','TEST_CALLS','IMPORTS')),
+            kind TEXT NOT NULL CHECK(kind IN ('CALLS','TEST_CALLS','IMPORTS','DEPENDS_ON')),
             support_count INTEGER NOT NULL CHECK(support_count > 0),
             PRIMARY KEY(source_id, target_id, kind)
          ) WITHOUT ROWID;
@@ -8038,7 +8174,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
                 'generated-output-unobserved','generated-output-ambiguous',
                 'external-dependency','dependency-collapsed','language-not-indexed',
                 'coverage-unmapped-file','coverage-unmapped-region','missing-test-context',
-                'ambiguous-test-context'
+                'ambiguous-test-context','terraform-override-unmodeled'
             )),
             target_hint TEXT,
             occurrences INTEGER NOT NULL CHECK(occurrences>0),
@@ -8064,7 +8200,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE INDEX source_notes_file_lines ON source_notes(file_id, line_start);
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=10;",
+         PRAGMA user_version=11;",
     )
     .map_err(db_error)
 }
@@ -8257,6 +8393,26 @@ fn load_neighbors(
               WHERE e.source_id=?1 AND e.kind='IMPORTS'
               ORDER BY e.target_id LIMIT ?2",
         ),
+        (
+            "dependent <-",
+            false,
+            false,
+            "SELECT n.id, n.kind, n.name, f.path, n.line_start
+               FROM edges e JOIN nodes n ON n.id=e.source_id
+               JOIN files f ON f.id=n.file_id
+              WHERE e.target_id=?1 AND e.kind='DEPENDS_ON'
+              ORDER BY e.source_id LIMIT ?2",
+        ),
+        (
+            "depends-on ->",
+            false,
+            false,
+            "SELECT n.id, n.kind, n.name, f.path, n.line_start
+               FROM edges e JOIN nodes n ON n.id=e.target_id
+               JOIN files f ON f.id=n.file_id
+              WHERE e.source_id=?1 AND e.kind='DEPENDS_ON'
+              ORDER BY e.target_id LIMIT ?2",
+        ),
     ];
     let mut neighbors = Vec::with_capacity(limit);
 
@@ -8441,6 +8597,7 @@ fn title(kind: &str) -> Option<&str> {
         "type" => Some("Type"),
         "function" => Some("Function"),
         "test" => Some("Test"),
+        "terraform" => Some("Terraform"),
         _ => None,
     }
 }
@@ -13054,6 +13211,7 @@ mod tests {
             &ChangeCalls {
                 nodes: HashMap::new(),
                 edges: BTreeSet::from([(1, 3, true), (2, 3, false), (3, 5, false)]),
+                dependencies: BTreeSet::new(),
             },
             (6, 50),
             DependencyMode::Boundary,
@@ -13699,7 +13857,7 @@ mod tests {
             match kind {
                 EdgeKind::TestCalls => assert_eq!(source_kind, NodeKind::Test),
                 EdgeKind::Calls => assert_ne!(source_kind, NodeKind::Test),
-                EdgeKind::Imports => {}
+                EdgeKind::Imports | EdgeKind::DependsOn => {}
             }
             let candidate = format!("test:owned-edge:{index}");
             graph
@@ -13712,10 +13870,10 @@ mod tests {
             for _ in 0..support_count {
                 graph.refs.push(RefInput {
                     source_key: source_key.clone(),
-                    kind: if kind == EdgeKind::Imports {
-                        RefKind::Imports
-                    } else {
-                        RefKind::Calls
+                    kind: match kind {
+                        EdgeKind::Imports => RefKind::Imports,
+                        EdgeKind::DependsOn => RefKind::DependsOn,
+                        EdgeKind::Calls | EdgeKind::TestCalls => RefKind::Calls,
                     },
                     line,
                     keys: vec![candidate.clone()],

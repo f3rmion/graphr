@@ -1470,7 +1470,7 @@ fn completeness_reports_direct_static_calls_without_legacy_fields() {
     let output = complete_graph_pages(&mut client, output, 6, 50);
 
     for expected in [
-        "languages=rust,python,javascript,typescript,cpp",
+        "languages=rust,python,javascript,typescript,cpp,terraform",
         "completeness content_capture=complete source_capture=complete syntax_parse=complete site_classification=complete static_model=complete evidence_capture=not-applicable provenance_model=not-applicable execution_mapping=not-applicable traversal=complete",
         "claim kind=affected-callers status=complete basis=resolved-static-call-graph",
         "claim kind=affected-flows status=complete basis=resolved-static-call-graph",
@@ -2026,6 +2026,178 @@ fn cpp_index_search_view_and_changes_over_mcp() {
     ] {
         assert!(changes.contains(expected), "missing {expected}: {changes}");
     }
+    client.close();
+}
+
+#[test]
+fn terraform_review_follows_dependencies_across_files_and_local_modules() {
+    let fixture = Fixture::new();
+    let root = &fixture.path;
+    let files = [
+        (
+            "network.tf",
+            "resource \"aws_vpc\" \"main\" { cidr_block = \"10.0.0.0/16\" }\n",
+        ),
+        (
+            "child/main.tf",
+            r#"
+variable "vpc" {}
+resource "aws_subnet" "public" {
+  vpc_id = var.vpc
+}
+output "subnet_id" {
+  value = aws_subnet.public.id
+}
+"#,
+        ),
+        (
+            "main.tf",
+            r#"
+module "network" {
+  source = "./child"
+  vpc = aws_vpc.main.id
+}
+output "published" {
+  value = "subnet-${module.network.subnet_id}"
+}
+"#,
+        ),
+        (
+            "root.tf.json",
+            r#"{
+  "resource": {
+    "aws_route_table": {
+      "isolated": {
+        "vpc_id": "${aws_vpc.main.id}",
+        "depends_on": ["module.network"]
+      }
+    }
+  }
+}"#,
+        ),
+        (
+            "other/isolated.tf",
+            r#"
+resource "aws_vpc" "main" {}
+resource "aws_subnet" "public" {
+  vpc_id = aws_vpc.main.id
+}
+"#,
+        ),
+    ];
+    for (path, contents) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    init_git(root);
+    git(root, &["add", "."]);
+    git_commit(root, "Terraform baseline");
+    index_repository(root);
+    fs::write(
+        root.join("network.tf"),
+        "resource \"aws_vpc\" \"main\" { cidr_block = \"10.1.0.0/16\" }\n",
+    )
+    .unwrap();
+
+    let mut client = Client::start(root);
+    let snapshot_id = client.snapshot_id.clone().unwrap();
+    let search_node = |client: &mut Client, name, file: &str| {
+        let result = response_text(&client.search(name, Some("terraform")));
+        result
+            .lines()
+            .find(|line| line.contains(&format!(" {file}:")))
+            .unwrap_or_else(|| panic!("missing {name} in {file}: {result}"))
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let vpc = search_node(&mut client, "aws_vpc.main", "network.tf");
+    let child = search_node(&mut client, "aws_subnet.public", "child/main.tf");
+    let publish = search_node(&mut client, "output.published", "main.tf");
+
+    let impact = response_text(&client.call(
+        "impact",
+        rmcp::serde_json::json!({
+            "snapshot_id": snapshot_id, "node_ref": vpc, "depth": 6
+        }),
+    ));
+    for expected in [
+        "module.network main.tf:",
+        "output.published main.tf:",
+        "aws_route_table.isolated root.tf.json:",
+    ] {
+        assert!(impact.contains(expected), "{impact}");
+    }
+    assert!(!impact.contains("other/isolated.tf"), "{impact}");
+    let path = response_text(&client.call(
+        "path",
+        rmcp::serde_json::json!({
+            "snapshot_id": snapshot_id, "from_ref": publish, "to_ref": child,
+        }),
+    ));
+    assert!(
+        path.contains("depends-on ->") && path.contains("output.subnet_id"),
+        "{path}"
+    );
+    let view = client.view(&child, 1, 30);
+    assert!(
+        view.contains("depends-on ->") && view.contains("var.vpc"),
+        "{view}"
+    );
+
+    let captured = capture_changes(&mut client, &snapshot_id, 3, 50);
+    let changes = captured
+        .queries()
+        .map(|capture| capture.text.as_str())
+        .collect::<String>();
+    assert!(
+        changes.contains("changed source terraform network.tf"),
+        "{changes}"
+    );
+    assert!(
+        changes.contains("dependent <-") && changes.contains("module.network"),
+        "{changes}"
+    );
+    let dot = response_text(&client.changes_dot(3, 50));
+    assert!(dot.contains("[label=\"depends on\"]"), "{dot}");
+    client.close();
+
+    let fresh = Fixture::new();
+    init_git(&fresh.path);
+    for (path, contents) in files {
+        let target = fresh.path.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, contents).unwrap();
+    }
+    git(&fresh.path, &["add", "."]);
+    git_commit(&fresh.path, "Fresh Terraform baseline");
+    fs::copy(root.join("network.tf"), fresh.path.join("network.tf")).unwrap();
+    // Remove a declaration referenced by an unchanged parent file.
+    for path in [root, &fresh.path] {
+        fs::write(path.join("child/main.tf"), "variable \"vpc\" {}\n").unwrap();
+    }
+    assert_immutable_graphs_match(root, &fresh.path);
+    assert_eq!(
+        named_edge_kind_count(
+            root,
+            "main.tf",
+            "output.published",
+            "child/main.tf",
+            "output.subnet_id",
+            "DEPENDS_ON"
+        ),
+        0,
+    );
+    let mut client = Client::start(root);
+    let publish = search_node(&mut client, "output.published", "main.tf");
+    let view = response_text(&client.view(&publish, 1, 30));
+    assert!(view.contains("reason=unresolved-dependency"), "{view}");
+    assert!(
+        view.contains("target=\"module.network.subnet_id\""),
+        "{view}"
+    );
     client.close();
 }
 

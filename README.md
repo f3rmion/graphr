@@ -1,7 +1,7 @@
 # Graphr
 
-Fast, compact Rust, Python, JavaScript/JSX, TypeScript/TSX, and C++ code-graph
-views for Codex and Claude over MCP stdio.
+Fast, compact code-graph views for Codex and Claude over MCP stdio. Supports
+Rust, Python, JavaScript/JSX, TypeScript/TSX, C++, and Terraform.
 
 Graphr is inspired by [code-review-graph](https://github.com/tirth8205/code-review-graph)'s approach to focusing AI review context. Thanks to @tirth8205 and its contributors for originating that work.
 
@@ -162,7 +162,7 @@ Each snapshot graphs the whole head tree, not only the changed files.
 
 | Tool | Parameters (default) | Output budget |
 | --- | --- | --- |
-| `search` | `query` up to 256 bytes, `kind` `file`, `type`, `function`, or `test`, `limit` 1–20 (8) | 1.5 KiB |
+| `search` | `query` up to 256 bytes, `kind` `file`, `type`, `function`, `test`, or `terraform`, `limit` 1–20 (8) | 1.5 KiB |
 | `view` | `node_ref`, `depth` 0–6 (1), `max_nodes` 1–50 (30) | 4 KiB |
 | `impact` | `node_ref`, `depth` 1–6 (3), `max_nodes` 1–50 (30) | 4 KiB |
 | `path` | `from_ref`, `to_ref`, `max_hops` 1–8 (6), `direction` `forward` or `any` (`forward`) | 4 KiB |
@@ -171,7 +171,8 @@ Each snapshot graphs the whole head tree, not only the changed files.
 or signature token and returns matches in index order, without relevance
 ranking. `view` walks `member ->`, `test <-`, `caller <-`, `impl <-`,
 `call ->`, `implements ->`, `in <-`, and `import ->` breadth first, then lists
-source notes, gap records, and evidence for the root.
+source notes, gap records, and evidence for the root. Terraform edges render as
+`depends-on ->` and `dependent <-`.
 
 `impact` lists what reaches a node in reverse, breadth first: callers, tests,
 importers, implementors, and the supertype members the node overrides. For a
@@ -187,8 +188,9 @@ n1:… Function get src/lib.rs:6
 ```
 
 `path` returns the shortest static route between two nodes over calls, test
-calls, imports, implementations, and dispatch. `direction="forward"` follows
-stored edge direction; `direction="any"` also walks edges backwards and prints
+calls, imports, implementations, dispatch, and Terraform dependencies.
+`direction="forward"` follows stored edge direction. `direction="any"` also
+walks edges backwards and prints
 the reverse labels (`caller <-`, `test <-`, `importer <-`, `impl <-`,
 `dispatch <-`):
 
@@ -316,10 +318,11 @@ inspect dependency internals.
 
 ### Languages
 
-Graphr detects Rust, Python, JavaScript/JSX, TypeScript/TSX, and C++ sources
-automatically. Rust uses `.rs`, Python uses `.py`, JavaScript and TypeScript use
+Graphr detects Rust, Python, JavaScript/JSX, TypeScript/TSX, C++, and Terraform
+sources automatically. Rust uses `.rs`, Python uses `.py`, JavaScript and TypeScript use
 `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`, `.cts`, and `.d.ts`, and
-C++ uses `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, and `.h`.
+C++ uses `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, and `.h`. Terraform uses
+`.tf` and `.tf.json`.
 
 For Rust, graph semantics include modules, types, functions, methods, `use`
 imports and aliases, calls, `impl Trait for Type` implementations, test
@@ -348,6 +351,19 @@ quoted includes, inheritance, direct and qualified calls, `this` calls, and
 GoogleTest or Catch2/doctest test cases. Graphr does not preprocess source, read
 `compile_commands.json`, resolve system headers, instantiate templates, infer
 receiver types, or choose between overloads; ambiguous targets produce no edge.
+
+Terraform links resources, data sources, ephemeral resources, inputs, locals,
+outputs, and module calls using expression references and `depends_on`. Each
+directory has its own Terraform address space. For a relative module source in
+the snapshot, Graphr links the call to declared inputs it passes and links
+output references to the child declaration. `impact` follows dependents and
+`changes` shows them in the text and DOT graphs.
+
+Terraform analysis works at the declaration level, including references with
+indexes and splats. Dynamic and external module sources and override files
+produce coverage gaps. Terraform evaluates provider configuration and expands
+individual instances. Use `terraform plan` for resource creations,
+replacements, and deletions.
 
 Every supported language uses the same incremental indexing and rename
 detection pipeline. Rename detection runs independently within regular source

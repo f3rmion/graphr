@@ -105,6 +105,7 @@ enum SearchKind {
     Type,
     Function,
     Test,
+    Terraform,
 }
 
 impl SearchKind {
@@ -114,6 +115,7 @@ impl SearchKind {
             Self::Type => "type",
             Self::Function => "function",
             Self::Test => "test",
+            Self::Terraform => "terraform",
         }
     }
 }
@@ -269,7 +271,9 @@ impl Graphr {
         Ok(structured_result(self.jobs.cancel(&params.job_id)))
     }
 
-    #[tool(description = "Find files, types, functions, and tests in one immutable snapshot")]
+    #[tool(
+        description = "Find files, types, functions, tests, and Terraform declarations in one immutable snapshot"
+    )]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -735,7 +739,10 @@ mod tests {
         };
         let instructions = server.get_info().instructions.unwrap();
 
-        assert!(instructions.contains("Rust, Python, JavaScript/JSX, TypeScript/TSX, and C++"));
+        assert!(
+            instructions
+                .contains("Rust, Python, JavaScript/JSX, TypeScript/TSX, C++, and Terraform")
+        );
 
         for required in [
             "worktree_root",

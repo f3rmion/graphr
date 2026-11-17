@@ -9,6 +9,7 @@ pub(crate) enum Relation {
     Calls,
     TestCalls,
     Imports,
+    DependsOn,
     /// Type to the trait or base type it implements or extends.
     Implements,
     /// Supertype member to the same-name member that overrides it.
@@ -21,6 +22,7 @@ impl Relation {
             "CALLS" => Some(Self::Calls),
             "TEST_CALLS" => Some(Self::TestCalls),
             "IMPORTS" => Some(Self::Imports),
+            "DEPENDS_ON" => Some(Self::DependsOn),
             _ => None,
         }
     }
@@ -31,6 +33,7 @@ impl Relation {
             Self::Calls => "call ->",
             Self::TestCalls => "test-call ->",
             Self::Imports => "import ->",
+            Self::DependsOn => "depends-on ->",
             Self::Implements => "implements ->",
             Self::Dispatch => "dispatch ->",
         }
@@ -42,6 +45,7 @@ impl Relation {
             Self::Calls => "caller <-",
             Self::TestCalls => "test <-",
             Self::Imports => "importer <-",
+            Self::DependsOn => "dependent <-",
             Self::Implements => "impl <-",
             Self::Dispatch => "dispatch <-",
         }

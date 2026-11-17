@@ -292,7 +292,7 @@ pub fn add_file(
         let kind = node_kind(definition.kind);
         node_keys.push(identity(
             &source.path,
-            kind_name(kind),
+            kind.db(),
             &path,
             definition.line_start,
             local,
@@ -871,15 +871,6 @@ fn node_kind(kind: DefinitionKind) -> NodeKind {
         DefinitionKind::Type => NodeKind::Type,
         DefinitionKind::Function => NodeKind::Function,
         DefinitionKind::Test => NodeKind::Test,
-    }
-}
-
-fn kind_name(kind: NodeKind) -> &'static str {
-    match kind {
-        NodeKind::File => "file",
-        NodeKind::Type => "type",
-        NodeKind::Function => "function",
-        NodeKind::Test => "test",
     }
 }
 

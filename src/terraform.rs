@@ -1,0 +1,822 @@
+use std::path::{Component, Path};
+
+use rmcp::serde_json;
+use tree_sitter::{Language, Node, Parser};
+
+use crate::git::Source;
+use crate::parse::{source_notes, syntax_gaps};
+use crate::store::{
+    GapCategory, GapInput, GapReason, Graph, NodeInput, NodeKind, RefInput, RefKind,
+    ResolutionState, SourceNoteInput,
+};
+
+const MAX_EXPRESSION_DEPTH: usize = 96;
+const MODULE_SOURCE_KEY: &str = "terraform-source:";
+
+#[derive(Default)]
+pub(crate) struct TerraformParsers {
+    hcl: Option<Parser>,
+    json: Option<Parser>,
+}
+
+fn parse(
+    parser: &mut Option<Parser>,
+    language: impl FnOnce() -> Language,
+    text: &str,
+) -> Result<Option<tree_sitter::Tree>, String> {
+    if parser.is_none() {
+        let mut new = Parser::new();
+        new.set_language(&language())
+            .map_err(|error| error.to_string())?;
+        *parser = Some(new);
+    }
+    Ok(parser
+        .as_mut()
+        .expect("parser initialized")
+        .parse(text, None))
+}
+
+pub(crate) fn add_file(
+    graph: &mut Graph,
+    source: &Source,
+    parsers: &mut TerraformParsers,
+) -> Result<(), String> {
+    let directory = source
+        .path
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent);
+    let file_key = format!("terraform-file:{}", source.path);
+    let line_end = u32::try_from(source.text.lines().count().max(1))
+        .map_err(|_| "Terraform file has too many lines")?;
+    graph.nodes.push(NodeInput {
+        key: file_key.clone(),
+        file_key: source.path.clone(),
+        kind: NodeKind::File,
+        name: source.path.clone(),
+        qualified_name: file_key.clone(),
+        parent_key: None,
+        owner_key: None,
+        line_start: 1,
+        line_end,
+        signature: String::new(),
+        keys: Vec::new(),
+    });
+
+    let refs_before = graph.refs.len();
+    let gaps_before = graph.gaps.len();
+    let mut file = TerraformFile {
+        graph,
+        source,
+        directory,
+        file_key,
+    };
+    let json = source.path.ends_with(".tf.json");
+    let tree = if json {
+        parse(
+            &mut parsers.json,
+            || tree_sitter_json::LANGUAGE.into(),
+            &source.text,
+        )?
+    } else {
+        parse(
+            &mut parsers.hcl,
+            || tree_sitter_hcl::LANGUAGE.into(),
+            &source.text,
+        )?
+    };
+    if let Some(tree) = tree {
+        let root = tree.root_node();
+        for gap in syntax_gaps(root) {
+            file.gap(
+                None,
+                gap.line_start as u32,
+                gap.line_end as u32,
+                GapReason::ParserError,
+                false,
+            );
+        }
+        if is_override(&source.path) {
+            file.gap(None, 1, line_end, GapReason::TerraformOverride, false);
+        } else if json {
+            if let Some(object) = named_children(root)
+                .into_iter()
+                .find(|node| node.kind() == "object")
+                && !root.has_error()
+                && serde_json::from_str::<serde_json::Value>(&source.text).is_ok()
+            {
+                file.json(object, &mut parsers.hcl)?;
+            } else if !root.has_error() {
+                file.gap(None, 1, line_end, GapReason::ParserError, false);
+            }
+        } else {
+            file.graph
+                .source_notes
+                .extend(
+                    source_notes(root, &source.text)
+                        .into_iter()
+                        .map(|note| SourceNoteInput {
+                            file_key: source.path.clone(),
+                            note,
+                        }),
+                );
+            if let Some(body) = named_children(root)
+                .into_iter()
+                .find(|node| node.kind() == "body")
+            {
+                file.hcl(body);
+            } else if !root.has_error() && !named_children(root).is_empty() {
+                file.gap(None, 1, line_end, GapReason::ParserError, false);
+            }
+        }
+    } else {
+        file.gap(None, 1, line_end, GapReason::ParserNoTree, false);
+    }
+
+    let sites = file.graph.refs.len() - refs_before
+        + file.graph.gaps[gaps_before..]
+            .iter()
+            .filter(|gap| gap.relation_site)
+            .count();
+    let stored = file
+        .graph
+        .files
+        .last_mut()
+        .ok_or("Terraform graph file is missing")?;
+    stored.observed_relation_sites =
+        u32::try_from(sites).map_err(|_| "too many Terraform dependency sites")?;
+    Ok(())
+}
+
+struct TerraformFile<'a> {
+    graph: &'a mut Graph,
+    source: &'a Source,
+    directory: &'a str,
+    file_key: String,
+}
+
+impl TerraformFile<'_> {
+    fn hcl(&mut self, body: Node<'_>) {
+        let text = &self.source.text;
+        for block in named_children(body) {
+            if block.kind() != "block" {
+                continue;
+            }
+            let children = named_children(block);
+            let Some(first) = children.first() else {
+                continue;
+            };
+            let kind = node_text(*first, text);
+            let labels = children
+                .iter()
+                .copied()
+                .skip(1)
+                .take_while(|child| child.kind() != "block_start")
+                .map(|child| decode_label(child, text))
+                .collect::<Option<Vec<_>>>();
+            let Some(labels) = labels else {
+                self.gap(
+                    None,
+                    line(block),
+                    end_line(block),
+                    GapReason::ParserError,
+                    false,
+                );
+                continue;
+            };
+            let body = children.into_iter().find(|child| child.kind() == "body");
+            if kind == "locals" && labels.is_empty() {
+                for attr in body.into_iter().flat_map(named_children) {
+                    if let Some((name, expression)) = hcl_attribute(attr, text) {
+                        let node = self.declaration(attr, format!("local.{name}"), None);
+                        self.hcl_expression(&node, expression, text, None, &mut Vec::new(), 0);
+                    }
+                }
+                continue;
+            }
+            let Some(address) = address(kind, &labels) else {
+                continue;
+            };
+            let attributes = body.map_or_else(Vec::new, named_children);
+            let source_attr = (kind == "module")
+                .then(|| {
+                    attributes
+                        .iter()
+                        .copied()
+                        .filter_map(|node| hcl_attribute(node, text))
+                        .find(|(name, _)| *name == "source")
+                        .map(|(_, node)| node)
+                })
+                .flatten();
+            let literal = source_attr.and_then(|node| hcl_string(node, text));
+            let local = literal
+                .as_deref()
+                .and_then(|path| local_directory(self.directory, path));
+            let node = self.declaration(block, address, local.as_deref());
+            if kind == "module" {
+                self.module_boundary(
+                    &node,
+                    source_attr.unwrap_or(block),
+                    literal.as_deref(),
+                    local.as_deref(),
+                );
+            }
+            for child in attributes {
+                if let Some((name, expression)) = hcl_attribute(child, text) {
+                    self.module_input(&node, kind, name, line(child), local.as_deref());
+                    if !literal_hcl_argument(kind, name) {
+                        self.hcl_expression(&node, expression, text, None, &mut Vec::new(), 0);
+                    }
+                } else {
+                    self.hcl_expression(&node, child, text, None, &mut Vec::new(), 0);
+                }
+            }
+        }
+    }
+
+    fn json(&mut self, root: Node<'_>, parser: &mut Option<Parser>) -> Result<(), String> {
+        let text = &self.source.text;
+        for (kind, _, value) in json_pairs(root, text) {
+            if kind == "locals" {
+                for (name, property, expression) in json_pairs(value, text) {
+                    let node = self.declaration(property, format!("local.{name}"), None);
+                    self.json_expression(&node, expression, false, parser)?;
+                }
+                continue;
+            }
+            let label_count = match kind.as_str() {
+                "resource" | "data" | "ephemeral" => 2,
+                "module" | "variable" | "output" | "check" => 1,
+                _ => continue,
+            };
+            let mut pending = vec![(Vec::new(), value, value)];
+            while let Some((labels, property, value)) = pending.pop() {
+                if value.kind() == "array" {
+                    pending.extend(
+                        named_children(value)
+                            .into_iter()
+                            .rev()
+                            .map(|entry| (labels.clone(), entry, entry)),
+                    );
+                } else if value.kind() != "object" {
+                    self.gap(
+                        None,
+                        line(value),
+                        end_line(value),
+                        GapReason::ParserError,
+                        false,
+                    );
+                } else if labels.len() < label_count {
+                    pending.extend(json_pairs(value, text).into_iter().rev().map(
+                        |(label, property, entry)| {
+                            let mut labels = labels.clone();
+                            labels.push(label);
+                            (labels, property, entry)
+                        },
+                    ));
+                } else if let Some(address) = address(&kind, &labels) {
+                    let args = json_pairs(value, text);
+                    let source_attr = args
+                        .iter()
+                        .find(|(name, _, _)| kind == "module" && name == "source")
+                        .map(|(_, _, node)| *node);
+                    let literal = source_attr.and_then(|node| json_string(node, text));
+                    let local = literal
+                        .as_deref()
+                        .and_then(|path| local_directory(self.directory, path));
+                    let node = self.declaration(property, address, local.as_deref());
+                    if kind == "module" {
+                        self.module_boundary(
+                            &node,
+                            source_attr.unwrap_or(property),
+                            literal.as_deref(),
+                            local.as_deref(),
+                        );
+                    }
+                    for (name, attr, expression) in args {
+                        self.module_input(&node, &kind, &name, line(attr), local.as_deref());
+                        if !literal_hcl_argument(&kind, &name) {
+                            self.json_expression(&node, expression, name == "depends_on", parser)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn declaration(&mut self, node: Node<'_>, address: String, local: Option<&str>) -> String {
+        let key = format!("{}:{}:{address}", self.file_key, node.start_byte());
+        let mut keys = vec![lookup_key(self.directory, &address)];
+        if let Some(local) = local {
+            keys.push(format!("{MODULE_SOURCE_KEY}{local}"));
+        }
+        self.graph.nodes.push(NodeInput {
+            key: key.clone(),
+            file_key: self.source.path.clone(),
+            kind: NodeKind::Terraform,
+            name: address,
+            qualified_name: key.clone(),
+            parent_key: Some(self.file_key.clone()),
+            owner_key: None,
+            line_start: line(node),
+            line_end: end_line(node),
+            signature: String::new(),
+            keys,
+        });
+        key
+    }
+
+    fn module_boundary(
+        &mut self,
+        node: &str,
+        source: Node<'_>,
+        literal: Option<&str>,
+        local: Option<&str>,
+    ) {
+        if local.is_none() {
+            let reason = if literal.is_some() {
+                GapReason::ExternalDependency
+            } else {
+                GapReason::DynamicOrUnsupportedDispatch
+            };
+            self.gap(Some(node), line(source), end_line(source), reason, true);
+        }
+    }
+
+    fn module_input(&mut self, node: &str, kind: &str, name: &str, line: u32, local: Option<&str>) {
+        if kind == "module"
+            && !matches!(
+                name,
+                "source" | "version" | "count" | "for_each" | "depends_on" | "providers"
+            )
+            && let Some(local) = local
+        {
+            self.reference(node, lookup_key(local, &format!("var.{name}")), line);
+        }
+    }
+
+    fn hcl_expression(
+        &mut self,
+        source: &str,
+        node: Node<'_>,
+        text: &str,
+        fixed_line: Option<u32>,
+        scope: &mut Vec<String>,
+        depth: usize,
+    ) {
+        let line_for = |node| fixed_line.unwrap_or_else(|| line(node));
+        if node.is_error() || node.is_missing() {
+            return;
+        }
+        if depth == MAX_EXPRESSION_DEPTH {
+            let start = line_for(node);
+            self.gap(
+                Some(source),
+                start,
+                start,
+                GapReason::DynamicOrUnsupportedDispatch,
+                true,
+            );
+            return;
+        }
+        let children = named_children(node);
+        let original_scope = scope.len();
+        let intro_kind = match node.kind() {
+            "for_tuple_expr" | "for_object_expr" => Some("for_intro"),
+            "template_for" => Some("template_for_start"),
+            _ => None,
+        };
+        let mut dynamic_iterator = None;
+        let block_kind = (node.kind() == "block")
+            .then(|| children.first().map(|child| node_text(*child, text)))
+            .flatten();
+        if block_kind == Some("dynamic")
+            && let Some(label) = children.get(1).and_then(|node| decode_label(*node, text))
+        {
+            dynamic_iterator = Some(label);
+        }
+
+        for child in children {
+            if child.kind() == "variable_expr" {
+                let root = node_text(child, text);
+                if scope.iter().any(|binding| binding == root) {
+                    continue;
+                }
+                let mut names = Vec::new();
+                let siblings =
+                    std::iter::successors(child.next_sibling(), |node| node.next_sibling());
+                for next in siblings.filter(|node| !node.is_extra()) {
+                    match next.kind() {
+                        "get_attr" => {
+                            if let Some(identifier) = next.named_child(0) {
+                                names.push(node_text(identifier, text));
+                            }
+                        }
+                        "index" => {}
+                        "splat" => {
+                            if let Some(splat) = next.named_child(0)
+                                && let Some(attr) = named_children(splat)
+                                    .into_iter()
+                                    .find(|node| node.kind() == "get_attr")
+                                && let Some(identifier) = attr.named_child(0)
+                            {
+                                names.push(node_text(identifier, text));
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
+                    if names.len() == 2 {
+                        break;
+                    }
+                }
+                self.traversal(source, root, &names, line_for(child));
+            } else if intro_kind == Some(child.kind()) {
+                for part in named_children(child)
+                    .into_iter()
+                    .filter(|part| part.kind() == "expression")
+                {
+                    self.hcl_expression(source, part, text, fixed_line, scope, depth + 1);
+                }
+                scope.extend(
+                    named_children(child)
+                        .into_iter()
+                        .filter(|part| part.kind() == "identifier")
+                        .map(|part| node_text(part, text).to_owned()),
+                );
+            } else if child.kind() == "body" && block_kind == Some("lifecycle") {
+                for attr in named_children(child) {
+                    if !matches!(hcl_attribute(attr, text), Some(("ignore_changes", _))) {
+                        self.hcl_expression(source, attr, text, fixed_line, scope, depth + 1);
+                    }
+                }
+            } else if child.kind() == "body"
+                && let Some(default) = &dynamic_iterator
+            {
+                let attributes = named_children(child);
+                let iterator = attributes
+                    .iter()
+                    .copied()
+                    .filter_map(|attr| hcl_attribute(attr, text))
+                    .find(|(name, _)| *name == "iterator")
+                    .map_or(default.as_str(), |(_, value)| node_text(value, text));
+                for attr in attributes {
+                    match hcl_attribute(attr, text) {
+                        Some(("iterator", _)) => {}
+                        Some(("for_each", expression)) => self.hcl_expression(
+                            source,
+                            expression,
+                            text,
+                            fixed_line,
+                            scope,
+                            depth + 1,
+                        ),
+                        _ => {
+                            scope.push(iterator.to_owned());
+                            self.hcl_expression(source, attr, text, fixed_line, scope, depth + 1);
+                            scope.pop();
+                        }
+                    }
+                }
+            } else {
+                self.hcl_expression(source, child, text, fixed_line, scope, depth + 1);
+            }
+        }
+        scope.truncate(original_scope);
+    }
+
+    fn json_expression(
+        &mut self,
+        source: &str,
+        root: Node<'_>,
+        bare_reference: bool,
+        parser: &mut Option<Parser>,
+    ) -> Result<(), String> {
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            match node.kind() {
+                "pair" => pending.extend(node.child_by_field_name("value")),
+                "array" | "object" => pending.extend(named_children(node).into_iter().rev()),
+                "string" => {
+                    let Some(value) = json_string(node, &self.source.text) else {
+                        continue;
+                    };
+                    if !bare_reference && !value.contains("${") && !value.contains("%{") {
+                        continue;
+                    }
+                    let expression = if bare_reference {
+                        format!("value = {value}\n")
+                    } else {
+                        let mut marker = "GRAPHR_TEMPLATE".to_owned();
+                        while value.lines().any(|line| line.trim() == marker) {
+                            marker.push('_');
+                        }
+                        format!("value = <<{marker}\n{value}\n{marker}\n")
+                    };
+                    if let Some(tree) =
+                        parse(parser, || tree_sitter_hcl::LANGUAGE.into(), &expression)?
+                        && !tree.root_node().has_error()
+                        && let Some(body) = tree.root_node().named_child(0)
+                        && body.named_child_count() == 1
+                        && let Some((_, value)) = body
+                            .named_child(0)
+                            .and_then(|attr| hcl_attribute(attr, &expression))
+                    {
+                        self.hcl_expression(
+                            source,
+                            value,
+                            &expression,
+                            Some(line(node)),
+                            &mut Vec::new(),
+                            0,
+                        );
+                    } else {
+                        self.gap(
+                            Some(source),
+                            line(node),
+                            end_line(node),
+                            GapReason::ParserError,
+                            true,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn traversal(&mut self, source: &str, root: &str, attributes: &[&str], line: u32) {
+        let address = match (root, attributes) {
+            ("data" | "ephemeral", [kind, name, ..]) => format!("{root}.{kind}.{name}"),
+            ("module", [name, output, ..]) => {
+                self.reference(
+                    source,
+                    lookup_key(self.directory, &format!("module.{name}")),
+                    line,
+                );
+                format!("module.{name}.{output}")
+            }
+            ("var" | "local" | "module", [name, ..]) => format!("{root}.{name}"),
+            (
+                "path" | "terraform" | "count" | "each" | "self" | "data" | "ephemeral" | "var"
+                | "local" | "module",
+                _,
+            ) => return,
+            (_, [name, ..]) => format!("{root}.{name}"),
+            _ => return,
+        };
+        self.reference(source, lookup_key(self.directory, &address), line);
+    }
+
+    fn reference(&mut self, source: &str, key: String, line: u32) {
+        self.graph.refs.push(RefInput {
+            source_key: source.to_owned(),
+            kind: RefKind::DependsOn,
+            line,
+            keys: vec![key],
+            alias_key: None,
+            resolved_target_key: None,
+            resolution: ResolutionState::Pending,
+        });
+    }
+
+    fn gap(
+        &mut self,
+        source: Option<&str>,
+        start: u32,
+        end: u32,
+        reason: GapReason,
+        relation_site: bool,
+    ) {
+        self.graph.gaps.push(GapInput {
+            file_key: Some(self.source.path.clone()),
+            source_key: source.map(str::to_owned),
+            run_key: None,
+            path: Some(self.source.path.clone()),
+            line_start: Some(start),
+            line_end: Some(end),
+            category: match reason {
+                GapReason::ExternalDependency => GapCategory::Boundary,
+                GapReason::DynamicOrUnsupportedDispatch => GapCategory::Relation,
+                GapReason::TerraformOverride => GapCategory::Language,
+                _ => GapCategory::Parse,
+            },
+            reason,
+            target_hint: None,
+            occurrences: 1,
+            relation_site,
+        });
+    }
+}
+
+fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|node| !node.is_extra())
+        .collect()
+}
+
+fn hcl_attribute<'tree, 'text>(
+    node: Node<'tree>,
+    text: &'text str,
+) -> Option<(&'text str, Node<'tree>)> {
+    if node.kind() != "attribute" {
+        return None;
+    }
+    let children = named_children(node);
+    let [name, value] = children.as_slice() else {
+        return None;
+    };
+    Some((node_text(*name, text), *value))
+}
+
+fn json_pairs<'a>(node: Node<'a>, text: &str) -> Vec<(String, Node<'a>, Node<'a>)> {
+    if node.kind() != "object" {
+        return Vec::new();
+    }
+    named_children(node)
+        .into_iter()
+        .filter_map(|pair| {
+            let key = json_string(pair.child_by_field_name("key")?, text)?;
+            Some((key, pair, pair.child_by_field_name("value")?))
+        })
+        .collect()
+}
+
+fn json_string(node: Node<'_>, text: &str) -> Option<String> {
+    (node.kind() == "string")
+        .then(|| serde_json::from_str(node_text(node, text)).ok())
+        .flatten()
+}
+
+fn decode_label(node: Node<'_>, text: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(node_text(node, text).to_owned()),
+        "string_lit" => serde_json::from_str(node_text(node, text)).ok(),
+        _ => None,
+    }
+}
+
+fn hcl_string(node: Node<'_>, text: &str) -> Option<String> {
+    let literal = node.named_child(0)?;
+    (node.named_child_count() == 1 && literal.kind() == "literal_value")
+        .then(|| decode_label(literal.named_child(0)?, text))
+        .flatten()
+}
+
+fn address(kind: &str, labels: &[String]) -> Option<String> {
+    let address = match (kind, labels) {
+        ("resource", [kind, name]) => format!("{kind}.{name}"),
+        ("data" | "ephemeral", [type_name, name]) => format!("{kind}.{type_name}.{name}"),
+        ("variable", [name]) => format!("var.{name}"),
+        ("module" | "output" | "check", [name]) => format!("{kind}.{name}"),
+        _ => return None,
+    };
+    (!address.chars().any(char::is_control)).then_some(address)
+}
+
+fn literal_hcl_argument(kind: &str, name: &str) -> bool {
+    matches!(
+        (kind, name),
+        ("variable", "type" | "default")
+            | ("module", "version" | "providers")
+            | ("resource" | "data" | "ephemeral", "provider")
+    )
+}
+
+fn lookup_key(directory: &str, address: &str) -> String {
+    format!("terraform:{}:{directory}:{address}", directory.len())
+}
+
+pub(crate) fn module_output(key: &str) -> Option<(String, &str)> {
+    let (directory, address) = lookup_address(key)?;
+    let (module, output) = address.strip_prefix("module.")?.split_once('.')?;
+    Some((lookup_key(directory, &format!("module.{module}")), output))
+}
+
+pub(crate) fn lookup_address(key: &str) -> Option<(&str, &str)> {
+    let (size, remainder) = key.strip_prefix("terraform:")?.split_once(':')?;
+    let (directory, address) = remainder.split_at_checked(size.parse().ok()?)?;
+    Some((directory, address.strip_prefix(':')?))
+}
+
+pub(crate) fn module_source(key: &str) -> Option<&str> {
+    key.strip_prefix(MODULE_SOURCE_KEY)
+}
+
+pub(crate) fn output_key(directory: &str, output: &str) -> String {
+    lookup_key(directory, &format!("output.{output}"))
+}
+
+fn local_directory(directory: &str, path: &str) -> Option<String> {
+    if (!path.starts_with("./") && !path.starts_with("../"))
+        || path.chars().any(|ch| ch.is_control() || ch == '\\')
+    {
+        return None;
+    }
+    let mut parts: Vec<_> = directory
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    for part in Path::new(path).components() {
+        match part {
+            Component::Normal(name) => parts.push(name.to_str()?),
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if parts.contains(&".git") || parts.contains(&".terraform") {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+fn is_override(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    matches!(name, "override.tf" | "override.tf.json")
+        || name.ends_with("_override.tf")
+        || name.ends_with("_override.tf.json")
+}
+
+fn node_text<'a>(node: Node<'_>, text: &'a str) -> &'a str {
+    text.get(node.byte_range()).unwrap_or_default()
+}
+
+fn line(node: Node<'_>) -> u32 {
+    (node.start_position().row + 1) as u32
+}
+
+fn end_line(node: Node<'_>) -> u32 {
+    let end = node.end_position();
+    ((end.row + usize::from(end.column > 0)) as u32).max(line(node))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::Language;
+    use crate::store::FileInput;
+
+    #[test]
+    fn expression_dependencies_distinguish_iterators_from_module_addresses() {
+        let source = Source {
+            path: "infra/main.tf".into(),
+            text: r#"
+locals {
+  names = [for local in var.groups : local.name if var.enabled]
+  id    = aws_vpc.main[0].id
+}
+
+resource "example" "dynamic" {
+  lifecycle {
+    ignore_changes = [tags.Name]
+  }
+
+  dynamic "entry" {
+    for_each = var.groups
+    iterator = group
+    content {
+      value = "${group.value}-${local.id}"
+    }
+  }
+}
+"#
+            .into(),
+        };
+        let mut graph = Graph {
+            files: vec![FileInput {
+                path: source.path.clone(),
+                language: Language::Terraform,
+                git_oid: None,
+                content_hash: *blake3::hash(source.text.as_bytes()).as_bytes(),
+                parse_context: String::new(),
+                byte_size: source.text.len() as u64,
+                replace: true,
+                observed_relation_sites: 0,
+            }],
+            ..Graph::default()
+        };
+        add_file(&mut graph, &source, &mut TerraformParsers::default()).unwrap();
+        assert!(graph.gaps.is_empty());
+        let references = graph
+            .refs
+            .iter()
+            .flat_map(|reference| &reference.keys)
+            .map(|key| lookup_address(key).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            references,
+            [
+                ("infra", "var.groups"),
+                ("infra", "var.enabled"),
+                ("infra", "aws_vpc.main"),
+                ("infra", "var.groups"),
+                ("infra", "local.id"),
+            ]
+        );
+    }
+}

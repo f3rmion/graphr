@@ -237,6 +237,7 @@ pub enum Language {
     JavaScript,
     TypeScript,
     Cpp,
+    Terraform,
 }
 
 #[derive(
@@ -273,12 +274,13 @@ pub fn dependency_package(path: &str) -> Option<&str> {
 }
 
 impl Language {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Rust,
         Self::Python,
         Self::JavaScript,
         Self::TypeScript,
         Self::Cpp,
+        Self::Terraform,
     ];
 
     pub const fn display_name(self) -> &'static str {
@@ -288,6 +290,7 @@ impl Language {
             Self::JavaScript => "JavaScript/JSX",
             Self::TypeScript => "TypeScript/TSX",
             Self::Cpp => "C++",
+            Self::Terraform => "Terraform",
         }
     }
 
@@ -298,6 +301,7 @@ impl Language {
             Self::JavaScript => "javascript",
             Self::TypeScript => "typescript",
             Self::Cpp => "cpp",
+            Self::Terraform => "terraform",
         }
     }
 
@@ -308,6 +312,7 @@ impl Language {
             "javascript" => Some(Self::JavaScript),
             "typescript" => Some(Self::TypeScript),
             "cpp" => Some(Self::Cpp),
+            "terraform" => Some(Self::Terraform),
             _ => None,
         }
     }
@@ -1894,8 +1899,26 @@ fn capture_target_changes(
         cancelled,
     )?;
     let mut source_paths = vec![
-        "*.rs", "*.py", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.mts", "*.cts",
-        "*.d.ts", "*.cpp", "*.cc", "*.cxx", "*.hpp", "*.hh", "*.hxx", "*.h",
+        "*.rs",
+        "*.py",
+        "*.js",
+        "*.jsx",
+        "*.mjs",
+        "*.cjs",
+        "*.ts",
+        "*.tsx",
+        "*.mts",
+        "*.cts",
+        "*.d.ts",
+        "*.cpp",
+        "*.cc",
+        "*.cxx",
+        "*.hpp",
+        "*.hh",
+        "*.hxx",
+        "*.h",
+        "*.tf",
+        "*.tf.json",
     ];
     if dependency_mode == DependencyMode::Boundary {
         source_paths.push(":(glob,exclude).cargo/vendor/*/**");
@@ -1949,6 +1972,8 @@ fn capture_target_changes(
         ":(exclude)*.hh",
         ":(exclude)*.hxx",
         ":(exclude)*.h",
+        ":(exclude)*.tf",
+        ":(exclude)*.tf.json",
     ];
     if dependency_mode == DependencyMode::Boundary {
         artifact_paths.push(":(glob,exclude).cargo/vendor/*/**");
@@ -4227,6 +4252,8 @@ fn parse_inventory_path(
         b".hh",
         b".hxx",
         b".h",
+        b".tf",
+        b".tf.json",
     ]
     .iter()
     .any(|suffix| raw_path.ends_with(suffix));
@@ -4293,12 +4320,16 @@ fn language_for_path(path: &str) -> Option<Language> {
     if path.ends_with(".d.ts") {
         return Some(Language::TypeScript);
     }
+    if path.ends_with(".tf.json") {
+        return Some(Language::Terraform);
+    }
     match relative.extension().and_then(OsStr::to_str) {
         Some("rs") => Some(Language::Rust),
         Some("py") => Some(Language::Python),
         Some("js" | "jsx" | "mjs" | "cjs") => Some(Language::JavaScript),
         Some("ts" | "tsx" | "mts" | "cts") => Some(Language::TypeScript),
         Some("cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "h") => Some(Language::Cpp),
+        Some("tf") => Some(Language::Terraform),
         _ => None,
     }
 }
@@ -5517,11 +5548,25 @@ mod tests {
     fn supported_language_registry_is_complete_and_ordered() {
         assert_eq!(
             Language::ALL.map(Language::as_str),
-            ["rust", "python", "javascript", "typescript", "cpp"]
+            [
+                "rust",
+                "python",
+                "javascript",
+                "typescript",
+                "cpp",
+                "terraform"
+            ]
         );
         assert_eq!(
             Language::ALL.map(Language::display_name),
-            ["Rust", "Python", "JavaScript/JSX", "TypeScript/TSX", "C++"]
+            [
+                "Rust",
+                "Python",
+                "JavaScript/JSX",
+                "TypeScript/TSX",
+                "C++",
+                "Terraform"
+            ]
         );
     }
 
@@ -5544,6 +5589,8 @@ mod tests {
             ("src/a.hh", Language::Cpp),
             ("src/a.hxx", Language::Cpp),
             ("src/a.h", Language::Cpp),
+            ("src/a.tf", Language::Terraform),
+            ("src/a.tf.json", Language::Terraform),
         ];
         for (path, expected) in cases {
             assert_eq!(language_for_path(path), Some(expected), "{path}");
