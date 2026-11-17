@@ -14,6 +14,9 @@ use crate::store::{
 
 const MAX_EXPRESSION_DEPTH: usize = 96;
 const MODULE_SOURCE_KEY: &str = "terraform-source:";
+const PROVIDER_SOURCE_KEY: &str = "terraform-provider-source:";
+const PROVIDER_CONFIG_KEY: &str = "terraform-provider-configuration";
+const PROVIDER_REFERENCE_KEY: &str = "terraform-provider-reference:";
 const MAX_MODULE_DEPTH: usize = 16;
 const MAX_CHILD_RECORDS: usize = 250_000;
 const MAX_CHILD_BYTES: usize = 64 * 1024 * 1024;
@@ -49,6 +52,7 @@ pub(crate) fn add_file(
 ) -> Result<(), String> {
     let directory = module_directory(&source.path);
     let file_key = format!("terraform-file:{}", source.path);
+    let file_node = graph.nodes.len();
     let line_end = u32::try_from(source.text.lines().count().max(1))
         .map_err(|_| "Terraform file has too many lines")?;
     graph.nodes.push(NodeInput {
@@ -70,6 +74,7 @@ pub(crate) fn add_file(
         source,
         directory,
         file_key,
+        file_node,
     };
     let json = source.path.ends_with(".tf.json");
     let tree = if json {
@@ -141,6 +146,7 @@ struct TerraformFile<'a> {
     source: &'a Source,
     directory: &'a str,
     file_key: String,
+    file_node: usize,
 }
 
 impl TerraformFile<'_> {
@@ -173,6 +179,12 @@ impl TerraformFile<'_> {
                 continue;
             };
             let body = children.into_iter().find(|child| child.kind() == "body");
+            if kind == "terraform" {
+                if let Some(body) = body {
+                    self.hcl_provider_requirements(body, text);
+                }
+                continue;
+            }
             if kind == "locals" && labels.is_empty() {
                 for attr in body.into_iter().flat_map(named_children) {
                     if let Some((name, expression)) = hcl_attribute(attr, text) {
@@ -182,10 +194,29 @@ impl TerraformFile<'_> {
                 }
                 continue;
             }
-            let Some(address) = address(kind, &labels) else {
+            let attributes = body.map_or_else(Vec::new, named_children);
+            let argument = |name| {
+                attributes
+                    .iter()
+                    .copied()
+                    .filter_map(|node| hcl_attribute(node, text))
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value)
+            };
+            let alias = (kind == "provider").then(|| argument("alias")).flatten();
+            let provider_alias = alias
+                .and_then(|node| hcl_string(node, text))
+                .filter(|alias| terraform_identifier(alias));
+            if let Some(alias) = alias
+                && provider_alias.is_none()
+            {
+                self.provider_gap(None, alias);
+                continue;
+            }
+            let Some(address) = declaration_address(kind, &labels, provider_alias.as_deref())
+            else {
                 continue;
             };
-            let attributes = body.map_or_else(Vec::new, named_children);
             let source_attr = (kind == "module")
                 .then(|| {
                     attributes
@@ -201,6 +232,18 @@ impl TerraformFile<'_> {
                 .as_deref()
                 .and_then(|path| local_directory(self.directory, path));
             let node = self.declaration(block, address.clone(), local.as_deref());
+            if kind == "provider" {
+                self.mark_provider_configuration();
+            }
+            if let Some(resource_type) = resource_type(kind, &labels) {
+                self.resource_provider(
+                    &node,
+                    resource_type,
+                    argument("provider"),
+                    |value| hcl_provider(value, text),
+                    line(block),
+                );
+            }
             if kind == "module" {
                 self.module_boundary(
                     &node,
@@ -211,6 +254,10 @@ impl TerraformFile<'_> {
             }
             for child in attributes {
                 if let Some((name, expression)) = hcl_attribute(child, text) {
+                    if kind == "module" && name == "providers" {
+                        self.hcl_provider_mappings(&node, &address, expression, text);
+                        continue;
+                    }
                     let binding = local
                         .as_ref()
                         .and_then(|_| self.module_argument(&node, &address, name, child));
@@ -234,6 +281,10 @@ impl TerraformFile<'_> {
     fn json(&mut self, root: Node<'_>, parser: &mut Option<Parser>) -> Result<(), String> {
         let text = &self.source.text;
         for (kind, _, value) in json_pairs(root, text) {
+            if kind == "terraform" {
+                self.json_provider_requirements(value, text);
+                continue;
+            }
             if kind == "locals" {
                 for (name, property, expression) in json_pairs(value, text) {
                     let node = self.declaration(property, format!("local.{name}"), None);
@@ -243,7 +294,7 @@ impl TerraformFile<'_> {
             }
             let label_count = match kind.as_str() {
                 "resource" | "data" | "ephemeral" => 2,
-                "module" | "variable" | "output" | "check" => 1,
+                "module" | "variable" | "output" | "check" | "provider" => 1,
                 _ => continue,
             };
             let mut pending = vec![(Vec::new(), value, value)];
@@ -271,8 +322,28 @@ impl TerraformFile<'_> {
                             (labels, property, entry)
                         },
                     ));
-                } else if let Some(address) = address(&kind, &labels) {
+                } else {
                     let args = json_pairs(value, text);
+                    let argument = |name| {
+                        args.iter()
+                            .find(|(key, _, _)| key == name)
+                            .map(|(_, _, value)| *value)
+                    };
+                    let alias = (kind == "provider").then(|| argument("alias")).flatten();
+                    let provider_alias = alias
+                        .and_then(|node| json_string(node, text))
+                        .filter(|alias| terraform_identifier(alias));
+                    if let Some(alias) = alias
+                        && provider_alias.is_none()
+                    {
+                        self.provider_gap(None, alias);
+                        continue;
+                    }
+                    let Some(address) =
+                        declaration_address(&kind, &labels, provider_alias.as_deref())
+                    else {
+                        continue;
+                    };
                     let source_attr = args
                         .iter()
                         .find(|(name, _, _)| kind == "module" && name == "source")
@@ -282,6 +353,18 @@ impl TerraformFile<'_> {
                         .as_deref()
                         .and_then(|path| local_directory(self.directory, path));
                     let node = self.declaration(property, address.clone(), local.as_deref());
+                    if kind == "provider" {
+                        self.mark_provider_configuration();
+                    }
+                    if let Some(resource_type) = resource_type(&kind, &labels) {
+                        self.resource_provider(
+                            &node,
+                            resource_type,
+                            argument("provider"),
+                            |value| json_string(value, text),
+                            line(property),
+                        );
+                    }
                     if kind == "module" {
                         self.module_boundary(
                             &node,
@@ -291,6 +374,10 @@ impl TerraformFile<'_> {
                         );
                     }
                     for (name, attr, expression) in args {
+                        if kind == "module" && name == "providers" {
+                            self.json_provider_mappings(&node, &address, expression, text);
+                            continue;
+                        }
                         let binding = local
                             .as_ref()
                             .and_then(|_| self.module_argument(&node, &address, &name, attr));
@@ -367,6 +454,172 @@ impl TerraformFile<'_> {
         let binding = self.declaration(argument, address.clone(), None);
         self.reference(node, lookup_key(self.directory, &address), line(argument));
         Some(binding)
+    }
+
+    fn hcl_provider_requirements(&mut self, body: Node<'_>, text: &str) {
+        for block in named_children(body) {
+            if block.kind() != "block"
+                || block
+                    .named_child(0)
+                    .is_none_or(|name| node_text(name, text) != "required_providers")
+            {
+                continue;
+            }
+            for attr in named_children(block)
+                .into_iter()
+                .filter(|child| child.kind() == "body")
+                .flat_map(named_children)
+            {
+                if let Some((local, value)) = hcl_attribute(attr, text) {
+                    for (_, key, source) in hcl_object_pairs(value).unwrap_or_default() {
+                        if (node_text(key, text) == "source"
+                            || hcl_string(key, text).as_deref() == Some("source"))
+                            && let Some(source) = hcl_string(source, text)
+                        {
+                            self.provider_requirement(local, &source);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn json_provider_requirements(&mut self, block: Node<'_>, text: &str) {
+        for object in json_objects(block) {
+            for (_, _, required) in json_pairs(object, text)
+                .into_iter()
+                .filter(|(key, _, _)| key == "required_providers")
+            {
+                for required in json_objects(required) {
+                    for (local, _, value) in json_pairs(required, text) {
+                        for (_, _, source) in json_pairs(value, text)
+                            .into_iter()
+                            .filter(|(key, _, _)| key == "source")
+                        {
+                            if let Some(source) = json_string(source, text) {
+                                self.provider_requirement(&local, &source);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn provider_requirement(&mut self, local: &str, source: &str) {
+        if terraform_identifier(local)
+            && let Some(provider) = normalized_provider_source(source)
+        {
+            self.graph.nodes[self.file_node]
+                .keys
+                .push(format!("{PROVIDER_SOURCE_KEY}{local}:{provider}"));
+        }
+    }
+
+    fn mark_provider_configuration(&mut self) {
+        self.graph
+            .nodes
+            .last_mut()
+            .expect("just added provider")
+            .keys
+            .push(PROVIDER_CONFIG_KEY.to_owned());
+    }
+
+    fn resource_provider<'tree>(
+        &mut self,
+        resource: &str,
+        resource_type: &str,
+        explicit: Option<Node<'tree>>,
+        read: impl FnOnce(Node<'tree>) -> Option<String>,
+        declaration_line: u32,
+    ) {
+        if let Some(value) = explicit {
+            if let Some(address) = read(value).filter(|address| provider_address(address).is_some())
+            {
+                self.provider_reference(resource, &address, line(value));
+            } else {
+                self.provider_gap(Some(resource), value);
+            }
+        } else if let Some(name) = resource_type
+            .split('_')
+            .next()
+            .filter(|name| terraform_identifier(name))
+        {
+            self.provider_reference(resource, name, declaration_line);
+        }
+    }
+
+    fn hcl_provider_mappings(
+        &mut self,
+        node: &str,
+        address: &str,
+        expression: Node<'_>,
+        text: &str,
+    ) {
+        if let Some(pairs) = hcl_object_pairs(expression) {
+            for (entry, key, value) in pairs {
+                self.provider_mapping(
+                    node,
+                    address,
+                    entry,
+                    hcl_provider(key, text),
+                    hcl_provider(value, text),
+                );
+            }
+        } else {
+            self.provider_gap(Some(node), expression);
+        }
+    }
+
+    fn json_provider_mappings(
+        &mut self,
+        node: &str,
+        address: &str,
+        expression: Node<'_>,
+        text: &str,
+    ) {
+        if expression.kind() == "object" {
+            for (child, pair, value) in json_pairs(expression, text) {
+                self.provider_mapping(node, address, pair, Some(child), json_string(value, text));
+            }
+        } else {
+            self.provider_gap(Some(node), expression);
+        }
+    }
+
+    fn provider_mapping(
+        &mut self,
+        node: &str,
+        module: &str,
+        span: Node<'_>,
+        child: Option<String>,
+        parent: Option<String>,
+    ) {
+        if let (Some(child), Some(parent)) = (child, parent)
+            && provider_address(&child).is_some()
+            && provider_address(&parent).is_some()
+        {
+            let address = format!("{module}.providers.{child}");
+            let binding = self.declaration(span, address.clone(), None);
+            self.reference(node, lookup_key(self.directory, &address), line(span));
+            self.provider_reference(&binding, &parent, line(span));
+        } else {
+            self.provider_gap(Some(node), span);
+        }
+    }
+
+    fn provider_reference(&mut self, source: &str, address: &str, line: u32) {
+        self.reference(source, format!("{PROVIDER_REFERENCE_KEY}{address}"), line);
+    }
+
+    fn provider_gap(&mut self, source: Option<&str>, node: Node<'_>) {
+        self.gap(
+            source,
+            line(node),
+            end_line(node),
+            GapReason::TerraformProviderUnmodeled,
+            true,
+        );
     }
 
     fn hcl_expression(
@@ -599,7 +852,9 @@ impl TerraformFile<'_> {
             line_end: Some(end),
             category: match reason {
                 GapReason::ExternalDependency => GapCategory::Boundary,
-                GapReason::DynamicOrUnsupportedDispatch => GapCategory::Relation,
+                GapReason::DynamicOrUnsupportedDispatch | GapReason::TerraformProviderUnmodeled => {
+                    GapCategory::Relation
+                }
                 GapReason::TerraformOverride => GapCategory::Language,
                 _ => GapCategory::Parse,
             },
@@ -645,6 +900,54 @@ fn json_pairs<'a>(node: Node<'a>, text: &str) -> Vec<(String, Node<'a>, Node<'a>
         .collect()
 }
 
+fn json_objects(node: Node<'_>) -> Vec<Node<'_>> {
+    match node.kind() {
+        "object" => vec![node],
+        "array" => named_children(node)
+            .into_iter()
+            .filter(|entry| entry.kind() == "object")
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn hcl_object_pairs(mut node: Node<'_>) -> Option<Vec<(Node<'_>, Node<'_>, Node<'_>)>> {
+    while matches!(node.kind(), "expression" | "collection_value") {
+        let children = named_children(node);
+        let [child] = children.as_slice() else {
+            return None;
+        };
+        node = *child;
+    }
+    (node.kind() == "object").then(|| {
+        named_children(node)
+            .into_iter()
+            .filter_map(|entry| {
+                Some((
+                    entry,
+                    entry.child_by_field_name("key")?,
+                    entry.child_by_field_name("val")?,
+                ))
+            })
+            .collect()
+    })
+}
+
+fn hcl_provider(node: Node<'_>, text: &str) -> Option<String> {
+    let children = named_children(node);
+    match children.as_slice() {
+        [name] if name.kind() == "variable_expr" => Some(node_text(*name, text).to_owned()),
+        [name, alias] if name.kind() == "variable_expr" && alias.kind() == "get_attr" => {
+            Some(format!(
+                "{}.{}",
+                node_text(*name, text),
+                node_text(alias.named_child(0)?, text)
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn json_string(node: Node<'_>, text: &str) -> Option<String> {
     (node.kind() == "string")
         .then(|| serde_json::from_str(node_text(node, text)).ok())
@@ -666,8 +969,12 @@ fn hcl_string(node: Node<'_>, text: &str) -> Option<String> {
         .flatten()
 }
 
-fn address(kind: &str, labels: &[String]) -> Option<String> {
+fn declaration_address(kind: &str, labels: &[String], alias: Option<&str>) -> Option<String> {
     let address = match (kind, labels) {
+        ("provider", [name]) if terraform_identifier(name) => alias.map_or_else(
+            || format!("provider.{name}"),
+            |alias| format!("provider.{name}.{alias}"),
+        ),
         ("resource", [kind, name]) => format!("{kind}.{name}"),
         ("data" | "ephemeral", [type_name, name]) => format!("{kind}.{type_name}.{name}"),
         ("variable", [name]) => format!("var.{name}"),
@@ -677,11 +984,61 @@ fn address(kind: &str, labels: &[String]) -> Option<String> {
     (!address.chars().any(char::is_control)).then_some(address)
 }
 
+fn resource_type<'a>(kind: &str, labels: &'a [String]) -> Option<&'a str> {
+    match (kind, labels) {
+        ("resource" | "data" | "ephemeral", [name, _]) => Some(name),
+        _ => None,
+    }
+}
+
+fn terraform_identifier(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+        && characters.all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn provider_address(address: &str) -> Option<(&str, &str)> {
+    let (name, alias) = address
+        .split_once('.')
+        .map_or((address, None), |(name, alias)| (name, Some(alias)));
+    (terraform_identifier(name) && alias.is_none_or(terraform_identifier))
+        .then_some((name, alias.unwrap_or("")))
+}
+
+fn normalized_provider_source(address: &str) -> Option<String> {
+    let parts = address.split('/').collect::<Vec<_>>();
+    let source_part = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-' || ch == b'_')
+    };
+    match parts.as_slice() {
+        [namespace, name] if source_part(namespace) && source_part(name) => {
+            Some(format!("registry.terraform.io/{address}").to_ascii_lowercase())
+        }
+        [host, namespace, name]
+            if !host.is_empty()
+                && host
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
+                && source_part(namespace)
+                && source_part(name) =>
+        {
+            Some(address.to_ascii_lowercase())
+        }
+        _ => None,
+    }
+}
+
 fn literal_hcl_argument(kind: &str, name: &str) -> bool {
     matches!(
         (kind, name),
         ("variable", "type" | "default")
             | ("module", "version" | "providers")
+            | ("provider", "alias" | "version")
             | ("resource" | "data" | "ephemeral", "provider")
     )
 }
@@ -717,6 +1074,11 @@ fn module_output_call(address: &str) -> Option<&str> {
     module_call(call).then_some(call)
 }
 
+fn provider_mapping_address(address: &str) -> Option<(&str, &str)> {
+    let (call, selection) = address.split_once(".providers.")?;
+    module_call(call).then_some((call, selection))
+}
+
 fn dependency(source_key: String, key: String, line: u32) -> RefInput {
     RefInput {
         source_key,
@@ -736,6 +1098,68 @@ struct Module<'a> {
     calls: BTreeMap<&'a str, Option<&'a NodeInput>>,
     records: usize,
     bytes: usize,
+    provider_requirements: HashMap<String, String>,
+    provider_configurations: HashMap<ProviderSlot, Option<&'a str>>,
+    provider_mappings: HashMap<&'a str, Vec<(&'a str, &'a str)>>,
+}
+
+#[derive(Eq, Hash, PartialEq)]
+struct ProviderSlot {
+    source: String,
+    alias: String,
+}
+
+impl Module<'_> {
+    fn provider_slot(&self, address: &str) -> Option<ProviderSlot> {
+        let (local, alias) = provider_address(address)?;
+        let source = self
+            .provider_requirements
+            .get(local)
+            .cloned()
+            .unwrap_or_else(|| {
+                if local == "terraform" {
+                    "terraform.io/builtin/terraform".to_owned()
+                } else {
+                    format!(
+                        "registry.terraform.io/hashicorp/{}",
+                        local.to_ascii_lowercase()
+                    )
+                }
+            });
+        Some(ProviderSlot {
+            source,
+            alias: alias.to_owned(),
+        })
+    }
+}
+
+fn remember_provider<'a>(
+    providers: &mut HashMap<ProviderSlot, Option<&'a str>>,
+    slot: ProviderSlot,
+    address: &'a str,
+) {
+    providers
+        .entry(slot)
+        .and_modify(|current| {
+            if *current != Some(address) {
+                *current = None;
+            }
+        })
+        .or_insert(Some(address));
+}
+
+fn child_provider_mappings<'a>(
+    caller: &Module<'a>,
+    child: &Module<'_>,
+    call: &str,
+) -> HashMap<ProviderSlot, Option<&'a str>> {
+    let mut mappings = HashMap::new();
+    for &(selection, address) in caller.provider_mappings.get(call).into_iter().flatten() {
+        if let Some(slot) = child.provider_slot(selection) {
+            remember_provider(&mut mappings, slot, address);
+        }
+    }
+    mappings
 }
 
 struct Instance<'a> {
@@ -746,6 +1170,7 @@ struct Instance<'a> {
     depth: usize,
     children: BTreeMap<&'a str, usize>,
     controls: Vec<String>,
+    provider_mappings: HashMap<ProviderSlot, Option<&'a str>>,
 }
 
 impl<'a> Instance<'a> {
@@ -758,6 +1183,7 @@ impl<'a> Instance<'a> {
             depth: 0,
             children: BTreeMap::new(),
             controls: Vec::new(),
+            provider_mappings: HashMap::new(),
         }
     }
 
@@ -771,6 +1197,33 @@ impl<'a> Instance<'a> {
 
     fn lookup(&self, symbol: &str) -> String {
         lookup_key(self.root, &self.address(symbol))
+    }
+}
+
+fn provider_target(
+    modules: &BTreeMap<&str, Module<'_>>,
+    instances: &[Instance<'_>],
+    mut index: usize,
+    slot: &ProviderSlot,
+) -> Option<String> {
+    loop {
+        let instance = &instances[index];
+        if let Some(address) = instance.provider_mappings.get(slot) {
+            let (caller, _) = instance.caller?;
+            return address.map(|address| instances[caller].lookup(address));
+        }
+        if let Some(address) = modules[instance.directory]
+            .provider_configurations
+            .get(slot)
+        {
+            return address.map(|address| instance.lookup(address));
+        }
+        // Terraform inherits default configurations by source address. An
+        // alias must be mapped explicitly at each boundary where it is used.
+        if !slot.alias.is_empty() {
+            return None;
+        }
+        index = instance.caller?.0;
     }
 }
 
@@ -798,6 +1251,28 @@ pub(crate) fn project_modules(graph: &mut Graph, cancelled: &AtomicBool) -> Resu
             .saturating_add(usize::try_from(file.byte_size).unwrap_or(usize::MAX));
         sites.insert(file.path.clone(), 0_usize);
     }
+    for file_node in graph
+        .nodes
+        .iter_mut()
+        .filter(|node| node.kind == NodeKind::File && sites.contains_key(&node.file_key))
+    {
+        let module = modules
+            .get_mut(module_directory(&file_node.file_key))
+            .expect("Terraform file inventoried");
+        file_node.keys.retain(|key| {
+            if let Some((local, source)) = key
+                .strip_prefix(PROVIDER_SOURCE_KEY)
+                .and_then(|key| key.split_once(':'))
+            {
+                module
+                    .provider_requirements
+                    .insert(local.to_owned(), source.to_owned());
+                false
+            } else {
+                true
+            }
+        });
+    }
     let mut refs_by_node = HashMap::<_, Vec<_>>::new();
     for reference in &terraform_refs {
         check_projection_cancelled(cancelled)?;
@@ -822,6 +1297,21 @@ pub(crate) fn project_modules(graph: &mut Graph, cancelled: &AtomicBool) -> Resu
                 .entry(&node.name)
                 .and_modify(|call| *call = None)
                 .or_insert(Some(node));
+        }
+        if node.keys.iter().any(|key| key == PROVIDER_CONFIG_KEY)
+            && let Some(selection) = node
+                .name
+                .strip_prefix("provider.")
+                .and_then(|name| module.provider_slot(name))
+        {
+            remember_provider(&mut module.provider_configurations, selection, &node.name);
+        }
+        if let Some((call, selection)) = provider_mapping_address(&node.name) {
+            module
+                .provider_mappings
+                .entry(call)
+                .or_default()
+                .push((selection, &node.name));
         }
     }
 
@@ -857,12 +1347,46 @@ pub(crate) fn project_modules(graph: &mut Graph, cancelled: &AtomicBool) -> Resu
                 ));
             }
             let refs_before = graph.refs.len();
+            let provider_gaps_before = graph.gaps.len();
             for reference in refs_by_node.get(node.key.as_str()).into_iter().flatten() {
-                let (_, target) = reference
+                let raw = reference
                     .keys
                     .first()
-                    .and_then(|key| lookup_address(key))
                     .ok_or("Terraform reference address is missing")?;
+                if let Some(address) = raw.strip_prefix(PROVIDER_REFERENCE_KEY) {
+                    let provider = modules[instance.directory]
+                        .provider_slot(address)
+                        .ok_or("invalid provider reference")?;
+                    let incompatible_mapping = provider_mapping_address(&node.name)
+                        .and_then(|(call, child_address)| {
+                            let &child = instance.children.get(call)?;
+                            modules[instances[child].directory].provider_slot(child_address)
+                        })
+                        .is_some_and(|child| child.source != provider.source);
+                    if !incompatible_mapping
+                        && let Some(target) =
+                            provider_target(&modules, &instances, instance_id, &provider)
+                    {
+                        graph
+                            .refs
+                            .push(dependency(key.clone(), target, reference.line));
+                    } else if incompatible_mapping || !provider.alias.is_empty() {
+                        let reason = if incompatible_mapping {
+                            GapReason::TerraformProviderUnmodeled
+                        } else {
+                            GapReason::UnresolvedDependency
+                        };
+                        let mut gap =
+                            module_gap(node, &key, reason, Some(&format!("provider.{address}")));
+                        gap.category = GapCategory::Relation;
+                        gap.line_start = Some(reference.line);
+                        gap.line_end = Some(reference.line);
+                        graph.gaps.push(gap);
+                    }
+                    continue;
+                }
+                let (_, target) =
+                    lookup_address(raw).ok_or("Terraform reference address is missing")?;
                 let target = module_output_call(target)
                     .filter(|call| {
                         modules[instance.directory].calls.contains_key(call)
@@ -911,7 +1435,7 @@ pub(crate) fn project_modules(graph: &mut Graph, cancelled: &AtomicBool) -> Resu
             let count = sites
                 .get_mut(&node.file_key)
                 .ok_or("Terraform declaration file is missing")?;
-            *count += graph.refs.len() - refs_before;
+            *count += (graph.refs.len() - refs_before) + (graph.gaps.len() - provider_gaps_before);
             if let Some(&reason) = boundaries.get(&(instance_id, node.name.as_str())) {
                 graph
                     .gaps
@@ -1032,6 +1556,11 @@ fn module_instances<'a>(
                         depth: parent.depth + 1,
                         children: BTreeMap::new(),
                         controls,
+                        provider_mappings: child_provider_mappings(
+                            &modules[parent.directory],
+                            module,
+                            address,
+                        ),
                     };
                     let child_id = instances.len();
                     instances.push(child);
@@ -1173,7 +1702,8 @@ resource "example" "dynamic" {
 "#
             .into(),
         };
-        let graph = parse_source(&source);
+        let mut graph = parse_source(&source);
+        project_modules(&mut graph, &AtomicBool::new(false)).unwrap();
         assert!(graph.gaps.is_empty());
         let references = graph
             .refs

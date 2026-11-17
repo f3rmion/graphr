@@ -2356,6 +2356,189 @@ output "id" {
     client.close();
 }
 
+#[test]
+fn terraform_provider_aliases_follow_their_module_calls() {
+    let fixture = Fixture::new();
+    let root = &fixture.path;
+    let providers = r#"{
+  "terraform": {
+    "required_providers": {
+      "ops": {"source": "hashicorp/aws"}
+    }
+  },
+  "provider": {
+    "ops": [
+      {"region": "us-east-2"},
+      {"alias": "replica", "region": "us-west-2"}
+    ]
+  },
+  "data": {
+    "aws_region": {
+      "replica": {"provider": "ops.replica"}
+    }
+  }
+}
+"#;
+    let staging = r#"{
+  "module": {
+    "staging": {
+      "source": "./modules/network",
+      "providers": {"aws": "ops.replica", "aws.peer": "ops.audit"}
+    }
+  }
+}
+"#;
+    let files = [
+        ("providers.tf.json", providers),
+        ("staging.tf.json", staging),
+        (
+            "prod.tf",
+            r#"
+provider "ops" {
+  alias = "primary"
+  region = "us-east-1"
+}
+provider "ops" {
+  alias = "audit"
+  region = "us-west-1"
+}
+module "prod" {
+  source = "./modules/network"
+  providers = { aws = ops.primary, aws.peer = ops.audit }
+}
+module "inherited" {
+  source = "./modules/leaf"
+}
+data "aws_region" "primary" {
+  provider = ops.primary
+}
+"#,
+        ),
+        (
+            "modules/network/main.tf",
+            r#"
+terraform {
+  required_providers {
+    aws = {
+      source = "registry.terraform.io/hashicorp/aws"
+      configuration_aliases = [aws.peer]
+    }
+  }
+}
+module "implicit" {
+  source = "../leaf"
+}
+module "forwarded" {
+  source = "../leaf"
+  providers = { aws = aws.peer }
+}
+data "aws_caller_identity" "peer" {
+  provider = aws.peer
+}
+"#,
+        ),
+        (
+            "modules/leaf/main.tf",
+            r#"
+resource "aws_s3_bucket" "logs" {}
+"#,
+        ),
+    ];
+    for (path, contents) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    init_git(root);
+    git(root, &["add", "."]);
+    git_commit(root, "Terraform provider baseline");
+    index_repository(root);
+    fs::write(
+        root.join("providers.tf.json"),
+        providers.replace("us-west-2", "us-east-1"),
+    )
+    .unwrap();
+
+    let mut client = Client::start(root);
+    let impact = |client: &mut Client, address: &str| {
+        let search = response_text(&client.search(address, Some("terraform")));
+        let node_ref = search
+            .lines()
+            .find(|line| line.contains(&format!(" Terraform {address} ")))
+            .unwrap_or_else(|| panic!("missing {address}: {search}"))
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let snapshot_id = client.snapshot_id.clone().unwrap();
+        response_text(&client.call(
+            "impact",
+            rmcp::serde_json::json!({
+                "snapshot_id": snapshot_id, "node_ref": node_ref, "depth": 6,
+            }),
+        ))
+    };
+
+    let replica = impact(&mut client, "provider.ops.replica");
+    for expected in [
+        "data.aws_region.replica",
+        "module.staging.providers.aws",
+        "module.staging.module.implicit.aws_s3_bucket.logs",
+    ] {
+        assert!(replica.contains(expected), "{replica}");
+    }
+    assert!(!replica.contains("module.prod"), "{replica}");
+    assert!(
+        !replica.contains("module.staging.module.forwarded"),
+        "{replica}"
+    );
+
+    let audit = impact(&mut client, "provider.ops.audit");
+    for expected in [
+        "module.prod.data.aws_caller_identity.peer",
+        "module.staging.data.aws_caller_identity.peer",
+        "module.prod.module.forwarded.aws_s3_bucket.logs",
+        "module.staging.module.forwarded.aws_s3_bucket.logs",
+    ] {
+        assert!(audit.contains(expected), "{audit}");
+    }
+    assert!(!audit.contains(".module.implicit."), "{audit}");
+
+    let default = impact(&mut client, "provider.ops");
+    assert!(
+        default.contains("module.inherited.aws_s3_bucket.logs"),
+        "{default}"
+    );
+    assert!(
+        !default.contains("module.staging") && !default.contains("module.prod"),
+        "{default}"
+    );
+
+    let dot = response_text(&client.changes_dot(4, 50));
+    assert!(
+        dot.contains("module.staging.module.implicit.aws_s3_bucket.logs"),
+        "{dot}"
+    );
+    assert!(!dot.contains("module.prod"), "{dot}");
+
+    fs::write(
+        root.join("staging.tf.json"),
+        staging.replace("ops.replica", "ops.primary"),
+    )
+    .unwrap();
+    client.index_and_wait("boundary");
+    let old = impact(&mut client, "provider.ops.replica");
+    assert!(!old.contains("module.staging"), "{old}");
+    let new = impact(&mut client, "provider.ops.primary");
+    for expected in [
+        "data.aws_region.primary",
+        "module.prod.module.implicit.aws_s3_bucket.logs",
+        "module.staging.module.implicit.aws_s3_bucket.logs",
+    ] {
+        assert!(new.contains(expected), "{new}");
+    }
+    client.close();
+}
+
 const TYPES: &str = r#"
     export interface Config { value: string }
 "#;

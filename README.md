@@ -362,6 +362,13 @@ follow the same call, including through nested modules. A configuration root in
 a subdirectory prefixes its child addresses with that directory and `::`.
 `impact` follows dependents and `changes` shows them in the text and DOT graphs.
 
+Provider configurations are searchable as `provider.<name>` or
+`provider.<name>.<alias>`. Resources and data sources link to their selected
+configuration. Local calls resolve `providers` mappings and inherited
+defaults by provider source address, including when a caller and child use
+different local names. For example, `impact` on `provider.aws.replica` follows
+only the calls and resources that use that configuration.
+
 Terraform analysis works at the declaration level, including references with
 indexes and splats. Graphr reports coverage gaps for override files, external
 or computed module sources, recursive module calls, and bounded expansions.
