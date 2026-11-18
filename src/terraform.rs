@@ -1924,9 +1924,14 @@ check "health" {
       {"for_each": "${var.ports}", "iterator": "rule", "content": {
         "to_port": "${rule.value}",
         "dynamic": {"cidr": {"for_each": "${rule.value.cidrs}", "content": {"block": "${cidr.value}"}}}
-      }}
+      }},
+      {"for_each": "${ingress.extra}", "labels": ["${ingress.key}"], "content": {}}
     ]},
-    "lifecycle": {"ignore_changes": ["tags"], "replace_triggered_by": ["aws_instance.x.id"]}
+    "lifecycle": {
+      "ignore_changes": ["tags"],
+      "replace_triggered_by": ["aws_instance.x.id"],
+      "precondition": [{"condition": "${var.ok}", "error_message": "x"}]
+    }
   }}
 }}"#
             .into(),
@@ -1937,7 +1942,10 @@ check "health" {
             dependencies(&graph),
             [
                 ("aws_security_group.sg", "aws_instance.x"),
+                // `for_each` cannot use the iterator it defines.
+                ("aws_security_group.sg", "ingress.extra"),
                 ("aws_security_group.sg", "var.env"),
+                ("aws_security_group.sg", "var.ok"),
                 ("aws_security_group.sg", "var.owner"),
                 ("aws_security_group.sg", "var.ports"),
                 ("aws_security_group.sg", "var.ports"),
