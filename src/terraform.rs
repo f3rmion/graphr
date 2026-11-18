@@ -402,14 +402,25 @@ impl TerraformFile<'_> {
                             .as_ref()
                             .and_then(|_| self.module_argument(&node, &address, &name, attr));
                         if !literal_hcl_argument(&kind, &name) {
-                            // Pass the pair so nested-block handling also sees top-level keys.
-                            self.json_expression(
-                                binding.as_deref().unwrap_or(&node),
-                                attr,
-                                name == "depends_on",
-                                &mut Vec::new(),
-                                parser,
-                            )?;
+                            let dependent = binding.as_deref().unwrap_or(&node);
+                            // Module arguments are attributes; other bodies may hold blocks.
+                            if kind == "module" {
+                                self.json_expression(
+                                    dependent,
+                                    expression,
+                                    name == "depends_on",
+                                    &mut Vec::new(),
+                                    parser,
+                                )?;
+                            } else {
+                                self.json_argument(
+                                    dependent,
+                                    &name,
+                                    expression,
+                                    &mut Vec::new(),
+                                    parser,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -774,6 +785,74 @@ impl TerraformFile<'_> {
         scope.truncate(original_scope);
     }
 
+    /// Walks one argument of a JSON block body, where Terraform reserves
+    /// `lifecycle` and `dynamic` as block types. Deeper objects can be map
+    /// attributes, so `json_expression` gives those keys no meaning.
+    fn json_argument(
+        &mut self,
+        source: &str,
+        name: &str,
+        value: Node<'_>,
+        scope: &mut Vec<String>,
+        parser: &mut Option<Parser>,
+    ) -> Result<(), String> {
+        let text = &self.source.text;
+        match name {
+            "lifecycle" => {
+                for (name, _, value) in json_objects(value)
+                    .into_iter()
+                    .flat_map(|body| json_pairs(body, text))
+                {
+                    // Terraform reads these strings as bare references.
+                    let bare = name == "replace_triggered_by";
+                    self.json_expression(source, value, bare, scope, parser)?;
+                }
+            }
+            // Recursion stays within the serde_json nesting limit checked in `add_file`.
+            "dynamic" => {
+                for (label, _, blocks) in json_objects(value)
+                    .into_iter()
+                    .flat_map(|labels| json_pairs(labels, text))
+                {
+                    for block in json_objects(blocks) {
+                        let arguments = json_pairs(block, text);
+                        let iterator = arguments
+                            .iter()
+                            .find(|(name, _, _)| name == "iterator")
+                            .and_then(|(_, _, iterator)| json_string(*iterator, text))
+                            .unwrap_or_else(|| label.clone());
+                        for (name, _, value) in arguments {
+                            match name.as_str() {
+                                "iterator" => {}
+                                // As in HCL, `for_each` cannot use its own iterator.
+                                "for_each" => {
+                                    self.json_expression(source, value, false, scope, parser)?;
+                                }
+                                "content" => {
+                                    scope.push(iterator.clone());
+                                    for (name, _, value) in json_objects(value)
+                                        .into_iter()
+                                        .flat_map(|body| json_pairs(body, text))
+                                    {
+                                        self.json_argument(source, &name, value, scope, parser)?;
+                                    }
+                                    scope.pop();
+                                }
+                                _ => {
+                                    scope.push(iterator.clone());
+                                    self.json_expression(source, value, false, scope, parser)?;
+                                    scope.pop();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => self.json_expression(source, value, name == "depends_on", scope, parser)?,
+        }
+        Ok(())
+    }
+
     fn json_expression(
         &mut self,
         source: &str,
@@ -786,45 +865,7 @@ impl TerraformFile<'_> {
         let mut pending = vec![root];
         while let Some(node) = pending.pop() {
             match node.kind() {
-                "pair" => {
-                    let Some(value) = node.child_by_field_name("value") else {
-                        continue;
-                    };
-                    let key = node
-                        .child_by_field_name("key")
-                        .and_then(|key| json_string(key, text));
-                    match key.as_deref() {
-                        // Terraform reads these lifecycle strings as attribute
-                        // paths and bare references, not as templates.
-                        Some("ignore_changes") => {}
-                        Some("replace_triggered_by") => {
-                            self.json_expression(source, value, true, scope, parser)?;
-                        }
-                        // Each block binds its `iterator`, or else its label, for
-                        // the whole value. Recursion stays within the serde_json
-                        // nesting limit checked in `add_file`.
-                        Some("dynamic") => {
-                            let bound = scope.len();
-                            for (label, _, blocks) in json_objects(value)
-                                .into_iter()
-                                .flat_map(|labels| json_pairs(labels, text))
-                            {
-                                for block in json_objects(blocks) {
-                                    let iterator = json_pairs(block, text)
-                                        .into_iter()
-                                        .find(|(name, _, _)| name == "iterator")
-                                        .and_then(|(_, _, iterator)| json_string(iterator, text));
-                                    scope.push(iterator.unwrap_or_else(|| label.clone()));
-                                }
-                            }
-                            let result =
-                                self.json_expression(source, value, bare_reference, scope, parser);
-                            scope.truncate(bound);
-                            result?;
-                        }
-                        _ => pending.push(value),
-                    }
-                }
+                "pair" => pending.extend(node.child_by_field_name("value")),
                 "array" | "object" => pending.extend(named_children(node).into_iter().rev()),
                 "string" => {
                     let Some(value) = json_string(node, text) else {
@@ -1873,9 +1914,17 @@ check "health" {
             text: r#"{"resource": {
   "aws_instance": {"x": {"ami": "abc"}},
   "aws_security_group": {"sg": {
+    "tags": {
+      "ignore_changes": "${var.team}",
+      "replace_triggered_by": "${var.owner}",
+      "dynamic": {"var": {"key": "${var.env}"}}
+    },
     "dynamic": {"ingress": [
       {"for_each": "${var.ports}", "content": {"from_port": "${ingress.value}"}},
-      {"for_each": "${var.ports}", "iterator": "rule", "content": {"to_port": "${rule.value}"}}
+      {"for_each": "${var.ports}", "iterator": "rule", "content": {
+        "to_port": "${rule.value}",
+        "dynamic": {"cidr": {"for_each": "${rule.value.cidrs}", "content": {"block": "${cidr.value}"}}}
+      }}
     ]},
     "lifecycle": {"ignore_changes": ["tags"], "replace_triggered_by": ["aws_instance.x.id"]}
   }}
@@ -1888,8 +1937,11 @@ check "health" {
             dependencies(&graph),
             [
                 ("aws_security_group.sg", "aws_instance.x"),
+                ("aws_security_group.sg", "var.env"),
+                ("aws_security_group.sg", "var.owner"),
                 ("aws_security_group.sg", "var.ports"),
                 ("aws_security_group.sg", "var.ports"),
+                ("aws_security_group.sg", "var.team"),
             ]
         );
     }

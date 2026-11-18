@@ -372,6 +372,9 @@ only the calls and resources that use that configuration.
 Terraform analysis works at the declaration level, including references with
 indexes and splats. Graphr reports coverage gaps for override files, external
 or computed module sources, recursive module calls, and bounded expansions.
+In JSON configuration, Graphr reads `dynamic` and `lifecycle` as blocks only
+directly in a declaration body or in `dynamic` content; deeper objects can be
+map values, so an iterator used there reports an unresolved dependency.
 Terraform evaluates provider configuration and expands individual `count` and
 `for_each` instances. Use `terraform plan` for resource creations,
 replacements, and deletions.
