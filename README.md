@@ -401,7 +401,10 @@ Risk output states that higher is riskier and includes flow, test,
 security-name, and caller component scores plus a short rationale. The caller
 component tiers direct production fan-in, including callers of overridden
 members, at 1, 2–3, 4–15, and 16 or more callers; 16 or more adds
-`high-fan-in` to the rationale. `test_path_confidence=heuristic` and
+`high-fan-in` to the rationale. Terraform declarations count direct dependents
+as callers and have no test component, because Graphr does not index Terraform
+tests; their rationale starts with `test-paths-unmodeled`.
+`test_path_confidence=heuristic` and
 `test_path_provenance=resolved-static-call-graph` describe bounded static
 evidence, not runtime test proof; community and churn factors are not used.
 

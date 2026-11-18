@@ -2160,6 +2160,13 @@ resource "aws_subnet" "public" {
         changes.contains("dependent <-") && changes.contains("module.network"),
         "{changes}"
     );
+    assert!(
+        changes.contains(
+            "risk_components=flow:0.0000,test_paths:0.0000,security:0.0000,callers:0.0500 \
+             risk_rationale=test-paths-unmodeled+caller-impact "
+        ),
+        "{changes}"
+    );
     let dot = response_text(&client.changes_dot(3, 50));
     assert!(dot.contains("[label=\"depends on\"]"), "{dot}");
     client.close();
@@ -2197,6 +2204,17 @@ resource "aws_subnet" "public" {
     assert!(
         view.contains("target=\"module.network.subnet_id\""),
         "{view}"
+    );
+    let snapshot_id = client.snapshot_id.clone().unwrap();
+    let changes = capture_changes(&mut client, &snapshot_id, 3, 50)
+        .queries()
+        .map(|capture| capture.text.as_str())
+        .collect::<String>();
+    assert!(
+        changes.contains(
+            "broken_reference source=output.published@main.tf:7 target=module.network.subnet_id"
+        ),
+        "{changes}"
     );
     client.close();
 }

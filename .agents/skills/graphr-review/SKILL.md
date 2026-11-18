@@ -78,7 +78,7 @@ Treat `static_evidence_status` and `dynamic_evidence_status` as independent
 facts. Binary, oversized, unsafe, non-regular, type-changed, unmerged, cursor,
 and remediation failures make content coverage incomplete. Complete artifact
 coverage does not add indexed source languages: Graphr indexes Rust, Python,
-JavaScript/JSX, TypeScript/TSX, and C++.
+JavaScript/JSX, TypeScript/TSX, C++, and Terraform.
 
 If `inspect_root` reports `snapshot_matches_worktree=false`, the snapshot remains historical and immutable but no longer proves the selected live worktree was reviewed. Explicitly queue a fresh `index` for the same selected root/range/target and restart from its completed snapshot. If divergence repeats, stop; never fall back to a live diff or default checkout.
 

@@ -152,7 +152,9 @@ struct TerraformFile<'a> {
 impl TerraformFile<'_> {
     fn hcl(&mut self, body: Node<'_>) {
         let text = &self.source.text;
-        for block in named_children(body) {
+        let mut blocks = named_children(body);
+        blocks.reverse();
+        while let Some(block) = blocks.pop() {
             if block.kind() != "block" {
                 continue;
             }
@@ -271,6 +273,14 @@ impl TerraformFile<'_> {
                             0,
                         );
                     }
+                } else if kind == "check"
+                    && child.kind() == "block"
+                    && child
+                        .named_child(0)
+                        .is_some_and(|name| node_text(name, text) == "data")
+                {
+                    // Terraform keeps check-scoped data sources in the module's data namespace.
+                    blocks.push(child);
                 } else {
                     self.hcl_expression(&node, child, text, None, &mut Vec::new(), 0);
                 }
@@ -280,7 +290,12 @@ impl TerraformFile<'_> {
 
     fn json(&mut self, root: Node<'_>, parser: &mut Option<Parser>) -> Result<(), String> {
         let text = &self.source.text;
-        for (kind, _, value) in json_pairs(root, text) {
+        let mut blocks = json_pairs(root, text)
+            .into_iter()
+            .rev()
+            .map(|(kind, _, value)| (kind, value))
+            .collect::<Vec<_>>();
+        while let Some((kind, value)) = blocks.pop() {
             if kind == "terraform" {
                 self.json_provider_requirements(value, text);
                 continue;
@@ -288,7 +303,7 @@ impl TerraformFile<'_> {
             if kind == "locals" {
                 for (name, property, expression) in json_pairs(value, text) {
                     let node = self.declaration(property, format!("local.{name}"), None);
-                    self.json_expression(&node, expression, false, parser)?;
+                    self.json_expression(&node, expression, false, &mut Vec::new(), parser)?;
                 }
                 continue;
             }
@@ -378,14 +393,21 @@ impl TerraformFile<'_> {
                             self.json_provider_mappings(&node, &address, expression, text);
                             continue;
                         }
+                        if kind == "check" && name == "data" {
+                            // Terraform keeps check-scoped data sources in the module's data namespace.
+                            blocks.push(("data".to_owned(), expression));
+                            continue;
+                        }
                         let binding = local
                             .as_ref()
                             .and_then(|_| self.module_argument(&node, &address, &name, attr));
                         if !literal_hcl_argument(&kind, &name) {
+                            // Pass the pair so nested-block handling also sees top-level keys.
                             self.json_expression(
                                 binding.as_deref().unwrap_or(&node),
-                                expression,
+                                attr,
                                 name == "depends_on",
+                                &mut Vec::new(),
                                 parser,
                             )?;
                         }
@@ -757,15 +779,55 @@ impl TerraformFile<'_> {
         source: &str,
         root: Node<'_>,
         bare_reference: bool,
+        scope: &mut Vec<String>,
         parser: &mut Option<Parser>,
     ) -> Result<(), String> {
+        let text = &self.source.text;
         let mut pending = vec![root];
         while let Some(node) = pending.pop() {
             match node.kind() {
-                "pair" => pending.extend(node.child_by_field_name("value")),
+                "pair" => {
+                    let Some(value) = node.child_by_field_name("value") else {
+                        continue;
+                    };
+                    let key = node
+                        .child_by_field_name("key")
+                        .and_then(|key| json_string(key, text));
+                    match key.as_deref() {
+                        // Terraform reads these lifecycle strings as attribute
+                        // paths and bare references, not as templates.
+                        Some("ignore_changes") => {}
+                        Some("replace_triggered_by") => {
+                            self.json_expression(source, value, true, scope, parser)?;
+                        }
+                        // Each block binds its `iterator`, or else its label, for
+                        // the whole value. Recursion stays within the serde_json
+                        // nesting limit checked in `add_file`.
+                        Some("dynamic") => {
+                            let bound = scope.len();
+                            for (label, _, blocks) in json_objects(value)
+                                .into_iter()
+                                .flat_map(|labels| json_pairs(labels, text))
+                            {
+                                for block in json_objects(blocks) {
+                                    let iterator = json_pairs(block, text)
+                                        .into_iter()
+                                        .find(|(name, _, _)| name == "iterator")
+                                        .and_then(|(_, _, iterator)| json_string(iterator, text));
+                                    scope.push(iterator.unwrap_or_else(|| label.clone()));
+                                }
+                            }
+                            let result =
+                                self.json_expression(source, value, bare_reference, scope, parser);
+                            scope.truncate(bound);
+                            result?;
+                        }
+                        _ => pending.push(value),
+                    }
+                }
                 "array" | "object" => pending.extend(named_children(node).into_iter().rev()),
                 "string" => {
-                    let Some(value) = json_string(node, &self.source.text) else {
+                    let Some(value) = json_string(node, text) else {
                         continue;
                     };
                     if !bare_reference && !value.contains("${") && !value.contains("%{") {
@@ -789,14 +851,7 @@ impl TerraformFile<'_> {
                             .named_child(0)
                             .and_then(|attr| hcl_attribute(attr, &expression))
                     {
-                        self.hcl_expression(
-                            source,
-                            value,
-                            &expression,
-                            Some(line(node)),
-                            &mut Vec::new(),
-                            0,
-                        );
+                        self.hcl_expression(source, value, &expression, Some(line(node)), scope, 0);
                     } else {
                         self.gap(
                             Some(source),
@@ -1047,10 +1102,21 @@ fn lookup_key(directory: &str, address: &str) -> String {
     format!("terraform:{}:{directory}:{address}", directory.len())
 }
 
-pub(crate) fn lookup_address(key: &str) -> Option<(&str, &str)> {
+fn lookup_address(key: &str) -> Option<(&str, &str)> {
     let (size, remainder) = key.strip_prefix("terraform:")?.split_once(':')?;
     let (directory, address) = remainder.split_at_checked(size.parse().ok()?)?;
     Some((directory, address.strip_prefix(':')?))
+}
+
+/// Renders a lookup key as `directory:address`, or as the address at the
+/// repository root.
+pub(crate) fn display_key(key: &str) -> Option<String> {
+    let (directory, address) = lookup_address(key)?;
+    Some(if directory.is_empty() {
+        address.to_owned()
+    } else {
+        format!("{directory}:{address}")
+    })
 }
 
 fn module_directory(path: &str) -> &str {
@@ -1735,5 +1801,96 @@ resource "example" "dynamic" {
         assert_eq!(graph.gaps.len(), 1);
         assert_eq!(graph.gaps[0].reason, GapReason::TerraformModuleCycle);
         assert_eq!(graph.files[0].observed_relation_sites, 1);
+    }
+
+    /// Source declaration and target address of every dependency, sorted.
+    fn dependencies(graph: &Graph) -> Vec<(&str, &str)> {
+        let mut dependencies = graph
+            .refs
+            .iter()
+            .map(|reference| {
+                let source = graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.key == reference.source_key)
+                    .unwrap();
+                (
+                    source.name.as_str(),
+                    lookup_address(&reference.keys[0]).unwrap().1,
+                )
+            })
+            .collect::<Vec<_>>();
+        dependencies.sort_unstable();
+        dependencies
+    }
+
+    #[test]
+    fn check_scoped_data_sources_are_module_declarations() {
+        for (path, text) in [
+            (
+                "infra/main.tf",
+                r#"
+check "health" {
+  data "http" "probe" {
+    url = var.url
+  }
+  assert {
+    condition     = data.http.probe.status_code == 200
+    error_message = "down"
+  }
+}
+"#,
+            ),
+            (
+                "infra/main.tf.json",
+                r#"{"check": {"health": {
+  "data": {"http": {"probe": {"url": "${var.url}"}}},
+  "assert": [{"condition": "${data.http.probe.status_code == 200}", "error_message": "down"}]
+}}}"#,
+            ),
+        ] {
+            let mut graph = parse_source(&Source {
+                path: path.into(),
+                text: text.into(),
+            });
+            project_modules(&mut graph, &AtomicBool::new(false)).unwrap();
+            assert!(graph.gaps.is_empty(), "{path}");
+            assert_eq!(
+                dependencies(&graph),
+                [
+                    ("check.health", "data.http.probe"),
+                    ("data.http.probe", "var.url"),
+                ],
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_lifecycle_and_dynamic_blocks_follow_terraform_references() {
+        let mut graph = parse_source(&Source {
+            path: "infra/main.tf.json".into(),
+            text: r#"{"resource": {
+  "aws_instance": {"x": {"ami": "abc"}},
+  "aws_security_group": {"sg": {
+    "dynamic": {"ingress": [
+      {"for_each": "${var.ports}", "content": {"from_port": "${ingress.value}"}},
+      {"for_each": "${var.ports}", "iterator": "rule", "content": {"to_port": "${rule.value}"}}
+    ]},
+    "lifecycle": {"ignore_changes": ["tags"], "replace_triggered_by": ["aws_instance.x.id"]}
+  }}
+}}"#
+            .into(),
+        });
+        project_modules(&mut graph, &AtomicBool::new(false)).unwrap();
+        assert!(graph.gaps.is_empty());
+        assert_eq!(
+            dependencies(&graph),
+            [
+                ("aws_security_group.sg", "aws_instance.x"),
+                ("aws_security_group.sg", "var.ports"),
+                ("aws_security_group.sg", "var.ports"),
+            ]
+        );
     }
 }

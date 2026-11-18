@@ -1894,7 +1894,8 @@ fn graph_diff(
         output.push('@');
         push_escaped(&mut output, &shorten(path, API_FIELD_LIMIT), usize::MAX);
         output.push_str(&format!(":{line}"));
-        push_api_field(&mut output, "target", key);
+        let target = crate::terraform::display_key(key);
+        push_api_field(&mut output, "target", target.as_deref().unwrap_or(key));
         output.push('\n');
         records.push(output);
     }
@@ -2721,6 +2722,8 @@ struct NodeRisk {
     test_node: bool,
     test_gap: bool,
     indirect_test_covered: bool,
+    /// Graphr does not index tests for this kind, so test paths are not scored.
+    tests_unmodeled: bool,
 }
 
 type NodeRiskCounts = HashMap<i64, (u32, u32, bool)>;
@@ -3092,18 +3095,23 @@ fn analyze_changed_roots(
             .ok_or_else(|| "node risk counts are missing".to_owned())?;
         let is_test = node.kind == "test";
         let tests_apply = !is_test && node.kind != "terraform";
-        risks.insert(
-            root.id,
-            node_risk(
-                flow_score,
-                if is_test { 5 } else { tests },
-                security_sensitive(&node.name, &node.qualified_name),
-                callers,
-                is_test,
-                tests_apply && tests == 0,
-                tests_apply && tests > 0 && !directly_tested,
-            ),
+        let mut risk = node_risk(
+            flow_score,
+            if is_test { 5 } else { tests },
+            security_sensitive(&node.name, &node.qualified_name),
+            callers,
+            is_test,
+            tests_apply && tests == 0,
+            tests_apply && tests > 0 && !directly_tested,
         );
+        if !is_test && !tests_apply {
+            // Graphr does not index Terraform tests, so test paths neither add
+            // nor reduce risk.
+            risk.score -= risk.test_component;
+            risk.test_component = 0;
+            risk.tests_unmodeled = true;
+        }
+        risks.insert(root.id, risk);
     }
 
     Ok(ChangeAnalysis {
@@ -3614,7 +3622,7 @@ fn node_risk_counts(connection: &Connection, ids: &[i64]) -> Result<(NodeRiskCou
          )
          SELECT changed.id,
                 (SELECT count(DISTINCT source_id) FROM edges
-                  WHERE kind='CALLS'
+                  WHERE kind IN ('CALLS','DEPENDS_ON')
                     AND (target_id=changed.id
                          OR target_id IN (SELECT base_id FROM overrides
                                            WHERE member_id=changed.id))),
@@ -3827,6 +3835,7 @@ fn node_risk(
         test_node,
         test_gap,
         indirect_test_covered,
+        tests_unmodeled: false,
     }
 }
 
@@ -3891,6 +3900,8 @@ fn risk_metadata(risk: Option<&NodeRisk>) -> String {
         "no-static-test-path".to_owned()
     } else if risk.indirect_test_covered {
         "indirect-test-coverage".to_owned()
+    } else if risk.tests_unmodeled {
+        "test-paths-unmodeled".to_owned()
     } else {
         "direct-test-coverage".to_owned()
     };
@@ -4128,13 +4139,9 @@ fn static_gap_records(connection: &Connection, scope: &CoverageScope) -> Result<
             if matches!(
                 reason,
                 GapReason::UnresolvedDependency | GapReason::AmbiguousDependency
-            ) && let Some((directory, address)) = crate::terraform::lookup_address(&target)
+            ) && let Some(address) = crate::terraform::display_key(&target)
             {
-                return if directory.is_empty() {
-                    address.to_owned()
-                } else {
-                    format!("{directory}:{address}")
-                };
+                return address;
             }
             target
         });
@@ -13138,6 +13145,7 @@ mod tests {
                     test_node: false,
                     test_gap: false,
                     indirect_test_covered: false,
+                    tests_unmodeled: false,
                 },
             )]),
             flows: vec![
@@ -13356,6 +13364,7 @@ mod tests {
                     test_node: false,
                     test_gap: false,
                     indirect_test_covered: false,
+                    tests_unmodeled: false,
                 },
             )]),
             flows: vec![AffectedFlow {
@@ -13501,6 +13510,7 @@ mod tests {
                     test_node: false,
                     test_gap: false,
                     indirect_test_covered: false,
+                    tests_unmodeled: false,
                 },
             );
             flows.push(AffectedFlow {
@@ -13613,6 +13623,7 @@ mod tests {
                         test_node: false,
                         test_gap: false,
                         indirect_test_covered: false,
+                        tests_unmodeled: false,
                     },
                 )]),
                 flows,
