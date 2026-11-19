@@ -1,9 +1,9 @@
 [package]
 name = "graphr"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.97.1"
-description = "Fast, compact Rust, Python, JavaScript, TypeScript, and C++ code graphs for AI code review over MCP stdio"
+description = "Fast, compact Rust, Python, JavaScript, TypeScript, C++, and Terraform code graphs for AI code review over MCP stdio"
 license = "MIT"
 repository = "https://github.com/f3rmion/graphr"
 readme = "README.md"
