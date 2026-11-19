@@ -1470,7 +1470,7 @@ fn completeness_reports_direct_static_calls_without_legacy_fields() {
     let output = complete_graph_pages(&mut client, output, 6, 50);
 
     for expected in [
-        "languages=rust,python,javascript,typescript,cpp",
+        "languages=rust,python,javascript,typescript,cpp,terraform",
         "completeness content_capture=complete source_capture=complete syntax_parse=complete site_classification=complete static_model=complete evidence_capture=not-applicable provenance_model=not-applicable execution_mapping=not-applicable traversal=complete",
         "claim kind=affected-callers status=complete basis=resolved-static-call-graph",
         "claim kind=affected-flows status=complete basis=resolved-static-call-graph",
@@ -2025,6 +2025,542 @@ fn cpp_index_search_view_and_changes_over_mcp() {
         "WorkerTest.Runs",
     ] {
         assert!(changes.contains(expected), "missing {expected}: {changes}");
+    }
+    client.close();
+}
+
+#[test]
+fn terraform_review_follows_dependencies_across_files_and_local_modules() {
+    let fixture = Fixture::new();
+    let root = &fixture.path;
+    let files = [
+        (
+            "network.tf",
+            "resource \"aws_vpc\" \"main\" { cidr_block = \"10.0.0.0/16\" }\n",
+        ),
+        (
+            "child/main.tf",
+            r#"
+variable "vpc" {}
+resource "aws_subnet" "public" {
+  vpc_id = var.vpc
+}
+output "subnet_id" {
+  value = aws_subnet.public.id
+}
+"#,
+        ),
+        (
+            "main.tf",
+            r#"
+module "network" {
+  source = "./child"
+  vpc = aws_vpc.main.id
+}
+output "published" {
+  value = "subnet-${module.network.subnet_id}"
+}
+"#,
+        ),
+        (
+            "root.tf.json",
+            r#"{
+  "resource": {
+    "aws_route_table": {
+      "isolated": {
+        "vpc_id": "${aws_vpc.main.id}",
+        "depends_on": ["module.network"]
+      }
+    }
+  },
+  "locals": [{"keyed": {"${aws_vpc.main.id}": "x"}}, {"chained": "${local.keyed}"}]
+}"#,
+        ),
+        (
+            "locals.tf.json",
+            r#"{"locals": {"single": "${local.chained}"}}"#,
+        ),
+        (
+            "other/isolated.tf",
+            r#"
+resource "aws_vpc" "main" {}
+resource "aws_subnet" "public" {
+  vpc_id = aws_vpc.main.id
+}
+"#,
+        ),
+    ];
+    for (path, contents) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    init_git(root);
+    git(root, &["add", "."]);
+    git_commit(root, "Terraform baseline");
+    index_repository(root);
+    fs::write(
+        root.join("network.tf"),
+        "resource \"aws_vpc\" \"main\" { cidr_block = \"10.1.0.0/16\" }\n",
+    )
+    .unwrap();
+
+    let mut client = Client::start(root);
+    let snapshot_id = client.snapshot_id.clone().unwrap();
+    let search_node = |client: &mut Client, name, file: &str| {
+        let result = response_text(&client.search(name, Some("terraform")));
+        result
+            .lines()
+            .find(|line| line.contains(&format!(" {file}:")))
+            .unwrap_or_else(|| panic!("missing {name} in {file}: {result}"))
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let vpc = search_node(&mut client, "aws_vpc.main", "network.tf");
+    let child = search_node(&mut client, "aws_subnet.public", "child/main.tf");
+    let publish = search_node(&mut client, "output.published", "main.tf");
+
+    let impact = response_text(&client.call(
+        "impact",
+        rmcp::serde_json::json!({
+            "snapshot_id": snapshot_id, "node_ref": vpc, "depth": 6
+        }),
+    ));
+    for expected in [
+        "module.network main.tf:",
+        "output.published main.tf:",
+        "aws_route_table.isolated root.tf.json:",
+        "local.keyed root.tf.json:",
+        "local.chained root.tf.json:",
+        "local.single locals.tf.json:",
+    ] {
+        assert!(impact.contains(expected), "{impact}");
+    }
+    assert!(!impact.contains("other/isolated.tf"), "{impact}");
+    let path = response_text(&client.call(
+        "path",
+        rmcp::serde_json::json!({
+            "snapshot_id": snapshot_id, "from_ref": publish, "to_ref": child,
+        }),
+    ));
+    assert!(
+        path.contains("depends-on ->") && path.contains("output.subnet_id"),
+        "{path}"
+    );
+    let view = client.view(&child, 1, 30);
+    assert!(
+        view.contains("depends-on ->") && view.contains("var.vpc"),
+        "{view}"
+    );
+
+    let captured = capture_changes(&mut client, &snapshot_id, 3, 50);
+    let changes = captured
+        .queries()
+        .map(|capture| capture.text.as_str())
+        .collect::<String>();
+    assert!(
+        changes.contains("changed source terraform network.tf"),
+        "{changes}"
+    );
+    assert!(
+        changes.contains("dependent <-") && changes.contains("module.network"),
+        "{changes}"
+    );
+    assert!(
+        changes.contains(
+            "risk_components=flow:0.0000,test_paths:0.0000,security:0.0000,callers:0.0500 \
+             risk_rationale=test-paths-unmodeled+caller-impact "
+        ),
+        "{changes}"
+    );
+    let dot = response_text(&client.changes_dot(3, 50));
+    assert!(dot.contains("[label=\"depends on\"]"), "{dot}");
+    client.close();
+
+    let fresh = Fixture::new();
+    init_git(&fresh.path);
+    for (path, contents) in files {
+        let target = fresh.path.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, contents).unwrap();
+    }
+    git(&fresh.path, &["add", "."]);
+    git_commit(&fresh.path, "Fresh Terraform baseline");
+    fs::copy(root.join("network.tf"), fresh.path.join("network.tf")).unwrap();
+    // Remove a declaration referenced by an unchanged parent file.
+    for path in [root, &fresh.path] {
+        fs::write(path.join("child/main.tf"), "variable \"vpc\" {}\n").unwrap();
+    }
+    assert_immutable_graphs_match(root, &fresh.path);
+    assert_eq!(
+        named_edge_kind_count(
+            root,
+            "main.tf",
+            "output.published",
+            "child/main.tf",
+            "output.subnet_id",
+            "DEPENDS_ON"
+        ),
+        0,
+    );
+    let mut client = Client::start(root);
+    let publish = search_node(&mut client, "output.published", "main.tf");
+    let view = response_text(&client.view(&publish, 1, 30));
+    assert!(view.contains("reason=unresolved-dependency"), "{view}");
+    assert!(
+        view.contains("target=\"module.network.subnet_id\""),
+        "{view}"
+    );
+    let snapshot_id = client.snapshot_id.clone().unwrap();
+    let changes = capture_changes(&mut client, &snapshot_id, 3, 50)
+        .queries()
+        .map(|capture| capture.text.as_str())
+        .collect::<String>();
+    assert!(
+        changes.contains(
+            "broken_reference source=output.published@main.tf:7 target=module.network.subnet_id"
+        ),
+        "{changes}"
+    );
+    client.close();
+}
+
+#[test]
+fn terraform_module_calls_keep_nested_input_paths_separate() {
+    let fixture = Fixture::new();
+    let root = &fixture.path;
+    let prod = r#"
+module "prod" {
+  source = "./modules/network"
+  vpc = aws_vpc.prod.id
+  depends_on = [aws_vpc.prerequisite]
+}
+output "prod_id" {
+  value = module.prod.subnet_id
+}
+resource "terraform_data" "watcher" {
+  depends_on = [module.prod]
+}
+"#;
+    let files = [
+        ("prod.tf", prod),
+        (
+            "vpcs.tf",
+            r#"
+resource "aws_vpc" "prod" {
+  cidr_block = "10.0.0.0/16"
+}
+resource "aws_vpc" "staging" {}
+resource "aws_vpc" "prerequisite" {}
+"#,
+        ),
+        (
+            "staging.tf.json",
+            r#"{
+  "module": {
+    "staging": {
+      "source": "./modules/network",
+      "vpc": "${aws_vpc.staging.id}"
+    }
+  },
+  "output": {
+    "staging_id": {"value": "${module.staging.subnet_id}"}
+  }
+}"#,
+        ),
+        (
+            "modules/network/main.tf",
+            r#"
+variable "vpc" {}
+module "subnet" {
+  source = "../subnet"
+  vpc = var.vpc
+}
+output "subnet_id" {
+  value = module.subnet.id
+}
+"#,
+        ),
+        (
+            "modules/subnet/main.tf",
+            r#"
+variable "vpc" {}
+resource "aws_subnet" "private" {
+  vpc_id = var.vpc
+}
+output "id" {
+  value = aws_subnet.private.id
+}
+"#,
+        ),
+    ];
+    for (path, contents) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    init_git(root);
+    git(root, &["add", "."]);
+    git_commit(root, "Terraform modules baseline");
+    index_repository(root);
+    let vpcs = fs::read_to_string(root.join("vpcs.tf")).unwrap();
+    fs::write(root.join("vpcs.tf"), vpcs.replace("10.0.0.0", "10.1.0.0")).unwrap();
+
+    let mut client = Client::start(root);
+    let node = |client: &mut Client, address: &str| {
+        let search = response_text(&client.search(address, Some("terraform")));
+        search
+            .lines()
+            .find(|line| line.contains(&format!(" Terraform {address} ")))
+            .unwrap_or_else(|| panic!("missing {address}: {search}"))
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let impact = |client: &mut Client, address: &str| {
+        let node_ref = node(client, address);
+        let snapshot_id = client.snapshot_id.clone().unwrap();
+        response_text(&client.call(
+            "impact",
+            rmcp::serde_json::json!({"snapshot_id": snapshot_id, "node_ref": node_ref, "depth": 6}),
+        ))
+    };
+    let prod_impact = impact(&mut client, "aws_vpc.prod");
+    assert!(
+        prod_impact.contains("module.prod.module.subnet.aws_subnet.private"),
+        "{prod_impact}"
+    );
+    assert!(!prod_impact.contains("module.staging"), "{prod_impact}");
+    let prerequisite = impact(&mut client, "aws_vpc.prerequisite");
+    assert!(
+        prerequisite.contains("module.prod.module.subnet.aws_subnet.private"),
+        "{prerequisite}"
+    );
+    assert!(!prerequisite.contains("module.staging"), "{prerequisite}");
+    let child = impact(&mut client, "module.prod.module.subnet.aws_subnet.private");
+    assert!(child.contains("terraform_data.watcher"), "{child}");
+
+    let snapshot_id = client.snapshot_id.clone().unwrap();
+    let from_ref = node(&mut client, "output.prod_id");
+    let to_ref = node(&mut client, "aws_vpc.prod");
+    let path = response_text(&client.call(
+        "path",
+        rmcp::serde_json::json!({"snapshot_id": snapshot_id, "from_ref": from_ref, "to_ref": to_ref, "max_hops": 8}),
+    ));
+    assert!(
+        path.contains("module.prod.input.vpc")
+            && path.contains("module.prod.module.subnet.aws_subnet.private"),
+        "{path}"
+    );
+    assert!(!path.contains("module.staging"), "{path}");
+
+    let dot = response_text(&client.changes_dot(6, 50));
+    assert!(
+        dot.contains("module.prod.module.subnet.aws_subnet.private"),
+        "{dot}"
+    );
+    assert!(!dot.contains("module.staging"), "{dot}");
+
+    fs::write(
+        root.join("prod.tf"),
+        prod.replace("aws_vpc.prod.id", "aws_vpc.staging.id"),
+    )
+    .unwrap();
+    client.index_and_wait("boundary");
+    let old = impact(&mut client, "aws_vpc.prod");
+    assert!(!old.contains("module.prod"), "{old}");
+    let new = impact(&mut client, "aws_vpc.staging");
+    for address in [
+        "module.prod.module.subnet.aws_subnet.private",
+        "module.staging.module.subnet.aws_subnet.private",
+    ] {
+        assert!(new.contains(address), "{new}");
+    }
+    client.close();
+}
+
+#[test]
+fn terraform_provider_aliases_follow_their_module_calls() {
+    let fixture = Fixture::new();
+    let root = &fixture.path;
+    let providers = r#"{
+  "terraform": {
+    "required_providers": {
+      "ops": {"source": "hashicorp/aws"}
+    }
+  },
+  "provider": {
+    "ops": [
+      {"region": "us-east-2"},
+      {"alias": "replica", "region": "us-west-2"}
+    ]
+  },
+  "data": {
+    "aws_region": {
+      "replica": {"provider": "ops.replica"}
+    }
+  }
+}
+"#;
+    let staging = r#"{
+  "module": {
+    "staging": {
+      "source": "./modules/network",
+      "providers": {"aws": "ops.replica", "aws.peer": "ops.audit"}
+    }
+  }
+}
+"#;
+    let files = [
+        ("providers.tf.json", providers),
+        ("staging.tf.json", staging),
+        (
+            "prod.tf",
+            r#"
+provider "ops" {
+  alias = "primary"
+  region = "us-east-1"
+}
+provider "ops" {
+  alias = "audit"
+  region = "us-west-1"
+}
+module "prod" {
+  source = "./modules/network"
+  providers = { aws = ops.primary, aws.peer = ops.audit }
+}
+module "inherited" {
+  source = "./modules/leaf"
+}
+data "aws_region" "primary" {
+  provider = ops.primary
+}
+"#,
+        ),
+        (
+            "modules/network/main.tf",
+            r#"
+terraform {
+  required_providers {
+    aws = {
+      source = "registry.terraform.io/hashicorp/aws"
+      configuration_aliases = [aws.peer]
+    }
+  }
+}
+module "implicit" {
+  source = "../leaf"
+}
+module "forwarded" {
+  source = "../leaf"
+  providers = { aws = aws.peer }
+}
+data "aws_caller_identity" "peer" {
+  provider = aws.peer
+}
+"#,
+        ),
+        (
+            "modules/leaf/main.tf",
+            r#"
+resource "aws_s3_bucket" "logs" {}
+"#,
+        ),
+    ];
+    for (path, contents) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    init_git(root);
+    git(root, &["add", "."]);
+    git_commit(root, "Terraform provider baseline");
+    index_repository(root);
+    fs::write(
+        root.join("providers.tf.json"),
+        providers.replace("us-west-2", "us-east-1"),
+    )
+    .unwrap();
+
+    let mut client = Client::start(root);
+    let impact = |client: &mut Client, address: &str| {
+        let search = response_text(&client.search(address, Some("terraform")));
+        let node_ref = search
+            .lines()
+            .find(|line| line.contains(&format!(" Terraform {address} ")))
+            .unwrap_or_else(|| panic!("missing {address}: {search}"))
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let snapshot_id = client.snapshot_id.clone().unwrap();
+        response_text(&client.call(
+            "impact",
+            rmcp::serde_json::json!({
+                "snapshot_id": snapshot_id, "node_ref": node_ref, "depth": 6,
+            }),
+        ))
+    };
+
+    let replica = impact(&mut client, "provider.ops.replica");
+    for expected in [
+        "data.aws_region.replica",
+        "module.staging.providers.aws",
+        "module.staging.module.implicit.aws_s3_bucket.logs",
+    ] {
+        assert!(replica.contains(expected), "{replica}");
+    }
+    assert!(!replica.contains("module.prod"), "{replica}");
+    assert!(
+        !replica.contains("module.staging.module.forwarded"),
+        "{replica}"
+    );
+
+    let audit = impact(&mut client, "provider.ops.audit");
+    for expected in [
+        "module.prod.data.aws_caller_identity.peer",
+        "module.staging.data.aws_caller_identity.peer",
+        "module.prod.module.forwarded.aws_s3_bucket.logs",
+        "module.staging.module.forwarded.aws_s3_bucket.logs",
+    ] {
+        assert!(audit.contains(expected), "{audit}");
+    }
+    assert!(!audit.contains(".module.implicit."), "{audit}");
+
+    let default = impact(&mut client, "provider.ops");
+    assert!(
+        default.contains("module.inherited.aws_s3_bucket.logs"),
+        "{default}"
+    );
+    assert!(
+        !default.contains("module.staging") && !default.contains("module.prod"),
+        "{default}"
+    );
+
+    let dot = response_text(&client.changes_dot(4, 50));
+    assert!(
+        dot.contains("module.staging.module.implicit.aws_s3_bucket.logs"),
+        "{dot}"
+    );
+    assert!(!dot.contains("module.prod"), "{dot}");
+
+    fs::write(
+        root.join("staging.tf.json"),
+        staging.replace("ops.replica", "ops.primary"),
+    )
+    .unwrap();
+    client.index_and_wait("boundary");
+    let old = impact(&mut client, "provider.ops.replica");
+    assert!(!old.contains("module.staging"), "{old}");
+    let new = impact(&mut client, "provider.ops.primary");
+    for expected in [
+        "data.aws_region.primary",
+        "module.prod.module.implicit.aws_s3_bucket.logs",
+        "module.staging.module.implicit.aws_s3_bucket.logs",
+    ] {
+        assert!(new.contains(expected), "{new}");
     }
     client.close();
 }

@@ -554,7 +554,7 @@ pub(crate) fn add_file(
         node_keys.push(identity(
             language,
             &source.path,
-            kind_name(kind),
+            kind.db(),
             &path,
             definition.line_start,
             ordinal,
@@ -1480,15 +1480,6 @@ fn node_kind(kind: DefinitionKind) -> NodeKind {
         DefinitionKind::Class | DefinitionKind::Type { .. } => NodeKind::Type,
         DefinitionKind::Function | DefinitionKind::Method => NodeKind::Function,
         DefinitionKind::Test(_) => NodeKind::Test,
-    }
-}
-
-fn kind_name(kind: NodeKind) -> &'static str {
-    match kind {
-        NodeKind::File => "file",
-        NodeKind::Type => "type",
-        NodeKind::Function => "function",
-        NodeKind::Test => "test",
     }
 }
 
