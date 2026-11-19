@@ -2072,8 +2072,13 @@ output "published" {
         "depends_on": ["module.network"]
       }
     }
-  }
+  },
+  "locals": [{"keyed": {"${aws_vpc.main.id}": "x"}}, {"chained": "${local.keyed}"}]
 }"#,
+        ),
+        (
+            "locals.tf.json",
+            r#"{"locals": {"single": "${local.chained}"}}"#,
         ),
         (
             "other/isolated.tf",
@@ -2127,6 +2132,9 @@ resource "aws_subnet" "public" {
         "module.network main.tf:",
         "output.published main.tf:",
         "aws_route_table.isolated root.tf.json:",
+        "local.keyed root.tf.json:",
+        "local.chained root.tf.json:",
+        "local.single locals.tf.json:",
     ] {
         assert!(impact.contains(expected), "{impact}");
     }

@@ -301,7 +301,10 @@ impl TerraformFile<'_> {
                 continue;
             }
             if kind == "locals" {
-                for (name, property, expression) in json_pairs(value, text) {
+                for (name, property, expression) in json_objects(value)
+                    .into_iter()
+                    .flat_map(|block| json_pairs(block, text))
+                {
                     let node = self.declaration(property, format!("local.{name}"), None);
                     self.json_expression(&node, expression, false, &mut Vec::new(), parser)?;
                 }
@@ -865,7 +868,13 @@ impl TerraformFile<'_> {
         let mut pending = vec![root];
         while let Some(node) = pending.pop() {
             match node.kind() {
-                "pair" => pending.extend(node.child_by_field_name("value")),
+                // Terraform reads object keys in expressions as string templates.
+                "pair" => pending.extend(
+                    ["value", "key"]
+                        .map(|field| node.child_by_field_name(field))
+                        .into_iter()
+                        .flatten(),
+                ),
                 "array" | "object" => pending.extend(named_children(node).into_iter().rev()),
                 "string" => {
                     let Some(value) = json_string(node, text) else {
@@ -1950,6 +1959,32 @@ check "health" {
                 ("aws_security_group.sg", "var.ports"),
                 ("aws_security_group.sg", "var.ports"),
                 ("aws_security_group.sg", "var.team"),
+            ]
+        );
+    }
+
+    #[test]
+    fn json_locals_blocks_and_templated_object_keys_keep_references() {
+        let mut graph = parse_source(&Source {
+            path: "infra/main.tf.json".into(),
+            text: r#"{
+  "locals": [
+    {"a": "${var.input}", "map": {"${var.key}": "value"}},
+    {"b": "${local.a}"}
+  ],
+  "output": {"result": {"value": "${local.b}"}}
+}"#
+            .into(),
+        });
+        project_modules(&mut graph, &AtomicBool::new(false)).unwrap();
+        assert!(graph.gaps.is_empty());
+        assert_eq!(
+            dependencies(&graph),
+            [
+                ("local.a", "var.input"),
+                ("local.b", "local.a"),
+                ("local.map", "var.key"),
+                ("output.result", "local.b"),
             ]
         );
     }
