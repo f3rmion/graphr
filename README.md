@@ -353,7 +353,8 @@ GoogleTest or Catch2/doctest test cases. Graphr does not preprocess source, read
 receiver types, or choose between overloads; ambiguous targets produce no edge.
 
 Terraform links resources, data sources, ephemeral resources, inputs, locals,
-outputs, and module calls using expression references and `depends_on`. Each
+outputs, checks, and module calls using expression references and
+`depends_on`, including deprecated quoted references. Each
 configuration root has its own Terraform address space. For a relative module
 source in the snapshot, each call gets its own copies of the child declarations.
 For example, `module.prod.input.vpc` is the argument at the call site and
@@ -370,8 +371,9 @@ different local names. For example, `impact` on `provider.aws.replica` follows
 only the calls and resources that use that configuration.
 
 Terraform analysis works at the declaration level, including references with
-indexes and splats. Graphr reports coverage gaps for override files, external
-or computed module sources, recursive module calls, and bounded expansions.
+indexes and splats. Graphr reports coverage gaps for override files, `import`
+blocks, external or computed module sources, recursive module calls, bounded
+expansions, and provider sources it cannot normalize.
 In JSON configuration, Graphr reads `dynamic` and `lifecycle` as blocks only
 directly in a declaration body or in `dynamic` content; deeper objects can be
 map values, so an iterator used there reports an unresolved dependency.

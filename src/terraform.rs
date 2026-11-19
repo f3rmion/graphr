@@ -129,7 +129,7 @@ pub(crate) fn add_file(
                 .into_iter()
                 .find(|node| node.kind() == "body")
             {
-                file.hcl(body);
+                file.hcl(body, &mut parsers.hcl)?;
             } else if !root.has_error() && !named_children(root).is_empty() {
                 file.gap(None, 1, line_end, GapReason::ParserError, false);
             }
@@ -150,7 +150,7 @@ struct TerraformFile<'a> {
 }
 
 impl TerraformFile<'_> {
-    fn hcl(&mut self, body: Node<'_>) {
+    fn hcl(&mut self, body: Node<'_>, parser: &mut Option<Parser>) -> Result<(), String> {
         let text = &self.source.text;
         let mut blocks = named_children(body);
         blocks.reverse();
@@ -163,14 +163,7 @@ impl TerraformFile<'_> {
                 continue;
             };
             let kind = node_text(*first, text);
-            let labels = children
-                .iter()
-                .copied()
-                .skip(1)
-                .take_while(|child| child.kind() != "block_start")
-                .map(|child| decode_label(child, text))
-                .collect::<Option<Vec<_>>>();
-            let Some(labels) = labels else {
+            let Some(labels) = hcl_labels(block, text) else {
                 self.gap(
                     None,
                     line(block),
@@ -194,6 +187,10 @@ impl TerraformFile<'_> {
                         self.hcl_expression(&node, expression, text, None, &mut Vec::new(), 0);
                     }
                 }
+                continue;
+            }
+            if kind == "import" {
+                self.import_gap(block);
                 continue;
             }
             let attributes = body.map_or_else(Vec::new, named_children);
@@ -263,15 +260,11 @@ impl TerraformFile<'_> {
                     let binding = local
                         .as_ref()
                         .and_then(|_| self.module_argument(&node, &address, name, child));
-                    if !literal_hcl_argument(kind, name) {
-                        self.hcl_expression(
-                            binding.as_deref().unwrap_or(&node),
-                            expression,
-                            text,
-                            None,
-                            &mut Vec::new(),
-                            0,
-                        );
+                    let dependent = binding.as_deref().unwrap_or(&node);
+                    if name == "depends_on" {
+                        self.hcl_depends_on(dependent, expression, text, parser)?;
+                    } else if !literal_hcl_argument(kind, name) {
+                        self.hcl_expression(dependent, expression, text, None, &mut Vec::new(), 0);
                     }
                 } else if kind == "check"
                     && child.kind() == "block"
@@ -279,13 +272,21 @@ impl TerraformFile<'_> {
                         .named_child(0)
                         .is_some_and(|name| node_text(name, text) == "data")
                 {
-                    // Terraform keeps check-scoped data sources in the module's data namespace.
+                    // Terraform keeps check-scoped data sources in the module's
+                    // data namespace, and the check depends on each of them.
+                    if let Some(labels) = hcl_labels(child, text)
+                        && let [data_type, name] = labels.as_slice()
+                    {
+                        let address = format!("data.{data_type}.{name}");
+                        self.reference(&node, lookup_key(self.directory, &address), line(child));
+                    }
                     blocks.push(child);
                 } else {
                     self.hcl_expression(&node, child, text, None, &mut Vec::new(), 0);
                 }
             }
         }
+        Ok(())
     }
 
     fn json(&mut self, root: Node<'_>, parser: &mut Option<Parser>) -> Result<(), String> {
@@ -307,6 +308,12 @@ impl TerraformFile<'_> {
                 {
                     let node = self.declaration(property, format!("local.{name}"), None);
                     self.json_expression(&node, expression, false, &mut Vec::new(), parser)?;
+                }
+                continue;
+            }
+            if kind == "import" {
+                for block in json_objects(value) {
+                    self.import_gap(block);
                 }
                 continue;
             }
@@ -397,7 +404,24 @@ impl TerraformFile<'_> {
                             continue;
                         }
                         if kind == "check" && name == "data" {
-                            // Terraform keeps check-scoped data sources in the module's data namespace.
+                            // Terraform keeps check-scoped data sources in the module's
+                            // data namespace, and the check depends on each of them.
+                            for (data_type, _, names) in json_objects(expression)
+                                .into_iter()
+                                .flat_map(|types| json_pairs(types, text))
+                            {
+                                for (name, property, _) in json_objects(names)
+                                    .into_iter()
+                                    .flat_map(|names| json_pairs(names, text))
+                                {
+                                    let address = format!("data.{data_type}.{name}");
+                                    self.reference(
+                                        &node,
+                                        lookup_key(self.directory, &address),
+                                        line(property),
+                                    );
+                                }
+                            }
                             blocks.push(("data".to_owned(), expression));
                             continue;
                         }
@@ -510,9 +534,9 @@ impl TerraformFile<'_> {
                     for (_, key, source) in hcl_object_pairs(value).unwrap_or_default() {
                         if (node_text(key, text) == "source"
                             || hcl_string(key, text).as_deref() == Some("source"))
-                            && let Some(source) = hcl_string(source, text)
+                            && let Some(address) = hcl_string(source, text)
                         {
-                            self.provider_requirement(local, &source);
+                            self.provider_requirement(local, &address, source);
                         }
                     }
                 }
@@ -532,8 +556,8 @@ impl TerraformFile<'_> {
                             .into_iter()
                             .filter(|(key, _, _)| key == "source")
                         {
-                            if let Some(source) = json_string(source, text) {
-                                self.provider_requirement(&local, &source);
+                            if let Some(address) = json_string(source, text) {
+                                self.provider_requirement(&local, &address, source);
                             }
                         }
                     }
@@ -542,10 +566,15 @@ impl TerraformFile<'_> {
         }
     }
 
-    fn provider_requirement(&mut self, local: &str, source: &str) {
-        if terraform_identifier(local)
-            && let Some(provider) = normalized_provider_source(source)
-        {
+    fn provider_requirement(&mut self, local: &str, source: &str, span: Node<'_>) {
+        if terraform_identifier(local) {
+            // An explicit source never falls back to the implied
+            // `hashicorp/<local>`; one Graphr cannot normalize keeps its own
+            // lowercased identity and reports a gap.
+            let provider = normalized_provider_source(source).unwrap_or_else(|| {
+                self.provider_gap(None, span);
+                source.to_ascii_lowercase()
+            });
             self.graph.nodes[self.file_node]
                 .keys
                 .push(format!("{PROVIDER_SOURCE_KEY}{local}:{provider}"));
@@ -654,6 +683,18 @@ impl TerraformFile<'_> {
             line(node),
             end_line(node),
             GapReason::TerraformProviderUnmodeled,
+            true,
+        );
+    }
+
+    /// Graphr does not model `import` blocks, whose expressions Terraform
+    /// evaluates for the target resource.
+    fn import_gap(&mut self, block: Node<'_>) {
+        self.gap(
+            None,
+            line(block),
+            end_line(block),
+            GapReason::TerraformImportUnmodeled,
             true,
         );
     }
@@ -883,37 +924,51 @@ impl TerraformFile<'_> {
                     if !bare_reference && !value.contains("${") && !value.contains("%{") {
                         continue;
                     }
-                    let expression = if bare_reference {
-                        format!("value = {value}\n")
-                    } else {
-                        let mut marker = "GRAPHR_TEMPLATE".to_owned();
-                        while value.lines().any(|line| line.trim() == marker) {
-                            marker.push('_');
-                        }
-                        format!("value = <<{marker}\n{value}\n{marker}\n")
-                    };
-                    if let Some(tree) =
-                        parse(parser, || tree_sitter_hcl::LANGUAGE.into(), &expression)?
-                        && !tree.root_node().has_error()
-                        && let Some(body) = tree.root_node().named_child(0)
-                        && body.named_child_count() == 1
-                        && let Some((_, value)) = body
-                            .named_child(0)
-                            .and_then(|attr| hcl_attribute(attr, &expression))
-                    {
-                        self.hcl_expression(source, value, &expression, Some(line(node)), scope, 0);
-                    } else {
-                        self.gap(
-                            Some(source),
-                            line(node),
-                            end_line(node),
-                            GapReason::ParserError,
-                            true,
-                        );
-                    }
+                    self.string_expression(source, &value, node, bare_reference, scope, parser)?;
                 }
                 _ => {}
             }
+        }
+        Ok(())
+    }
+
+    /// Parses a string Terraform evaluates as a bare reference or a template,
+    /// attributing its references to the line of `span`.
+    fn string_expression(
+        &mut self,
+        source: &str,
+        value: &str,
+        span: Node<'_>,
+        bare_reference: bool,
+        scope: &mut Vec<String>,
+        parser: &mut Option<Parser>,
+    ) -> Result<(), String> {
+        let expression = if bare_reference {
+            format!("value = {value}\n")
+        } else {
+            let mut marker = "GRAPHR_TEMPLATE".to_owned();
+            while value.lines().any(|line| line.trim() == marker) {
+                marker.push('_');
+            }
+            format!("value = <<{marker}\n{value}\n{marker}\n")
+        };
+        if let Some(tree) = parse(parser, || tree_sitter_hcl::LANGUAGE.into(), &expression)?
+            && !tree.root_node().has_error()
+            && let Some(body) = tree.root_node().named_child(0)
+            && body.named_child_count() == 1
+            && let Some((_, value)) = body
+                .named_child(0)
+                .and_then(|attr| hcl_attribute(attr, &expression))
+        {
+            self.hcl_expression(source, value, &expression, Some(line(span)), scope, 0);
+        } else {
+            self.gap(
+                Some(source),
+                line(span),
+                end_line(span),
+                GapReason::ParserError,
+                true,
+            );
         }
         Ok(())
     }
@@ -932,6 +987,27 @@ impl TerraformFile<'_> {
             _ => return,
         };
         self.reference(source, lookup_key(self.directory, &address), line);
+    }
+
+    /// Terraform still accepts deprecated quoted references in `depends_on`.
+    fn hcl_depends_on(
+        &mut self,
+        source: &str,
+        expression: Node<'_>,
+        text: &str,
+        parser: &mut Option<Parser>,
+    ) -> Result<(), String> {
+        let elements = hcl_collection(expression)
+            .filter(|node| node.kind() == "tuple")
+            .map_or_else(|| vec![expression], named_children);
+        for element in elements {
+            if let Some(reference) = hcl_string(element, text) {
+                self.string_expression(source, &reference, element, true, &mut Vec::new(), parser)?;
+            } else {
+                self.hcl_expression(source, element, text, None, &mut Vec::new(), 0);
+            }
+        }
+        Ok(())
     }
 
     fn reference(&mut self, source: &str, key: String, line: u32) {
@@ -957,9 +1033,9 @@ impl TerraformFile<'_> {
             line_end: Some(end),
             category: match reason {
                 GapReason::ExternalDependency => GapCategory::Boundary,
-                GapReason::DynamicOrUnsupportedDispatch | GapReason::TerraformProviderUnmodeled => {
-                    GapCategory::Relation
-                }
+                GapReason::DynamicOrUnsupportedDispatch
+                | GapReason::TerraformProviderUnmodeled
+                | GapReason::TerraformImportUnmodeled => GapCategory::Relation,
                 GapReason::TerraformOverride => GapCategory::Language,
                 _ => GapCategory::Parse,
             },
@@ -1016,7 +1092,8 @@ fn json_objects(node: Node<'_>) -> Vec<Node<'_>> {
     }
 }
 
-fn hcl_object_pairs(mut node: Node<'_>) -> Option<Vec<(Node<'_>, Node<'_>, Node<'_>)>> {
+/// Unwraps single-element expression wrappers down to a tuple, object, or term.
+fn hcl_collection(mut node: Node<'_>) -> Option<Node<'_>> {
     while matches!(node.kind(), "expression" | "collection_value") {
         let children = named_children(node);
         let [child] = children.as_slice() else {
@@ -1024,6 +1101,11 @@ fn hcl_object_pairs(mut node: Node<'_>) -> Option<Vec<(Node<'_>, Node<'_>, Node<
         };
         node = *child;
     }
+    Some(node)
+}
+
+fn hcl_object_pairs(node: Node<'_>) -> Option<Vec<(Node<'_>, Node<'_>, Node<'_>)>> {
+    let node = hcl_collection(node)?;
     (node.kind() == "object").then(|| {
         named_children(node)
             .into_iter()
@@ -1065,6 +1147,15 @@ fn decode_label(node: Node<'_>, text: &str) -> Option<String> {
         "string_lit" => serde_json::from_str(node_text(node, text)).ok(),
         _ => None,
     }
+}
+
+fn hcl_labels(block: Node<'_>, text: &str) -> Option<Vec<String>> {
+    named_children(block)
+        .into_iter()
+        .skip(1)
+        .take_while(|child| child.kind() != "block_start")
+        .map(|child| decode_label(child, text))
+        .collect()
 }
 
 fn hcl_string(node: Node<'_>, text: &str) -> Option<String> {
@@ -1124,15 +1215,21 @@ fn normalized_provider_source(address: &str) -> Option<String> {
         [namespace, name] if source_part(namespace) && source_part(name) => {
             Some(format!("registry.terraform.io/{address}").to_ascii_lowercase())
         }
-        [host, namespace, name]
-            if !host.is_empty()
-                && host
+        [host, namespace, name] if source_part(namespace) && source_part(name) => {
+            // As svchost does: an optional decimal port, without the default 443.
+            let (name_part, port) = host
+                .split_once(':')
+                .map_or((*host, None), |(host, port)| (host, Some(port)));
+            let port = match port.map(str::parse::<u16>) {
+                None | Some(Ok(443)) => String::new(),
+                Some(Ok(port)) => format!(":{port}"),
+                Some(Err(_)) => return None,
+            };
+            (!name_part.is_empty()
+                && name_part
                     .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
-                && source_part(namespace)
-                && source_part(name) =>
-        {
-            Some(address.to_ascii_lowercase())
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.'))
+            .then(|| format!("{name_part}{port}/{namespace}/{name}").to_ascii_lowercase())
         }
         _ => None,
     }
@@ -1775,20 +1872,30 @@ mod tests {
     use crate::store::FileInput;
 
     fn parse_source(source: &Source) -> Graph {
+        parse_sources(std::slice::from_ref(source))
+    }
+
+    fn parse_sources(sources: &[Source]) -> Graph {
         let mut graph = Graph {
-            files: vec![FileInput {
-                path: source.path.clone(),
-                language: Language::Terraform,
-                git_oid: None,
-                content_hash: *blake3::hash(source.text.as_bytes()).as_bytes(),
-                parse_context: String::new(),
-                byte_size: source.text.len() as u64,
-                replace: true,
-                observed_relation_sites: 0,
-            }],
+            files: sources
+                .iter()
+                .map(|source| FileInput {
+                    path: source.path.clone(),
+                    language: Language::Terraform,
+                    git_oid: None,
+                    content_hash: *blake3::hash(source.text.as_bytes()).as_bytes(),
+                    parse_context: String::new(),
+                    byte_size: source.text.len() as u64,
+                    replace: true,
+                    observed_relation_sites: 0,
+                })
+                .collect(),
             ..Graph::default()
         };
-        add_file(&mut graph, source, &mut TerraformParsers::default()).unwrap();
+        let mut parsers = TerraformParsers::default();
+        for source in sources {
+            add_file(&mut graph, source, &mut parsers).unwrap();
+        }
         graph
     }
 
@@ -1885,7 +1992,7 @@ check "health" {
     url = var.url
   }
   assert {
-    condition     = data.http.probe.status_code == 200
+    condition     = var.enabled
     error_message = "down"
   }
 }
@@ -1895,7 +2002,7 @@ check "health" {
                 "infra/main.tf.json",
                 r#"{"check": {"health": {
   "data": {"http": {"probe": {"url": "${var.url}"}}},
-  "assert": [{"condition": "${data.http.probe.status_code == 200}", "error_message": "down"}]
+  "assert": [{"condition": "${var.enabled}", "error_message": "down"}]
 }}}"#,
             ),
         ] {
@@ -1908,7 +2015,9 @@ check "health" {
             assert_eq!(
                 dependencies(&graph),
                 [
+                    // Terraform links a check to its nested data source.
                     ("check.health", "data.http.probe"),
+                    ("check.health", "var.enabled"),
                     ("data.http.probe", "var.url"),
                 ],
                 "{path}"
@@ -1986,6 +2095,175 @@ check "health" {
                 ("local.map", "var.key"),
                 ("output.result", "local.b"),
             ]
+        );
+    }
+
+    #[test]
+    fn quoted_hcl_depends_on_follows_static_references() {
+        let mut graph = parse_sources(&[
+            Source {
+                path: "main.tf".into(),
+                text: r#"
+resource "terraform_data" "a" {}
+data "http" "d" {
+  depends_on = ["terraform_data.a"]
+}
+resource "terraform_data" "b" {
+  depends_on = ["terraform_data.a[0]", "data.http.d", "module.m", terraform_data.c]
+}
+output "o" {
+  value      = 1
+  depends_on = [" terraform_data.b "]
+}
+module "m" {
+  source     = "./child"
+  depends_on = ["terraform_data.a"]
+}
+"#
+                .into(),
+            },
+            Source {
+                path: "child/main.tf".into(),
+                text: String::new(),
+            },
+        ]);
+        project_modules(&mut graph, &AtomicBool::new(false)).unwrap();
+        assert!(graph.gaps.is_empty());
+        assert_eq!(
+            dependencies(&graph),
+            [
+                ("data.http.d", "terraform_data.a"),
+                ("module.m", "module.m.configuration.depends_on"),
+                ("module.m.configuration.depends_on", "terraform_data.a"),
+                ("output.o", "terraform_data.b"),
+                ("terraform_data.b", "data.http.d"),
+                ("terraform_data.b", "module.m"),
+                ("terraform_data.b", "terraform_data.a"),
+                ("terraform_data.b", "terraform_data.c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn import_blocks_report_unmodeled_coverage() {
+        for (path, text) in [
+            (
+                "main.tf",
+                "resource \"terraform_data\" \"item\" {}\nimport {\n  to = terraform_data.item\n  id = var.identifier\n}\n",
+            ),
+            (
+                "main.tf.json",
+                r#"{"resource": {"terraform_data": {"item": {}}},
+"import": [{"to": "terraform_data.item", "id": "${var.identifier}"}]}"#,
+            ),
+        ] {
+            let mut graph = parse_source(&Source {
+                path: path.into(),
+                text: text.into(),
+            });
+            project_modules(&mut graph, &AtomicBool::new(false)).unwrap();
+            assert!(dependencies(&graph).is_empty(), "{path}");
+            let gaps = graph
+                .gaps
+                .iter()
+                .map(|gap| (gap.reason, gap.line_start, gap.line_end))
+                .collect::<Vec<_>>();
+            let lines = if path.ends_with(".json") {
+                (2, 2)
+            } else {
+                (2, 5)
+            };
+            assert_eq!(
+                gaps,
+                [(
+                    GapReason::TerraformImportUnmodeled,
+                    Some(lines.0),
+                    Some(lines.1)
+                )],
+                "{path}"
+            );
+            assert_eq!(graph.files[0].observed_relation_sites, 1, "{path}");
+        }
+    }
+
+    #[test]
+    fn provider_sources_with_ports_match_across_local_names() {
+        let mut graph = parse_sources(&[
+            Source {
+                path: "main.tf".into(),
+                text: r#"
+terraform {
+  required_providers {
+    ops = { source = "LOCALHOST:1234/example/test" }
+  }
+}
+provider "ops" {}
+provider "ops" {
+  alias = "second"
+}
+module "inherit" {
+  source = "./child"
+}
+module "mapped" {
+  source    = "./child"
+  providers = { test = ops.second }
+}
+"#
+                .into(),
+            },
+            Source {
+                path: "child/main.tf".into(),
+                text: r#"
+terraform {
+  required_providers {
+    test = { source = "localhost:1234/example/test" }
+  }
+}
+resource "test_thing" "x" {}
+"#
+                .into(),
+            },
+        ]);
+        project_modules(&mut graph, &AtomicBool::new(false)).unwrap();
+        assert!(graph.gaps.is_empty());
+        assert_eq!(
+            dependencies(&graph),
+            [
+                ("module.inherit", "module.inherit.test_thing.x"),
+                // Default inheritance matches by source address, not local name.
+                ("module.inherit.test_thing.x", "provider.ops"),
+                ("module.mapped", "module.mapped.providers.test"),
+                ("module.mapped", "module.mapped.test_thing.x"),
+                ("module.mapped.providers.test", "provider.ops.second"),
+                ("module.mapped.test_thing.x", "module.mapped.providers.test"),
+            ]
+        );
+        // As in svchost, the default HTTPS port is not part of the identity.
+        assert_eq!(
+            normalized_provider_source("example.com:443/A/b"),
+            Some("example.com/a/b".to_owned())
+        );
+    }
+
+    #[test]
+    fn unsupported_provider_source_reports_a_gap_instead_of_a_default() {
+        let mut graph = parse_source(&Source {
+            path: "main.tf".into(),
+            text: r#"
+terraform {
+  required_providers {
+    aws = { source = "example.com/a/b/c" }
+  }
+}
+provider "aws" {}
+resource "aws_instance" "x" {}
+"#
+            .into(),
+        });
+        project_modules(&mut graph, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            graph.gaps.iter().map(|gap| gap.reason).collect::<Vec<_>>(),
+            [GapReason::TerraformProviderUnmodeled]
         );
     }
 }

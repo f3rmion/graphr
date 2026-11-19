@@ -18,7 +18,7 @@ use crate::git::{
 };
 use crate::graph::{CodeGraph, Relation, Step};
 
-pub(crate) const SCHEMA_VERSION: i64 = 13;
+pub(crate) const SCHEMA_VERSION: i64 = 14;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
@@ -193,6 +193,7 @@ pub enum GapReason {
     TerraformModuleCycle,
     TerraformModuleLimit,
     TerraformProviderUnmodeled,
+    TerraformImportUnmodeled,
     UnresolvedDependency,
     AmbiguousDependency,
     DynamicOrUnsupportedDispatch,
@@ -223,6 +224,7 @@ impl GapReason {
             Self::TerraformModuleCycle => "terraform-module-cycle",
             Self::TerraformModuleLimit => "terraform-module-expansion-limit",
             Self::TerraformProviderUnmodeled => "terraform-provider-unmodeled",
+            Self::TerraformImportUnmodeled => "terraform-import-unmodeled",
             Self::UnresolvedDependency => "unresolved-dependency",
             Self::AmbiguousDependency => "ambiguous-dependency",
             Self::DynamicOrUnsupportedDispatch => "dynamic-or-unsupported-dispatch",
@@ -253,6 +255,7 @@ impl GapReason {
             "terraform-module-cycle" => Some(Self::TerraformModuleCycle),
             "terraform-module-expansion-limit" => Some(Self::TerraformModuleLimit),
             "terraform-provider-unmodeled" => Some(Self::TerraformProviderUnmodeled),
+            "terraform-import-unmodeled" => Some(Self::TerraformImportUnmodeled),
             "unresolved-dependency" => Some(Self::UnresolvedDependency),
             "ambiguous-dependency" => Some(Self::AmbiguousDependency),
             "dynamic-or-unsupported-dispatch" => Some(Self::DynamicOrUnsupportedDispatch),
@@ -8148,7 +8151,8 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
                 'external-dependency','dependency-collapsed','language-not-indexed',
                 'coverage-unmapped-file','coverage-unmapped-region','missing-test-context',
                 'ambiguous-test-context','terraform-override-unmodeled','unresolved-dependency',
-                'terraform-module-cycle','terraform-module-expansion-limit','terraform-provider-unmodeled'
+                'terraform-module-cycle','terraform-module-expansion-limit','terraform-provider-unmodeled',
+                'terraform-import-unmodeled'
             )),
             target_hint TEXT,
             occurrences INTEGER NOT NULL CHECK(occurrences>0),
@@ -8174,7 +8178,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE INDEX source_notes_file_lines ON source_notes(file_id, line_start);
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=13;",
+         PRAGMA user_version=14;",
     )
     .map_err(db_error)
 }
