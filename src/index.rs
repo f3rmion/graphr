@@ -26,7 +26,7 @@ use crate::store::{
     CoverageRegionInput, CoverageRunInput, EdgeInput, EdgeKind, EvidenceInput, EvidenceLineSpan,
     FileInput, GapCategory, GapInput, GapReason, Graph, ImportedArtifactInput, ModeledSiteInput,
     ModeledSiteKind, NodeInput, NodeKind, ProvenanceInput, RefInput, RefKind, ResolutionState,
-    SourceNoteInput, Store, TraitImplementationInput, no_change_dot,
+    SourceNoteInput, Store, TerraformPlanInput, TraitImplementationInput, no_change_dot,
 };
 use crate::terraform::TerraformParsers;
 use crate::workspace::{
@@ -140,6 +140,28 @@ impl Engine {
         let evidence_only_paths = manifest
             .as_ref()
             .map_or_else(BTreeSet::new, |manifest| manifest.evidence_only_paths());
+        if let Some(path) = manifest
+            .as_ref()
+            .and_then(|manifest| manifest.terraform_plan_path())
+        {
+            // Mutable snapshots also render Git history. Keep the raw plan out
+            // of captured diffs even when it was deleted from the selected index.
+            let private_paths = BTreeSet::from([path.to_owned()]);
+            repository.reject_tracked_evidence_paths(
+                &private_paths,
+                Some(&request.base_oid),
+                None,
+                cancelled,
+            )?;
+            if request.head_oid != request.base_oid {
+                repository.reject_tracked_evidence_paths(
+                    &private_paths,
+                    Some(&request.head_oid),
+                    None,
+                    cancelled,
+                )?;
+            }
+        }
         let capture = repository.capture_snapshot(
             &request.base_oid,
             &request.head_oid,
@@ -873,7 +895,16 @@ impl Engine {
                 "DOT changes do not accept a cursor",
             ));
         }
-        if let Some(reason) = snapshot.no_change_reason {
+        let show_plan = snapshot.no_change_reason.is_some()
+            && format == ChangesFormat::Review
+            && snapshot.provenance.evidence_manifest_digest.is_some()
+            && snapshot
+                .open_graph()
+                .and_then(|store| store.has_terraform_plan())
+                .map_err(query_operation_error)?;
+        if let Some(reason) = snapshot.no_change_reason
+            && !show_plan
+        {
             if cursor.is_some() {
                 return Err(OperationError::new(
                     ErrorCode::InvalidParameters,
@@ -909,7 +940,7 @@ impl Engine {
                     .open_graph()
                     .and_then(|mut store| {
                         let base = snapshot.open_base_graph()?;
-                        store.changes(
+                        let mut graph = store.changes(
                             snapshot_id,
                             &snapshot.changes,
                             depth,
@@ -917,7 +948,13 @@ impl Engine {
                             snapshot.dependency_mode,
                             base.as_ref(),
                             cancelled,
-                        )
+                        )?;
+                        if snapshot.provenance.evidence_manifest_digest.is_some() {
+                            graph.evidence.push_str(
+                                &store.terraform_plan_evidence(base.as_ref(), cancelled)?,
+                            );
+                        }
+                        Ok(graph)
                     })
                     .map_err(query_operation_error)?;
                 let review = Arc::new(ReviewSnapshot::new(
@@ -1124,23 +1161,29 @@ fn evidence_artifacts(
     for index in &evidence.scip {
         insert(ArtifactRole::ScipIndex, index)?;
     }
-    Ok(artifacts
+    let mut artifacts: Vec<_> = artifacts
         .into_iter()
         .map(
             |((role, path), (content_hash, byte_size))| ImportedArtifactInput {
-                key: format!(
-                    "{}:{}:{}",
-                    role.db(),
-                    path,
-                    blake3::Hash::from_bytes(content_hash).to_hex()
-                ),
+                key: artifact_key(role, &path, content_hash),
                 path,
                 role,
                 content_hash,
                 byte_size,
             },
         )
-        .collect())
+        .collect();
+    if let Some(plan) = &evidence.terraform_plan {
+        let role = ArtifactRole::TerraformPlan;
+        artifacts.push(ImportedArtifactInput {
+            key: artifact_key(role, &plan.path, plan.content_hash),
+            path: plan.path.clone(),
+            role,
+            content_hash: plan.content_hash,
+            byte_size: plan.byte_size,
+        });
+    }
+    Ok(artifacts)
 }
 
 fn build_generated_evidence(
@@ -1313,16 +1356,32 @@ fn build_generated_evidence(
             regions,
             branches,
             gaps,
+            terraform_plan: captured
+                .terraform_plan
+                .as_ref()
+                .map(|plan| TerraformPlanInput {
+                    artifact_key: artifact_key(
+                        ArtifactRole::TerraformPlan,
+                        &plan.path,
+                        plan.content_hash,
+                    ),
+                    root: plan.root.clone(),
+                    plan: plan.plan.clone(),
+                }),
         },
     ))
 }
 
 fn captured_artifact_key(role: ArtifactRole, artifact: &CapturedArtifact) -> String {
+    artifact_key(role, &artifact.path, artifact.content_hash)
+}
+
+fn artifact_key(role: ArtifactRole, path: &str, content_hash: [u8; 32]) -> String {
     format!(
         "{}:{}:{}",
         role.db(),
-        artifact.path,
-        blake3::Hash::from_bytes(artifact.content_hash).to_hex()
+        path,
+        blake3::Hash::from_bytes(content_hash).to_hex()
     )
 }
 
@@ -4351,6 +4410,7 @@ mod tests {
             }],
             coverage: Vec::new(),
             scip: Vec::new(),
+            terraform_plan: None,
         };
         let artifacts = evidence_artifacts(&evidence).unwrap();
 
@@ -4439,6 +4499,7 @@ mod tests {
             generated,
             coverage: Vec::new(),
             scip: Vec::new(),
+            terraform_plan: None,
         };
         let artifacts = evidence_artifacts(&captured).unwrap();
 
@@ -4570,6 +4631,7 @@ mod tests {
             generated,
             coverage: Vec::new(),
             scip: Vec::new(),
+            terraform_plan: None,
         };
         let artifacts = evidence_artifacts(&captured).unwrap();
 
@@ -4694,6 +4756,7 @@ mod tests {
                 }],
                 coverage: Vec::new(),
                 scip: Vec::new(),
+                terraform_plan: None,
             };
             let artifacts = evidence_artifacts(&captured).unwrap();
             let (graph, evidence) =

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use crate::git::{
 };
 use crate::graph::{CodeGraph, Relation, Step};
 
-pub(crate) const SCHEMA_VERSION: i64 = 14;
+pub(crate) const SCHEMA_VERSION: i64 = 15;
 const SEARCH_BUDGET: usize = 1536;
 const VIEW_BUDGET: usize = 4096;
 // ponytail: bound per-request root analysis; raise only with streamed/batched ranking.
@@ -412,6 +413,7 @@ pub enum ArtifactRole {
     GeneratedRust,
     CoverageReport,
     ScipIndex,
+    TerraformPlan,
 }
 
 impl ArtifactRole {
@@ -422,6 +424,7 @@ impl ArtifactRole {
             Self::GeneratedRust => "generated-rust",
             Self::CoverageReport => "coverage-report",
             Self::ScipIndex => "scip-index",
+            Self::TerraformPlan => "terraform-plan",
         }
     }
 
@@ -432,6 +435,7 @@ impl ArtifactRole {
             "generated-rust" => Some(Self::GeneratedRust),
             "coverage-report" => Some(Self::CoverageReport),
             "scip-index" => Some(Self::ScipIndex),
+            "terraform-plan" => Some(Self::TerraformPlan),
             _ => None,
         }
     }
@@ -530,6 +534,13 @@ pub struct EvidenceInput {
     pub regions: Vec<CoverageRegionInput>,
     pub branches: Vec<CoverageBranchInput>,
     pub gaps: Vec<GapInput>,
+    pub(crate) terraform_plan: Option<TerraformPlanInput>,
+}
+
+pub(crate) struct TerraformPlanInput {
+    pub artifact_key: String,
+    pub root: String,
+    pub plan: crate::terraform_plan::Plan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -895,7 +906,7 @@ impl Store {
         self.connection
             .prepare(
                 "SELECT path FROM imported_artifacts
-                  WHERE role IN ('manifest','generated-rust','coverage-report','scip-index')
+                  WHERE role IN ('manifest','generated-rust','coverage-report','scip-index','terraform-plan')
                   ORDER BY path",
             )
             .map_err(db_error)?
@@ -903,6 +914,31 @@ impl Store {
             .map_err(db_error)?
             .collect::<rusqlite::Result<BTreeSet<_>>>()
             .map_err(db_error)
+    }
+
+    pub(crate) fn has_terraform_plan(&self) -> Result<bool> {
+        self.connection
+            .query_row("SELECT EXISTS(SELECT 1 FROM terraform_plan)", [], |row| {
+                row.get(0)
+            })
+            .map_err(db_error)
+    }
+
+    pub(crate) fn terraform_plan_evidence(
+        &self,
+        base: Option<&Store>,
+        cancelled: &AtomicBool,
+    ) -> Result<String> {
+        let Some((root, plan)) = read_terraform_plan(&self.connection)? else {
+            return Ok(String::new());
+        };
+        render_terraform_plan(
+            &root,
+            &plan,
+            &self.connection,
+            base.map(|store| &store.connection),
+            cancelled,
+        )
     }
 
     pub fn search(
@@ -2111,6 +2147,147 @@ fn require_graph_invariants(connection: &Connection, cancelled: &AtomicBool) -> 
     check_cancelled(cancelled)
 }
 
+fn read_terraform_plan(
+    connection: &Connection,
+) -> Result<Option<(String, crate::terraform_plan::Plan)>> {
+    let row = connection
+        .query_row(
+            "SELECT p.root, p.payload, a.role, a.byte_size
+           FROM terraform_plan p JOIN imported_artifacts a ON a.id=p.artifact_id",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((root, payload, role, bytes)) = row else {
+        return Ok(None);
+    };
+    if role != ArtifactRole::TerraformPlan.db()
+        || !(1..=crate::terraform_plan::PLAN_LIMIT as i64).contains(&bytes)
+        || !crate::terraform_plan::root_is_safe(&root)
+    {
+        return Err("database Terraform plan identity is invalid".into());
+    }
+    let plan: crate::terraform_plan::Plan = rmcp::serde_json::from_str(&payload)
+        .map_err(|_| "database Terraform plan payload is invalid")?;
+    plan.validate()?;
+    Ok(Some((root, plan)))
+}
+
+enum PlanLocation {
+    Found { path: String, line: u32 },
+    Ambiguous,
+    Missing,
+}
+
+fn plan_location(
+    statement: &mut rusqlite::Statement<'_>,
+    root: &str,
+    address: &str,
+) -> Result<PlanLocation> {
+    let declaration = crate::terraform_plan::declaration_address(address)
+        .ok_or("Terraform plan resource address is invalid")?;
+    let root = if root == "." { "" } else { root };
+    let key = crate::terraform::lookup_key(root, &declaration);
+    let mut rows = statement.query([key]).map_err(db_error)?;
+    let Some(row) = rows.next().map_err(db_error)? else {
+        return Ok(PlanLocation::Missing);
+    };
+    let path = row.get(0).map_err(db_error)?;
+    let line = row.get(1).map_err(db_error)?;
+    if rows.next().map_err(db_error)?.is_some() {
+        Ok(PlanLocation::Ambiguous)
+    } else {
+        Ok(PlanLocation::Found { path, line })
+    }
+}
+
+fn render_terraform_plan(
+    root: &str,
+    plan: &crate::terraform_plan::Plan,
+    head: &Connection,
+    base: Option<&Connection>,
+    cancelled: &AtomicBool,
+) -> Result<String> {
+    const DECLARATION: &str = "SELECT f.path, n.line_start FROM node_keys k
+         JOIN nodes n ON n.id=k.node_id JOIN files f ON f.id=n.file_id
+         WHERE k.key=?1 AND n.kind='terraform' AND f.language='terraform'
+         ORDER BY n.id LIMIT 2";
+    let mut head = head.prepare(DECLARATION).map_err(db_error)?;
+    let mut base = base
+        .map(|base| base.prepare(DECLARATION))
+        .transpose()
+        .map_err(db_error)?;
+    let mut records = String::new();
+    let mut unmapped = 0;
+    for change in &plan.changes {
+        check_cancelled(cancelled)?;
+        write!(
+            records,
+            "terraform_change action={} address={:?}",
+            change.action.label(),
+            change.address
+        )
+        .expect("cannot fail writing to a String");
+        if let Some(order) = change.action.order() {
+            write!(records, " order={order}").expect("cannot fail writing to a String");
+        }
+        if let Some(deposed) = &change.deposed {
+            write!(records, " deposed={deposed}").expect("cannot fail writing to a String");
+        }
+        if change.importing {
+            records.push_str(" importing=true");
+        }
+        let mut location = plan_location(&mut head, root, &change.address)?;
+        let mut snapshot = "head";
+        if matches!(location, PlanLocation::Missing)
+            && change.action.may_use_base()
+            && let Some(base) = &mut base
+        {
+            location = plan_location(base, root, &change.address)?;
+            snapshot = "base";
+        }
+        match location {
+            PlanLocation::Found { path, line } => {
+                write!(records, " source={snapshot} path={path:?} line={line}")
+                    .expect("cannot fail writing to a String");
+            }
+            PlanLocation::Ambiguous => {
+                unmapped += 1;
+                records.push_str(" source=ambiguous");
+            }
+            PlanLocation::Missing => {
+                unmapped += 1;
+                records.push_str(" source=unmapped");
+            }
+        }
+        if let Some(previous) = &change.previous_address {
+            write!(records, " previous_address={previous:?}")
+                .expect("cannot fail writing to a String");
+        }
+        records.push('\n');
+    }
+    let flag = |value| match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    };
+    Ok(format!(
+        "terraform_plan root={root:?} basis=manifest-attested complete={} applyable={} errored={} changes={} unmapped={unmapped}\n{records}",
+        flag(plan.complete),
+        flag(plan.applyable),
+        flag(plan.errored),
+        plan.changes.len(),
+    ))
+}
+
 fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) -> Result<()> {
     check_cancelled(cancelled)?;
     for role in distinct_text(connection, "SELECT DISTINCT role FROM imported_artifacts")? {
@@ -2126,6 +2303,16 @@ fn require_evidence_invariants(connection: &Connection, cancelled: &AtomicBool) 
             "llvm" | "coverage_py" => {}
             _ => return Err("database coverage format is invalid".into()),
         }
+    }
+    let plan_artifacts = connection
+        .query_row(
+            "SELECT count(*) FROM imported_artifacts WHERE role='terraform-plan'",
+            [],
+            |row| row.get::<_, u32>(0),
+        )
+        .map_err(db_error)?;
+    if plan_artifacts != u32::from(read_terraform_plan(connection)?.is_some()) {
+        return Err("database Terraform plan artifact is inconsistent".into());
     }
     let unattested_scip: bool = connection
         .query_row(
@@ -6415,6 +6602,21 @@ fn insert_evidence(
         }
     }
 
+    if let Some(plan) = &evidence.terraform_plan {
+        check_cancelled(cancelled)?;
+        let (artifact, _, _) = artifacts
+            .get(&plan.artifact_key)
+            .filter(|(_, role, _)| *role == ArtifactRole::TerraformPlan)
+            .ok_or("Terraform plan artifact is missing")?;
+        let payload = rmcp::serde_json::to_string(&plan.plan)
+            .map_err(|_| "cannot encode Terraform plan evidence")?;
+        tx.execute(
+            "INSERT INTO terraform_plan VALUES(1,?1,?2,?3)",
+            params![artifact, plan.root, payload],
+        )
+        .map_err(db_error)?;
+    }
+
     let mut output_paths_by_basename = BTreeMap::<String, BTreeSet<String>>::new();
     for provenance in &evidence.provenance {
         let output_path = artifact_paths
@@ -8038,12 +8240,18 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             id INTEGER PRIMARY KEY,
             key TEXT NOT NULL UNIQUE CHECK(length(key)>0),
             role TEXT NOT NULL CHECK(role IN (
-                'manifest','input','generated-rust','coverage-report','scip-index'
+                'manifest','input','generated-rust','coverage-report','scip-index','terraform-plan'
             )),
             path TEXT NOT NULL CHECK(length(path)>0),
             content_hash BLOB NOT NULL CHECK(length(content_hash)=32),
             byte_size INTEGER NOT NULL CHECK(byte_size>=0),
             UNIQUE(role, path)
+         );
+         CREATE TABLE terraform_plan(
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            artifact_id INTEGER NOT NULL REFERENCES imported_artifacts(id) ON DELETE CASCADE,
+            root TEXT NOT NULL CHECK(length(root)>0),
+            payload TEXT NOT NULL CHECK(json_valid(payload))
          );
          CREATE TABLE provenance_links(
             id INTEGER PRIMARY KEY,
@@ -8178,7 +8386,7 @@ fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
          CREATE INDEX source_notes_file_lines ON source_notes(file_id, line_start);
          CREATE VIRTUAL TABLE nodes_fts
              USING fts5(name, qualified_name, path, signature);
-         PRAGMA user_version=14;",
+         PRAGMA user_version=15;",
     )
     .map_err(db_error)
 }
@@ -11361,6 +11569,7 @@ mod tests {
                     Vec::new()
                 },
                 gaps: Vec::new(),
+                terraform_plan: None,
                 provenance: Vec::new(),
             };
 
@@ -14258,6 +14467,7 @@ mod tests {
                 execution_count: 1,
             }],
             gaps: Vec::new(),
+            terraform_plan: None,
         }
     }
 

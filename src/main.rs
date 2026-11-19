@@ -15,6 +15,7 @@ mod schema;
 mod scip;
 mod store;
 mod terraform;
+mod terraform_plan;
 pub mod workspace;
 
 use std::env;
