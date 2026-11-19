@@ -1245,7 +1245,7 @@ fn literal_hcl_argument(kind: &str, name: &str) -> bool {
     )
 }
 
-fn lookup_key(directory: &str, address: &str) -> String {
+pub(crate) fn lookup_key(directory: &str, address: &str) -> String {
     format!("terraform:{}:{directory}:{address}", directory.len())
 }
 

@@ -210,7 +210,7 @@ built on first use per snapshot; see [Performance](#performance).
 ## External execution evidence
 
 First run `index` without evidence and retain its source-only `snapshot_id`.
-Run generators, tests, coverage tools, and SCIP indexers outside Graphr, write
+Run generators, tests, coverage tools, SCIP indexers, and Terraform outside Graphr. Write
 their outputs under the authorized worktree, then create a manifest bound to
 that source snapshot. Finally run the same `index` selection with
 `"evidence_manifest":"evidence.json"`. Graphr validates and imports the files
@@ -257,7 +257,12 @@ The closed v1 manifest is:
       "path": "index.scip",
       "blake3": "<64 lowercase hex>"
     }
-  ]
+  ],
+  "terraform_plan": {
+    "root": "infra",
+    "path": "target/graphr/terraform-plan.json",
+    "blake3": "<64 lowercase hex>"
+  }
 }
 ```
 
@@ -300,6 +305,27 @@ record. The evidence section reports
 and `view` and `changes` relation lines whose edge only SCIP supports end in
 ` via=scip`. Like coverage, this is producer attestation: Graphr verifies the
 digest and wire format, not the indexer's type analysis.
+
+### Terraform plan evidence
+
+The optional `terraform_plan` entry accepts one `terraform show -json` saved
+plan in JSON format `1.x`, up to 16 MiB and 8,192 resource change records. Use
+the repository-relative Terraform configuration directory as `root`, or `.`
+for the repository root. Keep the plan and evidence manifest untracked and
+write them after recording the source snapshot, or place them in an ignored
+directory. Graphr rejects a plan path tracked in the selected state or in
+either commit in the review range.
+
+The `evidence` section in `changes` shows the plan's resource instance
+addresses, actions, replacement order, and previous address for moves. It
+maps instances to declarations in the named root and uses the base graph when
+a removed declaration is missing from the head. Missing and ambiguous matches
+are visible. The plan's completeness, applicability, and error flags reflect
+the producer's report. The manifest attests that the plan belongs to the
+source snapshot and Graphr verifies the declared digest.
+
+Graphr retains the action and address metadata. Raw plan values and import
+IDs stay in the producer's file, which can contain sensitive data.
 
 Graphr has no process execution, causal build trace, runtime call ordering,
 mutation proof, JavaScript runtime coverage, before/after trust query, or

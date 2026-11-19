@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicBool;
 use serde::Deserialize;
 
 use crate::git::capture_evidence_file;
+use crate::terraform_plan::{self, PLAN_LIMIT, Plan};
 use crate::workspace::{ErrorCode, OperationError};
 
 pub const MANIFEST_LIMIT: u64 = 64 * 1024;
@@ -61,6 +62,16 @@ pub struct CapturedEvidence {
     pub generated: Vec<CapturedGenerated>,
     pub coverage: Vec<CapturedCoverage>,
     pub scip: Vec<CapturedArtifact>,
+    pub(crate) terraform_plan: Option<CapturedTerraformPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CapturedTerraformPlan {
+    pub path: String,
+    pub content_hash: [u8; 32],
+    pub byte_size: u64,
+    pub root: String,
+    pub plan: Plan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +133,14 @@ struct ManifestScip {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ManifestTerraformPlan {
+    path: String,
+    blake3: String,
+    root: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
     format_version: u32,
     source_snapshot_id: String,
@@ -129,6 +148,7 @@ struct Manifest {
     coverage: Vec<ManifestCoverage>,
     #[serde(default)]
     scip: Vec<ManifestScip>,
+    terraform_plan: Option<ManifestTerraformPlan>,
 }
 
 pub(crate) struct EvidenceManifest {
@@ -137,6 +157,7 @@ pub(crate) struct EvidenceManifest {
     generated: Vec<ManifestGenerated>,
     coverage: Vec<ManifestCoverage>,
     scip: Vec<ManifestScip>,
+    terraform_plan: Option<ManifestTerraformPlan>,
 }
 
 impl EvidenceManifest {
@@ -151,6 +172,10 @@ impl EvidenceManifest {
             .collect()
     }
 
+    pub(crate) fn terraform_plan_path(&self) -> Option<&str> {
+        self.terraform_plan.as_ref().map(|plan| plan.path.as_str())
+    }
+
     pub(crate) fn evidence_only_paths(&self) -> BTreeSet<String> {
         std::iter::once(self.manifest.path.clone())
             .chain(
@@ -160,6 +185,7 @@ impl EvidenceManifest {
             )
             .chain(self.coverage.iter().map(|coverage| coverage.path.clone()))
             .chain(self.scip.iter().map(|scip| scip.path.clone()))
+            .chain(self.terraform_plan.iter().map(|plan| plan.path.clone()))
             .collect()
     }
 
@@ -269,12 +295,41 @@ impl EvidenceManifest {
             charge_retained(&mut retained, &index)?;
             scip.push(index);
         }
+        let terraform_plan = if let Some(declaration) = self.terraform_plan {
+            let bytes = capture_evidence_file(root, &declaration.path, PLAN_LIMIT, cancelled)?;
+            let artifact = CapturedArtifact {
+                path: declaration.path,
+                content_hash: *blake3::hash(&bytes).as_bytes(),
+                bytes,
+            };
+            if artifact.content_hash != parse_digest(&declaration.blake3)? {
+                return Err(invalid("Terraform plan digest does not match"));
+            }
+            charge_retained(&mut retained, &artifact)?;
+            let plan = terraform_plan::decode(&artifact.bytes, cancelled).map_err(|error| {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    OperationError::new(ErrorCode::JobCancelled, error)
+                } else {
+                    invalid(error)
+                }
+            })?;
+            Some(CapturedTerraformPlan {
+                path: artifact.path,
+                content_hash: artifact.content_hash,
+                byte_size: artifact.bytes.len() as u64,
+                root: declaration.root,
+                plan,
+            })
+        } else {
+            None
+        };
         Ok(CapturedEvidence {
             source_snapshot_id: self.source_snapshot_id,
             manifest: self.manifest,
             generated,
             coverage,
             scip,
+            terraform_plan,
         })
     }
 }
@@ -321,6 +376,26 @@ pub(crate) fn capture_manifest(
         let _ = safe_str_path(&scip.path)?;
         let _ = parse_digest(&scip.blake3)?;
     }
+    if let Some(plan) = &value.terraform_plan {
+        let _ = safe_str_path(&plan.path)?;
+        let _ = parse_digest(&plan.blake3)?;
+        if !terraform_plan::root_is_safe(&plan.root) {
+            return Err(invalid("Terraform plan root is unsafe"));
+        }
+        if plan.path == path
+            || value.generated.iter().any(|item| {
+                plan.path == item.input.path
+                    || plan.path == item.output.path
+                    || plan.path == item.generator.path
+            })
+            || value.coverage.iter().any(|item| plan.path == item.path)
+            || value.scip.iter().any(|item| plan.path == item.path)
+        {
+            return Err(invalid(
+                "Terraform plan path must be exclusive to plan evidence",
+            ));
+        }
+    }
     value.generated.sort_unstable();
     if value.generated.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(invalid(
@@ -356,6 +431,7 @@ pub(crate) fn capture_manifest(
         generated: value.generated,
         coverage: value.coverage,
         scip: value.scip,
+        terraform_plan: value.terraform_plan,
     })
 }
 

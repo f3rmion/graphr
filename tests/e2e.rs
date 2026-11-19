@@ -14,6 +14,251 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension};
 
 #[test]
+fn terraform_plan_evidence_maps_instances_and_removals_without_retaining_values() {
+    use rmcp::serde_json::json;
+
+    let fixture = Fixture::new();
+    let root = &fixture.path;
+    for dir in ["infra", "shared", "other", "other/shared"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let files = [
+        (".gitignore", "/terraform-plan.json\n/evidence.json\n"),
+        (
+            "infra/main.tf",
+            "module \"staging\" { source = \"../shared\" }\n",
+        ),
+        (
+            "infra/retired.tf",
+            "resource \"aws_s3_bucket\" \"retired\" {}\n",
+        ),
+        (
+            "infra/instance.tf",
+            "resource \"aws_instance\" \"old\" {}\n",
+        ),
+        (
+            "shared/network.tf",
+            "resource \"aws_subnet\" \"private\" {}\n",
+        ),
+        (
+            "other/main.tf",
+            "module \"staging\" { source = \"./shared\" }\n",
+        ),
+        (
+            "other/shared/network.tf",
+            "resource \"aws_subnet\" \"private\" {}\n",
+        ),
+    ];
+    for (path, contents) in files {
+        fs::write(root.join(path), contents).unwrap();
+    }
+    init_git(root);
+    git(root, &["add", "."]);
+    git_commit(root, "Terraform plan baseline");
+    fs::remove_file(root.join("infra/retired.tf")).unwrap();
+    fs::write(
+        root.join("infra/instance.tf"),
+        "resource \"aws_instance\" \"renamed\" {}\n",
+    )
+    .unwrap();
+    git(root, &["add", "."]);
+    git_commit(root, "Terraform plan head");
+    let source = index_repository_request(root, "HEAD~1", "HEAD");
+
+    let secret = "plan-secret-value-should-never-be-cached";
+    let address = r#"module.staging["az.one]"].aws_subnet.private[0]"#;
+    let plan = rmcp::serde_json::to_vec(&json!({
+        "format_version": "1.2",
+        "configuration": {"root_module": {"value": secret}},
+        "applyable": true,
+        "complete": false,
+        "errored": false,
+        "resource_changes": [
+            {"address": address, "change": {
+                "actions": ["delete", "create"],
+                "before": {"password": secret},
+                "after": {"password": secret},
+                "replace_paths": [[secret]]
+            }},
+            {"address": "aws_s3_bucket.retired", "deposed": "deadbeef", "change": {"actions": ["delete"]}},
+            {"address": "aws_instance.renamed", "previous_address": "aws_instance.old", "change": {"actions": ["no-op"]}},
+            {"address": "aws_instance.unknown", "change": {"actions": ["update"]}},
+            {"address": "aws_instance.unchanged", "change": {"actions": ["no-op"], "after": {"password": secret}}}
+        ],
+        "prior_state": {"values": {"password": secret}}
+    })).unwrap();
+    fs::write(root.join("terraform-plan.json"), &plan).unwrap();
+
+    let manifest = |source: &rmcp::serde_json::Value| {
+        rmcp::serde_json::to_vec(&json!({
+            "format_version": 1,
+            "source_snapshot_id": source["snapshot_id"],
+            "generated": [],
+            "coverage": [],
+            "terraform_plan": {
+                "root": "infra",
+                "path": "terraform-plan.json",
+                "blake3": blake3::hash(&plan).to_hex().to_string()
+            }
+        }))
+        .unwrap()
+    };
+    fs::write(root.join("evidence.json"), manifest(&source)).unwrap();
+    let output = cli_index_with_evidence_request(
+        root,
+        "evidence.json",
+        "HEAD~1",
+        "HEAD",
+        "worktree",
+        true,
+        "boundary",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let completion = rmcp::serde_json::from_slice(&output.stdout).unwrap();
+    remember_graph(root, &completion);
+    let graph = fs::read(graph_path(root)).unwrap();
+    assert!(
+        !graph
+            .windows(secret.len())
+            .any(|bytes| bytes == secret.as_bytes())
+    );
+    let reviews = root.join(".git/graphr/v6/reviews");
+    for entry in fs::read_dir(reviews).unwrap() {
+        let review = fs::read(entry.unwrap().path()).unwrap();
+        assert!(
+            !review
+                .windows(secret.len())
+                .any(|bytes| bytes == secret.as_bytes())
+        );
+    }
+
+    let mut client = Client::start_unindexed(root);
+    let snapshot_id = completion["snapshot_id"].as_str().unwrap().to_owned();
+    let inspection = client.call(
+        "inspect_root",
+        json!({"worktree_root": root, "snapshot_id": snapshot_id}),
+    );
+    assert!(!tool_failed(&inspection), "{inspection}");
+    let changes = capture_changes(&mut client, &snapshot_id, 2, 30);
+    let report = changes
+        .queries()
+        .map(|page| page.text.as_str())
+        .collect::<String>();
+    assert!(report.contains("terraform_plan root=\"infra\" basis=manifest-attested complete=false applyable=true errored=false changes=4 unmapped=1"), "{report}");
+    assert!(report.contains(&format!("terraform_change action=replace address={address:?} order=delete,create source=head path=\"shared/network.tf\" line=1")), "{report}");
+    assert!(report.contains("terraform_change action=delete address=\"aws_s3_bucket.retired\" deposed=deadbeef source=base path=\"infra/retired.tf\" line=1"), "{report}");
+    assert!(report.contains("terraform_change action=move address=\"aws_instance.renamed\" source=head path=\"infra/instance.tf\" line=1 previous_address=\"aws_instance.old\""), "{report}");
+    assert!(
+        report.contains(
+            "terraform_change action=update address=\"aws_instance.unknown\" source=unmapped"
+        ),
+        "{report}"
+    );
+    assert!(
+        !report.contains("other/shared/network.tf") && !report.contains(secret),
+        "{report}"
+    );
+    assert!(!report.contains("aws_instance.unchanged"), "{report}");
+
+    let mut changed_plan = plan.clone();
+    changed_plan.push(b'\n');
+    fs::write(root.join("terraform-plan.json"), changed_plan).unwrap();
+    let output = cli_index_with_evidence_request(
+        root,
+        "evidence.json",
+        "HEAD~1",
+        "HEAD",
+        "worktree",
+        true,
+        "boundary",
+    );
+    assert!(!output.status.success());
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostics.contains("Terraform plan digest does not match"),
+        "{diagnostics}"
+    );
+    assert!(!diagnostics.contains(secret), "{diagnostics}");
+    fs::write(root.join("terraform-plan.json"), &plan).unwrap();
+
+    let source = index_repository(root);
+    fs::write(root.join("evidence.json"), manifest(&source)).unwrap();
+    let completion = successful_evidence_index(root);
+    let snapshot_id = completion["snapshot_id"].as_str().unwrap().to_owned();
+    let inspection = client.call(
+        "inspect_root",
+        json!({"worktree_root": root, "snapshot_id": snapshot_id}),
+    );
+    assert!(!tool_failed(&inspection), "{inspection}");
+    let clean_review = capture_changes(&mut client, &snapshot_id, 2, 30);
+    assert!(
+        clean_review
+            .queries()
+            .any(|page| page.text.contains("terraform_change action=replace"))
+    );
+    client.close();
+}
+
+#[test]
+fn terraform_plan_evidence_rejects_paths_tracked_in_the_base() {
+    use rmcp::serde_json::json;
+
+    let fixture = Fixture::new();
+    let root = &fixture.path;
+    init_git(root);
+    fs::write(root.join("terraform-plan.json"), "retired private plan").unwrap();
+    git(root, &["add", "."]);
+    git_commit(root, "tracked plan baseline");
+    fs::remove_file(root.join("terraform-plan.json")).unwrap();
+    git(root, &["add", "."]);
+    git_commit(root, "remove tracked plan");
+
+    let bytes = br#"{"format_version":"1.2","configuration":{}}"#;
+    fs::write(root.join("terraform-plan.json"), bytes).unwrap();
+    fs::write(
+        root.join("evidence.json"),
+        rmcp::serde_json::to_vec(&json!({
+            "format_version": 1,
+            "source_snapshot_id": "a".repeat(64),
+            "generated": [],
+            "coverage": [],
+            "terraform_plan": {
+                "root": ".",
+                "path": "terraform-plan.json",
+                "blake3": blake3::hash(bytes).to_hex().to_string()
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = cli_index_with_evidence_request(
+        root,
+        "evidence.json",
+        "HEAD~1",
+        "HEAD",
+        "worktree",
+        true,
+        "boundary",
+    );
+    assert!(!output.status.success());
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostics.contains("evidence files must not be tracked"),
+        "{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("retired private plan"),
+        "{diagnostics}"
+    );
+    let snapshots = root.join(".git/graphr/v6/snapshots");
+    assert!(!snapshots.exists() || fs::read_dir(snapshots).unwrap().next().is_none());
+}
+
+#[test]
 fn evidence_manifest_validation_rejects_unknown_fields_without_publication() {
     let fixture = Fixture::new();
     init_git(&fixture.path);
